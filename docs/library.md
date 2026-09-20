@@ -43,6 +43,11 @@ updates each shared parameter once. Backward releases its saved graph; a
 second backward through it reports an error. Leaf gradients accumulate until
 cleared, and replacing a parameter starts a fresh leaf.
 
+Transforms whose physical index map is the identity are metadata views: an
+already-satisfied `with_layout`, a contiguous `split`, and the corresponding
+`merge` share storage and add no CUDA launch. A real permutation still
+materializes and records its inverse for backward.
+
 Research assumptions can also fail executable checks. `SinglePass` guards the
 finite-corpus consumption budget. `Idr` consumes stable sample IDs and enforces
 declared coverage and repeat-rate limits for finite or generated streams.

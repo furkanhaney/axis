@@ -324,6 +324,21 @@ impl Tensor {
         Ok(())
     }
     fn gathered(&self, shape: Shape, layout: Layout, map: Vec<usize>) -> Result<Self> {
+        if map
+            .iter()
+            .enumerate()
+            .all(|(output, &input)| output == input)
+        {
+            return Ok(Self::node(
+                shape,
+                layout,
+                self.0.value.clone(),
+                self.device(),
+                vec![Edge::new(self, Rule::Identity)],
+                false,
+                None,
+            ));
+        }
         let value = self
             .device()
             .grouped(&self.0.value, None, &Plan::gather(&map)?, 1.0)?;
@@ -1041,6 +1056,9 @@ impl Tensor {
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
         let layout = Layout::new(self.shape(), &order.into_axes())?;
+        if self.0.layout.strides == layout.strides {
+            return Ok(self.clone());
+        }
         let mut map = vec![0; self.shape().len()];
         for i in 0..self.shape().len() {
             let coords = self.shape().coords(i);
