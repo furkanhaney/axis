@@ -122,6 +122,16 @@ impl Device {
             .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn mask_gradient(&self, gradient: &Buffer, winners: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(gradient.shape()[0] as usize)?;
+        kernels::mask_gradient(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            winners.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn scale(&self, a: &Buffer, scale: f32) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::scale((&mut out).partition([128]), a.as_ref(), scale)
@@ -948,6 +958,19 @@ mod kernels {
         } else {
             out.store(x * y);
         }
+    }
+    #[cutile::entry()]
+    fn mask_gradient(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        winners: &Tensor<f32, { [-1] }>,
+    ) {
+        let zero = constant(0.0f32, shape![128]);
+        out.store(select(
+            gt_tile(winners.load_like(out), zero),
+            gradient.load_like(out),
+            zero,
+        ));
     }
     #[cutile::entry()]
     fn scale(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>, factor: f32) {
