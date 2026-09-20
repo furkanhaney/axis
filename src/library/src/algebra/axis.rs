@@ -178,6 +178,7 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn identity_binding_and_validation() -> Result<()> {
         let x = Axis::new("x");
@@ -188,9 +189,61 @@ mod tests {
         assert!(Shape::new([x.of(2), x.of(2)]).is_err());
         assert!(Shape::new([x.of(0)]).is_err());
         assert!(Shape::new([x.of(usize::MAX), role.of(2)]).is_err());
+        let error = Shape::new([role.of(i32::MAX as usize + 1)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cuTile index range"), "{error}");
         assert_eq!(Shape::new([x.of(32)])?.extent(x)?, 32);
         assert_eq!(Shape::new([x.of(8)])?.extent(x)?, 8);
         assert_eq!(Shape::new([])?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn shapes_expose_logical_axes_and_coordinates() -> Result<()> {
+        let (batch, time, feature) = (Axis::new("batch"), Axis::new("time"), Axis::new("feature"));
+        let shape = Shape::new([batch.of(2), time.of(3), feature.of(4)])?;
+
+        assert_eq!(batch.name(), "batch");
+        assert_eq!(shape.dims(), &[batch.of(2), time.of(3), feature.of(4)]);
+        assert_eq!(shape.axes(), [batch, time, feature]);
+        assert_eq!(shape.rank(), 3);
+        assert_eq!(shape.len(), 24);
+        assert!(!shape.is_empty());
+        assert!(shape.contains(time));
+        assert!(!shape.contains(Axis::new("other")));
+        assert_eq!(shape.index(feature)?, 2);
+        assert_eq!(shape.coords(0), [0, 0, 0]);
+        assert_eq!(shape.coords(23), [1, 2, 3]);
+
+        let missing = Axis::new("missing");
+        let error = shape.extent(missing).unwrap_err().to_string();
+        assert!(error.contains("missing axis missing#"), "{error}");
+        assert_eq!(shape.select_axes(batch)?, [batch]);
+        assert_eq!(shape.select_axes([feature, batch])?, [feature, batch]);
+        assert_eq!(shape.select_axes(vec![time, feature])?, [time, feature]);
+        assert_eq!(shape.select_axes(&[batch, time][..])?, [batch, time]);
+        assert!(shape.select_axes([batch, batch]).is_err());
+        assert!(shape.select_axes(missing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn layouts_map_logical_coordinates_to_physical_storage() -> Result<()> {
+        let (batch, time, feature) = (Axis::new("batch"), Axis::new("time"), Axis::new("feature"));
+        let shape = Shape::new([batch.of(2), time.of(3), feature.of(4)])?;
+
+        let contiguous = Layout::contiguous(&shape);
+        assert_eq!(contiguous.strides, [12, 4, 1]);
+        assert_eq!(contiguous.offset(&[1, 2, 3]), 23);
+
+        let feature_major = Layout::new(&shape, &[feature, batch, time])?;
+        assert_eq!(feature_major.strides, [3, 1, 6]);
+        assert_eq!(feature_major.offset(&[1, 2, 3]), 23);
+
+        assert!(Layout::new(&shape, &[batch, time]).is_err());
+        assert!(Layout::new(&shape, &[batch, time, time]).is_err());
+        assert!(Layout::new(&shape, &[batch, time, Axis::new("other")]).is_err());
         Ok(())
     }
 }

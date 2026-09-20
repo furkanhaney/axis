@@ -368,6 +368,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn in_memory_sources_validate_ids_and_repeat_only_when_requested() -> Result<()> {
+        assert!(InMemoryDataset::<u8>::new(vec![]).is_err());
+        assert!(InMemoryDataset::with_ids(vec![10, 20], vec![7]).is_err());
+
+        let mut source = InMemoryDataset::with_ids(vec![10, 20], vec![70, 90])?;
+        assert_eq!(source.available(), Some(2));
+        let first = source.next_sample()?.expect("first sample");
+        assert_eq!((first.id, first.value), (70, 10));
+        let second = source.next_sample()?.expect("second sample");
+        assert_eq!((second.id, second.value), (90, 20));
+        assert!(source.next_sample()?.is_none());
+
+        let mut repeated = InMemoryDataset::with_ids(vec![10, 20], vec![70, 90])?.repeat();
+        let observed = (0..5)
+            .map(|_| {
+                let sample = repeated.next_sample()?.expect("repeating source");
+                Ok((sample.id, sample.value))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(observed, [(70, 10), (90, 20), (70, 10), (90, 20), (70, 10)]);
+        Ok(())
+    }
+
+    #[test]
+    fn data_regime_receipts_name_the_guarantee_they_record() -> Result<()> {
+        assert_eq!(
+            DataRegimeReceipt::Unchecked.to_string(),
+            "DATA REGIME\n\nunchecked"
+        );
+
+        let mut single = SinglePass::new(4)?;
+        let single = DataRegimeReceipt::SinglePass(single.consume(1)?).to_string();
+        assert!(single.contains("SINGLE PASS STATUS"), "{single}");
+        assert!(single.contains("coverage:              25.00%"), "{single}");
+
+        let mut passes = FinitePasses::new(2, 1)?;
+        let finite = DataRegimeReceipt::FinitePasses(passes.observe([1, 2])?).to_string();
+        assert!(finite.contains("FINITE PASSES STATUS"), "{finite}");
+
+        let mut idr = Idr::generated(IdrLimits::generated(0.0)?)?;
+        let idr = DataRegimeReceipt::Idr(idr.observe([1, 2])?).to_string();
+        assert!(idr.contains("IDR STATUS"), "{idr}");
+        Ok(())
+    }
+
+    #[test]
     fn finite_source_yields_a_short_final_batch_and_stops() -> Result<()> {
         let source = InMemoryDataset::new(vec![10, 20, 30, 40, 50])?;
         let mut loader = DataLoader::new(source, 3)?;
@@ -412,6 +458,7 @@ mod tests {
 
     #[test]
     fn source_kind_and_limit_kind_must_agree() -> Result<()> {
+        assert!(DataLoader::new(InMemoryDataset::new(vec![1])?, 0).is_err());
         assert!(
             DataLoader::new(AdditionDataset::new(1), 2)?
                 .assert_single_pass()
@@ -422,6 +469,50 @@ mod tests {
                 .assert_idr(IdrLimits::fixed(0.1, 0.0)?)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn single_pass_loader_reports_progress_without_reusing_samples() -> Result<()> {
+        let source = InMemoryDataset::with_ids(vec![10, 20, 30], vec![7, 8, 9])?;
+        let mut loader = DataLoader::new(source, 2)?.assert_single_pass()?;
+
+        let first = loader.next_batch()?.expect("first batch");
+        assert_eq!(first.samples, [10, 20]);
+        assert_eq!(first.sample_ids, [7, 8]);
+        assert_eq!(first.samples_seen_before, 0);
+        assert!(first.regime.to_string().contains("66.67%"));
+
+        let last = loader.next_batch()?.expect("short final batch");
+        assert_eq!(last.samples, [30]);
+        assert_eq!(last.samples_seen_before, 2);
+        assert!(last.regime.to_string().contains("100.00%"));
+        assert_eq!(loader.samples_delivered(), 3);
+        assert!(loader.next_batch()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn finite_pass_loader_validates_inputs_and_preserves_custom_id_sets() -> Result<()> {
+        assert!(FinitePassesLoader::<u8>::new(vec![], 1, 1, 0).is_err());
+        assert!(FinitePassesLoader::with_ids(vec![1, 2], vec![10], 1, 1, 0).is_err());
+        assert!(FinitePassesLoader::new(vec![1, 2], 0, 1, 0).is_err());
+        assert!(FinitePassesLoader::new(vec![1, 2], 1, 0, 0).is_err());
+
+        let mut loader =
+            FinitePassesLoader::with_ids(vec!["a", "b", "c"], vec![100, 200, 300], 8, 2, 17)?;
+        for expected_pass in 1..=2 {
+            let batch = loader.next_batch()?.expect("complete pass");
+            assert_eq!(batch.samples.len(), 3);
+            let mut ids = batch.sample_ids;
+            ids.sort_unstable();
+            assert_eq!(ids, [100, 200, 300]);
+            let DataRegimeReceipt::FinitePasses(receipt) = batch.regime else {
+                panic!("finite-pass receipt expected");
+            };
+            assert_eq!(receipt.completed_passes, expected_pass);
+        }
+        assert!(loader.next_batch()?.is_none());
         Ok(())
     }
 

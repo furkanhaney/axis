@@ -78,4 +78,19 @@ mod tests {
         assert!(Standardizer::fit(&[1.0, 1.0]).is_err());
         Ok(())
     }
+
+    #[test]
+    fn standardizer_rejects_nonfinite_data_and_supports_population_variance() -> Result<()> {
+        assert!(Standardizer::fit(&[1.0, f32::NAN]).is_err());
+        assert!(Standardizer::fit_with_correction(&[1.0, 2.0], 2).is_err());
+
+        let fit = Standardizer::fit_with_correction(&[1.0, 3.0], 0)?;
+        assert_eq!(fit.mean(), 2.0);
+        assert_eq!(fit.standard_deviation(), 1.0);
+        assert_eq!(fit.correction(), 0);
+        let mut values = [1.0, f32::INFINITY];
+        assert!(fit.transform_in_place(&mut values).is_err());
+        assert_eq!(values, [1.0, f32::INFINITY]);
+        Ok(())
+    }
 }

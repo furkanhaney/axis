@@ -313,11 +313,22 @@ mod tests {
     #[test]
     fn declarations_and_observations_reject_ambiguous_evidence() -> Result<()> {
         assert!(MonotonicityLimits::strict(-1.0).is_err());
+        assert!(MonotonicityLimits::strict(f64::NAN).is_err());
         assert!(MonotonicityLimits::new(0.0, 1.1).is_err());
+        assert!(MonotonicityLimits::new(0.0, f64::INFINITY).is_err());
         assert!(
             EmpiricalMonotonicity::new(
                 "",
                 "output",
+                MonotoneDirection::Increasing,
+                MonotonicityLimits::strict(0.0)?,
+            )
+            .is_err()
+        );
+        assert!(
+            EmpiricalMonotonicity::new(
+                "input",
+                "   ",
                 MonotoneDirection::Increasing,
                 MonotonicityLimits::strict(0.0)?,
             )
@@ -331,9 +342,43 @@ mod tests {
             MonotonicityLimits::strict(0.0)?,
         )?;
         assert!(check.assert_invariant().is_err());
+        assert_eq!(check.receipt().violation_rate(), 0.0);
+        assert!(check.observe_ordered_batch([]).is_err());
         assert!(check.observe_ordered(1.0, 1.0, 0.0, 0.0).is_err());
         assert!(check.observe_ordered(0.0, 1.0, f64::NAN, 0.0).is_err());
+        assert!(
+            check
+                .observe_ordered_batch([(0.0, 1.0, 0.0, 1.0), (2.0, 2.0, 1.0, 1.0)])
+                .is_err()
+        );
         assert_eq!(check.receipt().comparisons, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn tolerance_and_violation_rate_boundaries_are_inclusive() -> Result<()> {
+        let limits = MonotonicityLimits::new(0.5, 0.5)?;
+        assert_eq!(limits.absolute_tolerance(), 0.5);
+        assert_eq!(limits.max_violation_rate(), 0.5);
+
+        let mut check =
+            EmpiricalMonotonicity::new("price", "demand", MonotoneDirection::Decreasing, limits)?;
+        let receipt = check.observe_ordered_batch([(1.0, 2.0, 3.0, 3.5), (2.0, 3.0, 3.5, 4.25)])?;
+        assert_eq!(receipt.comparisons, 2);
+        assert_eq!(receipt.violations, 1);
+        assert_eq!(receipt.violation_rate(), 0.5);
+        assert_eq!(receipt.worst_violation, 0.75);
+        assert_eq!(receipt.smallest_input_span, 1.0);
+
+        let error = check
+            .observe_ordered(3.0, 5.0, 4.25, 5.0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("violation rate:         66.6667%"),
+            "{error}"
+        );
+        assert_eq!(check.receipt().comparisons, 3);
         Ok(())
     }
 }
