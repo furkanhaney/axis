@@ -301,64 +301,6 @@ impl fmt::Display for RegimeViolation {
 
 impl std::error::Error for RegimeViolation {}
 
-/// Exact sample-identity separation between training and evaluation populations.
-#[derive(Default)]
-pub struct TrainEvalDisjoint {
-    train: HashSet<u128>,
-    evaluation: HashSet<u128>,
-}
-
-impl TrainEvalDisjoint {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn observe_train(
-        &mut self,
-        ids: impl IntoIterator<Item = u128>,
-    ) -> Result<TrainEvalReceipt> {
-        for id in ids {
-            if self.evaluation.contains(&id) {
-                return Err(format!(
-                    "train/evaluation contamination: sample ID {id} was already observed in evaluation"
-                )
-                .into());
-            }
-            self.train.insert(id);
-        }
-        Ok(self.receipt())
-    }
-
-    pub fn observe_evaluation(
-        &mut self,
-        ids: impl IntoIterator<Item = u128>,
-    ) -> Result<TrainEvalReceipt> {
-        for id in ids {
-            if self.train.contains(&id) {
-                return Err(format!(
-                    "train/evaluation contamination: sample ID {id} was already observed in training"
-                )
-                .into());
-            }
-            self.evaluation.insert(id);
-        }
-        Ok(self.receipt())
-    }
-
-    pub fn receipt(&self) -> TrainEvalReceipt {
-        TrainEvalReceipt {
-            unique_train_ids: self.train.len(),
-            unique_evaluation_ids: self.evaluation.len(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TrainEvalReceipt {
-    pub unique_train_ids: usize,
-    pub unique_evaluation_ids: usize,
-}
-
 /// Exact accounting for a declared number of complete finite-corpus passes.
 pub struct FinitePasses {
     population: usize,
@@ -470,16 +412,6 @@ impl fmt::Display for FinitePassesReceipt {
     }
 }
 
-impl fmt::Display for TrainEvalReceipt {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "TRAIN/EVALUATION DISJOINTNESS\n\nunique training IDs:    {}\nunique evaluation IDs:  {}\nobserved overlap:        0\n\nPASS",
-            self.unique_train_ids, self.unique_evaluation_ids
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,35 +499,6 @@ mod tests {
         assert_eq!(snapshot.coverage(), None);
         assert_eq!(snapshot.epochs(), None);
         assert_eq!(snapshot.repeat_rate(), 0.0);
-        Ok(())
-    }
-
-    #[test]
-    fn train_and_evaluation_identity_overlap_fails_in_either_order() -> Result<()> {
-        let mut evaluation_first = TrainEvalDisjoint::new();
-        evaluation_first.observe_evaluation([100, 101])?;
-        let error = evaluation_first
-            .observe_train([1, 100])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("sample ID 100"), "{error}");
-
-        let mut train_first = TrainEvalDisjoint::new();
-        train_first.observe_train([7, 8])?;
-        let error = train_first
-            .observe_evaluation([9, 8])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("sample ID 8"), "{error}");
-
-        let mut disjoint = TrainEvalDisjoint::new();
-        let train = disjoint.observe_train([1, 1, 2])?;
-        assert_eq!(train.unique_train_ids, 2);
-        let receipt = disjoint.observe_evaluation([10, 10, 11])?;
-        assert_eq!(receipt.unique_evaluation_ids, 2);
-        let display = receipt.to_string();
-        assert!(display.contains("unique training IDs:    2"), "{display}");
-        assert!(display.contains("unique evaluation IDs:  2"), "{display}");
         Ok(())
     }
 

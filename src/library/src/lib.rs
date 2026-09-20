@@ -5,6 +5,8 @@ mod axis;
 mod backend;
 #[path = "research/data.rs"]
 mod data;
+#[path = "research/disjointness.rs"]
+mod disjointness;
 #[path = "model/metrics.rs"]
 mod metrics;
 #[path = "research/monotonicity.rs"]
@@ -26,6 +28,9 @@ pub use data::{
     AdditionDataset, AdditionSample, Batch, DataLoader, DataRegimeReceipt, DataSource,
     FinitePassesLoader, InMemoryDataset, Sample,
 };
+pub use disjointness::{
+    Disjointness, DisjointnessEvidence, DisjointnessReceipt, IdentityScheme, PopulationReceipt,
+};
 pub use metrics::CategoricalAccuracy;
 pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
@@ -37,7 +42,6 @@ pub use nn::{
 pub use preprocess::Standardizer;
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
-    TrainEvalDisjoint, TrainEvalReceipt,
 };
 pub use tensor::Tensor;
 pub use train::{Optimizer, TrainStep, Trainer};
@@ -50,11 +54,12 @@ mod tests;
 pub mod prelude {
     pub use crate::{
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy, Conv2d,
-        DataLoader, DataRegimeReceipt, DataSource, Device, Dim, EmpiricalMonotonicity,
-        EmpiricalMonotonicityReceipt, FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU,
-        Idr, IdrLimits, IdrReceipt, InMemoryDataset, LayerNorm, Linear, Module, MonotoneDirection,
-        MonotonicityLimits, Optimizer, ParamId, Parameter, PopulationLinear, ReLU, RegimeSnapshot,
-        Result, SGD, Sample, Sequential, Shape, SinglePass, Standardizer, Tensor,
-        TrainEvalDisjoint, TrainEvalReceipt, TrainStep, Trainer,
+        DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness, DisjointnessEvidence,
+        DisjointnessReceipt, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, FinitePasses,
+        FinitePassesLoader, FinitePassesReceipt, GELU, IdentityScheme, Idr, IdrLimits, IdrReceipt,
+        InMemoryDataset, LayerNorm, Linear, Module, MonotoneDirection, MonotonicityLimits,
+        Optimizer, ParamId, Parameter, PopulationLinear, PopulationReceipt, ReLU, RegimeSnapshot,
+        Result, SGD, Sample, Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep,
+        Trainer,
     };
 }

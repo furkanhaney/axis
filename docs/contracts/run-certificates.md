@@ -40,10 +40,12 @@ evaluation
     train/evaluation ID overlap           0 VERIFIED
 ```
 
-`IdrReceipt`, `FinitePassesReceipt`, and `TrainEvalReceipt` are the first
+`IdrReceipt`, `FinitePassesReceipt`, and `DisjointnessReceipt` are the first
 certificate fragments. None uses a broad PASS to imply unmeasured properties.
-Exact ID separation does not prove distributional independence; finite-pass
-accounting does not prove shuffle quality.
+Disjointness records the versioned identity scheme and says
+`VerifiedObservations`; exact canonical-key separation does not prove
+distributional independence, and finite-pass accounting does not prove shuffle
+quality.
 
 ## Claims declare prerequisites
 
