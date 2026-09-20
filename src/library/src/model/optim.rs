@@ -1187,6 +1187,53 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUDA"]
+    fn pure_muon_rejects_an_omitted_remainder_atomically() -> Result<()> {
+        let device = Device::cuda(0)?;
+        let (row, column, bias_axis) = (Axis::new("row"), Axis::new("column"), Axis::new("bias"));
+        let weight = Parameter::new(Tensor::from_slice(
+            &[0.2, -0.1, 0.3, 0.5],
+            [row.of(2), column.of(2)],
+            &device,
+        )?);
+        let bias = Parameter::new(Tensor::from_slice(
+            &[0.4, -0.6],
+            [bias_axis.of(2)],
+            &device,
+        )?);
+        let mut model = Parameters(vec![
+            ("weight".into(), weight.clone()),
+            ("bias".into(), bias.clone()),
+        ]);
+        set_gradient(&weight, &[0.3, -0.2, 0.1, 0.4])?;
+        set_gradient(&bias, &[0.25, -0.5])?;
+        let before_weight = weight.tensor().to_vec()?;
+        let before_bias = bias.tensor().to_vec()?;
+        let mut optimizer = Muon::new([MuonMatrix::axis_linear(&weight)], 0.02, 0.0)?;
+
+        let error = optimizer.step(&mut model).unwrap_err().to_string();
+        assert!(
+            error.contains("selection omits 1 unique model parameter"),
+            "{error}"
+        );
+        assert_eq!(optimizer.completed_steps(), 0);
+        assert!(optimizer.states.is_empty());
+        close(
+            "pure Muon omitted remainder preserves selected weight",
+            &weight.tensor().to_vec()?,
+            &before_weight,
+            0.0,
+        );
+        close(
+            "pure Muon omitted remainder preserves omitted bias",
+            &bias.tensor().to_vec()?,
+            &before_bias,
+            0.0,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
     fn tiled_l2_normalization_matches_scalar_oracle() -> Result<()> {
         let device = Device::cuda(0)?;
         let axis = Axis::new("value");

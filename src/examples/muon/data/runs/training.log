@@ -1,7 +1,13 @@
-   Compiling axis v0.4.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-muon/src/library)
-   Compiling axis-muon-acceptance v0.4.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-muon/src/examples/muon)
-    Finished `release` profile [optimized] target(s) in 7.73s
-     Running `target/release/axis-muon-acceptance --steps 100`
+AXIS MUON ACCEPTANCE RECEIPT
+
+implementation commit: ffb46cdc9960bb6db9565f36ff4cd13ebca82881
+hardware:              NVIDIA GeForce RTX 5060
+driver:                595.84
+CUDA toolkit:          13.2.51
+toolkit path:          <axis-repository>/build/cuda
+command:               CUDA_TOOLKIT_PATH=<axis-repository>/build/cuda bash src/examples/muon/scripts/train.sh --steps 100
+claim scope:           both optimizer paths learned on one deterministic task; no comparative winner claim
+
 optimizer=AdamW baseline_mse=0.26941565 final_mse=0.00241553
 EMPIRICAL LEARNING PROGRESS
 
