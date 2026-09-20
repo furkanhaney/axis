@@ -1,6 +1,7 @@
 # Axis
 
 [![Latest version](https://img.shields.io/crates/v/axis.svg)](https://crates.io/crates/axis)
+[![CI](https://github.com/furkanhaney/axis/actions/workflows/ci.yml/badge.svg)](https://github.com/furkanhaney/axis/actions/workflows/ci.yml)
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-b7410e?logo=rust)](https://www.rust-lang.org/)
 [![CUDA 13.2](https://img.shields.io/badge/CUDA-13.2-76b900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 [![cuTile 0.3.1](https://img.shields.io/badge/cuTile-0.3.1-5b5bd6)](https://github.com/NVlabs/cutile-rs)
