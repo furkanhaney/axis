@@ -41,7 +41,7 @@ archives by SHA-256:
 
 ```bash
 bash scripts/setup_cuda.sh
-bash scripts/install_hooks.sh
+bash scripts/hooks/install.sh
 bash scripts/check.sh
 ```
 

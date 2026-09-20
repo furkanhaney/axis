@@ -85,3 +85,27 @@ impl Tensor {
         Ok(CategoricalAccuracy { correct, total })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categorical_counts_compose_exactly_across_batches() {
+        let first = CategoricalAccuracy {
+            correct: 7,
+            total: 10,
+        };
+        let second = CategoricalAccuracy {
+            correct: 2,
+            total: 5,
+        };
+        let combined = first.merge(second);
+        assert_eq!(first.correct(), 7);
+        assert_eq!(first.total(), 10);
+        assert_eq!(first.fraction(), 0.7);
+        assert_eq!(combined.correct(), 9);
+        assert_eq!(combined.total(), 15);
+        assert_eq!(combined.fraction(), 0.6);
+    }
+}

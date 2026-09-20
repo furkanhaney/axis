@@ -529,9 +529,45 @@ mod tests {
     #[test]
     fn invalid_regime_declarations_fail() {
         assert!(IdrLimits::fixed(1.1, 0.0).is_err());
+        assert!(IdrLimits::fixed(f64::NAN, 0.0).is_err());
         assert!(IdrLimits::fixed(0.1, -0.1).is_err());
+        assert!(IdrLimits::generated(1.1).is_err());
         assert!(IdrLimits::generated(f64::NAN).is_err());
         assert!(SinglePass::new(0).is_err());
+        assert!(FinitePasses::new(0, 1).is_err());
+        assert!(FinitePasses::new(1, 0).is_err());
+
+        let fixed_limits = IdrLimits::fixed(0.5, 0.25).unwrap();
+        assert_eq!(fixed_limits.max_coverage(), Some(0.5));
+        assert_eq!(fixed_limits.max_repeat_rate(), 0.25);
+        assert!(Idr::generated(fixed_limits).is_err());
+
+        let generated_limits = IdrLimits::generated(0.25).unwrap();
+        assert_eq!(generated_limits.max_coverage(), None);
+        assert!(Idr::fixed(10, generated_limits).is_err());
+        assert!(Idr::fixed(0, fixed_limits).is_err());
+    }
+
+    #[test]
+    fn empty_and_boundary_snapshots_are_well_defined() -> Result<()> {
+        let mut pass = SinglePass::new(4)?;
+        assert_eq!(pass.snapshot().consumed, 0);
+        assert_eq!(pass.consume(0)?.coverage(), Some(0.0));
+        assert_eq!(pass.consume(4)?.epochs(), Some(1.0));
+
+        let mut fixed = Idr::fixed(4, IdrLimits::fixed(1.0, 0.25)?)?;
+        let receipt = fixed.observe([10, 11, 12, 12])?;
+        assert_eq!(fixed.snapshot(), receipt.snapshot);
+        assert_eq!(receipt.snapshot.unique, 3);
+        assert_eq!(receipt.snapshot.repeat_rate(), 0.25);
+        assert!(receipt.to_string().contains("available population:  4"));
+
+        let generated = Idr::generated(IdrLimits::generated(0.0)?)?;
+        let snapshot = generated.snapshot();
+        assert_eq!(snapshot.coverage(), None);
+        assert_eq!(snapshot.epochs(), None);
+        assert_eq!(snapshot.repeat_rate(), 0.0);
+        Ok(())
     }
 
     #[test]
@@ -551,6 +587,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("sample ID 8"), "{error}");
+
+        let mut disjoint = TrainEvalDisjoint::new();
+        let train = disjoint.observe_train([1, 1, 2])?;
+        assert_eq!(train.unique_train_ids, 2);
+        let receipt = disjoint.observe_evaluation([10, 10, 11])?;
+        assert_eq!(receipt.unique_evaluation_ids, 2);
+        let display = receipt.to_string();
+        assert!(display.contains("unique training IDs:    2"), "{display}");
+        assert!(display.contains("unique evaluation IDs:  2"), "{display}");
         Ok(())
     }
 
@@ -572,6 +617,25 @@ mod tests {
         short.observe([0, 1, 2, 0])?;
         let error = short.finish().unwrap_err().to_string();
         assert!(error.contains("1 samples of pass 2"), "{error}");
+
+        let mut changed_population = FinitePasses::new(3, 2)?;
+        changed_population.observe([0, 1, 2])?;
+        let error = changed_population
+            .observe([0, 1, 3])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("did not contain the established population"),
+            "{error}"
+        );
+
+        let mut complete = FinitePasses::new(1, 1)?;
+        complete.observe([42])?;
+        let error = complete.observe([42]).unwrap_err().to_string();
+        assert!(
+            error.contains("continued after the declared passes"),
+            "{error}"
+        );
         Ok(())
     }
 }

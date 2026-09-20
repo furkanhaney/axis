@@ -452,6 +452,24 @@ fn categorical_loss_and_device_adam_match_references() -> Result<()> {
     assert_eq!(masked.correct(), 1);
     assert_eq!(masked.total(), 1);
     assert_eq!(masked.fraction(), 1.0);
+    let wrong_shape = Tensor::from_slice(&[1.0], [batch.of(1)], &device)?;
+    let error = logits
+        .masked_categorical_accuracy(&targets, &wrong_shape, class)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("mask must match"), "{error}");
+    let nonbinary = Tensor::from_slice(&[1.0, 0.5], [batch.of(2)], &device)?;
+    let error = logits
+        .masked_categorical_accuracy(&targets, &nonbinary, class)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("mask must be binary"), "{error}");
+    let empty = Tensor::from_slice(&[0.0, 0.0], [batch.of(2)], &device)?;
+    let error = logits
+        .masked_categorical_accuracy(&targets, &empty, class)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("select at least one row"), "{error}");
     assert_eq!(losses.shape(), &Shape::new([batch.of(2)])?);
     let expected_loss = (1.0_f64 + (-1.0_f64).exp() + (-2.0_f64).exp()).ln();
     close(
@@ -691,5 +709,53 @@ fn masked_mean_normalizes_only_selected_elements() -> Result<()> {
         &device,
     )?;
     assert!(values.detach().masked_mean(&fractional).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn trainer_enforces_scalar_losses_and_drives_each_optimizer() -> Result<()> {
+    fn train_once<O: Optimizer>(device: &Device, optimizer: O) -> Result<(usize, f32)> {
+        let (batch, input_axis, output) =
+            (Axis::new("batch"), Axis::new("input"), Axis::new("output"));
+        let input = Tensor::from_slice(
+            &[1.0, -1.0, 0.5, 2.0],
+            [batch.of(2), input_axis.of(2)],
+            device,
+        )?;
+        let target = Tensor::from_slice(&[0.25, -0.5], [batch.of(2), output.of(1)], device)?;
+        let mut model = Linear::new(input_axis, output.of(1));
+        model.build(input.shape(), device, 17)?;
+        let mut trainer = Trainer::new(optimizer);
+
+        assert_eq!(trainer.completed_steps(), 0);
+        let _ = trainer.optimizer();
+        let _ = trainer.optimizer_mut();
+        let error = trainer
+            .step(&mut model, |model| model.forward(&input))
+            .err()
+            .expect("non-scalar loss must fail")
+            .to_string();
+        assert!(error.contains("must return a scalar"), "{error}");
+        assert_eq!(trainer.completed_steps(), 0);
+
+        let step = trainer.step(&mut model, |model| {
+            model
+                .forward(&input)?
+                .squared_error(&target)?
+                .mean([batch, output])
+        })?;
+        Ok((step.step(), step.pre_update_loss()?))
+    }
+
+    let device = Device::cuda(0)?;
+    for result in [
+        train_once(&device, SGD::new(0.01)?)?,
+        train_once(&device, Adam::new(0.01)?)?,
+        train_once(&device, AdamW::new(0.01, 0.001)?)?,
+    ] {
+        assert_eq!(result.0, 1);
+        assert!(result.1.is_finite() && result.1 >= 0.0);
+    }
     Ok(())
 }
