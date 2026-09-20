@@ -1,0 +1,481 @@
+use crate::prelude::*;
+
+fn close(name: &str, actual: &[f32], expected: &[f64]) {
+    assert_eq!(actual.len(), expected.len());
+    let mut max_error = 0.0_f64;
+    for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+        let error = (f64::from(a) - e).abs();
+        assert!(
+            a.is_finite() && e.is_finite() && error < 3e-6 + 3e-5 * e.abs(),
+            "{name}[{i}]: {a} != {e}"
+        );
+        max_error = max_error.max(error);
+    }
+    println!(
+        "check {name}: PASS {} elements max_abs_error={max_error:.2e}",
+        actual.len()
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn odd_features_short_batch_unrelated_axes_and_storage_order() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (b, t, f, o) = (
+        Axis::new("batch"),
+        Axis::new("time"),
+        Axis::new("feature"),
+        Axis::new("output"),
+    );
+    let values: Vec<_> = (0..3 * 2 * 17)
+        .map(|i| ((i * 7 % 31) as f32 - 15.0) / 16.0)
+        .collect();
+    let weights: Vec<_> = (0..17 * 5)
+        .map(|i| ((i * 3 % 19) as f32 - 9.0) / 20.0)
+        .collect();
+    let biases = [0.1, -0.2, 0.3, -0.4, 0.5];
+    let x = Tensor::from_slice(&values, [b.of(3), t.of(2), f.of(17)], &device)?
+        .with_layout([f, b, t])?
+        .with_grad();
+    let mut model = Linear::new(f, o.of(5));
+    // Bind using a larger batch and without time. Neither is part of Linear's feature binding.
+    model.build(&Shape::new([b.of(256), f.of(17)])?, &device, 5)?;
+    let params = model.parameters();
+    params[0].set_values(&weights)?;
+    params[1].set_values(&biases)?;
+    let prediction = model.forward(&x)?;
+    assert_eq!(
+        prediction.shape(),
+        &Shape::new([b.of(3), t.of(2), o.of(5)])?
+    );
+    let mut expected = vec![0.0; 6 * 5];
+    let mut dx = vec![0.0; values.len()];
+    let mut dw = vec![0.0; weights.len()];
+    let mut db = vec![0.0; 5];
+    for r in 0..6 {
+        for j in 0..5 {
+            let p = f64::from(biases[j])
+                + (0..17)
+                    .map(|i| f64::from(values[r * 17 + i]) * f64::from(weights[i * 5 + j]))
+                    .sum::<f64>();
+            expected[r * 5 + j] = p;
+            let dy = 2.0 * p / 30.0;
+            db[j] += dy;
+            for i in 0..17 {
+                dx[r * 17 + i] += dy * f64::from(weights[i * 5 + j]);
+                dw[i * 5 + j] += dy * f64::from(values[r * 17 + i]);
+            }
+        }
+    }
+    close("odd/layout predictions", &prediction.to_vec()?, &expected);
+    let canonical = Tensor::from_slice(&values, [b.of(3), t.of(2), f.of(17)], &device)?;
+    close(
+        "canonical predictions",
+        &model.forward(&canonical)?.to_vec()?,
+        &expected,
+    );
+    let mut leading_values = vec![0.0; values.len()];
+    for r in 0..6 {
+        for i in 0..17 {
+            leading_values[i * 6 + r] = values[r * 17 + i];
+        }
+    }
+    let leading = Tensor::from_slice(&leading_values, [f.of(17), b.of(3), t.of(2)], &device)?;
+    close(
+        "leading logical feature axis",
+        &model.forward(&leading)?.to_vec()?,
+        &expected,
+    );
+    prediction.mul(&prediction)?.mean([t, o, b])?.backward()?;
+    close(
+        "odd/layout input gradients",
+        &x.grad().unwrap().to_vec()?,
+        &dx,
+    );
+    close(
+        "odd/layout weight gradients",
+        &params[0].grad().unwrap().to_vec()?,
+        &dw,
+    );
+    close(
+        "odd/layout bias gradients",
+        &params[1].grad().unwrap().to_vec()?,
+        &db,
+    );
+    assert!(
+        model
+            .forward(&Tensor::from_slice(&[0.0; 18], [f.of(18)], &device)?)
+            .is_err()
+    );
+    // Public input/output identity may be the same while their extents differ.
+    let mut same = Linear::new(f, f.of(5));
+    same.build(x.shape(), &device, 1)?;
+    same.parameters()[0].set_values(&weights)?;
+    same.parameters()[1].set_values(&biases)?;
+    let out = same.forward(&x)?;
+    assert_eq!(out.extent(f)?, 5);
+    close("same-axis Linear", &out.to_vec()?, &expected);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn shared_axes_contract_and_both_input_derivatives() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (b, h, f, time) = (
+        Axis::new("batch"),
+        Axis::new("head"),
+        Axis::new("feature"),
+        Axis::new("time"),
+    );
+    let q = time.role("query");
+    let k = time.role("key");
+    let av: Vec<_> = (0..2 * 3 * 2 * 5)
+        .map(|i| (i as f32 - 25.0) / 30.0)
+        .collect();
+    let bv: Vec<_> = (0..2 * 4 * 2 * 5)
+        .map(|i| (i as f32 - 35.0) / 40.0)
+        .collect();
+    let a = Tensor::from_slice(&av, [b.of(2), q.of(3), h.of(2), f.of(5)], &device)?
+        .with_layout([f, b, h, q])?
+        .with_grad();
+    let rhs = Tensor::from_slice(&bv, [b.of(2), k.of(4), h.of(2), f.of(5)], &device)?
+        .with_layout([h, f, k, b])?
+        .with_grad();
+    let out = a.contract(&rhs, f)?;
+    assert_eq!(
+        out.shape(),
+        &Shape::new([b.of(2), q.of(3), h.of(2), k.of(4)])?
+    );
+    let mut expected = vec![];
+    let mut da = vec![0.0; av.len()];
+    let mut db = vec![0.0; bv.len()];
+    for batch in 0..2 {
+        for query in 0..3 {
+            for head in 0..2 {
+                for key in 0..4 {
+                    let mut value = 0.0;
+                    for feature in 0..5 {
+                        let ai = ((batch * 3 + query) * 2 + head) * 5 + feature;
+                        let bi = ((batch * 4 + key) * 2 + head) * 5 + feature;
+                        value += f64::from(av[ai]) * f64::from(bv[bi]);
+                        da[ai] += f64::from(bv[bi]) / 48.0;
+                        db[bi] += f64::from(av[ai]) / 48.0;
+                    }
+                    expected.push(value);
+                }
+            }
+        }
+    }
+    close("shared-axis contraction", &out.to_vec()?, &expected);
+    out.mean([q, k, b, h])?.backward()?;
+    close(
+        "contraction left gradient",
+        &a.grad().unwrap().to_vec()?,
+        &da,
+    );
+    close(
+        "contraction right gradient",
+        &rhs.grad().unwrap().to_vec()?,
+        &db,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn algebra_and_errors_are_explicit() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (b, t, f, h, d) = (
+        Axis::new("batch"),
+        Axis::new("time"),
+        Axis::new("feature"),
+        Axis::new("head"),
+        Axis::new("depth"),
+    );
+    let x = Tensor::from_slice(
+        &(0..24).map(|v| v as f32).collect::<Vec<_>>(),
+        [b.of(2), f.of(12)],
+        &device,
+    )?
+    .with_grad();
+    let split = x.with_layout([f, b])?.split(f, [h.of(3), d.of(4)])?;
+    let merged = split.with_layout([d, b, h])?.merge([h, d], f)?;
+    close(
+        "split/merge values",
+        &merged.to_vec()?,
+        &(0..24).map(f64::from).collect::<Vec<_>>(),
+    );
+    merged.mean([f, b])?.backward()?;
+    close(
+        "split/merge gradient",
+        &x.grad().unwrap().to_vec()?,
+        &[1.0 / 24.0; 24],
+    );
+    x.zero_grad();
+    // Use a fresh graph and nonuniform adjoints to check the inverse mapping.
+    let reversed = x
+        .split(f, [h.of(3), d.of(4)])?
+        .with_layout([d, b, h])?
+        .merge([d, h], f)?;
+    let mut expected = vec![];
+    let mut gradient = vec![0.0; 24];
+    for batch in 0..2 {
+        for depth in 0..4 {
+            for head in 0..3 {
+                let source = batch * 12 + head * 4 + depth;
+                let target = batch * 12 + depth * 3 + head;
+                expected.push(source as f64);
+                gradient[source] = target as f64 / 24.0;
+            }
+        }
+    }
+    close("reordered merge", &reversed.to_vec()?, &expected);
+    reversed.mul(&x.detach())?.mean([b, f])?.backward()?;
+    close(
+        "reordered merge gradient",
+        &x.grad().unwrap().to_vec()?,
+        &gradient,
+    );
+    let a = Tensor::from_slice(&[1., 2., 3., 4., 5., 6.], [b.of(2), t.of(3)], &device)?.with_grad();
+    let bias = Tensor::from_slice(&[10., 20., 30.], [t.of(3)], &device)?.with_grad();
+    let reordered = Tensor::from_slice(&[1., 4., 2., 5., 3., 6.], [t.of(3), b.of(2)], &device)?;
+    close(
+        "logical-axis alignment",
+        &a.sub(&reordered)?.to_vec()?,
+        &[0.0; 6],
+    );
+    a.add(&bias)?.mean([t, b])?.backward()?;
+    close(
+        "broadcast input gradient",
+        &a.grad().unwrap().to_vec()?,
+        &[1.0 / 6.0; 6],
+    );
+    close(
+        "broadcast bias reduction",
+        &bias.grad().unwrap().to_vec()?,
+        &[1.0 / 3.0; 3],
+    );
+    let scalar = Tensor::from_slice(&[2.0], [], &device)?.with_grad();
+    scalar.mul(&a.detach())?.mean([b, t])?.backward()?;
+    close(
+        "scalar broadcast gradient",
+        &scalar.grad().unwrap().to_vec()?,
+        &[3.5],
+    );
+    let other = Tensor::from_slice(&[2.0, 3.0], [f.of(2)], &device)?;
+    assert!(a.add(&other).is_err());
+    assert_eq!(
+        bias.outer(&other)?.shape(),
+        &Shape::new([t.of(3), f.of(2)])?
+    );
+    assert!(a.mean(f).is_err());
+    assert!(a.mean([b, b]).is_err());
+    assert!(a.backward().is_err());
+    assert!(a.rename(t, b).is_err());
+    assert!(a.with_layout([b, b]).is_err());
+    assert!(a.split(t, [f.of(2)]).is_err());
+    assert!(a.merge([b, t], f)?.extent(f)? == 6);
+    assert!(
+        a.add(&Tensor::from_slice(&[1., 2.], [t.of(2)], &device)?)
+            .is_err()
+    );
+    assert!(
+        a.add(&Tensor::from_slice(
+            &[1.; 6],
+            [b.of(2), Axis::new("time").of(3)],
+            &device
+        )?)
+        .is_err()
+    );
+    assert!(a.squared_error(&bias).is_err());
+    assert!(a.contract(&other, t).is_err());
+    assert!(Tensor::from_slice(&[1.0], [b.of(2)], &device).is_err());
+    assert!(SGD::new(f32::NAN).is_err());
+    let relu_input = Tensor::from_slice(&[-1.0, 0.0, 1.0], [f.of(3)], &device)?.with_grad();
+    relu_input.relu()?.mean(f)?.backward()?;
+    close(
+        "ReLU derivative including zero",
+        &relu_input.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 1.0 / 3.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn parameter_versions_accumulation_and_shared_updates() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let f = Axis::new("feature");
+    let p = Parameter::new(Tensor::from_slice(&[1.0, 2.0, 3.0], [f.of(3)], &device)?);
+    let stale = p.tensor().mul(&p.tensor())?.mean(f)?;
+    p.tensor().mul(&p.tensor())?.mean(f)?.backward()?;
+    p.tensor().mul(&p.tensor())?.mean(f)?.backward()?;
+    close(
+        "leaf gradient accumulation",
+        &p.grad().unwrap().to_vec()?,
+        &[4.0 / 3.0, 8.0 / 3.0, 4.0],
+    );
+    p.zero_grad();
+    assert!(p.grad().is_none());
+    p.tensor().mul(&p.tensor())?.mean(f)?.backward()?;
+    let id = p.id();
+    SGD::new(0.3)?.step_parameters([p.clone(), p.clone()])?;
+    assert_eq!(p.id(), id);
+    close(
+        "shared parameter updated once",
+        &p.tensor().to_vec()?,
+        &[0.8, 1.6, 2.4],
+    );
+    let error = stale.backward().err().unwrap().to_string();
+    assert!(error.contains("parameter changed"), "{error}");
+    let stale = p.tensor().mean(f)?;
+    p.set_values(&[1.0, 2.0, 3.0])?;
+    assert!(stale.backward().is_err());
+    // A missing gradient must fail before any of the parameters are replaced.
+    p.tensor().mean(f)?.backward()?;
+    let missing = Parameter::new(Tensor::from_slice(&[0.0], [], &device)?);
+    assert!(
+        SGD::new(1.0)?
+            .step_parameters([p.clone(), missing])
+            .is_err()
+    );
+    close(
+        "failed step is atomic",
+        &p.tensor().to_vec()?,
+        &[1., 2., 3.],
+    );
+    // A built module clone ties actual parameters and its two uses both contribute.
+    let mut layer = Linear::new(f, f.of(3));
+    assert!(layer.parameter("weight").is_err());
+    layer.build(&Shape::new([f.of(3)])?, &device, 1)?;
+    let params = [layer.parameter("weight")?, layer.parameter("bias")?];
+    params[0].set_values(&[1., 0., 0., 0., 1., 0., 0., 0., 1.])?;
+    params[1].set_values(&[0.; 3])?;
+    let b = Axis::new("batch");
+    layer.build(&Shape::new([b.of(7), f.of(3)])?, &device, 999)?;
+    assert_eq!(layer.parameter("weight")?.id(), params[0].id());
+    assert_eq!(
+        layer.parameter("weight")?.tensor().to_vec()?,
+        vec![1., 0., 0., 0., 1., 0., 0., 0., 1.]
+    );
+    assert!(layer.build(&Shape::new([f.of(4)])?, &device, 1).is_err());
+    let mut tied = Sequential::new((layer.clone(), layer));
+    assert_eq!(
+        tied.parameter("0.weight")?.id(),
+        tied.parameter("1.weight")?.id()
+    );
+    assert!(tied.parameter("2.weight").is_err());
+    let input = Tensor::from_slice(&[1., 2., 3.], [f.of(3)], &device)?;
+    tied.forward(&input)?.mean(f)?.backward()?;
+    close(
+        "tied layer bias contributions",
+        &params[1].grad().unwrap().to_vec()?,
+        &[2.0 / 3.0; 3],
+    );
+    SGD::new(0.3)?.step(&mut tied)?;
+    close(
+        "tied layer one update",
+        &params[1].tensor().to_vec()?,
+        &[-0.2; 3],
+    );
+    let nested = Sequential::new((ReLU, tied));
+    assert_eq!(nested.parameter("1.0.weight")?.id(), params[0].id());
+    assert_eq!(nested.parameter("1.1.weight")?.id(), params[0].id());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn categorical_loss_and_device_adam_match_references() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (class, batch) = (Axis::new("class"), Axis::new("batch"));
+    // Class is deliberately the leading logical axis; the loss must align it
+    // internally and return only the retained batch axis.
+    let logits = Tensor::from_slice(
+        &[1000.0, -1.0, 999.0, 0.0, 998.0, 1.0],
+        [class.of(3), batch.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let targets = Tensor::from_slice(
+        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [class.of(3), batch.of(2)],
+        &device,
+    )?;
+    let losses = logits.categorical_cross_entropy_with_logits(&targets, class)?;
+    assert_eq!(losses.shape(), &Shape::new([batch.of(2)])?);
+    let expected_loss = (1.0_f64 + (-1.0_f64).exp() + (-2.0_f64).exp()).ln();
+    close(
+        "stable categorical cross-entropy",
+        &losses.to_vec()?,
+        &[expected_loss, expected_loss],
+    );
+    losses.mean(batch)?.backward()?;
+    let p0 = 1.0 / (1.0 + (-1.0_f64).exp() + (-2.0_f64).exp());
+    let p1 = (-1.0_f64).exp() * p0;
+    let p2 = (-2.0_f64).exp() * p0;
+    close(
+        "categorical cross-entropy gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &[
+            (p0 - 1.0) / 2.0,
+            p2 / 2.0,
+            p1 / 2.0,
+            p1 / 2.0,
+            p2 / 2.0,
+            (p0 - 1.0) / 2.0,
+        ],
+    );
+    assert!(
+        logits
+            .detach()
+            .categorical_cross_entropy_with_logits(&targets.with_grad(), class)
+            .is_err()
+    );
+    let invalid_targets = Tensor::from_slice(
+        &[1.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+        [class.of(3), batch.of(2)],
+        &device,
+    )?;
+    let error = logits
+        .detach()
+        .categorical_cross_entropy_with_logits(&invalid_targets, class)
+        .err()
+        .expect("invalid categorical target")
+        .to_string();
+    assert!(error.contains("row 1 must sum to 1"), "{error}");
+
+    let feature = Axis::new("feature");
+    let parameter = Parameter::new(Tensor::from_slice(&[1.0, -2.0], [feature.of(2)], &device)?);
+    let coefficient = Tensor::from_slice(&[0.2, -0.4], [feature.of(2)], &device)?;
+    let mut adam = Adam::new(0.01)?;
+    for expected in [[0.99, -1.99], [0.98, -1.98]] {
+        parameter
+            .tensor()
+            .mul(&coefficient)?
+            .mean(feature)?
+            .backward()?;
+        adam.step_parameters([parameter.clone(), parameter.clone()])?;
+        close(
+            "device Adam update",
+            &parameter.tensor().to_vec()?,
+            &expected,
+        );
+        parameter.zero_grad();
+    }
+    assert_eq!(adam.completed_steps(), 2);
+    assert!(Adam::with_hyperparameters(0.1, 1.0, 0.999, 1e-8).is_err());
+    parameter.zero_grad();
+    parameter.tensor().scale(0.0)?.mean(feature)?.backward()?;
+    let mut adamw = AdamW::new(0.1, 0.2)?;
+    adamw.step_parameters([parameter.clone()])?;
+    close(
+        "device AdamW decay",
+        &parameter.tensor().to_vec()?,
+        &[0.9604, -1.9404],
+    );
+    assert_eq!(adamw.completed_steps(), 1);
+    assert!(AdamW::new(0.1, -0.1).is_err());
+    Ok(())
+}

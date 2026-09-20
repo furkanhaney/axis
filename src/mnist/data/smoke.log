@@ -1,0 +1,18 @@
+params: 970
+initial test_acc 0.1016
+epoch  1 train_loss 2.5409 test_acc 0.1016
+epoch  2 train_loss 2.2800 test_acc 0.1699
+epoch  3 train_loss 2.1225 test_acc 0.2812
+epoch  4 train_loss 2.0139 test_acc 0.3047
+epoch  5 train_loss 1.9188 test_acc 0.3398
+train time: 5.90s
+FINITE PASSES STATUS
+
+population:             2048
+declared passes:        5
+completed passes:       5
+samples in next pass:   0
+total observations:     10240
+
+PASS
+PASS: held-out accuracy improved in the bounded migration smoke

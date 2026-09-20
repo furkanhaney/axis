@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running `cutile-mlp/target/release/axis-mlp`
+initial train_mse=0.75104278 validation_mse=0.69325835
+step=1 train_mse=0.75104278
+step=100 train_mse=0.09959195
+step=200 train_mse=0.06743251
+step=300 train_mse=0.05397580
+step=400 train_mse=0.04617637
+step=500 train_mse=0.04102740
+final train_mse=0.04098369 validation_mse=0.05743700 elapsed_s=10.05
+PASS: named-axis MLP learned on cuTile

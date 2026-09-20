@@ -1,0 +1,18 @@
+[package]
+name = "cnn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cutile.workspace = true
+axis.workspace = true
+
+[[bin]]
+name = "cutile-cnn"
+path = "src/train.rs"
+
+[[bin]]
+name = "axis-cnn"
+path = "src/library.rs"

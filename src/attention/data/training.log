@@ -1,0 +1,20 @@
+$ bash cutile-mlp/src/attention/scripts/train.sh --steps 100
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running `cutile-mlp/target/release/axis-attention --steps 100`
+initial train_mse=4.30e-1 validation_mse=5.12e-1
+step=1 pre_update_train_mse=4.30e-1
+step=50 pre_update_train_mse=6.91e-2
+step=100 pre_update_train_mse=4.44e-2
+final train_mse=4.40e-2 validation_mse=5.23e-2
+PASS: causal attention learned prefix means on cuTile
+$ bash cutile-mlp/src/attention/scripts/train.sh --steps 200
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running `cutile-mlp/target/release/axis-attention --steps 200`
+initial train_mse=4.30e-1 validation_mse=5.12e-1
+step=1 pre_update_train_mse=4.30e-1
+step=50 pre_update_train_mse=6.91e-2
+step=100 pre_update_train_mse=4.44e-2
+step=150 pre_update_train_mse=2.92e-2
+step=200 pre_update_train_mse=1.82e-2
+final train_mse=1.81e-2 validation_mse=2.39e-2
+PASS: causal attention learned prefix means on cuTile

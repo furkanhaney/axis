@@ -1,0 +1,10 @@
+member    1/   4 lr=1.000e-4 initial_acc=0.0918 final_acc=0.0879
+member    2/   4 lr=1.428e-4 initial_acc=0.0312 final_acc=0.0352
+member    3/   4 lr=3.169e-3 initial_acc=0.0859 final_acc=0.2148
+member    4/   4 lr=2.365e-2 initial_acc=0.0684 final_acc=0.7461
+population 4 device cuda:0
+sequential fallback time 9.25s -> 0.43 runs/s
+accuracy: best 0.7461 median 0.2148 worst 0.0352
+accuracy by learning-rate quantile (low->high): 0.0879 0.0352 0.2148 0.7461
+learning-rate range sampled: [1.00e-4, 2.37e-2]
+PASS: bounded population improved held-out accuracy

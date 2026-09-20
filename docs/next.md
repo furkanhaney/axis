@@ -1,0 +1,94 @@
+# Continue from the working examples
+
+Updated 2026-09-20. This note preserves the decisions and next useful work;
+[library.md](library.md) is the contract, and [sample.rs](sample.rs) is the
+owner's larger, partially unimplemented API sketch.
+
+## What exists and why
+
+- `src/axis/` is the reusable crate, with its own manifest. `src/mlp/`,
+  `src/cnn/`, `src/attention/`, and `src/addition/` are separate program crates. Launch from the
+  research or workspace node, not a `src/` corridor. Shared CUDA setup and
+  Cargo/check runners stay at the workspace's `scripts/`.
+- MLP, attention, and CNN consume the library. CNN also retains its explicit
+  cuTile baseline; the two programs share only their independent scalar oracle.
+  Each consumer owns its independent scalar reference and program-specific
+  tests. The library must not import its consumers to obtain an oracle.
+- `Axis` is identity, `Dim` adds a tensor-local extent, and Layout is separate.
+  Same-name axes are distinct. `role` creates a fresh identity with ancestry;
+  it does not authorize implicit alignment. Attention now exercises this.
+- Preserve the explicit loss: forward, unreduced loss, and named `mean` remain
+  in each program. `Trainer` owns the invariant update ordering: zero gradients,
+  construct a fresh scalar loss, backward, then optimizer step.
+- `build` binds extents, validates, allocates, and initializes without a dummy
+  forward. A compatible second build preserves parameters. Structural names
+  such as `0.weight` and `query.weight` identify slots; runtime `ParamId`
+  identifies shared storage. Names are not yet a serialization format.
+- `SinglePass` and `Idr` make data-regime assumptions executable without
+  pretending exact identity proves statistical independence. IDR observes caller-defined stable IDs; it does not
+  infer semantic duplicates from tensor values. Exact tracking grows with the
+  number of unique samples. See [data regimes](data-regimes.md).
+- `DataLoader` accepts finite or generated `DataSource`s and withholds a batch
+  when its regime fails. `AdditionDataset` is the first inexhaustible source.
+  `Trainer` captures only update ordering; MLP, attention, and CNN still state
+  their forward, loss, and named reductions directly.
+- Attention composition stays in `src/attention/src/attention.rs`. Only its
+  required tensor operations, causal mask and softmax, entered the library.
+  A second consumer can justify promoting the composed module later.
+
+## Evidence and limits
+
+- MLP's 500-step held-out MSE matched the retained baseline at `5.74e-2`;
+  [MLP records](../src/mlp/README.md#library-mlp). Named loading and pre-update
+  logging passed the subsequent [feedback checks](../data/feedback-verification.log).
+- Attention's independent f64 forward and central differences pass for every
+  Q/K/V element, including reordered physical storage and a leading logical
+  feature axis. Causality and large-logit softmax checks pass. Its 200-step
+  held-out MSE falls from `5.12e-1` to `2.39e-2` on toy prefix means;
+  [training record](../src/attention/data/training.log).
+- CNN matches 4,096 scalar activation values, pooled features, logits, every
+  parameter gradient, overlapping input gradients, and one update. At 100
+  steps its held-out BCE falls from `7.04e-1` to `7.40e-2` with `100.00%`
+  accuracy; [CNN record](../src/cnn/data/library-training.log). Its Conv2d is
+  `unfold2d` plus Linear, so `col2im` is the reverse of the gather rather than
+  a separate special-case kernel.
+- Addition consumes 128,000 generated samples with zero observed identity
+  reuse and zero train/evaluation overlap. Its held-out MSE falls from
+  `8.06e-1` to `3.88e-3`; [addition record](../src/addition/data/training.log).
+- The first outside consumer now preserves categorical cross-entropy, Adam, and
+  exact finite passes; its smoke reaches `33.98%` held-out MNIST accuracy.
+  The population migration preserves accuracy-versus-learning-rate evidence but
+  exposes parameter population axes as the missing abstraction for fused
+  throughput. The panel migration drove device-resident AdamW and preserves its
+  preprocessing/split mechanics without claiming a completed GDP fit.
+- Current cuTile lowering uses synchronous f32 operations and CPU-built index
+  plans. GPU arithmetic and derivatives are real, but no speed claim follows:
+  contractions use gather/reduce plans, and softmax repeats row reductions.
+  Plans cap contributions at 16,777,216. There is no retained graph, CPU
+  fallback, mixed precision, or higher-order differentiation.
+- Causal masking is square and zero-offset. Softmax requires a finite entry
+  in each row and permits negative infinity elsewhere. Padding/all-masked
+  rows and cached decoding still need explicit contracts and witnesses.
+
+## Next useful implementation
+
+Add the stacked-convolution witness before expanding either the CNN surface or
+a full Transformer. Use small odd spatial extents and two differently sized
+feature axes. Compare both layers and the original input against an independent
+direct scalar forward/backward or finite differences. This should verify that
+the now-measured single-layer `unfold2d` input derivative composes through a
+second convolution.
+
+Only then choose the next CNN contract from a concrete program: padding and
+stride, or adaptive pooling and categorical loss. Keep unrelated axes and odd
+extents in acceptance checks; do not make tile-friendly dimensions an API
+rule. The current Conv2d deliberately promises only valid, stride-one
+cross-correlation.
+
+Run `bash cutile-mlp/scripts/check.sh` from the research root for formatting,
+Clippy and CPU/GPU verification. Smoke a new program before 100/full-step
+runs. Record actual evidence in the owning member's `data/`; update the
+contract and this note when a capability or next step changes. After study
+commits, regenerate the research index with
+`python3 scripts/research_index.py --write` and commit that generated README
+separately, because it records study commit counts.

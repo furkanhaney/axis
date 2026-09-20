@@ -1,0 +1,63 @@
+    Checking rasat-ml v0.1.0 (/mnt/fast980/projects/src/rasat/src/research/cutile-mlp)
+    Finished `release` profile [optimized] target(s) in 0.80s
+   Compiling rasat-ml v0.1.0 (/mnt/fast980/projects/src/rasat/src/research/cutile-mlp)
+    Finished `release` profile [optimized] target(s) in 2.58s
+     Running unittests src/lib.rs (cutile-mlp/target/release/deps/rasat_ml-b3db2d64ac1e5efa)
+
+running 6 tests
+test tests::algebra_and_errors_are_explicit ... ignored, requires CUDA
+test tests::mlp_matches_retained_f64_oracle ... ignored, requires CUDA; scripts/check_library.sh runs these explicitly
+test tests::odd_features_short_batch_unrelated_axes_and_storage_order ... ignored, requires CUDA
+test tests::parameter_versions_accumulation_and_shared_updates ... ignored, requires CUDA
+test tests::shared_axes_contract_and_both_input_derivatives ... ignored, requires CUDA
+test axis::tests::identity_binding_and_validation ... ok
+
+test result: ok. 1 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running unittests src/lib.rs (cutile-mlp/target/release/deps/rasat_ml-b3db2d64ac1e5efa)
+
+running 5 tests
+test tests::algebra_and_errors_are_explicit ... check split/merge values: PASS 24 elements max_abs_error=0.00e0
+check split/merge gradient: PASS 24 elements max_abs_error=1.24e-9
+check reordered merge: PASS 24 elements max_abs_error=0.00e0
+check reordered merge gradient: PASS 24 elements max_abs_error=3.97e-8
+check logical-axis alignment: PASS 6 elements max_abs_error=0.00e0
+check broadcast input gradient: PASS 6 elements max_abs_error=4.97e-9
+check broadcast bias reduction: PASS 3 elements max_abs_error=9.93e-9
+check scalar broadcast gradient: PASS 1 elements max_abs_error=0.00e0
+check ReLU derivative including zero: PASS 3 elements max_abs_error=9.93e-9
+ok
+test tests::mlp_matches_retained_f64_oracle ... check finite differences: PASS 16 parameters max_abs_error=3.59e-11
+check MLP predictions: PASS 512 elements max_abs_error=3.28e-7
+check MLP gradient 0: PASS 512 elements max_abs_error=3.19e-9
+check MLP gradient 1: PASS 32 elements max_abs_error=7.89e-9
+check MLP gradient 2: PASS 512 elements max_abs_error=1.24e-8
+check MLP gradient 3: PASS 16 elements max_abs_error=1.12e-8
+check MLP input gradients: PASS 512 elements max_abs_error=2.32e-9
+check MLP update 0: PASS 512 elements max_abs_error=3.09e-8
+check MLP update 1: PASS 32 elements max_abs_error=5.81e-9
+check MLP update 2: PASS 512 elements max_abs_error=1.65e-8
+check MLP update 3: PASS 16 elements max_abs_error=7.39e-9
+ok
+test tests::odd_features_short_batch_unrelated_axes_and_storage_order ... check odd/layout predictions: PASS 30 elements max_abs_error=1.72e-7
+check canonical predictions: PASS 30 elements max_abs_error=1.72e-7
+check leading logical feature axis: PASS 30 elements max_abs_error=1.72e-7
+check odd/layout input gradients: PASS 102 elements max_abs_error=1.75e-8
+check odd/layout weight gradients: PASS 85 elements max_abs_error=3.12e-8
+check odd/layout bias gradients: PASS 5 elements max_abs_error=2.01e-8
+check same-axis Linear: PASS 30 elements max_abs_error=1.72e-7
+ok
+test tests::parameter_versions_accumulation_and_shared_updates ... check leaf gradient accumulation: PASS 3 elements max_abs_error=7.95e-8
+check shared parameter updated once: PASS 3 elements max_abs_error=9.54e-8
+check failed step is atomic: PASS 3 elements max_abs_error=0.00e0
+check tied layer bias contributions: PASS 3 elements max_abs_error=1.99e-8
+check tied layer one update: PASS 3 elements max_abs_error=1.79e-8
+ok
+test tests::shared_axes_contract_and_both_input_derivatives ... check shared-axis contraction: PASS 48 elements max_abs_error=3.08e-7
+check contraction left gradient: PASS 60 elements max_abs_error=6.21e-9
+check contraction right gradient: PASS 80 elements max_abs_error=4.35e-9
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 15.99s
+

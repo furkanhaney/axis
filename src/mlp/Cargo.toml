@@ -1,0 +1,19 @@
+[package]
+name = "mlp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+default-run = "axis-mlp"
+
+[dependencies]
+axis.workspace = true
+cutile.workspace = true
+
+[[bin]]
+name = "axis-mlp"
+path = "src/train.rs"
+
+[[bin]]
+name = "cutile-mlp"
+path = "src/baseline.rs"

@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running `target/release/axis-cnn --steps 100`
+initial train_bce=7.03e-1 validation_bce=7.04e-1 validation_accuracy=50.00
+step=1 pre_update_train_bce=7.03e-1
+step=20 pre_update_train_bce=6.13e-1
+step=40 pre_update_train_bce=4.14e-1
+step=60 pre_update_train_bce=2.10e-1
+step=80 pre_update_train_bce=1.09e-1
+step=100 pre_update_train_bce=6.52e-2
+final train_bce=6.38e-2 validation_bce=7.40e-2 validation_accuracy=100.00
+PASS: named-axis CNN learned on cuTile

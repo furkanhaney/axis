@@ -1,0 +1,8 @@
+step  10 validation_mse_normalized 0.432660
+step  20 validation_mse_normalized 0.215144
+step  30 validation_mse_normalized 0.169395
+step  40 validation_mse_normalized 0.107304
+split=Future train_rows=256 train_countries=13 validation_rows=128 validation_countries=26
+params=89 initial_validation_mse=1.962119 best_validation_mse=0.107304 best_step=40
+optimizer=AdamW learning_rate=0.01 weight_decay=0.001
+PASS: bounded panel mechanics and best-checkpoint restoration
