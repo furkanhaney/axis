@@ -74,8 +74,11 @@ name the same parameter. Missing or ambiguous paths return errors. The MLP
 uses these paths to load its oracle weights without depending on iteration
 order. This is not yet a checkpoint format.
 
-The first backend is synchronous CUDA f32 using cuTile kernels. CPU code builds
-index plans; GPU kernels do forward arithmetic, derivatives, and SGD. These
+The first backend is stream-ordered CUDA using cuTile kernels. An eager training
+step enqueues allocations, forward arithmetic, derivatives, and optimizer
+updates without per-operation synchronization, retains every device/host buffer
+until the work completes, then synchronizes once at the Trainer step boundary.
+Explicit host reads also synchronize. CPU code builds index plans; these
 generic gather/reduction plans prioritize verifiable semantics. They are
 limited to 16,777,216 contributions per operation and are not a competitive
 GEMM implementation. Single-axis contractions take a batched tiled cuTile
@@ -207,8 +210,9 @@ a different bound feature extent requires a new model.
 Fallible tensor/model operations should return `Result`, including shape,
 device, and JIT errors. The sketch's omission of `?` is not an error policy.
 
-The first backend can execute the existing cuTile kernels synchronously. A
-small layout plan maps the semantic operation to its kernel specialization.
+The first backend submits the existing cuTile kernels in stream order and
+synchronizes at explicit step/read boundaries. A small layout plan maps the
+semantic operation to its kernel specialization.
 Specialization keys describe shapes, layouts, and dtype, rather than arbitrary
 new axis IDs or display names. Kernel tiling and padding remain backend choices;
 valid extents cannot be silently truncated to a multiple of 16.

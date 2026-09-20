@@ -1,7 +1,7 @@
-//! A synchronous, correctness-first cuTile backend. Plans contain indices, never values.
+//! A correctness-first cuTile backend. Plans contain indices, never values.
 use crate::Result;
 use cutile::prelude::*;
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 pub(crate) type Buffer = Arc<cutile::tensor::Tensor<f32>>;
 
@@ -10,7 +10,23 @@ pub struct Device(Rc<Context>);
 struct Context {
     stream: Arc<cutile::cuda_core::Stream>,
     bf16_matmul: bool,
+    pending: RefCell<Vec<Buffer>>,
+    pending_f32: RefCell<Vec<Arc<Vec<f32>>>>,
+    pending_host_i32: RefCell<Vec<Arc<Vec<i32>>>>,
+    pending_device_i32: RefCell<Vec<Arc<cutile::tensor::Tensor<i32>>>>,
 }
+
+trait Enqueue: DeviceOp + Sized {
+    fn enqueue_on(
+        self,
+        stream: &Arc<cutile::cuda_core::Stream>,
+    ) -> std::result::Result<<Self as DeviceOp>::Output, DeviceError> {
+        // Axis owns every buffer until `Device::synchronize`; all work is
+        // submitted to this one stream, so dependency order is preserved.
+        unsafe { self.async_on(stream) }
+    }
+}
+impl<T: DeviceOp> Enqueue for T {}
 
 impl Device {
     pub fn cuda(ordinal: usize) -> Result<Self> {
@@ -26,64 +42,89 @@ impl Device {
         Ok(Self(Rc::new(Context {
             stream: device.new_stream()?,
             bf16_matmul,
+            pending: RefCell::new(Vec::new()),
+            pending_f32: RefCell::new(Vec::new()),
+            pending_host_i32: RefCell::new(Vec::new()),
+            pending_device_i32: RefCell::new(Vec::new()),
         })))
     }
     pub(crate) fn same(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
+    fn track(&self, tensor: cutile::tensor::Tensor<f32>) -> Buffer {
+        let buffer = Arc::new(tensor);
+        self.0.pending.borrow_mut().push(buffer.clone());
+        buffer
+    }
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe { self.0.stream.synchronize()? };
+        self.0.pending.borrow_mut().clear();
+        self.0.pending_f32.borrow_mut().clear();
+        self.0.pending_host_i32.borrow_mut().clear();
+        self.0.pending_device_i32.borrow_mut().clear();
+        Ok(())
+    }
     pub(crate) fn upload(&self, values: Vec<f32>) -> Result<Buffer> {
-        Ok(Arc::new(
-            api::copy_host_vec_to_device(&Arc::new(values)).sync_on(&self.0.stream)?,
-        ))
+        let values = Arc::new(values);
+        let tensor = api::copy_host_vec_to_device(&values).enqueue_on(&self.0.stream)?;
+        self.0.pending_f32.borrow_mut().push(values);
+        Ok(self.track(tensor))
     }
     pub(crate) fn read(&self, buffer: &Buffer) -> Result<Vec<f32>> {
-        Ok(buffer.to_host_vec().sync_on(&self.0.stream)?)
+        let values = buffer.to_host_vec().sync_on(&self.0.stream)?;
+        self.0.pending.borrow_mut().clear();
+        self.0.pending_f32.borrow_mut().clear();
+        self.0.pending_host_i32.borrow_mut().clear();
+        self.0.pending_device_i32.borrow_mut().clear();
+        Ok(values)
     }
     fn zeros(&self, len: usize) -> Result<cutile::tensor::Tensor<f32>> {
-        Ok(api::zeros(&[len]).sync_on(&self.0.stream)?)
+        Ok(api::zeros(&[len]).enqueue_on(&self.0.stream)?)
     }
     pub(crate) fn zeros_buffer(&self, len: usize) -> Result<Buffer> {
-        Ok(Arc::new(self.zeros(len)?))
+        let tensor = self.zeros(len)?;
+        Ok(self.track(tensor))
     }
     pub(crate) fn binary(&self, a: &Buffer, b: &Buffer, op: i32) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::binary((&mut out).partition([128]), a.as_ref(), b.as_ref())
             .generics(vec![op.to_string()])
-            .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn scale(&self, a: &Buffer, scale: f32) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
-        kernels::scale((&mut out).partition([128]), a.as_ref(), scale).sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        kernels::scale((&mut out).partition([128]), a.as_ref(), scale)
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn relu(&self, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
-        kernels::relu((&mut out).partition([128]), a.as_ref()).sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        kernels::relu((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn relu_backward(&self, gradient: &Buffer, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::relu_backward((&mut out).partition([128]), gradient.as_ref(), a.as_ref())
-            .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn gelu(&self, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
-        kernels::gelu((&mut out).partition([128]), a.as_ref()).sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        kernels::gelu((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn gelu_backward(&self, gradient: &Buffer, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::gelu_backward((&mut out).partition([128]), gradient.as_ref(), a.as_ref())
-            .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn inverse_sqrt(&self, a: &Buffer, epsilon: f32) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::inverse_sqrt((&mut out).partition([128]), a.as_ref(), epsilon)
-            .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn inverse_sqrt_backward(
         &self,
@@ -98,8 +139,8 @@ impl Device {
             a.as_ref(),
             epsilon,
         )
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn binary_cross_entropy(&self, logits: &Buffer, targets: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(logits.shape()[0] as usize)?;
@@ -108,8 +149,8 @@ impl Device {
             logits.as_ref(),
             targets.as_ref(),
         )
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn binary_cross_entropy_backward(
         &self,
@@ -124,8 +165,8 @@ impl Device {
             logits.as_ref(),
             targets.as_ref(),
         )
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn categorical_cross_entropy(
         &self,
@@ -141,8 +182,8 @@ impl Device {
             targets.as_ref(),
             width as i32,
         )
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn categorical_cross_entropy_backward(
         &self,
@@ -159,8 +200,8 @@ impl Device {
             targets.as_ref(),
             width as i32,
         )
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     pub(crate) fn mask(&self, a: &Buffer, keep: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
@@ -170,8 +211,8 @@ impl Device {
             keep.as_ref(),
             f32::NEG_INFINITY,
         )
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
     /// Rows are contiguous after the tensor layer puts the reduced axis innermost.
     pub(crate) fn softmax(&self, a: &Buffer, width: usize) -> Result<Buffer> {
@@ -186,8 +227,8 @@ impl Device {
             width as i32,
         )
         .generics(vec![(tile_width as i32).to_string()])
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out.reshape(&[len])?))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out.reshape(&[len])?))
     }
     pub(crate) fn softmax_backward(
         &self,
@@ -212,8 +253,8 @@ impl Device {
             width as i32,
         )
         .generics(vec![(tile_width as i32).to_string()])
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out.reshape(&[len])?))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out.reshape(&[len])?))
     }
     pub(crate) fn matmul(
         &self,
@@ -231,13 +272,13 @@ impl Device {
         if self.0.bf16_matmul {
             kernels::matmul_bf16((&mut out).partition([1, 64, 64]), a.as_ref(), b.as_ref())
                 .generics(vec![bk.to_string(), (k as i32).to_string()])
-                .sync_on(&self.0.stream)?;
+                .enqueue_on(&self.0.stream)?;
         } else {
             kernels::matmul((&mut out).partition([1, 64, 64]), a.as_ref(), b.as_ref())
                 .generics(vec![bk.to_string(), (k as i32).to_string()])
-                .sync_on(&self.0.stream)?;
+                .enqueue_on(&self.0.stream)?;
         }
-        Ok(Arc::new(out.reshape(&[batch * m * n])?))
+        Ok(self.track(out.reshape(&[batch * m * n])?))
     }
     pub(crate) fn matmul_left_backward(
         &self,
@@ -259,7 +300,7 @@ impl Device {
                 rhs.as_ref(),
             )
             .generics(vec![bn.to_string(), (n as i32).to_string()])
-            .sync_on(&self.0.stream)?;
+            .enqueue_on(&self.0.stream)?;
         } else {
             kernels::matmul_left_backward(
                 (&mut out).partition([1, 64, 64]),
@@ -267,9 +308,9 @@ impl Device {
                 rhs.as_ref(),
             )
             .generics(vec![bn.to_string(), (n as i32).to_string()])
-            .sync_on(&self.0.stream)?;
+            .enqueue_on(&self.0.stream)?;
         }
-        Ok(Arc::new(out.reshape(&[batch * m * k])?))
+        Ok(self.track(out.reshape(&[batch * m * k])?))
     }
     pub(crate) fn matmul_right_backward(
         &self,
@@ -291,7 +332,7 @@ impl Device {
                 gradient.as_ref(),
             )
             .generics(vec![bm.to_string(), (m as i32).to_string()])
-            .sync_on(&self.0.stream)?;
+            .enqueue_on(&self.0.stream)?;
         } else {
             kernels::matmul_right_backward(
                 (&mut out).partition([1, 64, 64]),
@@ -299,9 +340,9 @@ impl Device {
                 gradient.as_ref(),
             )
             .generics(vec![bm.to_string(), (m as i32).to_string()])
-            .sync_on(&self.0.stream)?;
+            .enqueue_on(&self.0.stream)?;
         }
-        Ok(Arc::new(out.reshape(&[batch * k * n])?))
+        Ok(self.track(out.reshape(&[batch * k * n])?))
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn adam(
@@ -328,8 +369,8 @@ impl Device {
             beta1,
         )
         .generics(vec!["0".into()])
-        .sync_on(&self.0.stream)?;
-        let next_first = Arc::new(next_first);
+        .enqueue_on(&self.0.stream)?;
+        let next_first = self.track(next_first);
         let mut next_second = self.zeros(len)?;
         kernels::adam_moment(
             (&mut next_second).partition([128]),
@@ -338,8 +379,8 @@ impl Device {
             beta2,
         )
         .generics(vec!["1".into()])
-        .sync_on(&self.0.stream)?;
-        let next_second = Arc::new(next_second);
+        .enqueue_on(&self.0.stream)?;
+        let next_second = self.track(next_second);
         let mut updated = self.zeros(len)?;
         kernels::adam_update(
             (&mut updated).partition([128]),
@@ -354,8 +395,8 @@ impl Device {
             weight_decay,
         )
         .generics(vec![i32::from(learning_rates.is_some()).to_string()])
-        .sync_on(&self.0.stream)?;
-        Ok((Arc::new(updated), next_first, next_second))
+        .enqueue_on(&self.0.stream)?;
+        Ok((self.track(updated), next_first, next_second))
     }
     /// One group per output; each contribution gathers one or two input elements.
     pub(crate) fn grouped(
@@ -365,8 +406,12 @@ impl Device {
         plan: &Plan,
         scale: f32,
     ) -> Result<Buffer> {
-        let upload = |v: &Vec<i32>| {
-            api::copy_host_vec_to_device(&Arc::new(v.clone())).sync_on(&self.0.stream)
+        let upload = |v: &Vec<i32>| -> Result<Arc<cutile::tensor::Tensor<i32>>> {
+            let host = Arc::new(v.clone());
+            let device = Arc::new(api::copy_host_vec_to_device(&host).enqueue_on(&self.0.stream)?);
+            self.0.pending_host_i32.borrow_mut().push(host);
+            self.0.pending_device_i32.borrow_mut().push(device.clone());
+            Ok(device)
         };
         let offsets = upload(&plan.offsets)?;
         let left = upload(&plan.left)?;
@@ -376,14 +421,14 @@ impl Device {
             (&mut out).partition([1]),
             a.as_ref(),
             b.unwrap_or(a).as_ref(),
-            &offsets,
-            &left,
-            &right,
+            offsets.as_ref(),
+            left.as_ref(),
+            right.as_ref(),
             scale,
         )
         .generics(vec![i32::from(b.is_some()).to_string()])
-        .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
     }
 }
 

@@ -101,9 +101,10 @@ throughput success claim.
 - A `Trainer` that fixes update order: clear gradients, construct a fresh loss,
   backpropagate, then update once.
 
-The backend is synchronous f32 CUDA and favors inspectable correctness over
-speed. Contractions currently use CPU-built gather/reduce plans, so the project
-makes no competitive throughput claim.
+The backend enqueues each eager training step on one CUDA stream and
+synchronizes once at the step boundary. Single-axis contractions use batched
+tiled GEMM; multi-axis contractions retain the generic gather/reduce path.
+FP32 is the default, with an explicit BF16-matrix/FP32-state device policy.
 
 ## Measured programs
 

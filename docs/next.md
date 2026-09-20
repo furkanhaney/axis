@@ -62,14 +62,16 @@ owner's larger, partially unimplemented API sketch.
   correctness-first contraction lowering as the remaining throughput limit.
   The panel migration drove device-resident AdamW and preserves its
   preprocessing/split mechanics without claiming a completed GDP fit.
-- Current cuTile lowering uses synchronous f32 operations and CPU-built index
-  plans. GPU arithmetic and derivatives are real, but no broad speed claim
+- Current cuTile lowering enqueues one eager step on a CUDA stream, retains its
+  buffers, and synchronizes once at the Trainer boundary. GPU arithmetic and
+  derivatives are real, but no broad speed claim
   follows: single-axis contractions use batched tiled matrix multiplication;
   multi-axis contractions still use gather/reduce plans. Softmax performs one
   tiled forward or backward reduction per row, including non-power-of-two
   widths, instead of recomputing the row reduction for every output. Generic
-  plans retain their 16,777,216-contribution cap. There is no retained graph,
-  CPU fallback, mixed precision, or higher-order differentiation.
+  plans retain their 16,777,216-contribution cap. BF16 matrix products with
+  FP32 accumulation/state are explicit; there is no retained graph, CPU
+  fallback, or higher-order differentiation.
 - The outside Sudoku acceptance passed every host and CUDA oracle on an RTX
   5090, then trained over 1,600 fresh boards with zero observed reuse or
   train/evaluation overlap. The same run measured only 8% peak GPU utilization

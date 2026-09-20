@@ -55,6 +55,9 @@ impl<O: Optimizer> Trainer<O> {
         }
         loss.backward()?;
         self.optimizer.step(model)?;
+        // The eager graph enqueues one stream-ordered step. Synchronize once
+        // here instead of after every allocation and kernel launch.
+        loss.device().synchronize()?;
         self.completed_steps = next;
         Ok(TrainStep {
             step: next,
