@@ -27,6 +27,12 @@ struct GatherPlans {
 }
 
 #[derive(Clone)]
+enum UnfoldPlans {
+    Gather(GatherPlans),
+    Zero,
+}
+
+#[derive(Clone)]
 struct ReductionPlans {
     output: Shape,
     layout: Layout,
@@ -50,7 +56,12 @@ type UnfoldPlanKey = (
 thread_local! {
     static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
     static REDUCTION_PLANS: RefCell<HashMap<ReductionPlanKey, ReductionPlans>> = RefCell::new(HashMap::new());
-    static UNFOLD_PLANS: RefCell<HashMap<UnfoldPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
+    static UNFOLD_PLANS: RefCell<HashMap<UnfoldPlanKey, UnfoldPlans>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNFOLD_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
@@ -411,6 +422,49 @@ impl Tensor {
             false,
             None,
         ))
+    }
+    fn gathered_with_plans(&self, shape: Shape, plans: GatherPlans) -> Result<Self> {
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
+        let edges = self.requires_grad().then(|| {
+            Edge::new(
+                self,
+                Rule::Group {
+                    plan: plans.reverse,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )
+        });
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            value,
+            self.device(),
+            edges.into_iter().collect(),
+            false,
+            None,
+        ))
+    }
+    fn zero_gathered(&self, shape: Shape) -> Result<Self> {
+        let value = self.device().zeros_buffer(shape.len())?;
+        let edges = self
+            .requires_grad()
+            .then(|| Edge::new(self, Rule::Zero(self.shape().len())));
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            value,
+            self.device(),
+            edges.into_iter().collect(),
+            false,
+            None,
+        ))
+    }
+    #[cfg(test)]
+    pub(crate) fn unfold_plan_build_count() -> usize {
+        UNFOLD_PLAN_BUILDS.with(Cell::get)
     }
     fn align(&self, shape: &Shape) -> Result<Self> {
         let started = Instant::now();
@@ -1090,6 +1144,23 @@ impl Tensor {
             dims.extend([group, patch]);
         }
         let shape = Shape::new(dims)?;
+        let key = (
+            self.shape().clone(),
+            self.0.layout.clone(),
+            shape.clone(),
+            kernel,
+            stride,
+            padding,
+            group,
+        );
+        if let Some(plans) = UNFOLD_PLANS.with(|cache| cache.borrow().get(&key).cloned()) {
+            return match plans {
+                UnfoldPlans::Gather(plans) => self.gathered_with_plans(shape, plans),
+                UnfoldPlans::Zero => self.zero_gathered(shape),
+            };
+        }
+        #[cfg(test)]
+        UNFOLD_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
         let patch_index = shape.index(patch.axis)?;
         let output_height_index = shape.index(spatial[0])?;
         let output_width_index = shape.index(spatial[1])?;
@@ -1135,83 +1206,39 @@ impl Tensor {
             })
             .collect::<Vec<_>>();
         if map.iter().all(Option::is_none) {
-            let value = self.device().zeros_buffer(shape.len())?;
-            let edges = self
-                .requires_grad()
-                .then(|| Edge::new(self, Rule::Zero(self.shape().len())));
-            return Ok(Self::node(
-                shape.clone(),
-                Layout::contiguous(&shape),
-                value,
-                self.device(),
-                edges.into_iter().collect(),
-                false,
-                None,
-            ));
+            UNFOLD_PLANS.with(|cache| {
+                cache.borrow_mut().insert(key, UnfoldPlans::Zero);
+            });
+            return self.zero_gathered(shape);
         }
-        let key = (
-            self.shape().clone(),
-            self.0.layout.clone(),
-            shape.clone(),
-            kernel,
-            stride,
-            padding,
-            group,
-        );
-        let cached = UNFOLD_PLANS.with(|cache| cache.borrow().get(&key).cloned());
-        let plans = match cached {
-            Some(plans) => plans,
-            None => {
-                let dense = map.iter().all(Option::is_some);
-                let forward = if dense {
-                    let indices: Vec<_> = map.iter().copied().map(Option::unwrap).collect();
-                    Rc::new(Plan::gather(&indices)?)
-                } else {
-                    Rc::new(Plan::groups(
-                        map.iter()
-                            .map(|input| input.map(|index| vec![(index, 0)]).unwrap_or_default())
-                            .collect(),
-                        false,
-                    )?)
-                };
-                let mut reverse = vec![vec![]; self.shape().len()];
-                for (output, input) in map.into_iter().enumerate() {
-                    if let Some(input) = input {
-                        reverse[input].push((output, 0));
-                    }
-                }
-                let plans = GatherPlans {
-                    forward,
-                    reverse: Rc::new(Plan::groups(reverse, false)?),
-                };
-                UNFOLD_PLANS.with(|cache| {
-                    cache.borrow_mut().insert(key, plans.clone());
-                });
-                plans
-            }
+        let dense = map.iter().all(Option::is_some);
+        let forward = if dense {
+            let indices: Vec<_> = map.iter().copied().map(Option::unwrap).collect();
+            Rc::new(Plan::gather(&indices)?)
+        } else {
+            Rc::new(Plan::groups(
+                map.iter()
+                    .map(|input| input.map(|index| vec![(index, 0)]).unwrap_or_default())
+                    .collect(),
+                false,
+            )?)
         };
-        let value = self
-            .device()
-            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
-        let edges = self.requires_grad().then(|| {
-            Edge::new(
-                self,
-                Rule::Group {
-                    plan: plans.reverse,
-                    rhs: None,
-                    factor: 1.0,
-                },
-            )
+        let mut reverse = vec![vec![]; self.shape().len()];
+        for (output, input) in map.into_iter().enumerate() {
+            if let Some(input) = input {
+                reverse[input].push((output, 0));
+            }
+        }
+        let plans = GatherPlans {
+            forward,
+            reverse: Rc::new(Plan::groups(reverse, false)?),
+        };
+        UNFOLD_PLANS.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(key, UnfoldPlans::Gather(plans.clone()));
         });
-        Ok(Self::node(
-            shape.clone(),
-            Layout::contiguous(&shape),
-            value,
-            self.device(),
-            edges.into_iter().collect(),
-            false,
-            None,
-        ))
+        self.gathered_with_plans(shape, plans)
     }
     /// Sum the named shared axes; align remaining shared axes, retain distinct ones.
     pub fn contract(&self, rhs: &Self, axes: impl IntoAxes) -> Result<Self> {

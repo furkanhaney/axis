@@ -813,12 +813,21 @@ fn configured_grouped_conv2d_matches_scalar_forward_and_all_gradients() -> Resul
         }
     }
 
+    let plan_builds_before = Tensor::unfold_plan_build_count();
     let actual = conv.forward(&input)?;
+    let plan_builds_after = Tensor::unfold_plan_build_count();
+    assert_eq!(plan_builds_after, plan_builds_before + 1);
     close(
         "configured grouped Conv2d forward",
         &actual.to_vec()?,
         &expected,
     );
+    close(
+        "cached configured grouped Conv2d forward",
+        &conv.forward(&input)?.to_vec()?,
+        &expected,
+    );
+    assert_eq!(Tensor::unfold_plan_build_count(), plan_builds_after);
     actual.mean([batch, height, width, output])?.backward()?;
     close(
         "configured grouped Conv2d input gradient",
