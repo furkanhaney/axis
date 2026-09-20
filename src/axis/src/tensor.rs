@@ -54,6 +54,18 @@ enum Rule {
         probability: Buffer,
         width: usize,
     },
+    MatmulLeft {
+        rhs: Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
+    MatmulRight {
+        lhs: Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
     Group {
         plan: Plan,
         rhs: Option<Buffer>,
@@ -808,6 +820,61 @@ impl Tensor {
             }
         }
         let shape = Shape::new(dims)?;
+        let dense_matrix = axes.len() == 1
+            && self.shape().axes().last() == axes.first()
+            && rhs.shape().axes().first() == axes.first()
+            && self.0.layout.strides == Layout::contiguous(self.shape()).strides
+            && rhs.0.layout.strides == Layout::contiguous(rhs.shape()).strides
+            && self
+                .shape()
+                .axes()
+                .iter()
+                .filter(|axis| !axes.contains(axis))
+                .all(|axis| !rhs.shape().contains(*axis))
+            && rhs
+                .shape()
+                .axes()
+                .iter()
+                .filter(|axis| !axes.contains(axis))
+                .all(|axis| !self.shape().contains(*axis));
+        if dense_matrix {
+            let k = reduction.len();
+            let m = self.shape().len() / k;
+            let n = rhs.shape().len() / k;
+            let value = self.device().matmul(&self.0.value, &rhs.0.value, m, k, n)?;
+            let mut edges = vec![];
+            if self.requires_grad() {
+                edges.push(Edge::new(
+                    self,
+                    Rule::MatmulLeft {
+                        rhs: rhs.0.value.clone(),
+                        m,
+                        k,
+                        n,
+                    },
+                ));
+            }
+            if rhs.requires_grad() {
+                edges.push(Edge::new(
+                    rhs,
+                    Rule::MatmulRight {
+                        lhs: self.0.value.clone(),
+                        m,
+                        k,
+                        n,
+                    },
+                ));
+            }
+            return Ok(Self::node(
+                shape.clone(),
+                Layout::contiguous(&shape),
+                value,
+                self.device(),
+                edges,
+                false,
+                None,
+            ));
+        }
         Plan::check_size(
             shape
                 .len()
@@ -1068,6 +1135,12 @@ impl Tensor {
                             self.device()
                                 .softmax_backward(&gradient, probability, *width)?
                         }
+                        Rule::MatmulLeft { rhs, m, k, n } => self
+                            .device()
+                            .matmul_left_backward(&gradient, rhs, *m, *k, *n)?,
+                        Rule::MatmulRight { lhs, m, k, n } => self
+                            .device()
+                            .matmul_right_backward(lhs, &gradient, *m, *k, *n)?,
                         Rule::Group { plan, rhs, factor } => {
                             self.device()
                                 .grouped(&gradient, rhs.as_ref(), plan, *factor)?

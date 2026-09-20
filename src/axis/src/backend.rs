@@ -205,6 +205,65 @@ impl Device {
         .sync_on(&self.0.stream)?;
         Ok(Arc::new(out.reshape(&[len])?))
     }
+    pub(crate) fn matmul(
+        &self,
+        a: &Buffer,
+        b: &Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Buffer> {
+        let a = a.reshape(&[m, k])?;
+        let b = b.reshape(&[k, n])?;
+        let mut out = self.zeros(m * n)?.reshape(&[m, n])?;
+        let bk = contraction_tile(k);
+        kernels::matmul((&mut out).partition([16, 16]), a.as_ref(), b.as_ref())
+            .generics(vec![bk.to_string(), (k as i32).to_string()])
+            .sync_on(&self.0.stream)?;
+        Ok(Arc::new(out.reshape(&[m * n])?))
+    }
+    pub(crate) fn matmul_left_backward(
+        &self,
+        gradient: &Buffer,
+        rhs: &Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Buffer> {
+        let gradient = gradient.reshape(&[m, n])?;
+        let rhs = rhs.reshape(&[k, n])?;
+        let mut out = self.zeros(m * k)?.reshape(&[m, k])?;
+        let bn = contraction_tile(n);
+        kernels::matmul_left_backward(
+            (&mut out).partition([16, 16]),
+            gradient.as_ref(),
+            rhs.as_ref(),
+        )
+        .generics(vec![bn.to_string(), (n as i32).to_string()])
+        .sync_on(&self.0.stream)?;
+        Ok(Arc::new(out.reshape(&[m * k])?))
+    }
+    pub(crate) fn matmul_right_backward(
+        &self,
+        lhs: &Buffer,
+        gradient: &Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Buffer> {
+        let lhs = lhs.reshape(&[m, k])?;
+        let gradient = gradient.reshape(&[m, n])?;
+        let mut out = self.zeros(k * n)?.reshape(&[k, n])?;
+        let bm = contraction_tile(m);
+        kernels::matmul_right_backward(
+            (&mut out).partition([16, 16]),
+            lhs.as_ref(),
+            gradient.as_ref(),
+        )
+        .generics(vec![bm.to_string(), (m as i32).to_string()])
+        .sync_on(&self.0.stream)?;
+        Ok(Arc::new(out.reshape(&[k * n])?))
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn adam(
         &self,
@@ -289,6 +348,13 @@ impl Device {
     }
 }
 
+fn contraction_tile(extent: usize) -> i32 {
+    [16, 8, 4, 2]
+        .into_iter()
+        .find(|tile| extent.is_multiple_of(*tile))
+        .unwrap_or(1) as i32
+}
+
 /// CSR gather/reduction plan. Deliberately bounded until a tiled lowering replaces it.
 #[derive(Clone)]
 pub(crate) struct Plan {
@@ -348,6 +414,59 @@ impl Plan {
 #[cutile::module]
 mod kernels {
     use cutile::core::*;
+    #[cutile::entry()]
+    fn matmul<const BK: i32, const K: i32>(
+        out: &mut Tensor<f32, { [16, 16] }>,
+        a: &Tensor<f32, { [-1, K] }>,
+        b: &Tensor<f32, { [K, -1] }>,
+    ) {
+        let ap = a.partition(shape![16, BK]);
+        let bp = b.partition(shape![BK, 16]);
+        let pid = get_tile_block_id();
+        let mut value = load_tile_mut(out);
+        for block in 0i32..(K / BK) {
+            value = mma(ap.load([pid.0, block]), bp.load([block, pid.1]), value);
+        }
+        out.store(value);
+    }
+    #[cutile::entry()]
+    fn matmul_left_backward<const BN: i32, const N: i32>(
+        out: &mut Tensor<f32, { [16, 16] }>,
+        gradient: &Tensor<f32, { [-1, N] }>,
+        rhs: &Tensor<f32, { [-1, N] }>,
+    ) {
+        let gp = gradient.partition(shape![16, BN]);
+        let rp = rhs.partition(shape![16, BN]);
+        let pid = get_tile_block_id();
+        let mut value = load_tile_mut(out);
+        for block in 0i32..(N / BN) {
+            value = mma(
+                gp.load([pid.0, block]),
+                rp.load([pid.1, block]).transpose(),
+                value,
+            );
+        }
+        out.store(value);
+    }
+    #[cutile::entry()]
+    fn matmul_right_backward<const BM: i32, const M: i32>(
+        out: &mut Tensor<f32, { [16, 16] }>,
+        lhs: &Tensor<f32, { [M, -1] }>,
+        gradient: &Tensor<f32, { [M, -1] }>,
+    ) {
+        let lp = lhs.partition(shape![BM, 16]);
+        let gp = gradient.partition(shape![BM, 16]);
+        let pid = get_tile_block_id();
+        let mut value = load_tile_mut(out);
+        for block in 0i32..(M / BM) {
+            value = mma(
+                lp.load([block, pid.0]).transpose(),
+                gp.load([block, pid.1]),
+                value,
+            );
+        }
+        out.store(value);
+    }
     #[cutile::entry()]
     fn binary_cross_entropy(
         out: &mut Tensor<f32, { [128] }>,
