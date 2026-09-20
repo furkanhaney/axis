@@ -1,0 +1,68 @@
+name: Bug report
+description: Report incorrect behavior with a reproducible case
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping make Axis more trustworthy. Keep the claim as narrow as the evidence and remove private data from logs.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened, including the full error or incorrect result.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened, and which contract or invariant supports that expectation.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest program or exact commands that reproduce the problem.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Axis revision
+      description: Commit SHA or branch name.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Rust, GPU, driver, CUDA, and cuTile versions that matter.
+      placeholder: |
+        OS:
+        rustc:
+        GPU and driver:
+        CUDA:
+        cuTile:
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Additional evidence
+      description: Add a reduced log, receipt, reference result, or other context. Drag files here when useful.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for the same behavior.
+          required: true
+        - label: I removed credentials, private data, and unrelated output.
+          required: true

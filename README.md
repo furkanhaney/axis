@@ -3,7 +3,11 @@
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-b7410e?logo=rust)](https://www.rust-lang.org/)
 [![CUDA 13.2](https://img.shields.io/badge/CUDA-13.2-76b900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 [![cuTile 0.3.1](https://img.shields.io/badge/cuTile-0.3.1-5b5bd6)](https://github.com/NVlabs/cutile-rs)
+[![License: MIT](https://img.shields.io/badge/license-MIT-0b7285)](LICENSE.md)
 ![Experimental](https://img.shields.io/badge/status-experimental-f59e0b)
+
+[Why Axis](docs/thesis.md) · [Library contract](docs/library.md) ·
+[Contributing](CONTRIBUTING.md) · [License](LICENSE.md)
 
 ![A generated Sudoku board used by the Axis acceptance test](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_generated_puzzle.png)
 
@@ -16,6 +20,12 @@ Deep-learning programs are unusually good at being wrong while continuing to
 run. A loader wraps around, train and evaluation samples overlap, a class axis
 is reduced by accident, or a population of models quietly shares one set of
 weights—and the loss still goes down. Axis treats those as executable contracts.
+
+> **Project status:** Axis is active experimental research software. It is
+> CUDA-only, is not yet published as a crate, and its API can change as new
+> consumer programs expose better boundaries. The repository records measured
+> witnesses, but does not claim production readiness or framework-wide
+> performance parity.
 
 ## A training loop
 
@@ -219,3 +229,13 @@ The detailed contracts are in [library design](docs/library.md),
 [data regimes](docs/data-regimes.md), [static guarantees](docs/static-guarantees.md),
 and [run certificates](docs/run-certificates.md). The current implementation
 frontier is recorded in [next work](docs/next.md).
+
+## Contributing and license
+
+Human and agent-assisted contributions are welcome. Start with the
+[contribution guide](CONTRIBUTING.md), which explains how changes are scoped,
+verified, and presented for review.
+
+Original Axis material is available under the [MIT License](LICENSE.md).
+Dependencies, downloaded toolchains and datasets, and linked external artifacts
+retain their own licenses and terms.

@@ -1,0 +1,54 @@
+name: Capability proposal
+description: Propose a capability required by a concrete research program
+title: "proposal: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Axis grows from real experiments. Describe the consumer and evidence before proposing an API shape.
+  - type: textarea
+    id: experiment
+    attributes:
+      label: Motivating experiment
+      description: Which concrete program needs this, and what can it not express or verify today?
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Required contract
+      description: State the behavior or research assumption the framework should provide.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance evidence
+      description: What independent reference, invariant, or consumer run would show that the contribution works?
+    validations:
+      required: true
+  - type: textarea
+    id: sketch
+    attributes:
+      label: Possible design
+      description: Optional API or implementation sketch, including known tradeoffs.
+    validations:
+      required: false
+  - type: textarea
+    id: limits
+    attributes:
+      label: Claim boundaries
+      description: What would the proposed evidence establish, and what would it leave unproven?
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and current next-work documentation.
+          required: true
+        - label: This proposal is motivated by a concrete consumer rather than an operator checklist.
+          required: true
