@@ -57,7 +57,7 @@ output channel extents must be divisible by that value. Padding is symmetric
 per named spatial axis. Dilation and asymmetric padding are not implemented.
 
 ```bash
-cargo add axis@0.3.0
+cargo add axis@0.4.0
 ```
 
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
