@@ -4,6 +4,16 @@ Axis grows against outside programs that force several abstractions to compose.
 A small isolated operator is a unit witness; these programs are framework
 acceptance tests.
 
+## Paired Muon training — current
+
+The in-repository [Muon acceptance](../../src/examples/muon/README.md) trains
+identically initialized MLPs on the same deterministic regression populations.
+One uses AdamW throughout; the other explicitly assigns its first hidden
+weight to Muon and the exact remainder to AdamW. Both arms must emit separate
+held-out `LearningProgress` receipts. This is a composition and learning
+witness, not an optimizer ranking. In the recorded 100-step run, each arm
+reduced held-out MSE by more than 99% from the shared initialization.
+
 ## Sudoku transformer — current
 
 The sibling [`sudoku-transformer`](https://github.com/furkanhaney/sudoku-transformer) repo is the first complete transformer acceptance.

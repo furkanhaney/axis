@@ -48,6 +48,10 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn sum_squares(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn binary(&self, _a: &Buffer, _b: &Buffer, _op: i32) -> Result<Buffer> {
         unavailable()
     }
@@ -57,6 +61,10 @@ impl Device {
     }
 
     pub(crate) fn scale(&self, _a: &Buffer, _scale: f32) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn multiply_scalar(&self, _a: &Buffer, _scalar: &Buffer) -> Result<Buffer> {
         unavailable()
     }
 

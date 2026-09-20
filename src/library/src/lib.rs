@@ -1,4 +1,8 @@
 //! Experimental training with named axes on a stream-ordered cuTile GPU backend.
+//!
+//! Muon is adapted from Keller Jordan's reference implementation. The pinned
+//! source revision and MIT notice are packaged in
+//! [`THIRD_PARTY.md`](https://github.com/furkanhaney/axis/blob/main/src/library/THIRD_PARTY.md).
 #[path = "algebra/axis.rs"]
 mod axis;
 #[cfg(feature = "cuda")]
@@ -19,6 +23,8 @@ mod metrics;
 mod monotonicity;
 #[path = "model/nn.rs"]
 mod nn;
+#[path = "model/optim.rs"]
+mod optim;
 #[path = "model/preprocess.rs"]
 mod preprocess;
 #[path = "research/regime.rs"]
@@ -47,9 +53,10 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    Adam, AdamW, Conv2d, GELU, IntoLayers, LayerNorm, Linear, Module, ParamId, Parameter,
-    PopulationLinear, ReLU, SGD, Sequential,
+    Conv2d, GELU, IntoLayers, LayerNorm, Linear, Module, ParamId, Parameter, PopulationLinear,
+    ReLU, Sequential,
 };
+pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
 pub use preprocess::Standardizer;
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
@@ -75,8 +82,9 @@ pub mod prelude {
         FinitePassesLoader, FinitePassesReceipt, GELU, IdentityScheme, Idr, IdrLimits, IdrReceipt,
         InMemoryDataset, LayerNorm, LearningDirection, LearningEvidence, LearningLimits,
         LearningObservation, LearningProgress, LearningProgressReceipt, Linear, Module,
-        MonotoneDirection, MonotonicityLimits, Optimizer, ParamId, Parameter, PopulationLinear,
-        PopulationMode, PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, SGD,
-        Sample, Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
+        MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
+        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, SGD, Sample, Sequential,
+        Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
     };
 }

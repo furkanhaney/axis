@@ -1,0 +1,47 @@
+AXIS MUON ACCEPTANCE RECEIPT
+
+implementation commit: ffb46cdc9960bb6db9565f36ff4cd13ebca82881
+hardware:              NVIDIA GeForce RTX 5060
+driver:                595.84
+CUDA toolkit:          13.2.51
+toolkit path:          <axis-repository>/build/cuda
+command:               CUDA_TOOLKIT_PATH=<axis-repository>/build/cuda bash src/examples/muon/scripts/train.sh --steps 100
+claim scope:           both optimizer paths learned on one deterministic task; no comparative winner claim
+
+optimizer=AdamW baseline_mse=0.26941565 final_mse=0.00241553
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        AdamW fixed validation population
+direction:                    decrease
+observations:                 2
+baseline:                     0.26941565 at 0 optimizer steps
+terminal:                     0.00241553 at 100 optimizer steps
+absolute improvement:         0.26700012
+relative improvement:         99.1034%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 100 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+optimizer=MuonWithAuxAdamW baseline_mse=0.26941565 final_mse=0.00045361
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        MuonWithAuxAdamW fixed validation population
+direction:                    decrease
+observations:                 2
+baseline:                     0.26941565 at 0 optimizer steps
+terminal:                     0.00045361 at 100 optimizer steps
+absolute improvement:         0.26896203
+relative improvement:         99.8316%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 100 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+PASS: AdamW and explicitly partitioned Muon both learned

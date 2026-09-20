@@ -68,6 +68,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "axis-muon-acceptance"
+version = "0.4.0"
+dependencies = [
+ "axis",
+]
+
+[[package]]
 name = "axis-panel"
 version = "0.4.0"
 dependencies = [

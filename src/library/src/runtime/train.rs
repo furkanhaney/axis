@@ -1,5 +1,5 @@
 //! Minimal step ordering shared by concrete training programs.
-use crate::{Adam, AdamW, Module, Result, SGD, Tensor};
+use crate::{Adam, AdamW, Module, Muon, MuonWithAuxAdamW, Result, SGD, Tensor};
 use std::time::Instant;
 
 fn profile(label: &str, started: Instant) {
@@ -10,7 +10,6 @@ fn profile(label: &str, started: Instant) {
         );
     }
 }
-
 pub trait Optimizer {
     fn step<M: Module>(&mut self, model: &mut M) -> Result<()>;
 }
@@ -30,6 +29,18 @@ impl Optimizer for Adam {
 impl Optimizer for AdamW {
     fn step<M: Module>(&mut self, model: &mut M) -> Result<()> {
         AdamW::step(self, model)
+    }
+}
+
+impl Optimizer for Muon {
+    fn step<M: Module>(&mut self, model: &mut M) -> Result<()> {
+        Muon::step(self, model)
+    }
+}
+
+impl Optimizer for MuonWithAuxAdamW {
+    fn step<M: Module>(&mut self, model: &mut M) -> Result<()> {
+        MuonWithAuxAdamW::step(self, model)
     }
 }
 
