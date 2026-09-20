@@ -165,10 +165,19 @@ impl Device {
     }
     /// Rows are contiguous after the tensor layer puts the reduced axis innermost.
     pub(crate) fn softmax(&self, a: &Buffer, width: usize) -> Result<Buffer> {
-        let mut out = self.zeros(a.shape()[0] as usize)?;
-        kernels::softmax((&mut out).partition([1]), a.as_ref(), width as i32)
-            .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        let len = a.shape().iter().map(|&extent| extent as usize).product();
+        let rows = len / width;
+        let tile_width = width.next_power_of_two();
+        let input = a.reshape(&[rows, width])?;
+        let mut out = self.zeros(len)?.reshape(&[rows, width])?;
+        kernels::softmax(
+            (&mut out).partition([1, tile_width]),
+            input.as_ref(),
+            width as i32,
+        )
+        .generics(vec![(tile_width as i32).to_string()])
+        .sync_on(&self.0.stream)?;
+        Ok(Arc::new(out.reshape(&[len])?))
     }
     pub(crate) fn softmax_backward(
         &self,
@@ -176,15 +185,25 @@ impl Device {
         probability: &Buffer,
         width: usize,
     ) -> Result<Buffer> {
-        let mut out = self.zeros(probability.shape()[0] as usize)?;
+        let len = probability
+            .shape()
+            .iter()
+            .map(|&extent| extent as usize)
+            .product();
+        let rows = len / width;
+        let tile_width = width.next_power_of_two();
+        let gradient = gradient.reshape(&[rows, width])?;
+        let probability = probability.reshape(&[rows, width])?;
+        let mut out = self.zeros(len)?.reshape(&[rows, width])?;
         kernels::softmax_backward(
-            (&mut out).partition([1]),
+            (&mut out).partition([1, tile_width]),
             gradient.as_ref(),
             probability.as_ref(),
             width as i32,
         )
+        .generics(vec![(tile_width as i32).to_string()])
         .sync_on(&self.0.stream)?;
-        Ok(Arc::new(out))
+        Ok(Arc::new(out.reshape(&[len])?))
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn adam(
@@ -414,36 +433,40 @@ mod kernels {
         ));
     }
     #[cutile::entry()]
-    fn softmax(out: &mut Tensor<f32, { [1] }>, a: &Tensor<f32, { [-1] }>, width: i32) {
-        let pid = get_tile_block_id().0;
-        let start = (pid / width) * width;
-        let ap = a.partition(shape![1]);
-        let mut maximum = ap.load([start]);
-        for j in 1i32..width {
-            maximum = max_tile(maximum, ap.load([start + j]));
-        }
-        let mut sum = constant(0.0f32, shape![1]);
-        for j in 0i32..width {
-            sum = sum + exp(ap.load([start + j]) - maximum);
-        }
-        out.store(exp(ap.load([pid]) - maximum) / sum);
-    }
-    #[cutile::entry()]
-    fn softmax_backward(
-        out: &mut Tensor<f32, { [1] }>,
-        gradient: &Tensor<f32, { [-1] }>,
-        probability: &Tensor<f32, { [-1] }>,
+    fn softmax<const TILE_WIDTH: i32>(
+        out: &mut Tensor<f32, { [1, TILE_WIDTH] }>,
+        a: &Tensor<f32, { [-1, -1] }>,
         width: i32,
     ) {
-        let pid = get_tile_block_id().0;
-        let start = (pid / width) * width;
-        let gp = gradient.partition(shape![1]);
-        let pp = probability.partition(shape![1]);
-        let mut dot = constant(0.0f32, shape![1]);
-        for j in 0i32..width {
-            dot = dot + gp.load([start + j]) * pp.load([start + j]);
-        }
-        out.store(pp.load([pid]) * (gp.load([pid]) - dot));
+        let columns: Tile<i32, { [TILE_WIDTH] }> = iota(shape![TILE_WIDTH]);
+        let columns = columns.reshape(shape![1, TILE_WIDTH]);
+        let valid = lt_tile(columns, broadcast_scalar(width, shape![1, TILE_WIDTH]));
+        let loaded: Tile<f32, { [1, TILE_WIDTH] }> = a.load_like(out);
+        let negative_infinity: Tile<f32, { [1, TILE_WIDTH] }> =
+            constant(f32::NEG_INFINITY, shape![1, TILE_WIDTH]);
+        let values = select(valid, loaded, negative_infinity);
+        let maximum: Tile<f32, { [1] }> = reduce_max(values, 1i32);
+        let shifted = values - maximum.reshape(shape![1, 1]).broadcast(out.shape());
+        let zero: Tile<f32, { [1, TILE_WIDTH] }> = constant(0.0f32, shape![1, TILE_WIDTH]);
+        let numerator = select(valid, exp(shifted), zero);
+        let sum: Tile<f32, { [1] }> = reduce_sum(numerator, 1i32);
+        out.store(numerator / sum.reshape(shape![1, 1]).broadcast(out.shape()));
+    }
+    #[cutile::entry()]
+    fn softmax_backward<const TILE_WIDTH: i32>(
+        out: &mut Tensor<f32, { [1, TILE_WIDTH] }>,
+        gradient: &Tensor<f32, { [-1, -1] }>,
+        probability: &Tensor<f32, { [-1, -1] }>,
+        width: i32,
+    ) {
+        let columns: Tile<i32, { [TILE_WIDTH] }> = iota(shape![TILE_WIDTH]);
+        let columns = columns.reshape(shape![1, TILE_WIDTH]);
+        let valid = lt_tile(columns, broadcast_scalar(width, shape![1, TILE_WIDTH]));
+        let zero: Tile<f32, { [1, TILE_WIDTH] }> = constant(0.0f32, shape![1, TILE_WIDTH]);
+        let g: Tile<f32, { [1, TILE_WIDTH] }> = select(valid, gradient.load_like(out), zero);
+        let p: Tile<f32, { [1, TILE_WIDTH] }> = select(valid, probability.load_like(out), zero);
+        let dot: Tile<f32, { [1] }> = reduce_sum(g * p, 1i32);
+        out.store(p * (g - dot.reshape(shape![1, 1]).broadcast(out.shape())));
     }
     #[cutile::entry()]
     fn adam_moment<const SQUARE: i32>(

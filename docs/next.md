@@ -63,10 +63,12 @@ owner's larger, partially unimplemented API sketch.
   The panel migration drove device-resident AdamW and preserves its
   preprocessing/split mechanics without claiming a completed GDP fit.
 - Current cuTile lowering uses synchronous f32 operations and CPU-built index
-  plans. GPU arithmetic and derivatives are real, but no speed claim follows:
-  contractions use gather/reduce plans, and softmax repeats row reductions.
-  Plans cap contributions at 16,777,216. There is no retained graph, CPU
-  fallback, mixed precision, or higher-order differentiation.
+  plans. GPU arithmetic and derivatives are real, but no broad speed claim
+  follows: contractions still use gather/reduce plans. Softmax now performs
+  one tiled forward or backward reduction per row, including non-power-of-two
+  widths, instead of recomputing the row reduction for every output. Generic
+  plans retain their 16,777,216-contribution cap. There is no retained graph,
+  CPU fallback, mixed precision, or higher-order differentiation.
 - The outside Sudoku acceptance passed every host and CUDA oracle on an RTX
   5090, then trained over 1,600 fresh boards with zero observed reuse or
   train/evaluation overlap. The same run measured only 8% peak GPU utilization
@@ -83,11 +85,11 @@ owner's larger, partially unimplemented API sketch.
 
 ## Next useful implementation
 
-Remove the measured contraction-plan cliff first. A separately sized evaluation
-batch should either execute by chunking or fail before allocation with the
-operation and named shape in the diagnostic. Preserve the current numerical
-oracles while replacing CPU-built gather plans with tiled or fused lowering,
-then rerun the recorded Sudoku shapes and report utilization and elapsed time.
+Replace CPU-built contraction plans with tiled matrix multiplication, then
+rerun the recorded Sudoku shapes and report utilization and elapsed time.
+Chunked evaluation has removed the immediate evaluation-size cliff and tiled
+softmax has removed its redundant quadratic row work; Q/K/V projections and
+the two attention contractions are now the measured path to optimize.
 
 After that, use the next consumer to choose between production-transformer work
 (mixed precision, fused normalization and attention, serialization) and the

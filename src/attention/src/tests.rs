@@ -250,5 +250,20 @@ fn named_softmax_stability_and_mask_contract() -> Result<()> {
     for q in 0..3 {
         assert!(((0..3).map(|k| p[k * 3 + q]).sum::<f32>() - 1.0).abs() < 1e-6);
     }
+
+    // This shape crossed the former scalar-reduction contribution cap even
+    // though the tensor itself is small enough for an ordinary attention batch.
+    let rows = 2_560;
+    let width = 81;
+    let large = Tensor::from_slice(
+        &vec![0.0; rows * width],
+        [row.of(rows), key.of(width)],
+        &device,
+    )?
+    .softmax(key)?
+    .to_vec()?;
+    for values in large.chunks_exact(width) {
+        assert!((values.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
     Ok(())
 }

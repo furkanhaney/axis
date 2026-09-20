@@ -693,12 +693,6 @@ impl Tensor {
     /// Rows must contain finite values or -infinity and at least one finite value.
     pub fn softmax(&self, axis: Axis) -> Result<Self> {
         let width = self.extent(axis)?;
-        Plan::check_size(
-            self.shape()
-                .len()
-                .checked_mul(width)
-                .ok_or("softmax size overflow")?,
-        )?;
         let mut physical = self.shape().axes();
         physical.retain(|&a| a != axis);
         physical.push(axis);
