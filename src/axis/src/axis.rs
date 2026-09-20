@@ -46,7 +46,7 @@ impl fmt::Debug for Axis {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Dim {
     pub axis: Axis,
     pub extent: usize,
@@ -76,7 +76,7 @@ impl IntoAxes for &[Axis] {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Shape {
     dims: Vec<Dim>,
     len: usize,
@@ -148,7 +148,7 @@ impl Shape {
 }
 
 /// Physical strides indexed by the logical axes in Shape.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct Layout {
     pub strides: Vec<usize>,
 }

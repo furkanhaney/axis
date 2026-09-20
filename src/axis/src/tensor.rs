@@ -8,7 +8,40 @@ use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
+
+fn profile(label: &str, started: Instant) {
+    if std::env::var_os("AXIS_PROFILE").is_some() {
+        eprintln!(
+            "axis_profile {label} {:.6}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+#[derive(Clone)]
+struct GatherPlans {
+    forward: Rc<Plan>,
+    reverse: Rc<Plan>,
+}
+
+#[derive(Clone)]
+struct MeanPlans {
+    output: Shape,
+    layout: Layout,
+    factor: f32,
+    forward: Rc<Plan>,
+    reverse: Rc<Plan>,
+}
+
+type GatherPlanKey = (u8, Shape, Layout, Shape, Layout);
+type MeanPlanKey = (Shape, Layout, Vec<Axis>);
+
+thread_local! {
+    static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
+    static MEAN_PLANS: RefCell<HashMap<MeanPlanKey, MeanPlans>> = RefCell::new(HashMap::new());
+}
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
 
@@ -69,7 +102,7 @@ enum Rule {
         n: usize,
     },
     Group {
-        plan: Plan,
+        plan: Rc<Plan>,
         rhs: Option<Buffer>,
         factor: f32,
     },
@@ -339,51 +372,111 @@ impl Tensor {
                 None,
             ));
         }
+        let forward = Rc::new(Plan::gather(&map)?);
+        let reverse = Rc::new(Plan::reverse(&map, self.shape().len())?);
         let value = self
             .device()
-            .grouped(&self.0.value, None, &Plan::gather(&map)?, 1.0)?;
-        let edges = if self.requires_grad() {
-            vec![Edge::new(
+            .grouped(&self.0.value, None, forward.as_ref(), 1.0)?;
+        let edges = self.requires_grad().then(|| {
+            Edge::new(
                 self,
                 Rule::Group {
-                    plan: Plan::reverse(&map, self.shape().len())?,
+                    plan: reverse,
                     rhs: None,
                     factor: 1.0,
                 },
-            )]
-        } else {
-            vec![]
-        };
+            )
+        });
         Ok(Self::node(
             shape,
             layout,
             value,
             self.device(),
-            edges,
+            edges.into_iter().collect(),
             false,
             None,
         ))
     }
     fn align(&self, shape: &Shape) -> Result<Self> {
+        let started = Instant::now();
         let layout = Layout::contiguous(shape);
         if self.shape() == shape && self.0.layout.strides == layout.strides {
             return Ok(self.clone());
         }
-        let positions: Vec<_> = self
-            .shape()
-            .axes()
-            .iter()
-            .map(|&a| shape.index(a))
-            .collect::<Result<_>>()?;
-        let map = (0..shape.len())
-            .map(|i| {
-                let coords = shape.coords(i);
-                self.0
-                    .layout
-                    .offset(&positions.iter().map(|&p| coords[p]).collect::<Vec<_>>())
-            })
-            .collect();
-        self.gathered(shape.clone(), layout, map)
+        let key = (
+            0,
+            self.shape().clone(),
+            self.0.layout.clone(),
+            shape.clone(),
+            layout.clone(),
+        );
+        let cached = GATHER_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let plans = match cached {
+            Some(plans) => plans,
+            None => {
+                let positions: Vec<_> = self
+                    .shape()
+                    .axes()
+                    .iter()
+                    .map(|&a| shape.index(a))
+                    .collect::<Result<_>>()?;
+                let map = (0..shape.len())
+                    .map(|i| {
+                        let coords = shape.coords(i);
+                        self.0
+                            .layout
+                            .offset(&positions.iter().map(|&p| coords[p]).collect::<Vec<_>>())
+                    })
+                    .collect::<Vec<_>>();
+                if map
+                    .iter()
+                    .enumerate()
+                    .all(|(output, &input)| output == input)
+                {
+                    return Ok(Self::node(
+                        shape.clone(),
+                        layout,
+                        self.0.value.clone(),
+                        self.device(),
+                        vec![Edge::new(self, Rule::Identity)],
+                        false,
+                        None,
+                    ));
+                }
+                let plans = GatherPlans {
+                    forward: Rc::new(Plan::gather(&map)?),
+                    reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
+                };
+                GATHER_PLANS.with(|cache| {
+                    cache.borrow_mut().insert(key, plans.clone());
+                });
+                plans
+            }
+        };
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
+        let edges = self.requires_grad().then(|| {
+            Edge::new(
+                self,
+                Rule::Group {
+                    plan: plans.reverse,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )
+        });
+        let result = Self::node(
+            shape.clone(),
+            layout,
+            value,
+            self.device(),
+            edges.into_iter().collect(),
+            false,
+            None,
+        );
+        profile("align", started);
+        Ok(result)
     }
     fn binary(&self, rhs: &Self, op: i32) -> Result<Self> {
         self.compatible_device(rhs)?;
@@ -615,49 +708,67 @@ impl Tensor {
         ))
     }
     pub fn mean(&self, axes: impl IntoAxes) -> Result<Self> {
+        let started = Instant::now();
         let axes = self.shape().select_axes(axes)?;
-        let shape = Shape::new(
-            self.shape()
-                .dims()
-                .iter()
-                .copied()
-                .filter(|d| !axes.contains(&d.axis)),
-        )?;
-        let layout = Layout::contiguous(&shape);
-        let factor = shape.len() as f32 / self.shape().len() as f32;
-        let mut map = vec![0; self.shape().len()];
-        for i in 0..self.shape().len() {
-            let coords = self.shape().coords(i);
-            let output: Vec<_> = self
-                .shape()
-                .dims()
-                .iter()
-                .zip(&coords)
-                .filter(|(d, _)| !axes.contains(&d.axis))
-                .map(|(_, &c)| c)
-                .collect();
-            map[self.0.layout.offset(&coords)] = layout.offset(&output);
-        }
-        let value = self.device().grouped(
-            &self.0.value,
-            None,
-            &Plan::reverse(&map, shape.len())?,
-            factor,
-        )?;
-        let rule = Rule::Group {
-            plan: Plan::gather(&map)?,
-            rhs: None,
-            factor,
+        let key = (self.shape().clone(), self.0.layout.clone(), axes.clone());
+        let cached = MEAN_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let plans = match cached {
+            Some(plans) => plans,
+            None => {
+                let output = Shape::new(
+                    self.shape()
+                        .dims()
+                        .iter()
+                        .copied()
+                        .filter(|d| !axes.contains(&d.axis)),
+                )?;
+                let layout = Layout::contiguous(&output);
+                let factor = output.len() as f32 / self.shape().len() as f32;
+                let mut map = vec![0; self.shape().len()];
+                for i in 0..self.shape().len() {
+                    let coords = self.shape().coords(i);
+                    let retained: Vec<_> = self
+                        .shape()
+                        .dims()
+                        .iter()
+                        .zip(&coords)
+                        .filter(|(d, _)| !axes.contains(&d.axis))
+                        .map(|(_, &coordinate)| coordinate)
+                        .collect();
+                    map[self.0.layout.offset(&coords)] = layout.offset(&retained);
+                }
+                let plans = MeanPlans {
+                    output: output.clone(),
+                    layout,
+                    factor,
+                    forward: Rc::new(Plan::reverse(&map, output.len())?),
+                    reverse: Rc::new(Plan::gather(&map)?),
+                };
+                MEAN_PLANS.with(|cache| {
+                    cache.borrow_mut().insert(key, plans.clone());
+                });
+                plans
+            }
         };
-        Ok(Self::node(
-            shape,
-            layout,
+        let value =
+            self.device()
+                .grouped(&self.0.value, None, plans.forward.as_ref(), plans.factor)?;
+        let rule = Rule::Group {
+            plan: plans.reverse,
+            rhs: None,
+            factor: plans.factor,
+        };
+        let result = Self::node(
+            plans.output,
+            plans.layout,
             value,
             self.device(),
             vec![Edge::new(self, rule)],
             false,
             None,
-        ))
+        );
+        profile("mean", started);
+        Ok(result)
     }
     /// Reduce a tensor to the mean of elements selected by a constant binary mask.
     /// The mask must have the same named axes, and every axis must be reduced.
@@ -1005,7 +1116,7 @@ impl Tensor {
             edges.push(Edge::new(
                 self,
                 Rule::Group {
-                    plan: Plan::groups(dl, true)?,
+                    plan: Rc::new(Plan::groups(dl, true)?),
                     rhs: Some(rhs.0.value.clone()),
                     factor: 1.0,
                 },
@@ -1015,7 +1126,7 @@ impl Tensor {
             edges.push(Edge::new(
                 rhs,
                 Rule::Group {
-                    plan: Plan::groups(dr, true)?,
+                    plan: Rc::new(Plan::groups(dr, true)?),
                     rhs: Some(self.0.value.clone()),
                     factor: 1.0,
                 },
@@ -1059,12 +1170,54 @@ impl Tensor {
         if self.0.layout.strides == layout.strides {
             return Ok(self.clone());
         }
-        let mut map = vec![0; self.shape().len()];
-        for i in 0..self.shape().len() {
-            let coords = self.shape().coords(i);
-            map[layout.offset(&coords)] = self.0.layout.offset(&coords);
-        }
-        self.gathered(self.shape().clone(), layout, map)
+        let key = (
+            1,
+            self.shape().clone(),
+            self.0.layout.clone(),
+            self.shape().clone(),
+            layout.clone(),
+        );
+        let cached = GATHER_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let plans = match cached {
+            Some(plans) => plans,
+            None => {
+                let mut map = vec![0; self.shape().len()];
+                for i in 0..self.shape().len() {
+                    let coords = self.shape().coords(i);
+                    map[layout.offset(&coords)] = self.0.layout.offset(&coords);
+                }
+                let plans = GatherPlans {
+                    forward: Rc::new(Plan::gather(&map)?),
+                    reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
+                };
+                GATHER_PLANS.with(|cache| {
+                    cache.borrow_mut().insert(key, plans.clone());
+                });
+                plans
+            }
+        };
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
+        let edges = self.requires_grad().then(|| {
+            Edge::new(
+                self,
+                Rule::Group {
+                    plan: plans.reverse,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )
+        });
+        Ok(Self::node(
+            self.shape().clone(),
+            layout,
+            value,
+            self.device(),
+            edges.into_iter().collect(),
+            false,
+            None,
+        ))
     }
     pub fn split(&self, axis: Axis, dims: impl IntoIterator<Item = Dim>) -> Result<Self> {
         let index = self.shape().index(axis)?;
@@ -1075,6 +1228,17 @@ impl Tensor {
         let mut dims = self.shape().dims().to_vec();
         dims.splice(index..=index, parts.dims().iter().copied());
         let shape = Shape::new(dims)?;
+        if self.0.layout == Layout::contiguous(self.shape()) {
+            return Ok(Self::node(
+                shape.clone(),
+                Layout::contiguous(&shape),
+                self.0.value.clone(),
+                self.device(),
+                vec![Edge::new(self, Rule::Identity)],
+                false,
+                None,
+            ));
+        }
         let pl = Layout::contiguous(&parts);
         let map = (0..shape.len())
             .map(|i| {
@@ -1216,10 +1380,12 @@ impl Tensor {
                         } => self
                             .device()
                             .matmul_right_backward(lhs, &gradient, *batch, *m, *k, *n)?,
-                        Rule::Group { plan, rhs, factor } => {
-                            self.device()
-                                .grouped(&gradient, rhs.as_ref(), plan, *factor)?
-                        }
+                        Rule::Group { plan, rhs, factor } => self.device().grouped(
+                            &gradient,
+                            rhs.as_ref(),
+                            plan.as_ref(),
+                            *factor,
+                        )?,
                     };
                     let id = edge.input.0.id;
                     let sum = if let Some(existing) = adjoints.remove(&id) {

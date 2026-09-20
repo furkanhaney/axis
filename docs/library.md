@@ -82,6 +82,9 @@ Explicit host reads also synchronize. CPU code builds index plans; these
 generic gather/reduction plans prioritize verifiable semantics. They are
 limited to 16,777,216 contributions per operation and are not a competitive
 GEMM implementation. Single-axis contractions take a batched tiled cuTile
+matrix path. Axis caches host plans by named shape and layout, and retains up
+to 256 MiB of uploaded plans per device; larger and one-off plans remain
+step-local so a stable-shape speedup cannot grow device memory without bound.
 matrix multiplication path with 64x64 output tiles in forward and both
 derivatives. Axis reordering is
 materialized when the batch, row, reduction, and column groups are not already

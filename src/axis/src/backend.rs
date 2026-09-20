@@ -1,7 +1,22 @@
 //! A correctness-first cuTile backend. Plans contain indices, never values.
 use crate::Result;
 use cutile::prelude::*;
-use std::{cell::RefCell, rc::Rc};
+use std::time::Instant;
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+fn profile(label: &str, started: Instant) {
+    if std::env::var_os("AXIS_PROFILE").is_some() {
+        eprintln!(
+            "axis_profile {label} {:.6}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
 
 pub(crate) type Buffer = Arc<cutile::tensor::Tensor<f32>>;
 
@@ -14,6 +29,15 @@ struct Context {
     pending_f32: RefCell<Vec<Arc<Vec<f32>>>>,
     pending_host_i32: RefCell<Vec<Arc<Vec<i32>>>>,
     pending_device_i32: RefCell<Vec<Arc<cutile::tensor::Tensor<i32>>>>,
+    plans: RefCell<HashMap<u64, DevicePlan>>,
+    plan_bytes: Cell<usize>,
+}
+
+#[derive(Clone)]
+struct DevicePlan {
+    offsets: Arc<cutile::tensor::Tensor<i32>>,
+    left: Arc<cutile::tensor::Tensor<i32>>,
+    right: Arc<cutile::tensor::Tensor<i32>>,
 }
 
 trait Enqueue: DeviceOp + Sized {
@@ -46,6 +70,8 @@ impl Device {
             pending_f32: RefCell::new(Vec::new()),
             pending_host_i32: RefCell::new(Vec::new()),
             pending_device_i32: RefCell::new(Vec::new()),
+            plans: RefCell::new(HashMap::new()),
+            plan_bytes: Cell::new(0),
         })))
     }
     pub(crate) fn same(&self, other: &Self) -> bool {
@@ -57,7 +83,9 @@ impl Device {
         buffer
     }
     pub fn synchronize(&self) -> Result<()> {
+        let started = Instant::now();
         unsafe { self.0.stream.synchronize()? };
+        profile("synchronize", started);
         self.0.pending.borrow_mut().clear();
         self.0.pending_f32.borrow_mut().clear();
         self.0.pending_host_i32.borrow_mut().clear();
@@ -71,7 +99,9 @@ impl Device {
         Ok(self.track(tensor))
     }
     pub(crate) fn read(&self, buffer: &Buffer) -> Result<Vec<f32>> {
+        let started = Instant::now();
         let values = buffer.to_host_vec().sync_on(&self.0.stream)?;
+        profile("read", started);
         self.0.pending.borrow_mut().clear();
         self.0.pending_f32.borrow_mut().clear();
         self.0.pending_host_i32.borrow_mut().clear();
@@ -406,6 +436,7 @@ impl Device {
         plan: &Plan,
         scale: f32,
     ) -> Result<Buffer> {
+        let started = Instant::now();
         let upload = |v: &Vec<i32>| -> Result<Arc<cutile::tensor::Tensor<i32>>> {
             let host = Arc::new(v.clone());
             let device = Arc::new(api::copy_host_vec_to_device(&host).enqueue_on(&self.0.stream)?);
@@ -413,21 +444,46 @@ impl Device {
             self.0.pending_device_i32.borrow_mut().push(device.clone());
             Ok(device)
         };
-        let offsets = upload(&plan.offsets)?;
-        let left = upload(&plan.left)?;
-        let right = upload(if b.is_some() { &plan.right } else { &plan.left })?;
+        let cached = self.0.plans.borrow().get(&plan.id).cloned();
+        let device_plan = match cached {
+            Some(cached) => cached,
+            None => {
+                let uploaded = DevicePlan {
+                    offsets: upload(&plan.offsets)?,
+                    left: upload(&plan.left)?,
+                    right: upload(if b.is_some() { &plan.right } else { &plan.left })?,
+                };
+                let bytes = plan
+                    .offsets
+                    .len()
+                    .saturating_add(plan.left.len())
+                    .saturating_add(if b.is_some() {
+                        plan.right.len()
+                    } else {
+                        plan.left.len()
+                    })
+                    .saturating_mul(std::mem::size_of::<i32>());
+                const PLAN_CACHE_BYTES: usize = 256 * 1024 * 1024;
+                if self.0.plan_bytes.get().saturating_add(bytes) <= PLAN_CACHE_BYTES {
+                    self.0.plan_bytes.set(self.0.plan_bytes.get() + bytes);
+                    self.0.plans.borrow_mut().insert(plan.id, uploaded.clone());
+                }
+                uploaded
+            }
+        };
         let mut out = self.zeros(plan.offsets.len() - 1)?;
         kernels::grouped(
             (&mut out).partition([1]),
             a.as_ref(),
             b.unwrap_or(a).as_ref(),
-            offsets.as_ref(),
-            left.as_ref(),
-            right.as_ref(),
+            device_plan.offsets.as_ref(),
+            device_plan.left.as_ref(),
+            device_plan.right.as_ref(),
             scale,
         )
         .generics(vec![i32::from(b.is_some()).to_string()])
         .enqueue_on(&self.0.stream)?;
+        profile("grouped_submit", started);
         Ok(self.track(out))
     }
 }
@@ -440,8 +496,11 @@ fn contraction_tile(extent: usize) -> i32 {
 }
 
 /// CSR gather/reduction plan. Deliberately bounded until a tiled lowering replaces it.
+static NEXT_PLAN: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone)]
 pub(crate) struct Plan {
+    id: u64,
     pub offsets: Vec<i32>,
     pub left: Vec<i32>,
     pub right: Vec<i32>,
@@ -451,6 +510,7 @@ impl Plan {
         let count: usize = groups.iter().map(Vec::len).sum();
         Self::check_size(count)?;
         let mut result = Self {
+            id: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
             offsets: vec![0],
             left: Vec::with_capacity(count),
             right: Vec::new(),
@@ -469,6 +529,7 @@ impl Plan {
     pub fn gather(map: &[usize]) -> Result<Self> {
         Self::check_size(map.len())?;
         Ok(Self {
+            id: NEXT_PLAN.fetch_add(1, Ordering::Relaxed),
             offsets: (0..=map.len() as i32).collect(),
             left: map
                 .iter()
