@@ -60,6 +60,33 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
 
 #[test]
 #[ignore = "requires CUDA"]
+fn named_axis_minimum_preserves_groups_and_routes_ties_to_the_first_winner() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("batch");
+    let candidate = Axis::new("candidate");
+    let values = Tensor::from_slice(
+        &[3.0, 1.0, 1.0, 4.0, -2.0, 0.0],
+        [batch.of(2), candidate.of(3)],
+        &device,
+    )?
+    .with_layout([candidate, batch])?
+    .with_grad();
+
+    let minimum = values.min(candidate)?;
+    assert_eq!(minimum.shape(), &Shape::new([batch.of(2)])?);
+    close("named-axis minimum", &minimum.to_vec()?, &[1.0, -2.0]);
+    minimum.mean(batch)?.backward()?;
+    close(
+        "named-axis minimum gradient",
+        &values.grad().unwrap().to_vec()?,
+        &[0.0, 0.5, 0.0, 0.0, 0.5, 0.0],
+    );
+    assert!(values.min(Axis::new("missing")).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn odd_features_short_batch_unrelated_axes_and_storage_order() -> Result<()> {
     let device = Device::cuda(0)?;
     let (b, t, f, o) = (
