@@ -327,6 +327,12 @@ impl Conv2d {
         }
     }
     fn patch_shape(&self, input: &Shape) -> Result<Shape> {
+        if self.spatial[0] == self.spatial[1]
+            || self.input == self.spatial[0]
+            || self.input == self.spatial[1]
+        {
+            return Err("Conv2d requires distinct input-channel and spatial axes".into());
+        }
         let channels = input.extent(self.input)?;
         let height = input.extent(self.spatial[0])?;
         let width = input.extent(self.spatial[1])?;

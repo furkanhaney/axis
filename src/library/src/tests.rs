@@ -18,6 +18,47 @@ fn close(name: &str, actual: &[f32], expected: &[f64]) {
 }
 
 #[test]
+fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Result<()> {
+    let (batch, channel, height, width, output, population) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+        Axis::new("population"),
+    );
+    let image = Shape::new([batch.of(2), channel.of(3), height.of(5), width.of(7)])?;
+
+    let conv = Conv2d::new(channel, output.of(4), [height, width], [3, 2]);
+    assert_eq!(
+        conv.output_shape(&image)?,
+        Shape::new([batch.of(2), height.of(3), width.of(6), output.of(4)])?
+    );
+    for invalid in [
+        Conv2d::new(channel, output.of(4), [height, height], [3, 2]),
+        Conv2d::new(channel, output.of(4), [channel, width], [3, 2]),
+        Conv2d::new(channel, output.of(4), [height, width], [0, 2]),
+        Conv2d::new(channel, output.of(4), [height, width], [6, 2]),
+    ] {
+        assert!(invalid.output_shape(&image).is_err());
+    }
+
+    let linear = Linear::new(channel, output.of(4));
+    assert!(linear.output_shape(&Shape::new([batch.of(2)])?).is_err());
+    let population_linear = PopulationLinear::new(population.of(3), channel, output.of(4));
+    assert!(
+        population_linear
+            .output_shape(&Shape::new(
+                [batch.of(2), population.of(2), channel.of(3),]
+            )?)
+            .is_err()
+    );
+    assert!(LayerNorm::new(channel, 0.0).is_err());
+    assert!(LayerNorm::new(channel, f32::INFINITY).is_err());
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUDA"]
 fn odd_features_short_batch_unrelated_axes_and_storage_order() -> Result<()> {
     let device = Device::cuda(0)?;
@@ -184,6 +225,52 @@ fn shared_axes_contract_and_both_input_derivatives() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn multiple_axis_contraction_matches_dense_reference_and_gradients() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, inner_a, inner_b, column) = (
+        Axis::new("row"),
+        Axis::new("inner_a"),
+        Axis::new("inner_b"),
+        Axis::new("column"),
+    );
+    let left = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [row.of(2), inner_a.of(2), inner_b.of(2)],
+        &device,
+    )?
+    .with_layout([inner_b, row, inner_a])?
+    .with_grad();
+    let right = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [inner_a.of(2), inner_b.of(2), column.of(2)],
+        &device,
+    )?
+    .with_layout([column, inner_a, inner_b])?
+    .with_grad();
+
+    let output = left.contract(&right, [inner_a, inner_b])?;
+    assert_eq!(output.shape(), &Shape::new([row.of(2), column.of(2)])?);
+    close(
+        "multiple-axis contraction",
+        &output.to_vec()?,
+        &[50.0, 60.0, 114.0, 140.0],
+    );
+    output.mean([row, column])?.backward()?;
+    close(
+        "multiple-axis left gradient",
+        &left.grad().unwrap().to_vec()?,
+        &[0.75, 1.75, 2.75, 3.75, 0.75, 1.75, 2.75, 3.75],
+    );
+    close(
+        "multiple-axis right gradient",
+        &right.grad().unwrap().to_vec()?,
+        &[1.5, 1.5, 2.0, 2.0, 2.5, 2.5, 3.0, 3.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn bf16_matrix_products_keep_fp32_state_and_gradients_close() -> Result<()> {
     let m = Axis::new("row");
     let k = Axis::new("reduction");
@@ -337,6 +424,164 @@ fn algebra_and_errors_are_explicit() -> Result<()> {
         &relu_input.grad().unwrap().to_vec()?,
         &[0.0, 0.0, 1.0 / 3.0],
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn binary_cross_entropy_is_stable_and_differentiable() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let values = [-1000.0_f32, -2.0, 0.0, 2.0, 1000.0];
+    let target_values = [0.0_f32, 1.0, 0.0, 1.0, 1.0];
+    let logits = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let targets = Tensor::from_slice(&target_values, [feature.of(target_values.len())], &device)?;
+
+    let losses = logits.binary_cross_entropy_with_logits(&targets)?;
+    let expected = values
+        .iter()
+        .zip(target_values)
+        .map(|(&logit, target)| {
+            let logit = f64::from(logit);
+            logit.max(0.0) - logit * f64::from(target) + (-logit.abs()).exp().ln_1p()
+        })
+        .collect::<Vec<_>>();
+    close("stable binary cross-entropy", &losses.to_vec()?, &expected);
+
+    losses.mean(feature)?.backward()?;
+    let expected_gradient = values
+        .iter()
+        .zip(target_values)
+        .map(|(&logit, target)| {
+            let sigmoid = 1.0 / (1.0 + (-f64::from(logit)).exp());
+            (sigmoid - f64::from(target)) / values.len() as f64
+        })
+        .collect::<Vec<_>>();
+    close(
+        "binary cross-entropy gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits(&targets.with_grad())
+            .is_err()
+    );
+    let other = Axis::new("other");
+    let wrong_axes = Tensor::from_slice(&target_values, [other.of(5)], &device)?;
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits(&wrong_axes)
+            .is_err()
+    );
+    assert!(logits.item().is_err());
+    assert!(logits.scale(f32::NAN).is_err());
+    assert!(logits.inverse_sqrt(0.0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn causal_softmax_masks_values_and_gradients() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (query, key) = (Axis::new("query"), Axis::new("key"));
+    let logits = Tensor::from_slice(&[0.0; 9], [query.of(3), key.of(3)], &device)?.with_grad();
+    let probability = logits.causal_mask(query, key)?.softmax(key)?;
+    close(
+        "causal softmax probabilities",
+        &probability.to_vec()?,
+        &[
+            1.0,
+            0.0,
+            0.0,
+            0.5,
+            0.5,
+            0.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+        ],
+    );
+
+    let weights = Tensor::from_slice(&[1.0, 2.0, 4.0], [key.of(3)], &device)?;
+    probability.mul(&weights)?.mean([query, key])?.backward()?;
+    close(
+        "causal softmax gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &[
+            0.0,
+            0.0,
+            0.0,
+            -0.25 / 9.0,
+            0.25 / 9.0,
+            0.0,
+            -4.0 / 81.0,
+            -1.0 / 81.0,
+            5.0 / 81.0,
+        ],
+    );
+
+    assert!(logits.detach().causal_mask(query, query).is_err());
+    let rectangular = Tensor::from_slice(&[0.0; 6], [query.of(2), key.of(3)], &device)?;
+    assert!(rectangular.causal_mask(query, key).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn conv2d_lowers_valid_patches_and_sums_overlapping_gradients() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width, output) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+        [channel.of(1), height.of(3), width.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let mut conv = Conv2d::new(channel, output.of(1), [height, width], [2, 2]);
+    assert!(conv.forward(&input).is_err());
+    assert_eq!(
+        conv.build(input.shape(), &device, 7)?,
+        Shape::new([height.of(2), width.of(2), output.of(1)])?
+    );
+    conv.parameter("weight")?
+        .set_values(&[1.0, 0.0, 0.0, -1.0])?;
+    conv.parameter("bias")?.set_values(&[0.5])?;
+
+    let result = conv.forward(&input)?;
+    close("Conv2d forward", &result.to_vec()?, &[-3.5; 4]);
+    result.mean([height, width, output])?.backward()?;
+    close(
+        "Conv2d overlapping input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.25, 0.25, 0.0, 0.25, 0.0, -0.25, 0.0, -0.25, -0.25],
+    );
+    close(
+        "Conv2d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &[3.0, 4.0, 6.0, 7.0],
+    );
+    close(
+        "Conv2d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &[1.0],
+    );
+
+    let wrong_channels = Shape::new([channel.of(2), height.of(3), width.of(3)])?;
+    assert!(conv.output_shape(&wrong_channels).is_err());
+    let normalization = LayerNorm::new(channel, 1e-5)?;
+    assert!(normalization.forward(&input).is_err());
+    let population = Axis::new("population");
+    let unbuilt = PopulationLinear::new(population.of(2), channel, output.of(1));
+    assert!(unbuilt.forward(&input).is_err());
     Ok(())
 }
 
