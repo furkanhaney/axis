@@ -1,11 +1,11 @@
 initial evaluation_mse=0.80632222
 step=1 samples=256 pre_update_mse=0.67623574
 step=100 samples=25600 pre_update_mse=0.00242190
-step=200 samples=51200 pre_update_mse=0.01286699
-step=300 samples=76800 pre_update_mse=0.00441917
-step=400 samples=102400 pre_update_mse=0.00270581
-step=500 samples=128000 pre_update_mse=0.00372967
-final evaluation_mse=0.00387844 elapsed_s=1.65
+step=200 samples=51200 pre_update_mse=0.01286712
+step=300 samples=76800 pre_update_mse=0.00441918
+step=400 samples=102400 pre_update_mse=0.00270582
+step=500 samples=128000 pre_update_mse=0.00372966
+final evaluation_mse=0.00387844 elapsed_s=5.39
 IDR STATUS
 
 samples consumed:      128000
@@ -20,6 +20,34 @@ TRAIN/EVALUATION DISJOINTNESS
 unique training IDs:    128000
 unique evaluation IDs:  256
 observed overlap:        0
+
+PASS
+EMPIRICAL MONOTONICITY
+
+relation:               left operand -> predicted sum
+direction:              increasing
+ordered comparisons:    256
+observed violations:    0
+violation rate:         0.0000%
+max violation rate:     0.0000%
+worst output violation: 0.00000000
+absolute tolerance:     0.00000100
+smallest input span:    0.05099636
+evidence:                sampled ordered pairs; not a global guarantee
+
+PASS
+EMPIRICAL MONOTONICITY
+
+relation:               right operand -> predicted sum
+direction:              increasing
+ordered comparisons:    256
+observed violations:    0
+violation rate:         0.0000%
+max violation rate:     0.0000%
+worst output violation: 0.00000000
+absolute tolerance:     0.00000100
+smallest input span:    0.05010277
+evidence:                sampled ordered pairs; not a global guarantee
 
 PASS
 PASS: learned addition from fresh samples without epochs
