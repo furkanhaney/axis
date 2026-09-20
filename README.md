@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-0b7285)](LICENSE.md)
 ![Experimental](https://img.shields.io/badge/status-experimental-f59e0b)
 
-[crates.io](https://crates.io/crates/axis) · [v0.1.0 release](https://github.com/furkanhaney/axis/releases/tag/v0.1.0) ·
+[crates.io](https://crates.io/crates/axis) · [latest GitHub release](https://github.com/furkanhaney/axis/releases/latest) ·
 [Why Axis](docs/direction/thesis.md) · [Vision](docs/direction/vision.md) · [Library contract](docs/design/library.md) ·
 [Contributing](CONTRIBUTING.md) · [License](LICENSE.md) · [Trademarks](TRADEMARK.md)
 
