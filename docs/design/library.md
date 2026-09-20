@@ -61,6 +61,14 @@ Their constructor defaults use beta1 `0.9`, beta2 `0.999`, and epsilon `1e-8`;
 learning rate remains explicit, and AdamW also requires explicit decoupled
 weight decay.
 
+`Muon` applies EMA momentum, optional Nesterov interpolation, five-step
+Newton-Schulz orthogonalization, original rectangular-matrix scaling, and
+decoupled decay to explicitly oriented rank-2 parameters. `MuonWithAuxAdamW`
+validates that every selected `ParamId` belongs to the model and routes the
+exact deduplicated remainder to AdamW. Both partitions prepare before either
+commits. The orientation, scalar oracles, mixed-precision behavior, and current
+limits are documented in [the Muon contract](muon.md).
+
 `DataLoader` batches any `DataSource` and checks its regime before releasing a
 batch. Finite `InMemoryDataset` sources report corpus size; generated sources
 such as `AdditionDataset` do not invent one. Each guarded batch carries a
@@ -160,6 +168,7 @@ bash scripts/check.sh
 bash src/examples/mlp/scripts/train.sh --smoke
 bash src/examples/mlp/scripts/train.sh
 bash src/examples/addition/scripts/train.sh --smoke
+bash src/examples/muon/scripts/train.sh --smoke
 ```
 
 The verification script runs formatting, Clippy, the CPU shape test, and the

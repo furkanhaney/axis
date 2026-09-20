@@ -115,6 +115,40 @@ impl Device {
         let tensor = self.zeros(len)?;
         Ok(self.track(tensor))
     }
+    /// Reduce a flat FP32 buffer to one device-resident sum of squares.
+    ///
+    /// This deliberately does not use Axis's general indexed reduction plan:
+    /// Muon matrices can exceed that plan's contribution-count bound.
+    pub(crate) fn sum_squares(&self, a: &Buffer) -> Result<Buffer> {
+        const TILE_WIDTH: usize = 256;
+        let len: usize = a.shape().iter().map(|&extent| extent as usize).product();
+        if len == 0 {
+            return Err("sum of squares requires a nonempty buffer".into());
+        }
+        let logical_len = i32::try_from(len).map_err(|_| "sum of squares exceeds i32 indexing")?;
+        let partial_count = len.div_ceil(TILE_WIDTH);
+        let mut partials = self.zeros(partial_count)?;
+        kernels::sum_squares_tiles((&mut partials).partition([1]), a.as_ref(), logical_len)
+            .generics(vec![(TILE_WIDTH as i32).to_string()])
+            .enqueue_on(&self.0.stream)?;
+        let mut current = self.track(partials);
+        let mut current_len = partial_count;
+        while current_len > 1 {
+            let next_len = current_len.div_ceil(TILE_WIDTH);
+            let mut next = self.zeros(next_len)?;
+            kernels::sum_tiles(
+                (&mut next).partition([1]),
+                current.as_ref(),
+                i32::try_from(current_len)
+                    .map_err(|_| "sum of squares partial count exceeds i32 indexing")?,
+            )
+            .generics(vec![(TILE_WIDTH as i32).to_string()])
+            .enqueue_on(&self.0.stream)?;
+            current = self.track(next);
+            current_len = next_len;
+        }
+        Ok(current)
+    }
     pub(crate) fn binary(&self, a: &Buffer, b: &Buffer, op: i32) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::binary((&mut out).partition([128]), a.as_ref(), b.as_ref())
@@ -135,6 +169,22 @@ impl Device {
     pub(crate) fn scale(&self, a: &Buffer, scale: f32) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::scale((&mut out).partition([128]), a.as_ref(), scale)
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn multiply_scalar(&self, a: &Buffer, scalar: &Buffer) -> Result<Buffer> {
+        if scalar
+            .shape()
+            .iter()
+            .map(|&extent| extent as usize)
+            .product::<usize>()
+            != 1
+        {
+            return Err("device scalar multiplier must contain exactly one value".into());
+        }
+        let len = a.shape().iter().map(|&extent| extent as usize).product();
+        let mut out = self.zeros(len)?;
+        kernels::multiply_scalar((&mut out).partition([128]), a.as_ref(), scalar.as_ref())
             .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
@@ -905,6 +955,46 @@ mod kernels {
             }
         }
         out.store(sum);
+    }
+    #[cutile::entry()]
+    fn sum_squares_tiles<const TILE_WIDTH: i32>(
+        out: &mut Tensor<f32, { [1] }>,
+        input: &Tensor<f32, { [-1] }>,
+        len: i32,
+    ) {
+        let block = get_tile_block_id().0;
+        let offsets: Tile<i32, { [TILE_WIDTH] }> =
+            iota(shape![TILE_WIDTH]) + broadcast_scalar(block * TILE_WIDTH, shape![TILE_WIDTH]);
+        let valid = lt_tile(offsets, broadcast_scalar(len, shape![TILE_WIDTH]));
+        let loaded: Tile<f32, { [TILE_WIDTH] }> = input.partition(shape![TILE_WIDTH]).load([block]);
+        let zero = constant(0.0f32, shape![TILE_WIDTH]);
+        let values = select(valid, loaded, zero);
+        let sum: Tile<f32, { [] }> = reduce_sum(values * values, 0i32);
+        out.store(sum.reshape(shape![1]));
+    }
+    #[cutile::entry()]
+    fn sum_tiles<const TILE_WIDTH: i32>(
+        out: &mut Tensor<f32, { [1] }>,
+        input: &Tensor<f32, { [-1] }>,
+        len: i32,
+    ) {
+        let block = get_tile_block_id().0;
+        let offsets: Tile<i32, { [TILE_WIDTH] }> =
+            iota(shape![TILE_WIDTH]) + broadcast_scalar(block * TILE_WIDTH, shape![TILE_WIDTH]);
+        let valid = lt_tile(offsets, broadcast_scalar(len, shape![TILE_WIDTH]));
+        let loaded: Tile<f32, { [TILE_WIDTH] }> = input.partition(shape![TILE_WIDTH]).load([block]);
+        let zero = constant(0.0f32, shape![TILE_WIDTH]);
+        let sum: Tile<f32, { [] }> = reduce_sum(select(valid, loaded, zero), 0i32);
+        out.store(sum.reshape(shape![1]));
+    }
+    #[cutile::entry()]
+    fn multiply_scalar(
+        out: &mut Tensor<f32, { [128] }>,
+        input: &Tensor<f32, { [-1] }>,
+        scalar: &Tensor<f32, { [-1] }>,
+    ) {
+        let value: Tile<f32, { [1] }> = scalar.partition(shape![1]).load([0i32]);
+        out.store(input.load_like(out) * value.broadcast(shape![128]));
     }
     #[cutile::entry()]
     fn matmul<const BK: i32, const K: i32>(

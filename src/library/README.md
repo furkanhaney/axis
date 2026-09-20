@@ -15,7 +15,8 @@ The crate currently provides:
 - `Linear`, `Conv2d` with stride, symmetric padding, and grouped/depthwise
   channels, `LayerNorm`, activations, attention primitives, and sequential
   composition;
-- device-resident SGD, Adam, and AdamW;
+- device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
+  exact AdamW remainder;
 - generated and finite data loaders with executable single-pass, finite-pass,
   and IDR assertions;
 - versioned semantic identities with exact retained-population and
@@ -51,6 +52,9 @@ Axis requires Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile,
 `libclang`, and CUDA 13.2 or newer. It is early research software: APIs may
 change as real training programs expose better defaults and abstractions.
 
+The Muon implementation's pinned upstream revision and MIT attribution are in
+[THIRD_PARTY.md](THIRD_PARTY.md), which is included in every published crate.
+
 `Conv2d::new` defaults to stride one, no padding, and one group. Configure a
 depthwise layer by setting `groups` to the input channel count; both input and
 output channel extents must be divisible by that value. Padding is symmetric
@@ -61,7 +65,7 @@ cargo add axis@0.4.0
 ```
 
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
-CNN, attention, generated-data, MNIST, and research-script migrations with
+CNN, attention, generated-data, paired Muon, MNIST, and research-script migrations with
 independent numerical oracles. Contributions from humans and agents are both
 welcome under the repository's contribution contract. The project name and
 branding are covered by its

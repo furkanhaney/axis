@@ -796,6 +796,59 @@ impl Tensor {
             None,
         ))
     }
+    pub(crate) fn normalized_l2(&self, epsilon: f32) -> Result<Self> {
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err("L2 normalization epsilon must be finite and positive".into());
+        }
+        let scalar_shape = Shape::new([])?;
+        let norm_squared = Self::node(
+            scalar_shape.clone(),
+            Layout::contiguous(&scalar_shape),
+            self.device().sum_squares(&self.0.value)?,
+            self.device(),
+            vec![],
+            false,
+            None,
+        );
+        // Keep the normalizer device-resident. `inverse_sqrt` is the backend's
+        // unary square-root primitive; the minimum positive adjustment is far
+        // below the public Muon epsilon for every representable nonzero norm.
+        let inverse_root = norm_squared.inverse_sqrt(f32::MIN_POSITIVE)?;
+        let norm = norm_squared.mul(&inverse_root)?;
+        let denominator = norm.add(&Self::from_slice(&[epsilon], [], self.device())?)?;
+        let inverse_half = denominator.inverse_sqrt(f32::MIN_POSITIVE)?;
+        let inverse = inverse_half.mul(&inverse_half)?;
+        let value = self
+            .device()
+            .multiply_scalar(&self.0.value, &inverse.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![],
+            false,
+            None,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zeros_for_test(
+        dims: impl IntoIterator<Item = Dim>,
+        device: &Device,
+    ) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let value = device.zeros_buffer(shape.len())?;
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            value,
+            device,
+            vec![],
+            false,
+            None,
+        ))
+    }
     pub fn relu(&self) -> Result<Self> {
         let value = self.device().relu(&self.0.value)?;
         Ok(Self::node(

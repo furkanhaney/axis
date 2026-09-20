@@ -5,6 +5,7 @@ members = [
     "src/examples/cnn",
     "src/examples/attention",
     "src/examples/addition",
+    "src/examples/muon",
     "src/studies/training-dynamics/mnist",
     "src/studies/training-dynamics/mnist-population",
     "src/studies/energy-output/panel",

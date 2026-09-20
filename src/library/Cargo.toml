@@ -12,7 +12,7 @@ documentation = "https://docs.rs/axis"
 readme = "README.md"
 keywords = ["machine-learning", "cuda", "tensor", "gpu", "research"]
 categories = ["science", "mathematics"]
-include = ["src/**", "build.rs", "README.md", "LICENSE.md"]
+include = ["src/**", "build.rs", "README.md", "LICENSE.md", "THIRD_PARTY.md"]
 
 [features]
 default = ["cuda"]

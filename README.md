@@ -119,8 +119,9 @@ throughput success claim.
   grouped/depthwise channels, `LayerNorm`, `ReLU`, `GELU`, and `Sequential`.
 - Compact implicit Conv2d patch extraction and deterministic col2im, including
   plans larger than the generic 16,777,216-contribution ceiling.
-- Device-resident SGD, Adam, and AdamW. Adam can assign one learning rate to
-  each member of a named population axis.
+- Device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon. Adam
+  can assign one learning rate to each member of a named population axis; Muon
+  partitions are explicit and send the exact remainder to AdamW.
 - Finite datasets, generated streams, exact shuffled passes, single-pass and
   IDR guards, and train/evaluation identity separation.
 - Empirical increasing/decreasing checks over explicitly ordered input pairs,
@@ -147,6 +148,7 @@ wall times, not CUDA kernel durations; see the [execution profile](docs/backend/
 | [CNN](src/examples/cnn/README.md) | convolution forward/backward and learning | configured grouped convolution matches a scalar oracle; a depthwise-separable block composes; smoke reaches 100% accuracy |
 | [Attention](src/examples/attention/README.md) | causal attention and prefix-mean learning | central differences pass; held-out MSE falls to `2.39e-2` |
 | [Generated addition](src/examples/addition/README.md) | endless data with executable IDR assumptions | 128,000 fresh samples, zero observed reuse; held-out MSE falls to `3.88e-3` |
+| [Muon](src/examples/muon/README.md) | explicit Muon/AdamW partition and paired learning | both identically initialized arms reduce held-out MSE by more than 99% in 100 steps; no winner claim |
 | [MNIST](src/studies/training-dynamics/mnist/README.md) | finite-pass categorical training migration | bounded smoke improves held-out accuracy from 10.16% to 33.98% |
 | [MNIST population](src/studies/training-dynamics/mnist-population/README.md) | independent models and rates on one population axis | fused four-member smoke improves best accuracy from 8.20% to 60.55% |
 | [Country panel](src/studies/energy-output/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
@@ -166,7 +168,8 @@ axis/
 │   │   ├── addition/         generated-data IDR training
 │   │   ├── attention/        causal-attention consumer and oracle
 │   │   ├── cnn/              CNN consumer and scalar oracle
-│   │   └── mlp/              MLP consumer and explicit cuTile baseline
+│   │   ├── mlp/              MLP consumer and explicit cuTile baseline
+│   │   └── muon/             paired Muon and AdamW learning acceptance
 │   └── studies/
 │       ├── training-dynamics/
 │       │   ├── mnist/        finite-pass MNIST migration
@@ -217,6 +220,7 @@ bash src/examples/mlp/scripts/train.sh --smoke
 bash src/examples/cnn/scripts/train.sh --smoke
 bash src/examples/attention/scripts/train.sh --smoke
 bash src/examples/addition/scripts/train.sh --smoke
+bash src/examples/muon/scripts/train.sh --smoke
 bash src/studies/training-dynamics/mnist/scripts/train.sh --smoke
 bash src/studies/training-dynamics/mnist-population/scripts/train.sh --smoke
 bash src/studies/energy-output/panel/scripts/train.sh --smoke --split country
