@@ -186,6 +186,28 @@ fn main() -> Result<()> {
         "initial train_bce={:.2e} validation_bce={:.2e} validation_accuracy={:.2}",
         initial.0, initial_valid.0, initial_valid.1
     );
+    let mut train_learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        LearningLimits::any_improvement(),
+        LearningObservation::new(
+            "binary cross entropy",
+            "fixed training set",
+            "optimizer steps",
+            0,
+            f64::from(initial.0),
+        )?,
+    )?;
+    let mut validation_learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        LearningLimits::any_improvement(),
+        LearningObservation::new(
+            "binary cross entropy",
+            "fixed validation set",
+            "optimizer steps",
+            0,
+            f64::from(initial_valid.0),
+        )?,
+    )?;
     for _ in 0..steps {
         let report = trainer.step(&mut model, |model| {
             model
@@ -207,13 +229,23 @@ fn main() -> Result<()> {
         "final train_bce={:.2e} validation_bce={:.2e} validation_accuracy={:.2}",
         final_train.0, final_valid.0, final_valid.1
     );
-    if !final_train.0.is_finite()
-        || !final_valid.0.is_finite()
-        || final_train.0 >= initial.0
-        || final_valid.0 >= initial_valid.0
-    {
-        return Err("CNN training did not improve both losses".into());
-    }
+    let terminal_step = u64::try_from(steps)?;
+    train_learning.observe(LearningObservation::new(
+        "binary cross entropy",
+        "fixed training set",
+        "optimizer steps",
+        terminal_step,
+        f64::from(final_train.0),
+    )?)?;
+    validation_learning.observe(LearningObservation::new(
+        "binary cross entropy",
+        "fixed validation set",
+        "optimizer steps",
+        terminal_step,
+        f64::from(final_valid.0),
+    )?)?;
+    println!("{}", train_learning.assert_learning()?);
+    println!("{}", validation_learning.assert_learning()?);
     println!("PASS: named-axis CNN learned on cuTile");
     Ok(())
 }

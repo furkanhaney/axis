@@ -49,6 +49,13 @@ The caller is responsible for holding all other inputs fixed. The ordered
 input values make that test auditable instead of accepting two unexplained
 output arrays.
 
+Empirical learning progress applies the same claim discipline across training
+time. It compares finite observations of one named metric and population over a
+strictly increasing budget, then emits `VerifiedObservations`. It replaces
+handwritten `final < initial` gates without turning that comparison into a claim
+of convergence or generalization. The full boundary is documented in
+[learning progress](../contracts/learning-progress.md).
+
 A later architectural contract must use a different API and evidence type. A
 positive-weight parameterization, monotone lattice, or another constrained
 function class may eventually produce `Guaranteed<Monotone>`. Adversarial

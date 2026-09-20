@@ -23,7 +23,9 @@ The crate currently provides:
 - exact, batch-composable categorical accuracy counts;
 - train-fitted standardization with an explicit variance correction; and
 - empirical monotonicity checks over explicitly ordered input pairs, with
-  receipts that distinguish sampled evidence from a global guarantee.
+  receipts that distinguish sampled evidence from a global guarantee; and
+- empirical learning-progress checks that bind a metric and evaluation
+  population to ordered budget observations without claiming convergence.
 
 ```rust,no_run
 use axis::prelude::*;

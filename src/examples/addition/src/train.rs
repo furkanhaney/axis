@@ -195,6 +195,17 @@ fn main() -> Result<()> {
         .mean([batch, output])?
         .item()?;
     println!("initial evaluation_mse={initial_eval:.8}");
+    let mut learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        LearningLimits::any_improvement(),
+        LearningObservation::new(
+            "mean squared error",
+            "fixed generated evaluation batch",
+            "optimizer steps",
+            0,
+            f64::from(initial_eval),
+        )?,
+    )?;
 
     let mut trainer = Trainer::new(SGD::new(0.25)?);
     let started = Instant::now();
@@ -224,6 +235,13 @@ fn main() -> Result<()> {
         .squared_error(&eval_y)?
         .mean([batch, output])?
         .item()?;
+    learning.observe(LearningObservation::new(
+        "mean squared error",
+        "fixed generated evaluation batch",
+        "optimizer steps",
+        u64::try_from(steps)?,
+        f64::from(final_eval),
+    )?)?;
     println!(
         "final evaluation_mse={final_eval:.8} elapsed_s={:.2}",
         started.elapsed().as_secs_f64()
@@ -234,9 +252,7 @@ fn main() -> Result<()> {
         monotonicity_audit(&model, &evaluation.samples, batch, input, output, &device)?;
     println!("{left_monotonicity}");
     println!("{right_monotonicity}");
-    if !final_eval.is_finite() || final_eval >= initial_eval {
-        return Err("training did not improve held-out generated addition loss".into());
-    }
+    println!("{}", learning.assert_learning()?);
     println!("PASS: learned addition from fresh samples without epochs");
     Ok(())
 }
