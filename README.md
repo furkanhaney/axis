@@ -133,13 +133,13 @@ timings while investigating a workload.
 
 | Program | Purpose | Current witness |
 |---|---|---|
-| [MLP](src/mlp/README.md) | library and explicit cuTile baseline | both reach `5.74e-2` held-out MSE after 500 steps |
-| [CNN](src/cnn/README.md) | convolution forward/backward and learning | 4,096 activations plus all gradients match a scalar oracle; smoke reaches 100% accuracy |
-| [Attention](src/attention/README.md) | causal attention and prefix-mean learning | central differences pass; held-out MSE falls to `2.39e-2` |
-| [Generated addition](src/addition/README.md) | endless data with executable IDR assumptions | 128,000 fresh samples, zero observed reuse; held-out MSE falls to `3.88e-3` |
-| [MNIST](src/mnist/README.md) | finite-pass categorical training migration | bounded smoke improves held-out accuracy from 10.16% to 33.98% |
-| [MNIST population](src/mnist-population/README.md) | independent models and rates on one population axis | fused four-member smoke improves best accuracy from 8.20% to 60.55% |
-| [Country panel](src/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
+| [MLP](src/examples/mlp/README.md) | library and explicit cuTile baseline | both reach `5.74e-2` held-out MSE after 500 steps |
+| [CNN](src/examples/cnn/README.md) | convolution forward/backward and learning | 4,096 activations plus all gradients match a scalar oracle; smoke reaches 100% accuracy |
+| [Attention](src/examples/attention/README.md) | causal attention and prefix-mean learning | central differences pass; held-out MSE falls to `2.39e-2` |
+| [Generated addition](src/examples/addition/README.md) | endless data with executable IDR assumptions | 128,000 fresh samples, zero observed reuse; held-out MSE falls to `3.88e-3` |
+| [MNIST](src/studies/training-dynamics/mnist/README.md) | finite-pass categorical training migration | bounded smoke improves held-out accuracy from 10.16% to 33.98% |
+| [MNIST population](src/studies/training-dynamics/mnist-population/README.md) | independent models and rates on one population axis | fused four-member smoke improves best accuracy from 8.20% to 60.55% |
+| [Country panel](src/studies/energy-output/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
 | [Sudoku transformer](https://github.com/furkanhaney/sudoku-transformer) | bidirectional transformer plus generated IDR acceptance | 50 unique training boards, zero evaluation overlap, finite forward/backward/update |
 | [Chess transformer](https://gitlab.com/furkanhaney/chess-transformer) | geometric attention, joint policy/value learning, finite game-disjoint data | two AdamW updates, exact pass receipt, zero train/evaluation overlap |
 
@@ -151,14 +151,18 @@ show that the exercised path works; they are not a benchmark leaderboard.
 ```text
 axis/
 ├── src/
-│   ├── axis/                 reusable framework crate
-│   ├── mlp/                  MLP consumer and explicit cuTile baseline
-│   ├── cnn/                  CNN consumer and scalar oracle
-│   ├── attention/            causal-attention consumer and oracle
-│   ├── addition/             generated-data IDR training
-│   ├── mnist/                migrated finite-pass MNIST baseline
-│   ├── mnist-population/     migrated population learning-rate probe
-│   └── panel/                migrated country-year regression mechanics
+│   ├── library/              published Axis framework crate
+│   ├── examples/
+│   │   ├── addition/         generated-data IDR training
+│   │   ├── attention/        causal-attention consumer and oracle
+│   │   ├── cnn/              CNN consumer and scalar oracle
+│   │   └── mlp/              MLP consumer and explicit cuTile baseline
+│   └── studies/
+│       ├── training-dynamics/
+│       │   ├── mnist/        finite-pass MNIST migration
+│       │   └── mnist-population/
+│       └── energy-output/
+│           └── panel/        country-year regression migration
 ├── docs/                     shared contracts, assumptions, and next work
 ├── data/                     tracked evidence and selected runs; other contents ignored
 ├── scripts/                  CUDA setup, Cargo runner, checks, and censuses
@@ -199,13 +203,13 @@ Run commands from the repository root:
 ```bash
 bash scripts/check.sh
 
-bash src/mlp/scripts/train.sh --smoke
-bash src/cnn/scripts/train.sh --smoke
-bash src/attention/scripts/train.sh --smoke
-bash src/addition/scripts/train.sh --smoke
-bash src/mnist/scripts/train.sh --smoke
-bash src/mnist-population/scripts/train.sh --smoke
-bash src/panel/scripts/train.sh --smoke --split country
+bash src/examples/mlp/scripts/train.sh --smoke
+bash src/examples/cnn/scripts/train.sh --smoke
+bash src/examples/attention/scripts/train.sh --smoke
+bash src/examples/addition/scripts/train.sh --smoke
+bash src/studies/training-dynamics/mnist/scripts/train.sh --smoke
+bash src/studies/training-dynamics/mnist-population/scripts/train.sh --smoke
+bash src/studies/energy-output/panel/scripts/train.sh --smoke --split country
 ```
 
 `check.sh` runs formatting, Clippy, CPU tests, and serialized CUDA tests. The

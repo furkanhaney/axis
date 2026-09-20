@@ -27,9 +27,10 @@
 # Axis — executable research assumptions on named tensors
 
 Axis is the Rust training framework born from concrete Rasat research programs.
-The reusable crate lives at `src/axis/`; sibling folders under `src/` are real
-consumers and migration witnesses. Preserve that shape: shared behavior enters
-through the library, while experiment-specific policy stays with its consumer.
+The workspace's `src/` has three roles at one semantic level: the reusable
+crate in `src/library/`, compact consumers in `src/examples/`, and research
+ports in `src/studies/`. Preserve that shape: shared behavior enters through
+the library, while experiment-specific policy stays with its consumer.
 
 The original Python studies remain in `../research/`. Migrations link to those
 sources and state what they preserve, change, and have actually measured. A

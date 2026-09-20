@@ -49,8 +49,8 @@ def functions(path):
 
 
 def main():
-    left = functions(ROOT / "src/mlp/src/baseline.rs")
-    right = functions(ROOT / "src/cnn/src/train.rs")
+    left = functions(ROOT / "src/examples/mlp/src/baseline.rs")
+    right = functions(ROOT / "src/examples/cnn/src/train.rs")
     same = [name for name in sorted(left.keys() & right.keys())
             if left[name]["normalized"] == right[name]["normalized"]]
     print("| Identical function | MLP line | CNN line | Nonblank lines |")

@@ -28,7 +28,10 @@ When a shelf reaches the limit, group its contents by an actual subsystem or
 responsibility. Do not create compatibility paths after a move.
 
 Rust source does not live under any `docs/` directory. Non-compiling API
-sketches use Markdown code fences. The reusable crate groups files into
+sketches use Markdown code fences. Direct children of `src/` name roles at the
+same level: `library/` is the published crate, `examples/` holds compact
+teaching and acceptance consumers, and `studies/` holds research migrations
+grouped by research area. The reusable crate groups its own source into
 `algebra/`, `model/`, `research/`, and `runtime/` while keeping their Rust
 modules private and re-exporting the public API from `lib.rs`.
 
@@ -61,8 +64,11 @@ hook, the local check, and GitHub CI.
 ## Consequences
 
 Adding a ninth entry requires a small structural decision rather than another
-flat file. Moves require link and caller updates in the same change. Durable
-evidence remains reviewable, while ordinary experiment data stays local.
+flat file. A directory whose children mix a library, individual examples, and
+whole study families has failed even when its count is below eight: the cap is
+supposed to expose semantic structure, not excuse uneven abstraction levels.
+Moves require link and caller updates in the same change. Durable evidence
+remains reviewable, while ordinary experiment data stays local.
 
 The number eight is a local navigation budget, not a universal software law.
 If the rule forces artificial groupings, amend this ADR and the checker together

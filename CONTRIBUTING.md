@@ -13,7 +13,7 @@ and focused tests can go straight to a pull request.
 ## Choose work from a real experiment
 
 Axis grows from concrete research programs rather than an operator checklist.
-Framework behavior belongs in `src/axis/`; architecture, metrics, data policy,
+Framework behavior belongs in `src/library/`; architecture, metrics, data policy,
 and evidence specific to one experiment stay in that consumer's crate. A new
 abstraction should normally arrive with a program that needs it and an
 independent reference, oracle, or invariant that can catch a wrong result.

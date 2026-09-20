@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "src/axis",
-    "src/mlp",
-    "src/cnn",
-    "src/attention",
-    "src/addition",
-    "src/mnist",
-    "src/mnist-population",
-    "src/panel",
+    "src/library",
+    "src/examples/mlp",
+    "src/examples/cnn",
+    "src/examples/attention",
+    "src/examples/addition",
+    "src/studies/training-dynamics/mnist",
+    "src/studies/training-dynamics/mnist-population",
+    "src/studies/energy-output/panel",
 ]
-default-members = ["src/mlp"]
+default-members = ["src/examples/mlp"]
 resolver = "3"
 
 [workspace.package]
@@ -20,4 +20,4 @@ publish = false
 
 [workspace.dependencies]
 cutile = "=0.3.1"
-axis = { path = "src/axis" }
+axis = { path = "src/library" }
