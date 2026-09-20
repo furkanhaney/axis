@@ -20,6 +20,25 @@ The acceptance has two levels:
 2. Larger runs must produce a held-out learning curve and solve-rate evidence
    before the public README claims that Axis learns Sudoku.
 
+An RTX 5090 run completed 200 updates over 1,600 unique boards with zero reuse
+or evaluation overlap. Loss moved from `2.873419` to `2.170745`, while blank
+accuracy reached only `14.93%` and exact solves remained zero. This is a scaled
+mechanics witness, not yet the second acceptance level.
+
+## Chess transformer — current
+
+The sibling [`chess-transformer`](https://gitlab.com/furkanhaney/chess-transformer)
+repo exercises a different regime: a finite corpus split by whole game before
+positions are derived. It adds history-aware 64-square inputs, geometric
+attention bias, a bilinear 4,096-move policy, a win/draw/loss head, a joint
+objective, exact pass accounting, and game-disjoint identities.
+
+Its bounded smoke completes two AdamW updates and moves held-out total loss from
+`8.689576` to `7.676713` over two positions. The tiny corpus measures mechanics
+only. A future ability claim requires the versioned Lichess recipe and an
+independent game-level evaluation corpus; the migration explicitly rejects the
+old Python run's overlapping validation recipe.
+
 ## ask_bro — long-range
 
 `ask_bro` deliberately means the useful sub-30B model, not a particular host or
@@ -39,5 +58,5 @@ stack that Sudoku does not:
 The first honest milestone is not “27B compiles.” It is one frozen layer matching
 a trusted implementation on recorded inputs, then a complete forward pass, then
 generation, then enough performance to replace the existing capability. Sudoku
-should supply the shared math; ask_bro should drive only the machinery that
-appears when the model becomes real-sized.
+and Chess should supply the shared math; ask_bro should drive only the machinery
+that appears when the model becomes real-sized.

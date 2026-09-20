@@ -67,24 +67,33 @@ owner's larger, partially unimplemented API sketch.
   contractions use gather/reduce plans, and softmax repeats row reductions.
   Plans cap contributions at 16,777,216. There is no retained graph, CPU
   fallback, mixed precision, or higher-order differentiation.
+- The outside Sudoku acceptance passed every host and CUDA oracle on an RTX
+  5090, then trained over 1,600 fresh boards with zero observed reuse or
+  train/evaluation overlap. The same run measured only 8% peak GPU utilization
+  and failed evaluation batches of 16 and 64 at the 16,777,216-contribution
+  plan cap. This turns contraction planning and launch count into measured
+  framework limits rather than inferred performance concerns.
+- The outside Chess acceptance composes bidirectional attention,
+  input-dependent geometric bias, policy and value heads, AdamW, exact finite
+  passes, and game-disjoint evaluation. Its bounded smoke passes; it makes no
+  chess-ability claim.
 - Causal masking is square and zero-offset. Softmax requires a finite entry
   in each row and permits negative infinity elsewhere. Padding/all-masked
   rows and cached decoding still need explicit contracts and witnesses.
 
 ## Next useful implementation
 
-Add the stacked-convolution witness before expanding either the CNN surface or
-a full Transformer. Use small odd spatial extents and two differently sized
-feature axes. Compare both layers and the original input against an independent
-direct scalar forward/backward or finite differences. This should verify that
-the now-measured single-layer `unfold2d` input derivative composes through a
-second convolution.
+Remove the measured contraction-plan cliff first. A separately sized evaluation
+batch should either execute by chunking or fail before allocation with the
+operation and named shape in the diagnostic. Preserve the current numerical
+oracles while replacing CPU-built gather plans with tiled or fused lowering,
+then rerun the recorded Sudoku shapes and report utilization and elapsed time.
 
-Only then choose the next CNN contract from a concrete program: padding and
-stride, or adaptive pooling and categorical loss. Keep unrelated axes and odd
-extents in acceptance checks; do not make tile-friendly dimensions an API
-rule. The current Conv2d deliberately promises only valid, stride-one
-cross-correlation.
+After that, use the next consumer to choose between production-transformer work
+(mixed precision, fused normalization and attention, serialization) and the
+still useful stacked-convolution composition witness. Do not grow either
+surface from an operator checklist: the accepting program must own the need and
+the scalar or trusted reference.
 
 Run `bash scripts/check.sh` from the Axis root for formatting,
 Clippy and CPU/GPU verification. Smoke a new program before 100/full-step

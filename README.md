@@ -77,6 +77,13 @@ unique and overlap with the eight fixed evaluation boards was zero. Accuracy
 remained near chance, so this is a mechanics result rather than a Sudoku-solving
 claim.
 
+On a rented RTX 5090, the same tiny model completed 200 updates over 1,600 fresh
+boards: evaluation loss moved from `2.8734` to `2.1707`, blank accuracy reached
+`14.93%`, reuse and evaluation overlap remained zero, and exact solves remained
+zero. Peak GPU utilization was only 6% for that run, which makes launch count
+and contraction lowering the measured performance frontier rather than a
+throughput success claim.
+
 ![Loss from the first bounded Axis Sudoku run](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_acceptance_25.png)
 
 ## What works
@@ -110,6 +117,7 @@ makes no competitive throughput claim.
 | [MNIST population](src/mnist-population/README.md) | independent models and rates on one population axis | fused four-member smoke improves best accuracy from 8.20% to 60.55% |
 | [Country panel](src/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
 | [Sudoku transformer](https://github.com/furkanhaney/sudoku-transformer) | bidirectional transformer plus generated IDR acceptance | 50 unique training boards, zero evaluation overlap, finite forward/backward/update |
+| [Chess transformer](https://gitlab.com/furkanhaney/chess-transformer) | geometric attention, joint policy/value learning, finite game-disjoint data | two AdamW updates, exact pass receipt, zero train/evaluation overlap |
 
 These numbers are repository witnesses with different tasks and budgets. They
 show that the exercised path works; they are not a benchmark leaderboard.
@@ -197,8 +205,8 @@ program when the run stops satisfying it.
 The [project thesis](docs/thesis.md) is to give coordinates to the whole
 experiment, not only its tensors. It grows against an [acceptance
 ladder](docs/acceptance.md): the
-Sudoku transformer is current, and running the sub-30B model behind `ask_bro` is
-the long-range systems test.
+Sudoku and Chess transformers are current, and running the sub-30B model behind
+`ask_bro` is the long-range systems test.
 
 The detailed contracts are in [library design](docs/library.md),
 [data regimes](docs/data-regimes.md), [static guarantees](docs/static-guarantees.md),
