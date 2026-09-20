@@ -110,7 +110,8 @@ throughput success claim.
 ## What works
 
 - Named axes, explicit contraction, broadcasting, splitting, merging, masking,
-  softmax, categorical and binary cross-entropy, and squared error.
+  softmax, differentiable finite minimum, categorical and binary cross-entropy,
+  and squared error.
 - Reverse-mode differentiation with parameter version checks and explicit
   scalar loss reduction.
 - `Linear`, `PopulationLinear`, valid stride-one `Conv2d`, `LayerNorm`, `ReLU`,

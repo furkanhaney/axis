@@ -60,28 +60,75 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
 
 #[test]
 #[ignore = "requires CUDA"]
-fn named_axis_minimum_preserves_groups_and_routes_ties_to_the_first_winner() -> Result<()> {
+fn named_axis_minimum_preserves_axes_across_layouts_and_routes_ties() -> Result<()> {
     let device = Device::cuda(0)?;
-    let batch = Axis::new("batch");
-    let candidate = Axis::new("candidate");
+    let (batch, candidate, time) = (
+        Axis::new("batch"),
+        Axis::new("candidate"),
+        Axis::new("time"),
+    );
     let values = Tensor::from_slice(
-        &[3.0, 1.0, 1.0, 4.0, -2.0, 0.0],
-        [batch.of(2), candidate.of(3)],
+        &[3.0, 9.0, 1.0, 8.0, 1.0, 7.0, 4.0, 0.0, -2.0, 5.0, 6.0, -1.0],
+        [batch.of(2), candidate.of(3), time.of(2)],
         &device,
     )?
-    .with_layout([candidate, batch])?
+    .with_layout([candidate, time, batch])?
     .with_grad();
 
     let minimum = values.min(candidate)?;
-    assert_eq!(minimum.shape(), &Shape::new([batch.of(2)])?);
-    close("named-axis minimum", &minimum.to_vec()?, &[1.0, -2.0]);
-    minimum.mean(batch)?.backward()?;
+    assert_eq!(minimum.shape(), &Shape::new([batch.of(2), time.of(2)])?);
+    close(
+        "named-axis minimum",
+        &minimum.to_vec()?,
+        &[1.0, 7.0, -2.0, -1.0],
+    );
+    minimum.mean([batch, time])?.backward()?;
     close(
         "named-axis minimum gradient",
         &values.grad().unwrap().to_vec()?,
-        &[0.0, 0.5, 0.0, 0.0, 0.5, 0.0],
+        &[
+            0.0, 0.0, 0.25, 0.0, 0.0, 0.25, 0.0, 0.0, 0.25, 0.0, 0.0, 0.25,
+        ],
     );
-    assert!(values.min(Axis::new("missing")).is_err());
+    let error = values.min(Axis::new("missing")).err().unwrap().to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_axis_minimum_ignores_nonfinite_values_and_marks_empty_groups() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            f32::NAN,
+            f32::INFINITY,
+            3.0,
+            f32::NEG_INFINITY,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::INFINITY,
+        ],
+        [batch.of(2), candidate.of(5)],
+        &device,
+    )?
+    .with_grad();
+
+    let minimum = values.min(candidate)?;
+    let actual = minimum.to_vec()?;
+    assert_eq!(actual[0], 1.0);
+    assert!(actual[1].is_nan());
+
+    minimum.mean(batch)?.backward()?;
+    close(
+        "non-finite minimum gradient",
+        &values.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
     Ok(())
 }
 

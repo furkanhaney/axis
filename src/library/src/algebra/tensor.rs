@@ -27,7 +27,7 @@ struct GatherPlans {
 }
 
 #[derive(Clone)]
-struct MeanPlans {
+struct ReductionPlans {
     output: Shape,
     layout: Layout,
     factor: f32,
@@ -36,11 +36,11 @@ struct MeanPlans {
 }
 
 type GatherPlanKey = (u8, Shape, Layout, Shape, Layout);
-type MeanPlanKey = (Shape, Layout, Vec<Axis>);
+type ReductionPlanKey = (u8, Shape, Layout, Vec<Axis>);
 
 thread_local! {
     static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
-    static MEAN_PLANS: RefCell<HashMap<MeanPlanKey, MeanPlans>> = RefCell::new(HashMap::new());
+    static REDUCTION_PLANS: RefCell<HashMap<ReductionPlanKey, ReductionPlans>> = RefCell::new(HashMap::new());
 }
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
@@ -105,6 +105,10 @@ enum Rule {
         plan: Rc<Plan>,
         rhs: Option<Buffer>,
         factor: f32,
+    },
+    Minimum {
+        plan: Rc<Plan>,
+        winners: Buffer,
     },
 }
 impl Edge {
@@ -751,8 +755,8 @@ impl Tensor {
     pub fn mean(&self, axes: impl IntoAxes) -> Result<Self> {
         let started = Instant::now();
         let axes = self.shape().select_axes(axes)?;
-        let key = (self.shape().clone(), self.0.layout.clone(), axes.clone());
-        let cached = MEAN_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let key = (0, self.shape().clone(), self.0.layout.clone(), axes.clone());
+        let cached = REDUCTION_PLANS.with(|cache| cache.borrow().get(&key).cloned());
         let plans = match cached {
             Some(plans) => plans,
             None => {
@@ -778,14 +782,14 @@ impl Tensor {
                         .collect();
                     map[self.0.layout.offset(&coords)] = layout.offset(&retained);
                 }
-                let plans = MeanPlans {
+                let plans = ReductionPlans {
                     output: output.clone(),
                     layout,
                     factor,
                     forward: Rc::new(Plan::reverse(&map, output.len())?),
                     reverse: Rc::new(Plan::gather(&map)?),
                 };
-                MEAN_PLANS.with(|cache| {
+                REDUCTION_PLANS.with(|cache| {
                     cache.borrow_mut().insert(key, plans.clone());
                 });
                 plans
@@ -811,45 +815,75 @@ impl Tensor {
         profile("mean", started);
         Ok(result)
     }
-    /// Reduce one named axis by its minimum, routing gradients to the first winner on ties.
+    /// Reduce one named axis to its minimum finite value.
     ///
-    /// This correctness-first implementation synchronizes values to choose a constant winner
-    /// mask, then expresses the reduction through differentiable device operations.
+    /// Non-finite candidates are ignored. A group without a finite candidate returns NaN and
+    /// has zero derivative. Ties route the derivative to the first logical coordinate along
+    /// `axis`, independently of physical layout.
     pub fn min(&self, axis: Axis) -> Result<Self> {
         let started = Instant::now();
         let reduced_index = self.shape().index(axis)?;
         let extent = self.extent(axis)?;
-        let output = Shape::new(
-            self.shape()
-                .dims()
-                .iter()
-                .copied()
-                .filter(|d| d.axis != axis),
-        )?;
-        let values = self.to_vec()?;
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err("min requires finite values".into());
-        }
-        let mut winners = vec![usize::MAX; output.len()];
-        for logical in 0..self.shape().len() {
-            let coords = self.shape().coords(logical);
-            let mut group = 0;
-            for (index, dim) in self.shape().dims().iter().enumerate() {
-                if index != reduced_index {
-                    group = group * dim.extent + coords[index];
+        let key = (1, self.shape().clone(), self.0.layout.clone(), vec![axis]);
+        let cached = REDUCTION_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let plans = match cached {
+            Some(plans) => plans,
+            None => {
+                let output = Shape::new(
+                    self.shape()
+                        .dims()
+                        .iter()
+                        .copied()
+                        .filter(|d| d.axis != axis),
+                )?;
+                let layout = Layout::contiguous(&output);
+                let mut map = vec![0; self.shape().len()];
+                let mut groups = Vec::with_capacity(output.len());
+                for output_index in 0..output.len() {
+                    let output_coords = output.coords(output_index);
+                    let mut group = Vec::with_capacity(extent);
+                    for coordinate in 0..extent {
+                        let mut input_coords = output_coords.clone();
+                        input_coords.insert(reduced_index, coordinate);
+                        let physical = self.0.layout.offset(&input_coords);
+                        map[physical] = output_index;
+                        group.push((physical, 0));
+                    }
+                    groups.push(group);
                 }
+                let plans = ReductionPlans {
+                    output: output.clone(),
+                    layout,
+                    factor: 1.0,
+                    forward: Rc::new(Plan::groups(groups, false)?),
+                    reverse: Rc::new(Plan::gather(&map)?),
+                };
+                REDUCTION_PLANS.with(|cache| {
+                    cache.borrow_mut().insert(key, plans.clone());
+                });
+                plans
             }
-            let current = winners[group];
-            if current == usize::MAX || values[logical] < values[current] {
-                winners[group] = logical;
-            }
-        }
-        let mut mask = vec![0.0; self.shape().len()];
-        for winner in winners {
-            mask[winner] = 1.0;
-        }
-        let mask = Tensor::from_slice(&mask, self.shape().dims().iter().copied(), self.device())?;
-        let result = self.mul(&mask)?.mean(axis)?.scale(extent as f32)?;
+        };
+        let (value, winners) = self.device().grouped_minimum(
+            &self.0.value,
+            plans.forward.as_ref(),
+            plans.reverse.as_ref(),
+        )?;
+        let result = Self::node(
+            plans.output,
+            plans.layout,
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Minimum {
+                    plan: plans.reverse,
+                    winners,
+                },
+            )],
+            false,
+            None,
+        );
         profile("min", started);
         Ok(result)
     }
@@ -1469,6 +1503,11 @@ impl Tensor {
                             plan.as_ref(),
                             *factor,
                         )?,
+                        Rule::Minimum { plan, winners } => {
+                            let expanded =
+                                self.device().grouped(&gradient, None, plan.as_ref(), 1.0)?;
+                            self.device().binary(&expanded, winners, 2)?
+                        }
                     };
                     let id = edge.input.0.id;
                     let sum = if let Some(existing) = adjoints.remove(&id) {
