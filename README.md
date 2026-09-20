@@ -114,8 +114,8 @@ throughput success claim.
   and squared error.
 - Reverse-mode differentiation with parameter version checks and explicit
   scalar loss reduction.
-- `Linear`, `PopulationLinear`, valid stride-one `Conv2d`, `LayerNorm`, `ReLU`,
-  `GELU`, and `Sequential` modules.
+- `Linear`, `PopulationLinear`, `Conv2d` with stride, symmetric padding, and
+  grouped/depthwise channels, `LayerNorm`, `ReLU`, `GELU`, and `Sequential`.
 - Device-resident SGD, Adam, and AdamW. Adam can assign one learning rate to
   each member of a named population axis.
 - Finite datasets, generated streams, exact shuffled passes, single-pass and
@@ -138,7 +138,7 @@ timings while investigating a workload.
 | Program | Purpose | Current witness |
 |---|---|---|
 | [MLP](src/examples/mlp/README.md) | library and explicit cuTile baseline | both reach `5.74e-2` held-out MSE after 500 steps |
-| [CNN](src/examples/cnn/README.md) | convolution forward/backward and learning | 4,096 activations plus all gradients match a scalar oracle; smoke reaches 100% accuracy |
+| [CNN](src/examples/cnn/README.md) | convolution forward/backward and learning | configured grouped convolution matches a scalar oracle; a depthwise-separable block composes; smoke reaches 100% accuracy |
 | [Attention](src/examples/attention/README.md) | causal attention and prefix-mean learning | central differences pass; held-out MSE falls to `2.39e-2` |
 | [Generated addition](src/examples/addition/README.md) | endless data with executable IDR assumptions | 128,000 fresh samples, zero observed reuse; held-out MSE falls to `3.88e-3` |
 | [MNIST](src/studies/training-dynamics/mnist/README.md) | finite-pass categorical training migration | bounded smoke improves held-out accuracy from 10.16% to 33.98% |

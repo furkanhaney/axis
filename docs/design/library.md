@@ -30,9 +30,10 @@ consumer. Its query/key/value and output projections reuse Linear, Module
 parameter traversal, and SGD. Attention composition stays in that program;
 only named-axis softmax and causal masking join the tensor algebra.
 
-[The CNN](../../src/examples/cnn/README.md) is the third consumer. Conv2d composes valid
-patch extraction with Linear; global pooling is the existing named mean. Its
-explicit cuTile program remains beside it as a lower-level baseline.
+[The CNN](../../src/examples/cnn/README.md) is the third consumer. Conv2d
+composes named patch extraction with a channel-grouped contraction; global
+pooling is the existing named mean. Its explicit cuTile program remains beside
+it as a lower-level baseline.
 
 Implemented algebra includes identity/extent binding, strict subset-axis
 broadcasting, contraction with shared batch axes, physical layout changes,
@@ -85,18 +86,25 @@ GEMM implementation. Single-axis contractions take a batched tiled cuTile
 matrix path. Axis caches host plans by named shape and layout, and retains up
 to 256 MiB of uploaded plans per device; larger and one-off plans remain
 step-local so a stable-shape speedup cannot grow device memory without bound.
-matrix multiplication path with 64x64 output tiles in forward and both
-derivatives. Axis reordering is
-materialized when the batch, row, reduction, and column groups are not already
-contiguous; this covers both `Linear` and attention. Tensors participating in
-an operation must share the same `Device` handle. There is no CPU fallback,
-higher-order differentiation, or retained-graph mode. Softmax forward and
-backward use one tiled reduction per contiguous row, padding non-power-of-two
-widths inside the tile; they no
-longer inherit the generic index-plan contribution bound. Attention still
-composes separate contraction, mask, softmax, and value-contraction operations
-rather than using a fused attention kernel. Multi-axis contractions still use
-the generic plan path.
+Axis reordering is materialized when the batch, row, reduction, and column
+groups are not already contiguous; this covers both `Linear` and attention.
+Tensors participating in an operation must share the same `Device` handle.
+There is no CPU fallback, higher-order differentiation, or retained-graph
+mode. Softmax forward and backward use one tiled reduction per contiguous row,
+padding non-power-of-two widths inside the tile; they no longer inherit the
+generic index-plan contribution bound. Attention still composes separate
+contraction, mask, softmax, and value-contraction operations rather than using
+a fused attention kernel. Multi-axis contractions still use the generic plan
+path.
+
+Configured convolution currently lowers padding/stride to a CPU-built gather
+plan, then lowers each channel group to the batched single-axis contraction.
+The contraction and both of its derivatives use tiled matrix multiplication,
+but patch extraction and col2im remain generic indexed kernels. This path
+establishes exact semantics and autodiff; it is not a fused or direct
+convolution implementation and has not established competitive CNN throughput.
+Its patch plan inherits the 16,777,216-contribution limit. Fully padded windows
+produce exact zeros without indexing the input.
 
 `Device::cuda_bf16` is an explicit mixed-precision policy: matrix-product
 inputs are rounded to BF16 inside the kernel and accumulated into FP32. Stored
@@ -123,8 +131,9 @@ still enters cuTile and reports a missing toolkit, and a no-default-features
 build outside docs.rs is rejected. CI runs this contract on an ordinary Ubuntu
 runner without installing CUDA.
 
-Padding/stride variants, LSTM, and a full Transformer remain future
-slices; their presence in the owner's sketch does not imply implementation.
+Convolution dilation, asymmetric padding, LSTM, and a full Transformer remain
+future slices; their presence in the owner's sketch does not imply
+implementation.
 
 Run from the research node:
 
@@ -190,7 +199,7 @@ shape checks first; compile-time axis types can be evaluated later.
 | `causal_mask(query, key)` | Require distinct axes with equal extents; replace key positions greater than query positions with negative infinity and give them zero derivative. Square, zero-offset self-attention only. |
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
 | `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |
-| `Conv2d(input, output, spatial, kernel)` | Compose `unfold2d` with Linear; shrink the named spatial extents, replace the input-channel axis, and preserve unrelated axes. |
+| `Conv2d(input, output, spatial, kernel)` | Cross-correlate named spatial axes with configurable positive stride, finite symmetric zero-padding, and positive channel groups. Require both channel extents to divide evenly by groups; preserve unrelated axes and append the output-channel axis. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
 | `categorical_cross_entropy_with_logits(target, class)` | Accept constant one-hot/probability targets over the same axes, stably reduce the named class axis, and preserve all other axes. Backward is `softmax(logits) - target`. |
 | `Conv(input, output, spatial)` | Transform channels and spatial extents by the stated stride/padding/dilation rules. Preserve all unrelated axes. |
@@ -202,6 +211,18 @@ The layer therefore needs distinct internal input/output role axes, maps the
 input role to the incoming `feature`, and restores the public `feature` on the
 result. The same requirement appears in square linear projections and recurrent
 weights. Parameter shapes cannot simply inherit both public handles unchanged.
+
+`Conv2d::new` defaults to stride `[1, 1]`, padding `[0, 0]`, and one group.
+`stride([sy, sx])`, `padding([py, px])`, and `groups(g)` follow the order of
+the two supplied spatial axes. Each output extent is
+`floor((input + 2 * padding - kernel) / stride) + 1`; a kernel that does not fit
+the padded extent is rejected. Grouped weights have logical shape
+`[group, input-channel-in-group × kernel-y × kernel-x, output-channel-in-group]`,
+with the flattened patch ordered by input channel, kernel y, then kernel x.
+Depthwise convolution is the grouped case where `g` equals the input channel
+count (and commonly the output channel count). Reconfiguring a built layer to
+a different group geometry is rejected before execution. Dilation and
+asymmetric padding are not yet supported.
 
 Attention makes role axes public: query-time and key-time must be distinct
 identities even when both derive from time. Prefer a name such as
@@ -262,10 +283,12 @@ im2col copy. Likewise, MLP loss averages over batch and output while binary
 classification averages only over batch. Explicit loss reductions capture this
 difference directly.
 
-The current CNN has one trainable convolution. Its input-gradient oracle proves
-overlapping patch accumulation (`col2im`) for that operation, including a
-noncontiguous input layout. An actual two-convolution composition remains the
-next witness before the sample's stacked CNN is considered established.
+The trained CNN still has one trainable convolution. Its input-gradient oracle
+proves overlapping patch accumulation (`col2im`) for that operation. A second
+operator oracle covers padded, strided, grouped forward values and all
+derivatives from a noncontiguous input. A compact depthwise-ReLU-pointwise
+block supplies the first two-convolution composition witness. It establishes
+MobileNet-style mechanics, not MobileNetV2 architecture or performance.
 
 ## Build order and acceptance
 
@@ -284,11 +307,11 @@ actual outside consumer.
    contraction, causal mask, softmax, value contraction, and merge. Verify
    against independent f64 forward/finite differences before considering a
    reusable attention module or a full Transformer.
-4. **Executable CNN slice (first stage implemented):** valid stride-one
-   convolution, ReLU, named global mean, Linear, and stable binary loss now
-   reproduce the concrete CNN, including overlapping input gradients. A
-   stacked-convolution witness remains before same-padding, stride, adaptive
-   pooling, collapse, and categorical cross-entropy.
+4. **Executable CNN slice (implemented semantics):** convolution with stride,
+   symmetric padding and grouped/depthwise channels, ReLU, named global mean,
+   Linear, and stable binary loss reproduce the concrete CNN and a compact
+   depthwise-separable block. Adaptive pooling, collapse, categorical
+   cross-entropy, dilation, and an optimized convolution kernel remain.
 5. **LSTM and Transformer:** add each as a concrete next program. Recurrence
    drives state/sequence lifetime decisions; attention drives role axes,
    masked softmax, split/merge, and shared-parameter behavior. `Repeat` must

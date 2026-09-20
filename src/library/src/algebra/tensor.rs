@@ -66,6 +66,7 @@ struct Edge {
 }
 enum Rule {
     Identity,
+    Zero(usize),
     Scale(f32),
     Multiply(Buffer),
     Relu(Buffer),
@@ -979,41 +980,110 @@ impl Tensor {
         patch: Dim,
         kernel: [usize; 2],
     ) -> Result<Self> {
+        self.unfold2d_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0])
+    }
+
+    /// Lower a configured convolution to grouped patches. The group and patch
+    /// axes are appended so merging group/output channels restores Conv2d's
+    /// public rule that output channels are the final logical axis.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn unfold2d_grouped(
+        &self,
+        channels: Axis,
+        spatial: [Axis; 2],
+        group: Dim,
+        patch: Dim,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Result<Self> {
+        self.unfold2d_configured(
+            channels,
+            spatial,
+            Some(group),
+            patch,
+            kernel,
+            stride,
+            padding,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unfold2d_configured(
+        &self,
+        channels: Axis,
+        spatial: [Axis; 2],
+        group: Option<Dim>,
+        patch: Dim,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Result<Self> {
         if spatial[0] == spatial[1] || channels == spatial[0] || channels == spatial[1] {
             return Err("unfold2d requires distinct channel and spatial axes".into());
         }
         if kernel.contains(&0) {
             return Err("unfold2d kernel extents must be positive".into());
         }
+        if stride.contains(&0) {
+            return Err("unfold2d stride extents must be positive".into());
+        }
         let channel_extent = self.extent(channels)?;
         let input_height = self.extent(spatial[0])?;
         let input_width = self.extent(spatial[1])?;
-        if kernel[0] > input_height || kernel[1] > input_width {
-            return Err("unfold2d kernel exceeds the spatial extent".into());
+        let groups = group.map_or(1, |dim| dim.extent);
+        if !channel_extent.is_multiple_of(groups) {
+            return Err("unfold2d channels must be divisible by groups".into());
         }
-        let expected_patch = channel_extent
+        let padded_height = input_height
+            .checked_add(
+                padding[0]
+                    .checked_mul(2)
+                    .ok_or("unfold2d padding overflow")?,
+            )
+            .ok_or("unfold2d padded height overflow")?;
+        let padded_width = input_width
+            .checked_add(
+                padding[1]
+                    .checked_mul(2)
+                    .ok_or("unfold2d padding overflow")?,
+            )
+            .ok_or("unfold2d padded width overflow")?;
+        if kernel[0] > padded_height || kernel[1] > padded_width {
+            return Err("unfold2d kernel exceeds the padded spatial extent".into());
+        }
+        let channels_per_group = channel_extent / groups;
+        let expected_patch = channels_per_group
             .checked_mul(kernel[0])
             .and_then(|n| n.checked_mul(kernel[1]))
             .ok_or("unfold2d patch extent overflow")?;
         if patch.extent != expected_patch {
-            return Err("unfold2d patch extent must equal channels * kernel area".into());
+            return Err("unfold2d patch extent must equal channels per group * kernel area".into());
         }
-        let output_height = input_height - kernel[0] + 1;
-        let output_width = input_width - kernel[1] + 1;
-        let shape = Shape::new(self.shape().dims().iter().map(|dim| {
+        let output_height = (padded_height - kernel[0]) / stride[0] + 1;
+        let output_width = (padded_width - kernel[1]) / stride[1] + 1;
+        let mut dims = Vec::with_capacity(self.shape().rank() + usize::from(group.is_some()));
+        for dim in self.shape().dims() {
             if dim.axis == channels {
-                patch
+                if group.is_none() {
+                    dims.push(patch);
+                }
             } else if dim.axis == spatial[0] {
-                spatial[0].of(output_height)
+                dims.push(spatial[0].of(output_height));
             } else if dim.axis == spatial[1] {
-                spatial[1].of(output_width)
+                dims.push(spatial[1].of(output_width));
             } else {
-                *dim
+                dims.push(*dim);
             }
-        }))?;
+        }
+        if let Some(group) = group {
+            dims.extend([group, patch]);
+        }
+        let shape = Shape::new(dims)?;
         let patch_index = shape.index(patch.axis)?;
         let output_height_index = shape.index(spatial[0])?;
         let output_width_index = shape.index(spatial[1])?;
+        let group_index = group.map(|dim| shape.index(dim.axis)).transpose()?;
         let map = (0..shape.len())
             .map(|i| {
                 let output = shape.coords(i);
@@ -1021,7 +1091,20 @@ impl Tensor {
                 let kx = flattened % kernel[1];
                 let rest = flattened / kernel[1];
                 let ky = rest % kernel[0];
-                let channel = rest / kernel[0];
+                let channel_in_group = rest / kernel[0];
+                let channel = group_index
+                    .map(|index| output[index] * channels_per_group)
+                    .unwrap_or(0)
+                    + channel_in_group;
+                let padded_y = output[output_height_index] * stride[0] + ky;
+                let padded_x = output[output_width_index] * stride[1] + kx;
+                let input_y = padded_y.checked_sub(padding[0]);
+                let input_x = padded_x.checked_sub(padding[1]);
+                if input_y.is_none_or(|y| y >= input_height)
+                    || input_x.is_none_or(|x| x >= input_width)
+                {
+                    return None;
+                }
                 let input = self
                     .shape()
                     .dims()
@@ -1030,18 +1113,74 @@ impl Tensor {
                         if dim.axis == channels {
                             channel
                         } else if dim.axis == spatial[0] {
-                            output[output_height_index] + ky
+                            input_y.expect("validated")
                         } else if dim.axis == spatial[1] {
-                            output[output_width_index] + kx
+                            input_x.expect("validated")
                         } else {
                             output[shape.index(dim.axis).expect("retained axis")]
                         }
                     })
                     .collect::<Vec<_>>();
-                self.0.layout.offset(&input)
+                Some(self.0.layout.offset(&input))
             })
-            .collect();
-        self.gathered(shape.clone(), Layout::contiguous(&shape), map)
+            .collect::<Vec<_>>();
+        if map.iter().all(Option::is_some) {
+            return self.gathered(
+                shape.clone(),
+                Layout::contiguous(&shape),
+                map.into_iter().map(Option::unwrap).collect(),
+            );
+        }
+        if map.iter().all(Option::is_none) {
+            let value = self.device().zeros_buffer(shape.len())?;
+            let edges = self
+                .requires_grad()
+                .then(|| Edge::new(self, Rule::Zero(self.shape().len())));
+            return Ok(Self::node(
+                shape.clone(),
+                Layout::contiguous(&shape),
+                value,
+                self.device(),
+                edges.into_iter().collect(),
+                false,
+                None,
+            ));
+        }
+        let forward = Rc::new(Plan::groups(
+            map.iter()
+                .map(|input| input.map(|index| vec![(index, 0)]).unwrap_or_default())
+                .collect(),
+            false,
+        )?);
+        let mut reverse = vec![vec![]; self.shape().len()];
+        for (output, input) in map.into_iter().enumerate() {
+            if let Some(input) = input {
+                reverse[input].push((output, 0));
+            }
+        }
+        let reverse = Rc::new(Plan::groups(reverse, false)?);
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, forward.as_ref(), 1.0)?;
+        let edges = self.requires_grad().then(|| {
+            Edge::new(
+                self,
+                Rule::Group {
+                    plan: reverse,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )
+        });
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            value,
+            self.device(),
+            edges.into_iter().collect(),
+            false,
+            None,
+        ))
     }
     /// Sum the named shared axes; align remaining shared axes, retain distinct ones.
     pub fn contract(&self, rhs: &Self, axes: impl IntoAxes) -> Result<Self> {
@@ -1456,6 +1595,7 @@ impl Tensor {
                 for edge in edges.iter() {
                     let contribution = match &edge.rule {
                         Rule::Identity => gradient.clone(),
+                        Rule::Zero(len) => self.device().zeros_buffer(*len)?,
                         Rule::Scale(f) => self.device().scale(&gradient, *f)?,
                         Rule::Multiply(rhs) => self.device().binary(&gradient, rhs, 2)?,
                         Rule::Relu(x) => self.device().relu_backward(&gradient, x)?,

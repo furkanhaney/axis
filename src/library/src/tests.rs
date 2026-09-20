@@ -34,11 +34,35 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
         conv.output_shape(&image)?,
         Shape::new([batch.of(2), height.of(3), width.of(6), output.of(4)])?
     );
+    let configured = Conv2d::new(channel, output.of(6), [height, width], [3, 2])
+        .stride([2, 3])
+        .padding([1, 0])
+        .groups(3);
+    assert_eq!(
+        configured.output_shape(&image)?,
+        Shape::new([batch.of(2), height.of(3), width.of(2), output.of(6)])?
+    );
+    let depthwise = Conv2d::new(channel, channel.of(3), [height, width], [3, 3])
+        .padding([1, 1])
+        .groups(3);
+    assert_eq!(
+        depthwise.output_shape(&image)?,
+        Shape::new([batch.of(2), height.of(5), width.of(7), channel.of(3)])?
+    );
+    let wide_padding = Conv2d::new(channel, output.of(4), [height, width], [1, 1]).padding([2, 3]);
+    assert_eq!(
+        wide_padding.output_shape(&image)?,
+        Shape::new([batch.of(2), height.of(9), width.of(13), output.of(4)])?
+    );
     for invalid in [
         Conv2d::new(channel, output.of(4), [height, height], [3, 2]),
         Conv2d::new(channel, output.of(4), [channel, width], [3, 2]),
         Conv2d::new(channel, output.of(4), [height, width], [0, 2]),
         Conv2d::new(channel, output.of(4), [height, width], [6, 2]),
+        Conv2d::new(channel, output.of(4), [height, width], [3, 2]).stride([0, 1]),
+        Conv2d::new(channel, output.of(4), [height, width], [3, 2]).groups(0),
+        Conv2d::new(channel, output.of(4), [height, width], [3, 2]).groups(2),
+        Conv2d::new(channel, output.of(4), [height, width], [3, 2]).groups(3),
     ] {
         assert!(invalid.output_shape(&image).is_err());
     }
@@ -675,6 +699,181 @@ fn conv2d_lowers_valid_patches_and_sums_overlapping_gradients() -> Result<()> {
     let population = Axis::new("population");
     let unbuilt = PopulationLinear::new(population.of(2), channel, output.of(1));
     assert!(unbuilt.forward(&input).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn configured_grouped_conv2d_matches_scalar_forward_and_all_gradients() -> Result<()> {
+    const BATCHES: usize = 1;
+    const CHANNELS: usize = 4;
+    const HEIGHT: usize = 4;
+    const WIDTH: usize = 5;
+    const OUTPUTS: usize = 6;
+    const GROUPS: usize = 2;
+    const KERNEL: [usize; 2] = [2, 3];
+    const STRIDE: [usize; 2] = [2, 1];
+    const PADDING: [usize; 2] = [2, 3];
+    const OUTPUT_HEIGHT: usize = 4;
+    const OUTPUT_WIDTH: usize = 9;
+    const CHANNELS_PER_GROUP: usize = CHANNELS / GROUPS;
+    const OUTPUTS_PER_GROUP: usize = OUTPUTS / GROUPS;
+    const PATCH: usize = CHANNELS_PER_GROUP * KERNEL[0] * KERNEL[1];
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, height, width, output) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let inputs: Vec<_> = (0..BATCHES * CHANNELS * HEIGHT * WIDTH)
+        .map(|i| (i as f32 - 31.0) / 17.0)
+        .collect();
+    let weights: Vec<_> = (0..GROUPS * PATCH * OUTPUTS_PER_GROUP)
+        .map(|i| ((i * 7 % 29) as f32 - 14.0) / 19.0)
+        .collect();
+    let biases: Vec<_> = (0..OUTPUTS).map(|i| (i as f32 - 2.0) / 11.0).collect();
+    let input = Tensor::from_slice(
+        &inputs,
+        [
+            batch.of(BATCHES),
+            channel.of(CHANNELS),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+        ],
+        &device,
+    )?
+    .with_layout([width, batch, channel, height])?
+    .with_grad();
+    let mut conv = Conv2d::new(channel, output.of(OUTPUTS), [height, width], KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING)
+        .groups(GROUPS);
+    assert_eq!(
+        conv.build(input.shape(), &device, 19)?,
+        Shape::new([
+            batch.of(BATCHES),
+            height.of(OUTPUT_HEIGHT),
+            width.of(OUTPUT_WIDTH),
+            output.of(OUTPUTS),
+        ])?
+    );
+    conv.parameter("weight")?.set_values(&weights)?;
+    conv.parameter("bias")?.set_values(&biases)?;
+
+    let mut expected = vec![0.0_f64; BATCHES * OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUTS];
+    let mut input_gradient = vec![0.0_f64; inputs.len()];
+    let mut weight_gradient = vec![0.0_f64; weights.len()];
+    let mut bias_gradient = vec![0.0_f64; biases.len()];
+    let upstream = 1.0 / expected.len() as f64;
+    for n in 0..BATCHES {
+        for oy in 0..OUTPUT_HEIGHT {
+            for ox in 0..OUTPUT_WIDTH {
+                for oc in 0..OUTPUTS {
+                    let group = oc / OUTPUTS_PER_GROUP;
+                    let output_in_group = oc % OUTPUTS_PER_GROUP;
+                    let mut value = f64::from(biases[oc]);
+                    bias_gradient[oc] += upstream;
+                    for channel_in_group in 0..CHANNELS_PER_GROUP {
+                        let input_channel = group * CHANNELS_PER_GROUP + channel_in_group;
+                        for ky in 0..KERNEL[0] {
+                            for kx in 0..KERNEL[1] {
+                                let padded_y = oy * STRIDE[0] + ky;
+                                let padded_x = ox * STRIDE[1] + kx;
+                                let Some(iy) = padded_y.checked_sub(PADDING[0]) else {
+                                    continue;
+                                };
+                                let Some(ix) = padded_x.checked_sub(PADDING[1]) else {
+                                    continue;
+                                };
+                                if iy >= HEIGHT || ix >= WIDTH {
+                                    continue;
+                                }
+                                let input_index =
+                                    ((n * CHANNELS + input_channel) * HEIGHT + iy) * WIDTH + ix;
+                                let patch = (channel_in_group * KERNEL[0] + ky) * KERNEL[1] + kx;
+                                let weight_index =
+                                    (group * PATCH + patch) * OUTPUTS_PER_GROUP + output_in_group;
+                                value += f64::from(inputs[input_index])
+                                    * f64::from(weights[weight_index]);
+                                input_gradient[input_index] +=
+                                    upstream * f64::from(weights[weight_index]);
+                                weight_gradient[weight_index] +=
+                                    upstream * f64::from(inputs[input_index]);
+                            }
+                        }
+                    }
+                    let output_index =
+                        ((n * OUTPUT_HEIGHT + oy) * OUTPUT_WIDTH + ox) * OUTPUTS + oc;
+                    expected[output_index] = value;
+                }
+            }
+        }
+    }
+
+    let actual = conv.forward(&input)?;
+    close(
+        "configured grouped Conv2d forward",
+        &actual.to_vec()?,
+        &expected,
+    );
+    actual.mean([batch, height, width, output])?.backward()?;
+    close(
+        "configured grouped Conv2d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &input_gradient,
+    );
+    close(
+        "configured grouped Conv2d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &weight_gradient,
+    );
+    close(
+        "configured grouped Conv2d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &bias_gradient,
+    );
+    let regrouped = conv.groups(1);
+    let error = regrouped
+        .output_shape(input.shape())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("built parameters"), "{error}");
+
+    // A legal strided window can lie wholly in padding. It contributes zero
+    // before bias and therefore has zero input/weight derivatives.
+    let isolated = Tensor::from_slice(&[3.0], [channel.of(1), height.of(1), width.of(1)], &device)?
+        .with_grad();
+    let mut padded = Conv2d::new(channel, output.of(1), [height, width], [1, 1])
+        .stride([100, 100])
+        .padding([10, 10]);
+    padded.build(isolated.shape(), &device, 23)?;
+    padded.parameter("weight")?.set_values(&[2.0])?;
+    padded.parameter("bias")?.set_values(&[0.25])?;
+    let padded_result = padded.forward(&isolated)?;
+    close(
+        "all-padding Conv2d forward",
+        &padded_result.to_vec()?,
+        &[0.25],
+    );
+    padded_result.mean([height, width, output])?.backward()?;
+    close(
+        "all-padding Conv2d input gradient",
+        &isolated.grad().unwrap().to_vec()?,
+        &[0.0],
+    );
+    close(
+        "all-padding Conv2d weight gradient",
+        &padded.parameter("weight")?.grad().unwrap().to_vec()?,
+        &[0.0],
+    );
+    close(
+        "all-padding Conv2d bias gradient",
+        &padded.parameter("bias")?.grad().unwrap().to_vec()?,
+        &[1.0],
+    );
     Ok(())
 }
 
