@@ -1,6 +1,7 @@
 # Axis
 
 [![Latest version](https://img.shields.io/crates/v/axis.svg)](https://crates.io/crates/axis)
+[![Documentation](https://docs.rs/axis/badge.svg)](https://docs.rs/axis)
 
 Axis is an experimental Rust machine-learning library built on NVIDIA
 [cuTile Rust](https://github.com/NVlabs/cutile-rs). Tensor dimensions have
