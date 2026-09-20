@@ -106,11 +106,12 @@ selects finite or generated IDR semantics from `source.available()`. A batch is
 returned only after its regime assertion passes, and carries the corresponding
 structured receipt.
 
-`TrainEvalDisjoint` keeps separate exact ID sets and rejects any identity seen
-on both sides. The addition program registers its evaluation population first,
-then registers every fresh training batch before optimization. This catches an
-accidental shared generator seed. It proves observed identity separation, not
-semantic independence between the two generated populations.
+`Disjointness` is a separate multi-population contract. The addition program
+canonicalizes a problem as its ordered pair of operand bit patterns, registers
+the evaluation population first, then registers every fresh training batch
+before optimization. This catches a repeated problem even when it arrives under
+a different generator draw ID. The versioned identity scheme and exact evidence
+boundary are described in [semantic disjointness](disjointness.md).
 
 `observe` records the batch and then checks the limits. A failing snapshot
 therefore remains available for diagnostics. The error reports availability

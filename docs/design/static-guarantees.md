@@ -58,9 +58,12 @@ uses an aborting assertion; a diagnostic-only check must not be presented as a
 guarantee. Expensive semantic deduplication can be a periodic audit with its
 sampling and error model stated in the receipt.
 
-`Idr` and `TrainEvalDisjoint` are current examples. They exactly prove claims
-about caller-defined IDs. They do not prove independence, content novelty, or
-latent support.
+`Idr` and `Disjointness` are current examples. IDR proves claims about stable
+draw IDs. Disjointness can compare a stronger caller-defined canonical identity
+and labels its receipt `VerifiedObservations`. Neither proves independence,
+content novelty, latent support, or separation outside the observed run. A
+future construction-time partition must earn `Guaranteed` with an actual proof
+object rather than a declaration.
 
 ## Ownership is useful but not proof of uniqueness
 

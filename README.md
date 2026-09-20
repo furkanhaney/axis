@@ -59,9 +59,10 @@ let mut data = DataLoader::new(AdditionDataset::new(0xadd1_7100), 256)?
 let mut trainer = Trainer::new(SGD::new(0.25)?);
 ```
 
-There are no epochs in this example because the source never ends. If a sample
-identity repeats or crosses into the evaluation population, the run fails and
-prints a receipt explaining why.
+There are no epochs in this example because the source never ends. If a draw ID
+repeats, IDR fails. A separate `Disjointness` ledger compares canonical problem
+identities across training and evaluation, so the run also fails when distinct
+draw IDs encode the same problem.
 
 ## Sudoku as an acceptance test
 
@@ -72,9 +73,10 @@ program exercises a real transformer: learned token and position embeddings,
 bidirectional multi-head attention, pre-LayerNorm residual blocks, GELU,
 blank-only categorical loss, AdamW, and whole-puzzle accuracy.
 
-The data source generates valid boards and fresh clue masks indefinitely.
-Training and evaluation occupy separate identity namespaces, so the same run
-also tests Axis's infinite-data-regime and disjointness assertions.
+The data source generates valid boards and fresh clue masks indefinitely. The
+same run tests Axis's infinite-data-regime assertion and a semantic
+disjointness ledger whose identity is the clue board after canonical digit
+relabeling.
 
 ```mermaid
 flowchart LR
@@ -86,7 +88,7 @@ flowchart LR
     F --> G[9 logits per cell]
     G --> H[Loss on blanks only]
     H --> I[AdamW update]
-    C -. stable sample IDs .-> J[Train/eval disjointness]
+    C -. canonical puzzle identity .-> J[Train/tuning/audit disjointness]
 ```
 
 The first bounded run trained a 3,129-parameter acceptance model on 50 fresh
@@ -225,7 +227,7 @@ single pass                 no finite example is intentionally reused
 finite passes               reuse is explicit and counted
 no exact sample reuse       observed stable identities do not repeat
 IDR approximation           declared coverage and repeat limits still hold
-train/evaluation disjoint   observed identities do not cross the boundary
+semantic disjointness       canonical identities do not cross populations
 ```
 
 Passing `assert_idr()` does not prove independent samples or a rich underlying
@@ -240,8 +242,8 @@ Sudoku and Chess transformers are current, and running the sub-30B model behind
 `ask_bro` is the long-range systems test.
 
 The detailed contracts are in [library design](docs/design/library.md),
-[data regimes](docs/contracts/data-regimes.md), [static guarantees](docs/design/static-guarantees.md),
-and [run certificates](docs/contracts/run-certificates.md). The current implementation
+[data regimes](docs/contracts/data-regimes.md), [semantic disjointness](docs/contracts/disjointness.md),
+[static guarantees](docs/design/static-guarantees.md), and [run certificates](docs/contracts/run-certificates.md). The current implementation
 frontier is recorded in [next work](docs/direction/next.md).
 
 ## Contributing and license

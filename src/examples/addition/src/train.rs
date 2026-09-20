@@ -7,6 +7,10 @@ const HIDDEN: usize = 16;
 const TRAIN_SEED: u64 = 0xadd1_7100;
 const EVAL_SEED: u64 = 0xe7a1_0000;
 
+fn identity(sample: &AdditionSample) -> (u32, u32) {
+    (sample.left.to_bits(), sample.right.to_bits())
+}
+
 fn tensors(
     samples: &[AdditionSample],
     batch: Axis,
@@ -165,8 +169,15 @@ fn main() -> Result<()> {
     let evaluation = evaluation
         .next_batch()?
         .expect("generated evaluation source never ends");
-    let mut disjoint = TrainEvalDisjoint::new();
-    disjoint.observe_evaluation(evaluation.sample_ids.iter().copied())?;
+    let mut disjoint = Disjointness::new(
+        IdentityScheme::new(
+            "addition-operands",
+            "1",
+            "ordered pair of f32 operand bit patterns",
+        )?,
+        ["training", "evaluation"],
+    )?;
+    disjoint.observe("evaluation", evaluation.samples.iter().map(identity))?;
     let (eval_x, eval_y) = tensors(&evaluation.samples, batch, input, output, &device)?;
 
     let mut model = Sequential::new((
@@ -189,7 +200,7 @@ fn main() -> Result<()> {
         let fresh = train
             .next_batch()?
             .expect("generated training source never ends");
-        disjoint.observe_train(fresh.sample_ids.iter().copied())?;
+        disjoint.observe("training", fresh.samples.iter().map(identity))?;
         let (x, y) = tensors(&fresh.samples, batch, input, output, &device)?;
         let report = trainer.step(&mut model, |model| {
             model.forward(&x)?.squared_error(&y)?.mean([batch, output])
@@ -215,7 +226,7 @@ fn main() -> Result<()> {
         started.elapsed().as_secs_f64()
     );
     println!("{}", final_receipt.expect("positive step count"));
-    println!("{}", disjoint.receipt());
+    println!("{}", disjoint.assert_disjoint()?);
     let (left_monotonicity, right_monotonicity) =
         monotonicity_audit(&model, &evaluation.samples, batch, input, output, &device)?;
     println!("{left_monotonicity}");
