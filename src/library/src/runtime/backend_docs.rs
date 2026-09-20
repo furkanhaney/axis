@@ -52,6 +52,10 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn mask_gradient(&self, _gradient: &Buffer, _winners: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn scale(&self, _a: &Buffer, _scale: f32) -> Result<Buffer> {
         unavailable()
     }

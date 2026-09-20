@@ -818,8 +818,9 @@ impl Tensor {
     /// Reduce one named axis to its minimum finite value.
     ///
     /// Non-finite candidates are ignored. A group without a finite candidate returns NaN and
-    /// has zero derivative. Ties route the derivative to the first logical coordinate along
-    /// `axis`, independently of physical layout.
+    /// has zero derivative even if its upstream derivative is non-finite. Ties route the
+    /// derivative to the first logical coordinate along `axis`, independently of physical
+    /// layout.
     pub fn min(&self, axis: Axis) -> Result<Self> {
         let started = Instant::now();
         let reduced_index = self.shape().index(axis)?;
@@ -1506,7 +1507,7 @@ impl Tensor {
                         Rule::Minimum { plan, winners } => {
                             let expanded =
                                 self.device().grouped(&gradient, None, plan.as_ref(), 1.0)?;
-                            self.device().binary(&expanded, winners, 2)?
+                            self.device().mask_gradient(&expanded, winners)?
                         }
                     };
                     let id = edge.input.0.id;

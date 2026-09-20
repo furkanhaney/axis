@@ -129,6 +129,25 @@ fn named_axis_minimum_ignores_nonfinite_values_and_marks_empty_groups() -> Resul
         &values.grad().unwrap().to_vec()?,
         &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
     );
+
+    let all_nonfinite = Tensor::from_slice(
+        &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        [batch.of(1), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let zero = Tensor::from_slice(&[0.0], [batch.of(1)], &device)?;
+    let loss = all_nonfinite
+        .min(candidate)?
+        .squared_error(&zero)?
+        .mean(batch)?;
+    assert!(loss.to_vec()?[0].is_nan());
+    loss.backward()?;
+    close(
+        "all-nonfinite minimum with NaN cotangent",
+        &all_nonfinite.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 0.0],
+    );
     Ok(())
 }
 
