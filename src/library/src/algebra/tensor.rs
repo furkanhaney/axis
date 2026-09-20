@@ -37,10 +37,20 @@ struct ReductionPlans {
 
 type GatherPlanKey = (u8, Shape, Layout, Shape, Layout);
 type ReductionPlanKey = (u8, Shape, Layout, Vec<Axis>);
+type UnfoldPlanKey = (
+    Shape,
+    Layout,
+    Shape,
+    [usize; 2],
+    [usize; 2],
+    [usize; 2],
+    Option<Dim>,
+);
 
 thread_local! {
     static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
     static REDUCTION_PLANS: RefCell<HashMap<ReductionPlanKey, ReductionPlans>> = RefCell::new(HashMap::new());
+    static UNFOLD_PLANS: RefCell<HashMap<UnfoldPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
 }
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
@@ -1124,13 +1134,6 @@ impl Tensor {
                 Some(self.0.layout.offset(&input))
             })
             .collect::<Vec<_>>();
-        if map.iter().all(Option::is_some) {
-            return self.gathered(
-                shape.clone(),
-                Layout::contiguous(&shape),
-                map.into_iter().map(Option::unwrap).collect(),
-            );
-        }
         if map.iter().all(Option::is_none) {
             let value = self.device().zeros_buffer(shape.len())?;
             let edges = self
@@ -1146,27 +1149,55 @@ impl Tensor {
                 None,
             ));
         }
-        let forward = Rc::new(Plan::groups(
-            map.iter()
-                .map(|input| input.map(|index| vec![(index, 0)]).unwrap_or_default())
-                .collect(),
-            false,
-        )?);
-        let mut reverse = vec![vec![]; self.shape().len()];
-        for (output, input) in map.into_iter().enumerate() {
-            if let Some(input) = input {
-                reverse[input].push((output, 0));
+        let key = (
+            self.shape().clone(),
+            self.0.layout.clone(),
+            shape.clone(),
+            kernel,
+            stride,
+            padding,
+            group,
+        );
+        let cached = UNFOLD_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let plans = match cached {
+            Some(plans) => plans,
+            None => {
+                let dense = map.iter().all(Option::is_some);
+                let forward = if dense {
+                    let indices: Vec<_> = map.iter().copied().map(Option::unwrap).collect();
+                    Rc::new(Plan::gather(&indices)?)
+                } else {
+                    Rc::new(Plan::groups(
+                        map.iter()
+                            .map(|input| input.map(|index| vec![(index, 0)]).unwrap_or_default())
+                            .collect(),
+                        false,
+                    )?)
+                };
+                let mut reverse = vec![vec![]; self.shape().len()];
+                for (output, input) in map.into_iter().enumerate() {
+                    if let Some(input) = input {
+                        reverse[input].push((output, 0));
+                    }
+                }
+                let plans = GatherPlans {
+                    forward,
+                    reverse: Rc::new(Plan::groups(reverse, false)?),
+                };
+                UNFOLD_PLANS.with(|cache| {
+                    cache.borrow_mut().insert(key, plans.clone());
+                });
+                plans
             }
-        }
-        let reverse = Rc::new(Plan::groups(reverse, false)?);
+        };
         let value = self
             .device()
-            .grouped(&self.0.value, None, forward.as_ref(), 1.0)?;
+            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
         let edges = self.requires_grad().then(|| {
             Edge::new(
                 self,
                 Rule::Group {
-                    plan: reverse,
+                    plan: plans.reverse,
                     rhs: None,
                     factor: 1.0,
                 },

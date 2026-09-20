@@ -98,7 +98,8 @@ a fused attention kernel. Multi-axis contractions still use the generic plan
 path.
 
 Configured convolution currently lowers padding/stride to a CPU-built gather
-plan, then lowers each channel group to the batched single-axis contraction.
+plan cached by named shapes, layout, and convolution configuration, then lowers
+each channel group to the batched single-axis contraction.
 The contraction and both of its derivatives use tiled matrix multiplication,
 but patch extraction and col2im remain generic indexed kernels. This path
 establishes exact semantics and autodiff; it is not a fused or direct
