@@ -645,6 +645,47 @@ impl Tensor {
             None,
         ))
     }
+    pub(crate) fn categorical_correct_flags(&self, targets: &Self, class: Axis) -> Result<Self> {
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err("categorical accuracy requires identical axis sets".into());
+        }
+        self.compatible_device(targets)?;
+        self.shared_extents(targets)?;
+        let width = self.extent(class)?;
+        if width < 2 {
+            return Err("categorical accuracy requires at least two classes".into());
+        }
+        let mut ordered_dims: Vec<_> = self
+            .shape()
+            .dims()
+            .iter()
+            .copied()
+            .filter(|dim| dim.axis != class)
+            .collect();
+        let output = Shape::new(ordered_dims.iter().copied())?;
+        ordered_dims.push(class.of(width));
+        let ordered = Shape::new(ordered_dims)?;
+        let logits = self.align(&ordered)?;
+        let targets = targets.align(&ordered)?;
+        let value = self
+            .device()
+            .categorical_correct(&logits.0.value, &targets.0.value, width)?;
+        Ok(Self::node(
+            output.clone(),
+            Layout::contiguous(&output),
+            value,
+            self.device(),
+            vec![],
+            false,
+            None,
+        ))
+    }
     pub fn scale(&self, factor: f32) -> Result<Self> {
         if !factor.is_finite() {
             return Err("scale must be finite".into());

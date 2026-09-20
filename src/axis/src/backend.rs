@@ -233,6 +233,23 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn categorical_correct(
+        &self,
+        logits: &Buffer,
+        targets: &Buffer,
+        width: usize,
+    ) -> Result<Buffer> {
+        let rows = logits.shape()[0] as usize / width;
+        let mut out = self.zeros(rows)?;
+        kernels::categorical_correct(
+            (&mut out).partition([1]),
+            logits.as_ref(),
+            targets.as_ref(),
+            width as i32,
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn mask(&self, a: &Buffer, keep: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::mask(
@@ -752,6 +769,36 @@ mod kernels {
         let pp = probability.partition(shape![1]);
         let yp = targets.partition(shape![1]);
         out.store(gp.load([row]) * (pp.load([position]) - yp.load([position])));
+    }
+    #[cutile::entry()]
+    fn categorical_correct(
+        out: &mut Tensor<f32, { [1] }>,
+        logits: &Tensor<f32, { [-1] }>,
+        targets: &Tensor<f32, { [-1] }>,
+        width: i32,
+    ) {
+        let row = get_tile_block_id().0;
+        let start = row * width;
+        let zp = logits.partition(shape![1]);
+        let yp = targets.partition(shape![1]);
+        let mut predicted_value = zp.load([start]);
+        let mut target_value = yp.load([start]);
+        let mut predicted = constant(0i32, shape![1]);
+        let mut target = constant(0i32, shape![1]);
+        for j in 1i32..width {
+            let z = zp.load([start + j]);
+            let y = yp.load([start + j]);
+            let index = broadcast_scalar(j, shape![1]);
+            let z_better = gt_tile(z, predicted_value);
+            let y_better = gt_tile(y, target_value);
+            predicted_value = select(z_better, z, predicted_value);
+            target_value = select(y_better, y, target_value);
+            predicted = select(z_better, index, predicted);
+            target = select(y_better, index, target);
+        }
+        let one = constant(1.0f32, shape![1]);
+        let zero = constant(0.0f32, shape![1]);
+        out.store(select(eq_tile(predicted, target), one, zero));
     }
     #[cutile::entry()]
     fn mask(

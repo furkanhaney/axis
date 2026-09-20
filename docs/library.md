@@ -213,6 +213,13 @@ a different bound feature extent requires a new model.
 Fallible tensor/model operations should return `Result`, including shape,
 device, and JIT errors. The sketch's omission of `?` is not an error policy.
 
+Evaluation metrics belong to Axis when their semantics are independent of a
+dataset. `Tensor::categorical_accuracy` performs named-class argmax comparison
+on the device and returns exact `(correct, total)` counts, so chunked evaluators
+merge counts instead of averaging percentages. `Standardizer` fits finite,
+train-only values with an explicit variance correction (sample standard
+deviation by default) and applies the frozen transform to any later split.
+
 The first backend submits the existing cuTile kernels in stream order and
 synchronizes at explicit step/read boundaries. A small layout plan maps the
 semantic operation to its kernel specialization.

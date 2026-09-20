@@ -442,6 +442,11 @@ fn categorical_loss_and_device_adam_match_references() -> Result<()> {
         &device,
     )?;
     let losses = logits.categorical_cross_entropy_with_logits(&targets, class)?;
+    let accuracy = logits.categorical_accuracy(&targets, class)?;
+    assert_eq!(accuracy.correct(), 2);
+    assert_eq!(accuracy.total(), 2);
+    assert_eq!(accuracy.fraction(), 1.0);
+    assert_eq!(accuracy.merge(accuracy).total(), 4);
     assert_eq!(losses.shape(), &Shape::new([batch.of(2)])?);
     let expected_loss = (1.0_f64 + (-1.0_f64).exp() + (-2.0_f64).exp()).ln();
     close(

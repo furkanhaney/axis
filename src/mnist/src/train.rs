@@ -84,33 +84,13 @@ fn load_split(root: &Path, images_name: &str, labels_name: &str) -> Result<Vec<D
 }
 
 fn normalize(train: &mut [Digit], test: &mut [Digit]) -> Result<()> {
-    let n = train
-        .len()
-        .checked_mul(INPUTS)
-        .ok_or("pixel count overflow")?;
-    if n < 2 {
-        return Err("training split is too small to normalize".into());
-    }
-    let mean = train
-        .iter()
-        .flat_map(|digit| digit.input)
-        .map(f64::from)
-        .sum::<f64>()
-        / n as f64;
-    // torch.std() uses Bessel's correction by default.
-    let variance = train
-        .iter()
-        .flat_map(|digit| digit.input)
-        .map(|value| (f64::from(value) - mean).powi(2))
-        .sum::<f64>()
-        / (n - 1) as f64;
-    let std = variance.sqrt();
-    if !std.is_finite() || std == 0.0 {
-        return Err("training normalization has invalid standard deviation".into());
-    }
-    for digit in train.iter_mut().chain(test) {
-        for value in &mut digit.input {
-            *value = ((f64::from(*value) - mean) / std) as f32;
+    let training_values: Vec<_> = train.iter().flat_map(|digit| digit.input).collect();
+    let standardizer = Standardizer::fit(&training_values)?;
+    for split in [train, test] {
+        let mut values: Vec<_> = split.iter().flat_map(|digit| digit.input).collect();
+        standardizer.transform_in_place(&mut values)?;
+        for (digit, normalized) in split.iter_mut().zip(values.chunks_exact(INPUTS)) {
+            digit.input.copy_from_slice(normalized);
         }
     }
     Ok(())
@@ -148,29 +128,14 @@ fn accuracy(
     digits: &[Digit],
     batch_axis: Axis,
     input_axis: Axis,
+    class_axis: Axis,
     device: &Device,
 ) -> Result<f32> {
-    let inputs: Vec<_> = digits.iter().flat_map(|digit| digit.input).collect();
-    let tensor = Tensor::from_slice(
-        &inputs,
-        [batch_axis.of(digits.len()), input_axis.of(INPUTS)],
-        device,
-    )?;
-    let logits = model.forward(&tensor)?.to_vec()?;
-    let correct = logits
-        .chunks_exact(CLASSES)
-        .zip(digits)
-        .filter(|(row, digit)| {
-            let predicted = row
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(index, _)| index)
-                .unwrap();
-            predicted == usize::from(digit.label)
-        })
-        .count();
-    Ok(correct as f32 / digits.len() as f32)
+    let (inputs, targets) = tensors(digits, batch_axis, input_axis, class_axis, device)?;
+    Ok(model
+        .forward(&inputs)?
+        .categorical_accuracy(&targets, class_axis)?
+        .fraction())
 }
 
 fn parse() -> Result<Config> {
@@ -242,7 +207,7 @@ fn main() -> Result<()> {
     }
     println!("params: {parameters}");
 
-    let initial_accuracy = accuracy(&model, &test, batch_axis, input_axis, &device)?;
+    let initial_accuracy = accuracy(&model, &test, batch_axis, input_axis, class_axis, &device)?;
     println!("initial test_acc {initial_accuracy:.4}");
     let mut trainer = Trainer::new(Adam::new(config.learning_rate)?);
     let train_len = train.len();
@@ -264,7 +229,8 @@ fn main() -> Result<()> {
         })?;
         weighted_loss += f64::from(report.pre_update_loss()?) * count as f64;
         if receipt.completed_passes > reported_passes {
-            let test_accuracy = accuracy(&model, &test, batch_axis, input_axis, &device)?;
+            let test_accuracy =
+                accuracy(&model, &test, batch_axis, input_axis, class_axis, &device)?;
             println!(
                 "epoch {:2} train_loss {:.4} test_acc {test_accuracy:.4}",
                 receipt.completed_passes,
@@ -284,7 +250,7 @@ fn main() -> Result<()> {
         receipt,
     );
     if config.train_limit.is_some() {
-        let final_accuracy = accuracy(&model, &test, batch_axis, input_axis, &device)?;
+        let final_accuracy = accuracy(&model, &test, batch_axis, input_axis, class_axis, &device)?;
         if final_accuracy <= initial_accuracy {
             return Err("smoke run did not improve held-out accuracy".into());
         }
