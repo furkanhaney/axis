@@ -704,6 +704,68 @@ fn conv2d_lowers_valid_patches_and_sums_overlapping_gradients() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width, time, group, patch) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("time"),
+        Axis::new("conv_group"),
+        Axis::new("conv_patch"),
+    );
+    let values: Vec<_> = (0..3)
+        .flat_map(|y| (0..3).flat_map(move |x| (0..3).map(move |t| (100 * y + 10 * x + t) as f32)))
+        .collect();
+    let input = Tensor::from_slice(
+        &values,
+        [channel.of(1), height.of(3), width.of(3), time.of(3)],
+        &device,
+    )?;
+    let builds = Tensor::unfold_plan_build_count();
+    let height_width = input.unfold2d_grouped(
+        channel,
+        [height, width],
+        group.of(1),
+        patch.of(9),
+        [3, 3],
+        [1, 1],
+        [1, 1],
+    )?;
+    assert_eq!(Tensor::unfold_plan_build_count(), builds + 1);
+    let height_time = input.unfold2d_grouped(
+        channel,
+        [height, time],
+        group.of(1),
+        patch.of(9),
+        [3, 3],
+        [1, 1],
+        [1, 1],
+    )?;
+    assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
+
+    // Logical output coordinate h=1,w=2,t=0, patch(ky=1,kx=2).
+    // [height,width] reaches right padding; [height,time] retains width=2
+    // and reads input h=1,w=2,t=1.
+    let probe = ((3 + 2) * 3) * 9 + 5;
+    assert_eq!(height_width.to_vec()?[probe], 0.0);
+    assert_eq!(height_time.to_vec()?[probe], 121.0);
+    let repeated = input.unfold2d_grouped(
+        channel,
+        [height, width],
+        group.of(1),
+        patch.of(9),
+        [3, 3],
+        [1, 1],
+        [1, 1],
+    )?;
+    assert_eq!(repeated.to_vec()?, height_width.to_vec()?);
+    assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn configured_grouped_conv2d_matches_scalar_forward_and_all_gradients() -> Result<()> {
     const BATCHES: usize = 1;
     const CHANNELS: usize = 4;
