@@ -46,6 +46,19 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
         .output_shape(&image)?,
         Shape::new([batch.of(2), height.of(3), width.of(4), output.of(4)])?
     );
+    assert_eq!(
+        Conv2d::with_stride_padding(
+            channel,
+            output.of(6),
+            [height, width],
+            [3, 3],
+            [2, 2],
+            [1, 1],
+        )
+        .groups(3)
+        .output_shape(&image)?,
+        Shape::new([batch.of(2), height.of(3), width.of(4), output.of(6)])?
+    );
     for invalid in [
         Conv2d::new(channel, output.of(4), [height, height], [3, 2]),
         Conv2d::new(channel, output.of(4), [channel, width], [3, 2]),
@@ -59,6 +72,9 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
             [0, 2],
             [1, 1],
         ),
+        Conv2d::new(channel, output.of(4), [height, width], [3, 3]).groups(0),
+        Conv2d::new(channel, output.of(4), [height, width], [3, 3]).groups(2),
+        Conv2d::new(channel, output.of(4), [height, width], [3, 3]).groups(3),
     ] {
         assert!(invalid.output_shape(&image).is_err());
     }
@@ -658,6 +674,59 @@ fn conv2d_stride_and_padding_match_scalar_forward_and_gradients() -> Result<()> 
         "strided padded Conv2d bias gradient",
         &conv.parameter("bias")?.grad().unwrap().to_vec()?,
         &[1.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn grouped_conv2d_keeps_channel_groups_independent() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width, output) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        [channel.of(2), height.of(2), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let mut conv = Conv2d::new(channel, output.of(4), [height, width], [1, 1]).groups(2);
+    assert_eq!(
+        conv.build(input.shape(), &device, 23)?,
+        Shape::new([height.of(2), width.of(2), output.of(4)])?
+    );
+    conv.parameter("weight")?
+        .set_values(&[2.0, 3.0, 5.0, 7.0])?;
+    conv.parameter("bias")?.set_values(&[0.0, 0.5, 1.0, -1.0])?;
+
+    let result = conv.forward(&input)?;
+    close(
+        "grouped Conv2d forward",
+        &result.to_vec()?,
+        &[
+            2.0, 3.5, 51.0, 69.0, 4.0, 6.5, 101.0, 139.0, 6.0, 9.5, 151.0, 209.0, 8.0, 12.5, 201.0,
+            279.0,
+        ],
+    );
+    result.mean([height, width, output])?.backward()?;
+    close(
+        "grouped Conv2d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.3125, 0.3125, 0.3125, 0.3125, 0.75, 0.75, 0.75, 0.75],
+    );
+    close(
+        "grouped Conv2d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &[0.625, 0.625, 6.25, 6.25],
+    );
+    close(
+        "grouped Conv2d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &[0.25; 4],
     );
     Ok(())
 }

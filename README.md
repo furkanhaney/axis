@@ -113,8 +113,8 @@ throughput success claim.
   softmax, categorical and binary cross-entropy, and squared error.
 - Reverse-mode differentiation with parameter version checks and explicit
   scalar loss reduction.
-- `Linear`, `PopulationLinear`, strided and symmetrically padded `Conv2d`,
-  `LayerNorm`, `ReLU`, `GELU`, and `Sequential` modules.
+- `Linear`, `PopulationLinear`, grouped/depthwise, strided, and symmetrically
+  padded `Conv2d`, `LayerNorm`, `ReLU`, `GELU`, and `Sequential` modules.
 - Device-resident SGD, Adam, and AdamW. Adam can assign one learning rate to
   each member of a named population axis.
 - Finite datasets, generated streams, exact shuffled passes, single-pass and

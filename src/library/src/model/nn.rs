@@ -310,24 +310,38 @@ impl Module for PopulationLinear {
 /// Strided, symmetrically padded 2D cross-correlation followed by bias addition.
 pub struct Conv2d {
     input: Axis,
+    output: Dim,
     spatial: [Axis; 2],
     kernel: [usize; 2],
     stride: [usize; 2],
     padding: [usize; 2],
+    groups: usize,
     patch: Axis,
-    linear: Linear,
+    group: Axis,
+    group_patch: Axis,
+    group_output: Axis,
+    projection: Option<ConvProjection>,
+}
+enum ConvProjection {
+    Dense(Linear),
+    Grouped(PopulationLinear),
 }
 impl Conv2d {
     pub fn new(input: Axis, output: Dim, spatial: [Axis; 2], kernel: [usize; 2]) -> Self {
         let patch = input.role("conv_patch");
         Self {
             input,
+            output,
             spatial,
             kernel,
             stride: [1, 1],
             padding: [0, 0],
+            groups: 1,
             patch,
-            linear: Linear::new(patch, output),
+            group: input.role("conv_group"),
+            group_patch: input.role("conv_group_patch"),
+            group_output: output.axis.role("conv_group_output"),
+            projection: None,
         }
     }
     pub fn with_stride_padding(
@@ -343,6 +357,14 @@ impl Conv2d {
         convolution.padding = padding;
         convolution
     }
+    /// Divide input and output channels into independent convolution groups.
+    /// Setting `groups` to the input-channel extent creates a depthwise
+    /// convolution (with an optional output-channel multiplier).
+    pub fn groups(mut self, groups: usize) -> Self {
+        self.groups = groups;
+        self.projection = None;
+        self
+    }
     fn patch_shape(&self, input: &Shape) -> Result<Shape> {
         if self.spatial[0] == self.spatial[1]
             || self.input == self.spatial[0]
@@ -351,6 +373,14 @@ impl Conv2d {
             return Err("Conv2d requires distinct input-channel and spatial axes".into());
         }
         let channels = input.extent(self.input)?;
+        if self.groups == 0
+            || !channels.is_multiple_of(self.groups)
+            || !self.output.extent.is_multiple_of(self.groups)
+        {
+            return Err(
+                "Conv2d groups must be positive and divide both input and output channels".into(),
+            );
+        }
         let height = input
             .extent(self.spatial[0])?
             .checked_add(
@@ -393,13 +423,74 @@ impl Conv2d {
             }
         }))
     }
+    fn grouped_patch_shape(&self, patch: &Shape) -> Result<Shape> {
+        let patch_extent = patch.extent(self.patch)?;
+        let mut dims = patch.dims().to_vec();
+        let index = patch.index(self.patch)?;
+        dims.splice(
+            index..=index,
+            [
+                self.group.of(self.groups),
+                self.group_patch.of(patch_extent / self.groups),
+            ],
+        );
+        Shape::new(dims)
+    }
+    fn result_shape(&self, input: &Shape) -> Result<Shape> {
+        let patch = self.patch_shape(input)?;
+        Shape::new(
+            patch
+                .dims()
+                .iter()
+                .copied()
+                .filter(|dim| dim.axis != self.patch)
+                .chain([self.output]),
+        )
+    }
 }
 impl Module for Conv2d {
     fn output_shape(&self, input: &Shape) -> Result<Shape> {
-        self.linear.output_shape(&self.patch_shape(input)?)
+        let patch = self.patch_shape(input)?;
+        match &self.projection {
+            Some(ConvProjection::Dense(linear)) => {
+                linear.output_shape(&patch)?;
+            }
+            Some(ConvProjection::Grouped(linear)) => {
+                linear.output_shape(&self.grouped_patch_shape(&patch)?)?;
+            }
+            None => {}
+        }
+        self.result_shape(input)
     }
     fn build(&mut self, input: &Shape, device: &Device, seed: u64) -> Result<Shape> {
-        self.linear.build(&self.patch_shape(input)?, device, seed)
+        let patch = self.patch_shape(input)?;
+        let grouped_patch = (self.groups > 1)
+            .then(|| self.grouped_patch_shape(&patch))
+            .transpose()?;
+        if self.projection.is_none() {
+            self.projection = Some(if self.groups == 1 {
+                ConvProjection::Dense(Linear::new(self.patch, self.output))
+            } else {
+                ConvProjection::Grouped(PopulationLinear::new(
+                    self.group.of(self.groups),
+                    self.group_patch,
+                    self.group_output.of(self.output.extent / self.groups),
+                ))
+            });
+        }
+        match self.projection.as_mut().expect("initialized") {
+            ConvProjection::Dense(linear) => {
+                linear.build(&patch, device, seed)?;
+            }
+            ConvProjection::Grouped(linear) => {
+                linear.build(
+                    grouped_patch.as_ref().expect("grouped projection"),
+                    device,
+                    seed,
+                )?;
+            }
+        }
+        self.result_shape(input)
     }
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         self.output_shape(input.shape())?;
@@ -409,16 +500,37 @@ impl Module for Conv2d {
             .and_then(|n| n.checked_mul(self.kernel[1]))
             .ok_or("Conv2d patch extent overflow")?;
         let padded = input.pad2d(self.spatial, self.padding)?;
-        self.linear.forward(&padded.unfold2d_strided(
+        let patches = padded.unfold2d_strided(
             self.input,
             self.spatial,
             self.patch.of(patch_extent),
             self.kernel,
             self.stride,
-        )?)
+        )?;
+        match self
+            .projection
+            .as_ref()
+            .ok_or("Conv2d must be built before forward")?
+        {
+            ConvProjection::Dense(linear) => linear.forward(&patches),
+            ConvProjection::Grouped(linear) => linear
+                .forward(&patches.split(
+                    self.patch,
+                    [
+                        self.group.of(self.groups),
+                        self.group_patch.of(patch_extent / self.groups),
+                    ],
+                )?)?
+                .merge([self.group, self.group_output], self.output.axis)?
+                .reorder(self.result_shape(input.shape())?.axes()),
+        }
     }
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
-        self.linear.named_parameters()
+        match &self.projection {
+            Some(ConvProjection::Dense(linear)) => linear.named_parameters(),
+            Some(ConvProjection::Grouped(linear)) => linear.named_parameters(),
+            None => vec![],
+        }
     }
 }
 

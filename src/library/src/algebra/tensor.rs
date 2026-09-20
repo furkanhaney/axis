@@ -1283,6 +1283,17 @@ impl Tensor {
             None,
         ))
     }
+    pub(crate) fn reorder(&self, axes: impl IntoAxes) -> Result<Self> {
+        let axes = self.shape().select_axes(axes)?;
+        if axes.len() != self.shape().rank() {
+            return Err("reorder must contain every axis exactly once".into());
+        }
+        let shape = Shape::new(
+            axes.iter()
+                .map(|&axis| axis.of(self.extent(axis).expect("validated"))),
+        )?;
+        self.align(&shape)
+    }
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
         let layout = Layout::new(self.shape(), &order.into_axes())?;

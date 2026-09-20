@@ -190,7 +190,7 @@ shape checks first; compile-time axis types can be evaluated later.
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
 | `pad2d(spatial, padding)` | Symmetrically zero-pad two named spatial axes. Backward discards padded gradients and restores the original logical layout. |
 | `unfold2d_strided(channels, spatial, patch, kernel, stride)` | Extract valid strided patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. `unfold2d` is its stride-one form. |
-| `Conv2d(input, output, spatial, kernel)` | Compose optional symmetric padding, strided unfolding, and Linear; replace the input-channel axis and preserve unrelated axes. The basic constructor is valid stride-one; `with_stride_padding` declares other spatial geometry. |
+| `Conv2d(input, output, spatial, kernel)` | Compose optional symmetric padding, strided unfolding, and dense or grouped Linear projections; replace the input-channel axis and preserve unrelated axes. The basic constructor is valid stride-one; `with_stride_padding` declares other spatial geometry and `.groups(n)` partitions both channel axes. `groups == input_channels` is depthwise convolution with an optional channel multiplier. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
 | `categorical_cross_entropy_with_logits(target, class)` | Accept constant one-hot/probability targets over the same axes, stably reduce the named class axis, and preserve all other axes. Backward is `softmax(logits) - target`. |
 | `Conv(input, output, spatial)` | Transform channels and spatial extents by the stated stride/padding/dilation rules. Preserve all unrelated axes. |
@@ -287,8 +287,7 @@ actual outside consumer.
 4. **Executable CNN slice (first stage implemented):** strided, symmetrically
    padded convolution, ReLU, named global mean, Linear, and stable binary loss now
    reproduce the concrete CNN, including overlapping input gradients. A
-   stacked-convolution witness remains before adaptive pooling and collapse;
-   grouped/depthwise convolution remains a separate operator extension.
+   stacked-convolution witness remains before adaptive pooling and collapse.
 5. **LSTM and Transformer:** add each as a concrete next program. Recurrence
    drives state/sequence lifetime decisions; attention drives role axes,
    masked softmax, split/merge, and shared-parameter behavior. `Repeat` must
