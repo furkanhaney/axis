@@ -216,6 +216,18 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn unfold2d(&self, _input: &Buffer, _spec: &Unfold2dSpec) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn unfold2d_backward(
+        &self,
+        _gradient: &Buffer,
+        _spec: &Unfold2dSpec,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn grouped_minimum(
         &self,
         _a: &Buffer,
@@ -223,6 +235,32 @@ impl Device {
         _reverse: &Plan,
     ) -> Result<(Buffer, Buffer)> {
         unavailable()
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct Unfold2dSpec {
+    pub input_len: usize,
+    pub output_len: usize,
+    pub input_rank: i32,
+    pub output_rank: i32,
+    pub forward_metadata: Vec<i32>,
+    pub backward_metadata: Vec<i32>,
+    pub channels_per_group: i32,
+    pub kernel: [i32; 2],
+    pub stride: [i32; 2],
+    pub padding: [i32; 2],
+    pub input_spatial: [i32; 2],
+    pub output_spatial: [i32; 2],
+    pub input_special_strides: [i32; 3],
+    pub output_special_strides: [i32; 4],
+}
+
+impl Unfold2dSpec {
+    #[cfg(test)]
+    pub(crate) fn metadata_len(&self) -> usize {
+        self.forward_metadata.len() + self.backward_metadata.len()
     }
 }
 

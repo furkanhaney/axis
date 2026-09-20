@@ -761,6 +761,85 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
     )?;
     assert_eq!(repeated.to_vec()?, height_width.to_vec()?);
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
+
+    // An all-padding grouped result keeps the group-major layout required by
+    // the following contraction, including when its zero plan is cached.
+    let batch = Axis::new("batch");
+    let zero_input = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0],
+        [batch.of(2), channel.of(2), height.of(1), width.of(1)],
+        &device,
+    )?;
+    let zero_group = Axis::new("zero_group");
+    let zero_patch = Axis::new("zero_patch");
+    let zero_builds = Tensor::unfold_plan_build_count();
+    for _ in 0..2 {
+        let all_padding = zero_input.unfold2d_grouped(
+            channel,
+            [height, width],
+            zero_group.of(2),
+            zero_patch.of(1),
+            [1, 1],
+            [100, 100],
+            [10, 10],
+        )?;
+        assert_eq!(all_padding.to_vec()?, vec![0.0; 4]);
+        assert_eq!(all_padding.layout_strides(), &[1, 1, 1, 2, 1]);
+    }
+    assert_eq!(Tensor::unfold_plan_build_count(), zero_builds + 1);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn conv2d_rejects_padded_extent_outside_kernel_index_range_atomically() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width, output) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 3.0],
+        [channel.of(1), height.of(2), width.of(1)],
+        &device,
+    )?
+    .with_grad();
+    let mut overflowing = Conv2d::new(channel, output.of(1), [height, width], [1, 1])
+        .stride([1 << 30, 1])
+        .padding([i32::MAX as usize, 0]);
+    assert_eq!(
+        overflowing.build(input.shape(), &device, 31)?,
+        Shape::new([height.of(4), width.of(1), output.of(1)])?
+    );
+    overflowing.parameter("weight")?.set_values(&[1.0])?;
+    let builds = Tensor::unfold_plan_build_count();
+    let error = overflowing.forward(&input).err().unwrap().to_string();
+    assert_eq!(
+        error,
+        "unfold2d padded spatial extent exceeds the i32 kernel index range"
+    );
+    assert_eq!(Tensor::unfold_plan_build_count(), builds);
+
+    // Rejection happens before cache mutation, output allocation, or launch;
+    // the same input and device remain usable for a valid forward/backward.
+    let mut valid = Conv2d::new(channel, output.of(1), [height, width], [1, 1]);
+    valid.build(input.shape(), &device, 37)?;
+    valid.parameter("weight")?.set_values(&[1.0])?;
+    valid.parameter("bias")?.set_values(&[0.0])?;
+    let result = valid.forward(&input)?;
+    close(
+        "post-rejection Conv2d forward",
+        &result.to_vec()?,
+        &[1.0, 3.0],
+    );
+    result.mean([height, width, output])?.backward()?;
+    close(
+        "post-rejection Conv2d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.5, 0.5],
+    );
     Ok(())
 }
 
@@ -945,6 +1024,111 @@ fn configured_grouped_conv2d_matches_scalar_forward_and_all_gradients() -> Resul
         &padded.parameter("bias")?.grad().unwrap().to_vec()?,
         &[1.0],
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn depthwise_conv2d_large_implicit_plan_completes_forward_and_backward() -> Result<()> {
+    const BATCHES: usize = 128;
+    const CHANNELS: usize = 32;
+    const HEIGHT: usize = 32;
+    const WIDTH: usize = 32;
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, height, width) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &vec![1.0; BATCHES * CHANNELS * HEIGHT * WIDTH],
+        [
+            batch.of(BATCHES),
+            channel.of(CHANNELS),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+        ],
+        &device,
+    )?
+    .with_grad();
+    let mut conv = Conv2d::new(channel, channel.of(CHANNELS), [height, width], [3, 3])
+        .padding([1, 1])
+        .groups(CHANNELS);
+    conv.build(input.shape(), &device, 29)?;
+    conv.parameter("weight")?.set_values(&[1.0; CHANNELS * 9])?;
+    conv.parameter("bias")?.set_values(&[0.25; CHANNELS])?;
+
+    // The former indexed lowering needed 128 * 32 * 32 * 32 * 9 =
+    // 37,748,736 contributions and failed at its 16,777,216-plan cap.
+    let output = conv.forward(&input)?;
+    assert!(
+        Tensor::unfold_plan_metadata_max() <= 4 * (4 + 5),
+        "implicit unfold metadata must stay O(rank)"
+    );
+    assert_eq!(
+        output.shape(),
+        &Shape::new([
+            batch.of(BATCHES),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+            channel.of(CHANNELS),
+        ])?
+    );
+    let values = output.to_vec()?;
+    for batch_index in 0..BATCHES {
+        for y in 0..HEIGHT {
+            let y_uses = if y == 0 || y + 1 == HEIGHT { 2 } else { 3 };
+            for x in 0..WIDTH {
+                let x_uses = if x == 0 || x + 1 == WIDTH { 2 } else { 3 };
+                let expected = (y_uses * x_uses) as f32 + 0.25;
+                for channel_index in 0..CHANNELS {
+                    let index = ((batch_index * HEIGHT + y) * WIDTH + x) * CHANNELS + channel_index;
+                    assert_eq!(values[index], expected, "output[{index}]");
+                }
+            }
+        }
+    }
+    let loss = output.mean([batch, height, width, channel])?;
+    assert!(loss.item()?.is_finite());
+    loss.backward()?;
+    assert_eq!(
+        conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        vec![1.0 / CHANNELS as f32; CHANNELS]
+    );
+    let mut expected_weight_gradient = Vec::with_capacity(CHANNELS * 9);
+    for _ in 0..CHANNELS {
+        for kernel_y in 0_usize..3 {
+            for kernel_x in 0_usize..3 {
+                let valid = (HEIGHT - kernel_y.abs_diff(1)) * (WIDTH - kernel_x.abs_diff(1));
+                expected_weight_gradient.push(valid as f64 / (CHANNELS * HEIGHT * WIDTH) as f64);
+            }
+        }
+    }
+    close(
+        "large depthwise Conv2d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &expected_weight_gradient,
+    );
+    let input_gradient = input.grad().unwrap().to_vec()?;
+    let denominator = (BATCHES * CHANNELS * HEIGHT * WIDTH) as f32;
+    for batch_index in 0..BATCHES {
+        for channel_index in 0..CHANNELS {
+            for y in 0..HEIGHT {
+                let y_uses = if y == 0 || y + 1 == HEIGHT { 2 } else { 3 };
+                for x in 0..WIDTH {
+                    let x_uses = if x == 0 || x + 1 == WIDTH { 2 } else { 3 };
+                    let index = ((batch_index * CHANNELS + channel_index) * HEIGHT + y) * WIDTH + x;
+                    let expected = (y_uses * x_uses) as f32 / denominator;
+                    assert!(
+                        (input_gradient[index] - expected).abs() < 1e-10,
+                        "input gradient[{index}]"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 

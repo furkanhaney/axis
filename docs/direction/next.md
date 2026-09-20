@@ -75,10 +75,12 @@ owner's larger, partially unimplemented API sketch.
   fallback, or higher-order differentiation.
 - The outside Sudoku acceptance passed every host and CUDA oracle on an RTX
   5090, then trained over 1,600 fresh boards with zero observed reuse or
-  train/evaluation overlap. The same run measured only 8% peak GPU utilization
-  and failed evaluation batches of 16 and 64 at the 16,777,216-contribution
-  plan cap. This turns contraction planning and launch count into measured
-  framework limits rather than inferred performance concerns.
+  train/evaluation overlap. That run measured only 8% peak GPU utilization and
+  exposed the former 16,777,216-contribution convolution-plan cap. Convolution
+  now computes unfold/col2im indices from compact geometry; its exact
+  128x32x32x32 depthwise acceptance completes forward and backward without a
+  per-contribution index allocation. The materialized patch tensor and eager
+  launch/composition costs remain measured performance work.
 - The outside Chess acceptance composes bidirectional attention,
   input-dependent geometric bias, policy and value heads, AdamW, exact finite
   passes, and game-disjoint evaluation. Its bounded smoke passes; it makes no

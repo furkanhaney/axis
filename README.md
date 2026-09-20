@@ -117,6 +117,8 @@ throughput success claim.
   scalar loss reduction.
 - `Linear`, `PopulationLinear`, `Conv2d` with stride, symmetric padding, and
   grouped/depthwise channels, `LayerNorm`, `ReLU`, `GELU`, and `Sequential`.
+- Compact implicit Conv2d patch extraction and deterministic col2im, including
+  plans larger than the generic 16,777,216-contribution ceiling.
 - Device-resident SGD, Adam, and AdamW. Adam can assign one learning rate to
   each member of a named population axis.
 - Finite datasets, generated streams, exact shuffled passes, single-pass and
