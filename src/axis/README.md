@@ -1,5 +1,7 @@
 # Axis
 
+[![Latest version](https://img.shields.io/crates/v/axis.svg)](https://crates.io/crates/axis)
+
 Axis is an experimental Rust machine-learning library built on NVIDIA
 [cuTile Rust](https://github.com/NVlabs/cutile-rs). Tensor dimensions have
 identities, not positions: a `batch` axis cannot silently become a `class`
@@ -39,6 +41,10 @@ fn main() -> Result<()> {
 Axis requires Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile,
 `libclang`, and CUDA 13.2 or newer. It is early research software: APIs may
 change as real training programs expose better defaults and abstractions.
+
+```bash
+cargo add axis@0.1.0
+```
 
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
 CNN, attention, generated-data, MNIST, and research-script migrations with

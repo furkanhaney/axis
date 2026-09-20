@@ -1,11 +1,13 @@
 # Axis
 
+[![Latest version](https://img.shields.io/crates/v/axis.svg)](https://crates.io/crates/axis)
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-b7410e?logo=rust)](https://www.rust-lang.org/)
 [![CUDA 13.2](https://img.shields.io/badge/CUDA-13.2-76b900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 [![cuTile 0.3.1](https://img.shields.io/badge/cuTile-0.3.1-5b5bd6)](https://github.com/NVlabs/cutile-rs)
 [![License: MIT](https://img.shields.io/badge/license-MIT-0b7285)](LICENSE.md)
 ![Experimental](https://img.shields.io/badge/status-experimental-f59e0b)
 
+[crates.io](https://crates.io/crates/axis) · [v0.1.0 release](https://github.com/furkanhaney/axis/releases/tag/v0.1.0) ·
 [Why Axis](docs/thesis.md) · [Library contract](docs/library.md) ·
 [Contributing](CONTRIBUTING.md) · [License](LICENSE.md)
 
@@ -22,10 +24,15 @@ is reduced by accident, or a population of models quietly shares one set of
 weights—and the loss still goes down. Axis treats those as executable contracts.
 
 > **Project status:** Axis is active experimental research software. It is
-> CUDA-only, is not yet published as a crate, and its API can change as new
-> consumer programs expose better boundaries. The repository records measured
-> witnesses, but does not claim production readiness or framework-wide
-> performance parity.
+> CUDA-only, and its API can change as new consumer programs expose better
+> boundaries. The repository records measured witnesses, but does not claim
+> production readiness or framework-wide performance parity.
+
+Add the current crates.io release to a Rust project:
+
+```bash
+cargo add axis@0.1.0
+```
 
 ## A training loop
 
