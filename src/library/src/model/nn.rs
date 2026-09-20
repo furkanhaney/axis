@@ -316,9 +316,10 @@ impl Module for PopulationLinear {
 ///
 /// Padding is symmetric and may produce windows containing only zeros.
 /// Dilation and asymmetric padding are not currently supported. The cuTile
-/// backend materializes a generic indexed patch tensor before its tiled
-/// grouped contraction, so this is a correctness path rather than a fused or
-/// throughput-competitive convolution kernel.
+/// backend computes patch indices from compact geometry and uses deterministic
+/// input-centric col2im for its derivative. It still materializes the patch
+/// tensor before tiled grouped contraction, so this is a correctness path
+/// rather than a fused or throughput-competitive convolution kernel.
 pub struct Conv2d {
     input: Axis,
     output: Dim,

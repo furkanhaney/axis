@@ -1,7 +1,7 @@
 use crate::{
     Axis, Device, Dim, IntoAxes, Result, Shape,
     axis::Layout,
-    backend::{Buffer, Plan},
+    backend::{Buffer, Plan, Unfold2dSpec},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -28,7 +28,7 @@ struct GatherPlans {
 
 #[derive(Clone)]
 enum UnfoldPlans {
-    Gather(GatherPlans),
+    Implicit(Rc<Unfold2dSpec>),
     Zero,
 }
 
@@ -64,6 +64,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static UNFOLD_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static UNFOLD_PLAN_METADATA_MAX: Cell<usize> = const { Cell::new(0) };
 }
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
@@ -134,6 +135,7 @@ enum Rule {
         plan: Rc<Plan>,
         winners: Buffer,
     },
+    Unfold2d(Rc<Unfold2dSpec>),
 }
 impl Edge {
     fn new(input: &Tensor, rule: Rule) -> Self {
@@ -425,23 +427,19 @@ impl Tensor {
             None,
         ))
     }
-    fn gathered_with_plans(&self, shape: Shape, plans: GatherPlans) -> Result<Self> {
-        let value = self
-            .device()
-            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
-        let edges = self.requires_grad().then(|| {
-            Edge::new(
-                self,
-                Rule::Group {
-                    plan: plans.reverse,
-                    rhs: None,
-                    factor: 1.0,
-                },
-            )
-        });
+    fn unfolded_with_spec(
+        &self,
+        shape: Shape,
+        layout: Layout,
+        spec: Rc<Unfold2dSpec>,
+    ) -> Result<Self> {
+        let value = self.device().unfold2d(&self.0.value, spec.as_ref())?;
+        let edges = self
+            .requires_grad()
+            .then(|| Edge::new(self, Rule::Unfold2d(spec)));
         Ok(Self::node(
-            shape.clone(),
-            Layout::contiguous(&shape),
+            shape,
+            layout,
             value,
             self.device(),
             edges.into_iter().collect(),
@@ -449,14 +447,14 @@ impl Tensor {
             None,
         ))
     }
-    fn zero_gathered(&self, shape: Shape) -> Result<Self> {
+    fn zero_gathered(&self, shape: Shape, layout: Layout) -> Result<Self> {
         let value = self.device().zeros_buffer(shape.len())?;
         let edges = self
             .requires_grad()
             .then(|| Edge::new(self, Rule::Zero(self.shape().len())));
         Ok(Self::node(
             shape.clone(),
-            Layout::contiguous(&shape),
+            layout,
             value,
             self.device(),
             edges.into_iter().collect(),
@@ -467,6 +465,14 @@ impl Tensor {
     #[cfg(test)]
     pub(crate) fn unfold_plan_build_count() -> usize {
         UNFOLD_PLAN_BUILDS.with(Cell::get)
+    }
+    #[cfg(test)]
+    pub(crate) fn unfold_plan_metadata_max() -> usize {
+        UNFOLD_PLAN_METADATA_MAX.with(Cell::get)
+    }
+    #[cfg(test)]
+    pub(crate) fn layout_strides(&self) -> &[usize] {
+        &self.0.layout.strides
     }
     fn align(&self, shape: &Shape) -> Result<Self> {
         let started = Instant::now();
@@ -1115,6 +1121,9 @@ impl Tensor {
                     .ok_or("unfold2d padding overflow")?,
             )
             .ok_or("unfold2d padded width overflow")?;
+        if padded_height > i32::MAX as usize || padded_width > i32::MAX as usize {
+            return Err("unfold2d padded spatial extent exceeds the i32 kernel index range".into());
+        }
         if kernel[0] > padded_height || kernel[1] > padded_width {
             return Err("unfold2d kernel exceeds the padded spatial extent".into());
         }
@@ -1157,92 +1166,137 @@ impl Tensor {
             padding,
             group,
         );
+        let mut output_order = vec![];
+        if let Some(group) = group {
+            output_order.push(group.axis);
+        }
+        output_order.extend(
+            shape
+                .axes()
+                .into_iter()
+                .filter(|axis| Some(*axis) != group.map(|dim| dim.axis) && *axis != patch.axis),
+        );
+        output_order.push(patch.axis);
+        let output_layout = Layout::new(&shape, &output_order)?;
+        const TILE_TAIL: usize = 127;
+        if self.shape().len() > i32::MAX as usize - TILE_TAIL
+            || shape.len() > i32::MAX as usize - TILE_TAIL
+        {
+            return Err("unfold2d tensor is too large for its 128-lane index arithmetic".into());
+        }
         if let Some(plans) = UNFOLD_PLANS.with(|cache| cache.borrow().get(&key).cloned()) {
             return match plans {
-                UnfoldPlans::Gather(plans) => self.gathered_with_plans(shape, plans),
-                UnfoldPlans::Zero => self.zero_gathered(shape),
+                UnfoldPlans::Implicit(spec) => self.unfolded_with_spec(shape, output_layout, spec),
+                UnfoldPlans::Zero => self.zero_gathered(shape, output_layout),
             };
         }
-        #[cfg(test)]
-        UNFOLD_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
-        let patch_index = shape.index(patch.axis)?;
-        let output_height_index = shape.index(spatial[0])?;
-        let output_width_index = shape.index(spatial[1])?;
-        let group_index = group.map(|dim| shape.index(dim.axis)).transpose()?;
-        let map = (0..shape.len())
-            .map(|i| {
-                let output = shape.coords(i);
-                let flattened = output[patch_index];
-                let kx = flattened % kernel[1];
-                let rest = flattened / kernel[1];
-                let ky = rest % kernel[0];
-                let channel_in_group = rest / kernel[0];
-                let channel = group_index
-                    .map(|index| output[index] * channels_per_group)
-                    .unwrap_or(0)
-                    + channel_in_group;
-                let padded_y = output[output_height_index] * stride[0] + ky;
-                let padded_x = output[output_width_index] * stride[1] + kx;
-                let input_y = padded_y.checked_sub(padding[0]);
-                let input_x = padded_x.checked_sub(padding[1]);
-                if input_y.is_none_or(|y| y >= input_height)
-                    || input_x.is_none_or(|x| x >= input_width)
-                {
-                    return None;
-                }
-                let input = self
-                    .shape()
-                    .dims()
-                    .iter()
-                    .map(|dim| {
-                        if dim.axis == channels {
-                            channel
-                        } else if dim.axis == spatial[0] {
-                            input_y.expect("validated")
-                        } else if dim.axis == spatial[1] {
-                            input_x.expect("validated")
-                        } else {
-                            output[shape.index(dim.axis).expect("retained axis")]
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                Some(self.0.layout.offset(&input))
+        let y_has_input = (0..output_height).any(|output| {
+            (0..kernel[0]).any(|offset| {
+                (output * stride[0] + offset)
+                    .checked_sub(padding[0])
+                    .is_some_and(|input| input < input_height)
             })
-            .collect::<Vec<_>>();
-        if map.iter().all(Option::is_none) {
+        });
+        let x_has_input = (0..output_width).any(|output| {
+            (0..kernel[1]).any(|offset| {
+                (output * stride[1] + offset)
+                    .checked_sub(padding[1])
+                    .is_some_and(|input| input < input_width)
+            })
+        });
+        if !y_has_input || !x_has_input {
+            let result = self.zero_gathered(shape, output_layout)?;
             UNFOLD_PLANS.with(|cache| {
                 cache.borrow_mut().insert(key, UnfoldPlans::Zero);
             });
-            return self.zero_gathered(shape);
+            #[cfg(test)]
+            UNFOLD_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
+            return Ok(result);
         }
-        let dense = map.iter().all(Option::is_some);
-        let forward = if dense {
-            let indices: Vec<_> = map.iter().copied().map(Option::unwrap).collect();
-            Rc::new(Plan::gather(&indices)?)
-        } else {
-            Rc::new(Plan::groups(
-                map.iter()
-                    .map(|input| input.map(|index| vec![(index, 0)]).unwrap_or_default())
-                    .collect(),
-                false,
-            )?)
-        };
-        let mut reverse = vec![vec![]; self.shape().len()];
-        for (output, input) in map.into_iter().enumerate() {
-            if let Some(input) = input {
-                reverse[input].push((output, 0));
-            }
+
+        let to_i32 = |value: usize| -> Result<i32> { Ok(i32::try_from(value)?) };
+        let mut forward_metadata = Vec::with_capacity(shape.rank() * 4);
+        for (index, dim) in shape.dims().iter().enumerate() {
+            let (input_stride, role) = if dim.axis == spatial[0] {
+                (0, 1)
+            } else if dim.axis == spatial[1] {
+                (0, 2)
+            } else if group.is_some_and(|group| dim.axis == group.axis) {
+                (0, 3)
+            } else if dim.axis == patch.axis {
+                (0, 4)
+            } else {
+                let input_index = self.shape().index(dim.axis)?;
+                (to_i32(self.0.layout.strides[input_index])?, 0)
+            };
+            forward_metadata.extend([
+                to_i32(dim.extent)?,
+                to_i32(output_layout.strides[index])?,
+                input_stride,
+                role,
+            ]);
         }
-        let plans = GatherPlans {
-            forward,
-            reverse: Rc::new(Plan::groups(reverse, false)?),
-        };
+        let mut backward_metadata = Vec::with_capacity(self.shape().rank() * 4);
+        for (index, dim) in self.shape().dims().iter().enumerate() {
+            let (output_stride, role) = if dim.axis == channels {
+                (0, 1)
+            } else if dim.axis == spatial[0] {
+                (0, 2)
+            } else if dim.axis == spatial[1] {
+                (0, 3)
+            } else {
+                let output_index = shape.index(dim.axis)?;
+                (to_i32(output_layout.strides[output_index])?, 0)
+            };
+            backward_metadata.extend([
+                to_i32(dim.extent)?,
+                to_i32(self.0.layout.strides[index])?,
+                output_stride,
+                role,
+            ]);
+        }
+        let input_stride =
+            |axis| -> Result<i32> { to_i32(self.0.layout.strides[self.shape().index(axis)?]) };
+        let output_stride =
+            |axis| -> Result<i32> { to_i32(output_layout.strides[shape.index(axis)?]) };
+        let spec = Rc::new(Unfold2dSpec {
+            input_len: self.shape().len(),
+            output_len: shape.len(),
+            input_rank: to_i32(self.shape().rank())?,
+            output_rank: to_i32(shape.rank())?,
+            forward_metadata,
+            backward_metadata,
+            channels_per_group: to_i32(channels_per_group)?,
+            kernel: [to_i32(kernel[0])?, to_i32(kernel[1])?],
+            stride: [to_i32(stride[0])?, to_i32(stride[1])?],
+            padding: [to_i32(padding[0])?, to_i32(padding[1])?],
+            input_spatial: [to_i32(input_height)?, to_i32(input_width)?],
+            output_spatial: [to_i32(output_height)?, to_i32(output_width)?],
+            input_special_strides: [
+                input_stride(channels)?,
+                input_stride(spatial[0])?,
+                input_stride(spatial[1])?,
+            ],
+            output_special_strides: [
+                output_stride(spatial[0])?,
+                output_stride(spatial[1])?,
+                group.map_or(Ok(0), |group| output_stride(group.axis))?,
+                output_stride(patch.axis)?,
+            ],
+        });
+        let result = self.unfolded_with_spec(shape, output_layout, spec.clone())?;
         UNFOLD_PLANS.with(|cache| {
             cache
                 .borrow_mut()
-                .insert(key, UnfoldPlans::Gather(plans.clone()));
+                .insert(key, UnfoldPlans::Implicit(spec.clone()));
         });
-        self.gathered_with_plans(shape, plans)
+        #[cfg(test)]
+        {
+            UNFOLD_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
+            UNFOLD_PLAN_METADATA_MAX
+                .with(|maximum| maximum.set(maximum.get().max(spec.metadata_len())));
+        }
+        Ok(result)
     }
     /// Sum the named shared axes; align remaining shared axes, retain distinct ones.
     pub fn contract(&self, rhs: &Self, axes: impl IntoAxes) -> Result<Self> {
@@ -1710,6 +1764,9 @@ impl Tensor {
                             let expanded =
                                 self.device().grouped(&gradient, None, plan.as_ref(), 1.0)?;
                             self.device().mask_gradient(&expanded, winners)?
+                        }
+                        Rule::Unfold2d(spec) => {
+                            self.device().unfold2d_backward(&gradient, spec.as_ref())?
                         }
                     };
                     let id = edge.input.0.id;

@@ -97,15 +97,25 @@ contraction, mask, softmax, and value-contraction operations rather than using
 a fused attention kernel. Multi-axis contractions still use the generic plan
 path.
 
-Configured convolution currently lowers padding/stride to a CPU-built gather
-plan cached by named shapes, layout, and convolution configuration, then lowers
-each channel group to the batched single-axis contraction.
-The contraction and both of its derivatives use tiled matrix multiplication,
-but patch extraction and col2im remain generic indexed kernels. This path
-establishes exact semantics and autodiff; it is not a fused or direct
+Configured convolution lowers padding and stride through a compact
+`Unfold2dSpec`, then lowers each channel group to the batched single-axis
+contraction. The 128-lane patch kernel computes source indices from O(rank)
+metadata and writes group-major, matrix-ready storage while preserving the
+logical named shape. Reverse mode is an input-centric deterministic col2im:
+each physical input element enumerates its contributing windows and is written
+once, without atomics or a reverse index allocation. The contraction and both
+of its derivatives use tiled matrix multiplication.
+
+This removes convolution's former 16,777,216-contribution plan limit and the
+much larger host/device index allocations behind it. The materialized patch
+tensor remains: for example, `[batch=128, channel=32, height=32, width=32]`
+with a 3x3 depthwise kernel contains 37,748,736 FP32 patch values (144 MiB).
+The path establishes exact semantics and autodiff; it is not a fused or direct
 convolution implementation and has not established competitive CNN throughput.
-Its patch plan inherits the 16,777,216-contribution limit. Fully padded windows
-produce exact zeros without indexing the input.
+Fully padded windows produce exact zeros without indexing the input. Because
+the cuTile kernels use signed 32-bit coordinates, both composite padded spatial
+extents must fit `i32`; larger geometry is rejected before a plan is cached or
+a patch output is allocated.
 
 `Device::cuda_bf16` is an explicit mixed-precision policy: matrix-product
 inputs are rounded to BF16 inside the kernel and accumulated into FP32. Stored
