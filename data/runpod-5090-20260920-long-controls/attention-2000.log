@@ -1,0 +1,50 @@
+   Compiling attention v0.1.0 (/workspace/axis/src/attention)
+    Finished `release` profile [optimized] target(s) in 0.58s
+     Running `target/release/axis-attention --steps 2000`
+initial train_mse=4.30e-1 validation_mse=5.12e-1
+step=1 pre_update_train_mse=4.30e-1
+step=50 pre_update_train_mse=6.91e-2
+step=100 pre_update_train_mse=4.44e-2
+step=150 pre_update_train_mse=2.92e-2
+step=200 pre_update_train_mse=1.82e-2
+step=250 pre_update_train_mse=1.16e-2
+step=300 pre_update_train_mse=7.79e-3
+step=350 pre_update_train_mse=5.69e-3
+step=400 pre_update_train_mse=4.46e-3
+step=450 pre_update_train_mse=3.63e-3
+step=500 pre_update_train_mse=2.99e-3
+step=550 pre_update_train_mse=2.48e-3
+step=600 pre_update_train_mse=2.06e-3
+step=650 pre_update_train_mse=1.72e-3
+step=700 pre_update_train_mse=1.45e-3
+step=750 pre_update_train_mse=1.23e-3
+step=800 pre_update_train_mse=1.06e-3
+step=850 pre_update_train_mse=9.24e-4
+step=900 pre_update_train_mse=8.14e-4
+step=950 pre_update_train_mse=7.25e-4
+step=1000 pre_update_train_mse=6.52e-4
+step=1050 pre_update_train_mse=5.92e-4
+step=1100 pre_update_train_mse=5.41e-4
+step=1150 pre_update_train_mse=4.97e-4
+step=1200 pre_update_train_mse=4.60e-4
+step=1250 pre_update_train_mse=4.27e-4
+step=1300 pre_update_train_mse=3.99e-4
+step=1350 pre_update_train_mse=3.74e-4
+step=1400 pre_update_train_mse=3.51e-4
+step=1450 pre_update_train_mse=3.31e-4
+step=1500 pre_update_train_mse=3.13e-4
+step=1550 pre_update_train_mse=2.96e-4
+step=1600 pre_update_train_mse=2.81e-4
+step=1650 pre_update_train_mse=2.68e-4
+step=1700 pre_update_train_mse=2.55e-4
+step=1750 pre_update_train_mse=2.43e-4
+step=1800 pre_update_train_mse=2.33e-4
+step=1850 pre_update_train_mse=2.23e-4
+step=1900 pre_update_train_mse=2.14e-4
+step=1950 pre_update_train_mse=2.05e-4
+step=2000 pre_update_train_mse=1.97e-4
+final train_mse=1.97e-4 validation_mse=6.50e-4
+PASS: causal attention learned prefix means on cuTile
+real 21.12
+user 20.20
+sys 1.85

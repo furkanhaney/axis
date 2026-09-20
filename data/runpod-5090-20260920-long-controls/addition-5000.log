@@ -1,0 +1,302 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cfg-if v1.0.5
+  Downloaded block-buffer v0.10.4
+  Downloaded crypto-common v0.1.7
+  Downloaded cpufeatures v0.2.17
+  Downloaded futures-macro v0.3.34
+  Downloaded itoa v1.0.18
+  Downloaded rustc-hash v2.1.3
+  Downloaded futures-core v0.3.34
+  Downloaded oxide-artifacts v0.2.1
+  Downloaded thiserror v1.0.69
+  Downloaded anyhow v1.0.104
+  Downloaded autocfg v1.5.1
+  Downloaded lazycell v1.3.0
+  Downloaded generic-array v0.14.7
+  Downloaded lock_api v0.4.14
+  Downloaded phf_generator v0.11.3
+  Downloaded cuda-bindings v0.3.1
+  Downloaded either v1.18.0
+  Downloaded linkme v0.3.37
+  Downloaded thiserror-impl v1.0.69
+  Downloaded crossbeam-utils v0.8.23
+  Downloaded linkme-impl v0.3.37
+  Downloaded equivalent v1.0.2
+  Downloaded scopeguard v1.2.0
+  Downloaded errno v0.3.14
+  Downloaded futures-io v0.3.34
+  Downloaded futures-task v0.3.34
+  Downloaded home v0.5.12
+  Downloaded siphasher v1.0.3
+  Downloaded cuda-core-derive v0.3.1
+  Downloaded futures-sink v0.3.34
+  Downloaded glob v0.3.4
+  Downloaded lazy_static v1.5.0
+  Downloaded phf v0.11.3
+  Downloaded phf_shared v0.11.3
+  Downloaded rustc-hash v1.1.0
+  Downloaded shlex v1.3.0
+  Downloaded stacker v0.1.25
+  Downloaded clang-sys v1.9.1
+  Downloaded foldhash v0.1.5
+  Downloaded sha2 v0.10.9
+  Downloaded smallvec v1.16.1
+  Downloaded typenum v1.20.1
+  Downloaded convert_case v0.8.0
+  Downloaded digest v0.10.7
+  Downloaded futures v0.3.34
+  Downloaded futures-channel v0.3.34
+  Downloaded parking_lot_core v0.9.12
+  Downloaded phf_macros v0.11.3
+  Downloaded proc-macro2 v1.0.107
+  Downloaded quote v1.0.47
+  Downloaded rand_core v0.6.4
+  Downloaded shlex v2.0.1
+  Downloaded slab v0.4.12
+  Downloaded which v4.4.2
+  Downloaded cexpr v0.6.0
+  Downloaded dashmap v6.2.1
+  Downloaded find-msvc-tools v0.1.13
+  Downloaded futures-executor v0.3.34
+  Downloaded half v2.7.1
+  Downloaded libloading v0.8.9
+  Downloaded log v0.4.34
+  Downloaded once_cell v1.21.4
+  Downloaded pin-project-lite v0.2.17
+  Downloaded psm v0.1.32
+  Downloaded serde v1.0.229
+  Downloaded serde_core v1.0.229
+  Downloaded serde_derive v1.0.229
+  Downloaded unicode-ident v1.0.26
+  Downloaded version_check v0.9.5
+  Downloaded zmij v1.0.23
+  Downloaded ar_archive_writer v0.5.3
+  Downloaded bitflags v2.13.2
+  Downloaded crc32fast v1.5.2
+  Downloaded getrandom v0.4.3
+  Downloaded minimal-lexical v0.2.1
+  Downloaded num-traits v0.2.19
+  Downloaded cutile-macro v0.3.1
+  Downloaded indexmap v2.14.2
+  Downloaded prettyplease v0.2.37
+  Downloaded rand v0.8.8
+  Downloaded cutile-ir v0.3.1
+  Downloaded uuid v1.26.1
+  Downloaded memchr v2.8.3
+  Downloaded cc v1.4.7
+  Downloaded cuda-async v0.3.1
+  Downloaded cuda-core v0.3.1
+  Downloaded hashbrown v0.15.5
+  Downloaded nom v7.1.3
+  Downloaded serde_json v1.0.151
+  Downloaded aho-corasick v1.1.5
+  Downloaded futures-util v0.3.34
+  Downloaded hashbrown v0.17.1
+  Downloaded itertools v0.12.1
+  Downloaded itertools v0.14.0
+  Downloaded regex v1.13.1
+  Downloaded zerocopy-derive v0.8.57
+  Downloaded hashbrown v0.14.5
+  Downloaded bindgen v0.69.5
+  Downloaded cutile v0.3.1
+  Downloaded syn v2.0.119
+  Downloaded object v0.36.7
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustix v0.38.44
+  Downloaded cutile-compiler v0.3.1
+  Downloaded object v0.39.1
+  Downloaded zerocopy v0.8.57
+  Downloaded syn v3.0.6
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded regex-automata v0.4.18
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.4.15
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling memchr v2.8.3
+   Compiling libc v0.2.189
+   Compiling cfg-if v1.0.5
+   Compiling glob v0.3.4
+   Compiling prettyplease v0.2.37
+   Compiling rustix v0.38.44
+   Compiling version_check v0.9.5
+   Compiling either v1.18.0
+   Compiling crc32fast v1.5.2
+   Compiling zerocopy v0.8.57
+   Compiling regex-syntax v0.8.11
+   Compiling bitflags v2.13.2
+   Compiling linux-raw-sys v0.4.15
+   Compiling minimal-lexical v0.2.1
+   Compiling shlex v2.0.1
+   Compiling home v0.5.12
+   Compiling bindgen v0.69.5
+   Compiling find-msvc-tools v0.1.13
+   Compiling log v0.4.34
+   Compiling libloading v0.8.9
+   Compiling lazycell v1.3.0
+   Compiling object v0.39.1
+   Compiling shlex v1.3.0
+   Compiling rustc-hash v1.1.0
+   Compiling object v0.36.7
+   Compiling lazy_static v1.5.0
+   Compiling cc v1.4.7
+   Compiling thiserror v1.0.69
+   Compiling itertools v0.12.1
+   Compiling crossbeam-utils v0.8.23
+   Compiling parking_lot_core v0.9.12
+   Compiling anyhow v1.0.104
+   Compiling cuda-core v0.3.1
+   Compiling getrandom v0.4.3
+   Compiling generic-array v0.14.7
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling typenum v1.20.1
+   Compiling futures-sink v0.3.34
+   Compiling clang-sys v1.9.1
+   Compiling foldhash v0.1.5
+   Compiling linkme-impl v0.3.37
+   Compiling linkme v0.3.37
+   Compiling futures-core v0.3.34
+   Compiling hashbrown v0.15.5
+   Compiling futures-channel v0.3.34
+   Compiling futures-task v0.3.34
+   Compiling aho-corasick v1.1.5
+   Compiling nom v7.1.3
+   Compiling futures-io v0.3.34
+   Compiling pin-project-lite v0.2.17
+   Compiling slab v0.4.12
+   Compiling siphasher v1.0.3
+   Compiling smallvec v1.16.1
+   Compiling scopeguard v1.2.0
+   Compiling indexmap v2.14.2
+   Compiling cutile-compiler v0.3.1
+   Compiling rand_core v0.6.4
+   Compiling syn v2.0.119
+   Compiling syn v3.0.6
+   Compiling lock_api v0.4.14
+   Compiling phf_shared v0.11.3
+   Compiling rand v0.8.8
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling hashbrown v0.14.5
+   Compiling phf_generator v0.11.3
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling stacker v0.1.25
+   Compiling digest v0.10.7
+   Compiling cpufeatures v0.2.17
+   Compiling autocfg v1.5.1
+   Compiling regex-automata v0.4.18
+   Compiling rustc-hash v2.1.3
+   Compiling dashmap v6.2.1
+   Compiling zmij v1.0.23
+   Compiling sha2 v0.10.9
+   Compiling which v4.4.2
+   Compiling cexpr v0.6.0
+   Compiling num-traits v0.2.19
+   Compiling uuid v1.26.1
+   Compiling serde v1.0.229
+   Compiling unicode-segmentation v1.13.3
+   Compiling serde_json v1.0.151
+   Compiling itertools v0.14.0
+   Compiling itoa v1.0.18
+   Compiling convert_case v0.8.0
+   Compiling futures-macro v0.3.34
+   Compiling serde_derive v1.0.229
+   Compiling regex v1.13.1
+   Compiling ar_archive_writer v0.5.3
+   Compiling futures-util v0.3.34
+   Compiling psm v0.1.32
+   Compiling zerocopy-derive v0.8.57
+   Compiling thiserror-impl v1.0.69
+   Compiling cuda-core-derive v0.3.1
+   Compiling phf_macros v0.11.3
+   Compiling oxide-artifacts v0.2.1
+   Compiling phf v0.11.3
+   Compiling futures-executor v0.3.34
+   Compiling futures v0.3.34
+   Compiling cuda-bindings v0.3.1
+   Compiling half v2.7.1
+   Compiling cutile-ir v0.3.1
+   Compiling cuda-async v0.3.1
+   Compiling cutile-macro v0.3.1
+   Compiling cutile v0.3.1
+   Compiling axis v0.1.0 (/workspace/axis/src/axis)
+   Compiling addition v0.1.0 (/workspace/axis/src/addition)
+    Finished `release` profile [optimized] target(s) in 29.02s
+     Running `target/release/addition-train --steps 5000`
+initial evaluation_mse=0.80632222
+step=1 samples=256 pre_update_mse=0.67623574
+step=100 samples=25600 pre_update_mse=0.00242190
+step=200 samples=51200 pre_update_mse=0.01286699
+step=300 samples=76800 pre_update_mse=0.00441917
+step=400 samples=102400 pre_update_mse=0.00270581
+step=500 samples=128000 pre_update_mse=0.00372967
+step=600 samples=153600 pre_update_mse=0.00201288
+step=700 samples=179200 pre_update_mse=0.00250447
+step=800 samples=204800 pre_update_mse=0.00067885
+step=900 samples=230400 pre_update_mse=0.00251372
+step=1000 samples=256000 pre_update_mse=0.00133851
+step=1100 samples=281600 pre_update_mse=0.00205628
+step=1200 samples=307200 pre_update_mse=0.00089284
+step=1300 samples=332800 pre_update_mse=0.00224872
+step=1400 samples=358400 pre_update_mse=0.00162257
+step=1500 samples=384000 pre_update_mse=0.00107142
+step=1600 samples=409600 pre_update_mse=0.00135617
+step=1700 samples=435200 pre_update_mse=0.00080374
+step=1800 samples=460800 pre_update_mse=0.00083246
+step=1900 samples=486400 pre_update_mse=0.00072866
+step=2000 samples=512000 pre_update_mse=0.00048861
+step=2100 samples=537600 pre_update_mse=0.00269341
+step=2200 samples=563200 pre_update_mse=0.00015015
+step=2300 samples=588800 pre_update_mse=0.00022504
+step=2400 samples=614400 pre_update_mse=0.00378186
+step=2500 samples=640000 pre_update_mse=0.00010233
+step=2600 samples=665600 pre_update_mse=0.00032423
+step=2700 samples=691200 pre_update_mse=0.00109139
+step=2800 samples=716800 pre_update_mse=0.00034506
+step=2900 samples=742400 pre_update_mse=0.00141507
+step=3000 samples=768000 pre_update_mse=0.00005933
+step=3100 samples=793600 pre_update_mse=0.00110491
+step=3200 samples=819200 pre_update_mse=0.00049681
+step=3300 samples=844800 pre_update_mse=0.00015746
+step=3400 samples=870400 pre_update_mse=0.00023220
+step=3500 samples=896000 pre_update_mse=0.00172507
+step=3600 samples=921600 pre_update_mse=0.00010032
+step=3700 samples=947200 pre_update_mse=0.00006378
+step=3800 samples=972800 pre_update_mse=0.00078628
+step=3900 samples=998400 pre_update_mse=0.00099178
+step=4000 samples=1024000 pre_update_mse=0.00015048
+step=4100 samples=1049600 pre_update_mse=0.00034792
+step=4200 samples=1075200 pre_update_mse=0.00119339
+step=4300 samples=1100800 pre_update_mse=0.00015102
+step=4400 samples=1126400 pre_update_mse=0.00061550
+step=4500 samples=1152000 pre_update_mse=0.00069068
+step=4600 samples=1177600 pre_update_mse=0.00033508
+step=4700 samples=1203200 pre_update_mse=0.00008580
+step=4800 samples=1228800 pre_update_mse=0.00016624
+step=4900 samples=1254400 pre_update_mse=0.00036618
+step=5000 samples=1280000 pre_update_mse=0.00126910
+final evaluation_mse=0.00122140 elapsed_s=15.57
+IDR STATUS
+
+samples consumed:      1280000
+unique sample IDs:     1280000
+available population:  generated stream
+observed reuse:         0.0000%
+max observed reuse:     0.0000%
+
+PASS
+TRAIN/EVALUATION DISJOINTNESS
+
+unique training IDs:    1280000
+unique evaluation IDs:  256
+observed overlap:        0
+
+PASS
+PASS: learned addition from fresh samples without epochs
+real 48.78
+user 228.98
+sys 22.67
