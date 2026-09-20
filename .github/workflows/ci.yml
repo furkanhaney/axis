@@ -34,6 +34,9 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v7
 
+      - name: Trust the mounted checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install Rust 1.89
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
