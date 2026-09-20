@@ -1,0 +1,6 @@
+   Compiling axis v0.4.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-launch-gaps/src/library)
+   Compiling perm v0.1.0 (/mnt/fast980/projects/src/rasat/worktrees/research-perm-launch-gaps)
+    Finished `release` profile [optimized + debuginfo] target(s) in 8.86s
+     Running `/mnt/fast980/projects/src/rasat/build/axis-issue-22/release/perm --conv-scale`
+axis=0.4.0 source=path dependency backbone=conv-scale steps=1000 samples=48 seeds=[11]
+backbone=conv-scale method=ordered seed=11 initial=0.285610 final=0.036525 set_mse=0.02987020 ordered_mse=0.08725827 min_center_distance=0.135087 seconds=120.820

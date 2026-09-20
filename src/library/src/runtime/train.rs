@@ -1,5 +1,15 @@
 //! Minimal step ordering shared by concrete training programs.
 use crate::{Adam, AdamW, Module, Result, SGD, Tensor};
+use std::time::Instant;
+
+fn profile(label: &str, started: Instant) {
+    if std::env::var_os("AXIS_PROFILE").is_some() {
+        eprintln!(
+            "axis_profile {label} {:.6}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
 
 pub trait Optimizer {
     fn step<M: Module>(&mut self, model: &mut M) -> Result<()>;
@@ -46,18 +56,28 @@ impl<O: Optimizer> Trainer<O> {
             .completed_steps
             .checked_add(1)
             .ok_or("trainer step count overflow")?;
+        let started = Instant::now();
         model.zero_grad();
+        profile("train_zero_grad", started);
+        let started = Instant::now();
         let loss = loss(model)?;
+        profile("train_loss", started);
         if loss.shape().rank() != 0 {
             return Err(
                 "Trainer loss closure must return a scalar; reduce loss axes explicitly".into(),
             );
         }
+        let started = Instant::now();
         loss.backward()?;
+        profile("train_backward", started);
+        let started = Instant::now();
         self.optimizer.step(model)?;
+        profile("train_optimizer", started);
         // The eager graph enqueues one stream-ordered step. Synchronize once
         // here instead of after every allocation and kernel launch.
+        let started = Instant::now();
         loss.device().synchronize()?;
+        profile("train_boundary", started);
         self.completed_steps = next;
         Ok(TrainStep {
             step: next,

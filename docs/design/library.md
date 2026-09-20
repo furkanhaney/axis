@@ -86,6 +86,13 @@ GEMM implementation. Single-axis contractions take a batched tiled cuTile
 matrix path. Axis caches host plans by named shape and layout, and retains up
 to 256 MiB of uploaded plans per device; larger and one-off plans remain
 step-local so a stable-shape speedup cannot grow device memory without bound.
+Merge plans additionally include the ordered selected axes in their identity
+and retain at most 128 signatures or 256 MiB of plan-vector payload on the host.
+Keys and container overhead are additional, and entries are not evicted. This avoids rebuilding
+large Conv2d channel-flattening maps on every stable-shape forward without
+conflating merges that have equal output shapes but different flattening order.
+The measured execution profile and claim boundary are recorded in
+[the eager execution profile](../backend/execution.md).
 Axis reordering is materialized when the batch, row, reduction, and column
 groups are not already contiguous; this covers both `Linear` and attention.
 Tensors participating in an operation must share the same `Device` handle.
