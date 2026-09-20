@@ -175,7 +175,10 @@ fn main() -> Result<()> {
             "1",
             "ordered pair of f32 operand bit patterns",
         )?,
-        ["training", "evaluation"],
+        [
+            PopulationSpec::streaming("training"),
+            PopulationSpec::retained("evaluation"),
+        ],
     )?;
     disjoint.observe("evaluation", evaluation.samples.iter().map(identity))?;
     let (eval_x, eval_y) = tensors(&evaluation.samples, batch, input, output, &device)?;

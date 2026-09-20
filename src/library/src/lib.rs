@@ -33,7 +33,8 @@ pub use data::{
     FinitePassesLoader, InMemoryDataset, Sample,
 };
 pub use disjointness::{
-    Disjointness, DisjointnessEvidence, DisjointnessReceipt, IdentityScheme, PopulationReceipt,
+    Disjointness, DisjointnessEvidence, DisjointnessReceipt, IdentityScheme, PopulationMode,
+    PopulationReceipt, PopulationSpec,
 };
 pub use metrics::CategoricalAccuracy;
 pub use monotonicity::{
@@ -67,8 +68,8 @@ pub mod prelude {
         DisjointnessReceipt, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, FinitePasses,
         FinitePassesLoader, FinitePassesReceipt, GELU, IdentityScheme, Idr, IdrLimits, IdrReceipt,
         InMemoryDataset, LayerNorm, Linear, Module, MonotoneDirection, MonotonicityLimits,
-        Optimizer, ParamId, Parameter, PopulationLinear, PopulationReceipt, ReLU, RegimeSnapshot,
-        Result, SGD, Sample, Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep,
-        Trainer,
+        Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode, PopulationReceipt,
+        PopulationSpec, ReLU, RegimeSnapshot, Result, SGD, Sample, Sequential, Shape, SinglePass,
+        Standardizer, Tensor, TrainStep, Trainer,
     };
 }

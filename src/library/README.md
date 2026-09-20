@@ -15,8 +15,8 @@ The crate currently provides:
 - device-resident SGD, Adam, and AdamW;
 - generated and finite data loaders with executable single-pass, finite-pass,
   and IDR assertions;
-- versioned semantic identities with verified disjointness across any declared
-  research populations;
+- versioned semantic identities with exact retained-population and
+  bounded-memory streaming disjointness;
 - exact, batch-composable categorical accuracy counts;
 - train-fitted standardization with an explicit variance correction; and
 - empirical monotonicity checks over explicitly ordered input pairs, with

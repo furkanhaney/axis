@@ -12,7 +12,14 @@ let scheme = IdentityScheme::new(
     "1",
     "81 cells after first-occurrence digit relabeling; positions retained",
 )?;
-let mut split = Disjointness::new(scheme, ["training", "tuning", "audit"])?;
+let mut split = Disjointness::new(
+    scheme,
+    [
+        PopulationSpec::streaming("training"),
+        PopulationSpec::retained("tuning"),
+        PopulationSpec::retained("audit"),
+    ],
+)?;
 
 split.observe("tuning", tuning.iter().map(canonical_puzzle))?;
 split.observe("audit", audit.iter().map(canonical_puzzle))?;
@@ -26,11 +33,19 @@ equivalence relation in a versioned `IdentityScheme`. This makes the proof
 boundary visible in the receipt and allows a later canonicalizer change to be
 distinguished from a data change.
 
-Every observation is compared with every other declared population. Repeats
-within one population are allowed and counted separately. If any identity
-crosses a boundary, the complete incoming batch is rejected without changing
-the ledger. `assert_disjoint` also requires at least one observation from every
-declared population, catching misspelled or skipped evaluation paths.
+Retained populations are compared pairwise, and their repeats are counted.
+Exactly one population may instead be `streaming`. Its observations are checked
+against every retained identity and then discarded, so an endless training run
+uses memory proportional to the finite tuning/audit populations. All retained
+populations must be observed before streaming begins and are sealed afterward;
+otherwise later reference data could overlap discarded training history.
+
+Streaming mode deliberately does not claim unique identities or repeat counts
+inside the stream. Pair it with IDR when raw draw reuse matters. If all
+populations are bounded and pairwise history is needed, declare all of them
+retained by passing names directly. In either mode, a contaminated incoming
+batch is rejected without changing the ledger. `assert_disjoint` requires at
+least one observation from every declared population.
 
 The receipt says `VerifiedObservations`: it proves zero equality overlap among
 the identities delivered to this ledger. It does not prove that unobserved data
@@ -40,8 +55,9 @@ guarantee needs a separate proof-producing partition API; a label saying
 “different seed namespaces” is not sufficient when two seeds can generate the
 same semantic problem.
 
-The addition acceptance uses exact operand bit patterns rather than generator
-draw IDs. The Sudoku acceptance uses the clue board after canonical digit
-relabeling. Thus both consumers can detect a duplicate problem even when it was
-drawn under a distinct raw ID, while keeping the identity unit appropriate to
-the experiment.
+The addition acceptance retains exact operand bit patterns for evaluation and
+streams training problems against them. The Sudoku acceptance retains its
+tuning and audit keys while streaming training keys. The Sudoku program owns
+its clue-board canonicalizer; Axis verifies the identities it is given. Both
+consumers can detect a reference problem under a distinct raw draw ID without
+retaining an unbounded training history.
