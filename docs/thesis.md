@@ -49,3 +49,33 @@ evaluation regime
 
 Axis should keep execution inside the region the researcher declared, or stop
 with a useful account of which boundary was crossed.
+
+## Verification is the scarce resource
+
+Code generation makes plausible ML programs cheap. It does not make it cheap to
+know whether a run answered the question its author intended. A loss curve can
+look healthy after a loader wraps, an evaluation population leaks into training,
+a target shifts by the wrong offset, or supposedly equal-compute runs diverge.
+Axis is aimed at that verification bottleneck:
+
+```text
+research intent
+    -> constrained experiment
+    -> tensor program
+    -> GPU
+    -> evidence about what actually ran
+```
+
+Named axes help because they expose more of the mathematics to the compiler and
+reviewer. They are not the entire proposition. The same principle should move a
+known failure left over time: from a surprising result, to a receipt, to a
+runtime assertion, to a static check, and finally to a state the API cannot
+express.
+
+That makes Axis a place to encode scientific culture. Each real migration can
+contribute one durable check for a mistake that an experienced researcher would
+otherwise have to remember. Most checks remain dormant; declaring a causal
+objective, generated-data regime, or equal-compute comparison activates the
+ones that give those words operational meaning. The framework should prevent a
+program from presenting persuasive evidence after its declared regime has
+already failed.
