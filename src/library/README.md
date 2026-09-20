@@ -9,7 +9,8 @@ axis because both happen to have the same extent.
 
 The crate currently provides:
 
-- named-axis tensor algebra and reverse-mode differentiation;
+- named-axis tensor algebra and reverse-mode differentiation, including
+  deterministic finite minimum reductions;
 - `Linear`, `Conv2d`, `LayerNorm`, activations, attention primitives, and
   sequential composition;
 - device-resident SGD, Adam, and AdamW;

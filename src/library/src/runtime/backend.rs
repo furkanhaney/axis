@@ -454,40 +454,7 @@ impl Device {
         scale: f32,
     ) -> Result<Buffer> {
         let started = Instant::now();
-        let upload = |v: &Vec<i32>| -> Result<Arc<cutile::tensor::Tensor<i32>>> {
-            let host = Arc::new(v.clone());
-            let device = Arc::new(api::copy_host_vec_to_device(&host).enqueue_on(&self.0.stream)?);
-            self.0.pending_host_i32.borrow_mut().push(host);
-            self.0.pending_device_i32.borrow_mut().push(device.clone());
-            Ok(device)
-        };
-        let cached = self.0.plans.borrow().get(&plan.id).cloned();
-        let device_plan = match cached {
-            Some(cached) => cached,
-            None => {
-                let uploaded = DevicePlan {
-                    offsets: upload(&plan.offsets)?,
-                    left: upload(&plan.left)?,
-                    right: upload(if b.is_some() { &plan.right } else { &plan.left })?,
-                };
-                let bytes = plan
-                    .offsets
-                    .len()
-                    .saturating_add(plan.left.len())
-                    .saturating_add(if b.is_some() {
-                        plan.right.len()
-                    } else {
-                        plan.left.len()
-                    })
-                    .saturating_mul(std::mem::size_of::<i32>());
-                const PLAN_CACHE_BYTES: usize = 256 * 1024 * 1024;
-                if self.0.plan_bytes.get().saturating_add(bytes) <= PLAN_CACHE_BYTES {
-                    self.0.plan_bytes.set(self.0.plan_bytes.get() + bytes);
-                    self.0.plans.borrow_mut().insert(plan.id, uploaded.clone());
-                }
-                uploaded
-            }
-        };
+        let device_plan = self.device_plan(plan, b.is_some())?;
         let mut out = self.zeros(plan.offsets.len() - 1)?;
         kernels::grouped(
             (&mut out).partition([1]),
@@ -502,6 +469,79 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         profile("grouped_submit", started);
         Ok(self.track(out))
+    }
+
+    /// One minimum per CSR group plus a one-hot winner mask in input storage order.
+    pub(crate) fn grouped_minimum(
+        &self,
+        a: &Buffer,
+        forward: &Plan,
+        reverse: &Plan,
+    ) -> Result<(Buffer, Buffer)> {
+        let forward_plan = self.device_plan(forward, false)?;
+        let reverse_plan = self.device_plan(reverse, false)?;
+        let groups = forward.offsets.len() - 1;
+        let mut out = self.zeros(groups)?;
+        let mut winner_indices = api::zeros::<i32>(&[groups]).enqueue_on(&self.0.stream)?;
+        kernels::grouped_minimum(
+            (&mut out).partition([1]),
+            (&mut winner_indices).partition([1]),
+            a.as_ref(),
+            forward_plan.offsets.as_ref(),
+            forward_plan.left.as_ref(),
+            f32::MIN,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        )
+        .enqueue_on(&self.0.stream)?;
+        let mut winner_mask = self.zeros(a.shape()[0] as usize)?;
+        kernels::minimum_winner_mask(
+            (&mut winner_mask).partition([1]),
+            &winner_indices,
+            reverse_plan.left.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        self.0
+            .pending_device_i32
+            .borrow_mut()
+            .push(Arc::new(winner_indices));
+        Ok((self.track(out), self.track(winner_mask)))
+    }
+
+    fn device_plan(&self, plan: &Plan, product: bool) -> Result<DevicePlan> {
+        let cached = self.0.plans.borrow().get(&plan.id).cloned();
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        let upload = |values: &Vec<i32>| -> Result<Arc<cutile::tensor::Tensor<i32>>> {
+            let host = Arc::new(values.clone());
+            let device = Arc::new(api::copy_host_vec_to_device(&host).enqueue_on(&self.0.stream)?);
+            self.0.pending_host_i32.borrow_mut().push(host);
+            self.0.pending_device_i32.borrow_mut().push(device.clone());
+            Ok(device)
+        };
+        let uploaded = DevicePlan {
+            offsets: upload(&plan.offsets)?,
+            left: upload(&plan.left)?,
+            right: upload(if product { &plan.right } else { &plan.left })?,
+        };
+        let bytes = plan
+            .offsets
+            .len()
+            .saturating_add(plan.left.len())
+            .saturating_add(if product {
+                plan.right.len()
+            } else {
+                plan.left.len()
+            })
+            .saturating_mul(std::mem::size_of::<i32>());
+        const PLAN_CACHE_BYTES: usize = 256 * 1024 * 1024;
+        if self.0.plan_bytes.get().saturating_add(bytes) <= PLAN_CACHE_BYTES {
+            self.0.plan_bytes.set(self.0.plan_bytes.get() + bytes);
+            self.0.plans.borrow_mut().insert(plan.id, uploaded.clone());
+        }
+        Ok(uploaded)
     }
 }
 
@@ -1006,5 +1046,62 @@ mod kernels {
             }
         }
         out.store(sum * broadcast_scalar(scale, shape![1]));
+    }
+
+    #[cutile::entry()]
+    fn grouped_minimum(
+        out: &mut Tensor<f32, { [1] }>,
+        winners: &mut Tensor<i32, { [1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        offsets: &Tensor<i32, { [-1] }>,
+        left: &Tensor<i32, { [-1] }>,
+        minimum_finite: f32,
+        maximum_finite: f32,
+        positive_infinity: f32,
+        no_finite_value: f32,
+    ) {
+        let pid = get_tile_block_id().0;
+        let op = offsets.partition(shape![1]);
+        let start: i32 = tile_to_scalar(op.load([pid]).reshape(shape![]));
+        let end: i32 = tile_to_scalar(op.load([pid + 1i32]).reshape(shape![]));
+        let lp = left.partition(shape![1]);
+        let ap = a.partition(shape![1]);
+        let mut winner = constant(-1i32, shape![1]);
+        let mut minimum = broadcast_scalar(positive_infinity, shape![1]);
+        let finite_low = broadcast_scalar(minimum_finite, shape![1]);
+        let finite_high = broadcast_scalar(maximum_finite, shape![1]);
+        for i in start..end {
+            let candidate: i32 = tile_to_scalar(lp.load([i]).reshape(shape![]));
+            let value = ap.load([candidate]);
+            let finite = ge_tile(value, finite_low) & le_tile(value, finite_high);
+            let better = finite & lt_tile(value, minimum);
+            minimum = select(better, value, minimum);
+            let candidate_tile: Tile<i32, { [1] }> = scalar_to_tile(candidate).reshape(shape![1]);
+            winner = select(better, candidate_tile, winner);
+        }
+        let found = le_tile(minimum, finite_high);
+        winners.store(winner);
+        out.store(select(
+            found,
+            minimum,
+            broadcast_scalar(no_finite_value, shape![1]),
+        ));
+    }
+
+    #[cutile::entry()]
+    fn minimum_winner_mask(
+        out: &mut Tensor<f32, { [1] }>,
+        winners: &Tensor<i32, { [-1] }>,
+        groups: &Tensor<i32, { [-1] }>,
+    ) {
+        let pid = get_tile_block_id().0;
+        let gp = groups.partition(shape![1]);
+        let group: i32 = tile_to_scalar(gp.load([pid]).reshape(shape![]));
+        let wp = winners.partition(shape![1]);
+        let winner = wp.load([group]);
+        let input: Tile<i32, { [1] }> = scalar_to_tile(pid).reshape(shape![1]);
+        let one = constant(1.0f32, shape![1]);
+        let zero = constant(0.0f32, shape![1]);
+        out.store(select(eq_tile(winner, input), one, zero));
     }
 }
