@@ -1,4 +1,4 @@
-/.cuda/
+/build/
 /target/
 
 # Data is local by default. Only compact verification receipts and selected,
@@ -8,6 +8,3 @@
 !**/data/evidence/**
 !**/data/runs/
 !**/data/runs/**
-
-__pycache__/
-*.pyc

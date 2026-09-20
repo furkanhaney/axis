@@ -40,7 +40,7 @@ helper downloads a repository-local toolkit from NVIDIA and verifies the
 archives by SHA-256:
 
 ```bash
-python3 scripts/setup_cuda.py
+bash scripts/setup_cuda.sh
 bash scripts/install_hooks.sh
 bash scripts/check.sh
 ```

@@ -29,7 +29,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl git libclang-dev pkg-config python3
+            build-essential ca-certificates curl git libclang-dev pkg-config
 
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -42,8 +42,8 @@ jobs:
 
       - name: Verify repository structure and setup helper
         run: |
-          python3 scripts/check_structure.py
-          python3 -m unittest discover -s tests
+          bash scripts/check_structure.sh
+          bash tests/setup_cuda.sh
 
       - name: Check formatting
         run: |

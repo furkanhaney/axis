@@ -35,6 +35,10 @@ grouped by research area. The reusable crate groups its own source into
 `algebra/`, `model/`, `research/`, and `runtime/` while keeping their Rust
 modules private and re-exporting the public API from `lib.rs`.
 
+Repository automation under `scripts/` and `tests/` is shell. The structure
+gate rejects Python source and bytecode so a second scripting toolchain cannot
+quietly return.
+
 `data/` is ignored by default. Two descendants are repository artifacts:
 
 - `data/evidence/` for compact audits, oracle comparisons, and verification
@@ -45,7 +49,7 @@ Consumers own their records under their own `data/` directory. Cross-workspace
 records use the root lanes. A transient debug log remains local unless a
 documented claim depends on it.
 
-`scripts/check_structure.py` enforces these rules in the versioned pre-commit
+`scripts/check_structure.sh` enforces these rules in the versioned pre-commit
 hook, the local check, and GitHub CI.
 
 ## Alternatives considered

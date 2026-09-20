@@ -187,10 +187,10 @@ Provision the repository-local CUDA toolkit when the host does not already have
 a compatible toolkit:
 
 ```bash
-python3 scripts/setup_cuda.py
+bash scripts/setup_cuda.sh
 ```
 
-The generated `.cuda/` and Cargo `target/` directories stay local. CUDA's six
+The generated `build/cuda/` and Cargo `target/` directories stay local. CUDA's six
 library aliases are materialized as independent regular files after every
 setup invocation, including when all package markers already match. The setup
 rejects any other symlink in the local toolkit. The only external direct Rust

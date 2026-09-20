@@ -10,7 +10,7 @@ baselines now remain as oracles beside library-based consumers.
 Run from the Axis root:
 
 ```bash
-python3 scripts/compare_trainers.py
+bash scripts/compare_trainers.sh
 ```
 
 The initial census finds **8 identical function definitions, containing 93
