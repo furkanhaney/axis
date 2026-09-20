@@ -104,6 +104,25 @@ parameters, activations outside matrix products, reductions, gradients, and
 Adam state remain FP32. `Device::cuda` retains full FP32 matrix products. This
 keeps precision choice visible in the experiment rather than changing global
 semantics silently.
+
+### Hosted API documentation
+
+Normal Axis builds require CUDA because the cuTile dependency generates its
+bindings from the installed toolkit. docs.rs deliberately provides no CUDA
+toolkit, so its build disables Axis's default `cuda` feature and compiles a
+type-compatible, non-operational backend solely to let rustdoc traverse the
+same public tensor, model, training, and research-contract modules. Axis's
+build script selects that backend only when docs.rs sets `DOCS_RS`; disabling
+default features anywhere else is a compile error. The documentation path is
+therefore not a CPU runtime or an alternate installation mode.
+
+`tests/docsrs.sh` packages Axis first, then tests the artifact that crates.io
+will receive. It proves three boundaries in fresh target directories: rustdoc
+succeeds with both CUDA variables absent under `DOCS_RS`, the default build
+still enters cuTile and reports a missing toolkit, and a no-default-features
+build outside docs.rs is rejected. CI runs this contract on an ordinary Ubuntu
+runner without installing CUDA.
+
 Padding/stride variants, LSTM, and a full Transformer remain future
 slices; their presence in the owner's sketch does not imply implementation.
 

@@ -1,7 +1,11 @@
 //! Experimental training with named axes on a stream-ordered cuTile GPU backend.
 #[path = "algebra/axis.rs"]
 mod axis;
+#[cfg(feature = "cuda")]
 #[path = "runtime/backend.rs"]
+mod backend;
+#[cfg(all(not(feature = "cuda"), axis_docs_rs))]
+#[path = "runtime/backend_docs.rs"]
 mod backend;
 #[path = "research/data.rs"]
 mod data;
@@ -47,6 +51,11 @@ pub use tensor::Tensor;
 pub use train::{Optimizer, TrainStep, Trainer};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[cfg(all(not(feature = "cuda"), not(axis_docs_rs)))]
+compile_error!(
+    "Axis requires its default `cuda` feature; disabling it is reserved for the docs.rs build"
+);
 
 #[cfg(test)]
 mod tests;
