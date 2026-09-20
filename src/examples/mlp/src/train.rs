@@ -68,6 +68,28 @@ fn main() -> Result<()> {
     let initial = loss(&x, &y)?.item()?;
     let initial_valid = loss(&vx, &vy)?.item()?;
     println!("initial train_mse={initial:.8} validation_mse={initial_valid:.8}");
+    let mut train_learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        LearningLimits::any_improvement(),
+        LearningObservation::new(
+            "mean squared error",
+            "fixed training set",
+            "optimizer steps",
+            0,
+            f64::from(initial),
+        )?,
+    )?;
+    let mut validation_learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        LearningLimits::any_improvement(),
+        LearningObservation::new(
+            "mean squared error",
+            "fixed validation set",
+            "optimizer steps",
+            0,
+            f64::from(initial_valid),
+        )?,
+    )?;
     let started = Instant::now();
     for _ in 0..steps {
         let report = trainer.step(&mut model, |model| {
@@ -95,13 +117,23 @@ fn main() -> Result<()> {
         "final train_mse={final_loss:.8} validation_mse={final_valid:.8} elapsed_s={:.2}",
         started.elapsed().as_secs_f64()
     );
-    if !final_loss.is_finite()
-        || !final_valid.is_finite()
-        || final_loss >= initial
-        || final_valid >= initial_valid
-    {
-        return Err("training did not improve both losses".into());
-    }
+    let terminal_step = u64::try_from(steps)?;
+    train_learning.observe(LearningObservation::new(
+        "mean squared error",
+        "fixed training set",
+        "optimizer steps",
+        terminal_step,
+        f64::from(final_loss),
+    )?)?;
+    validation_learning.observe(LearningObservation::new(
+        "mean squared error",
+        "fixed validation set",
+        "optimizer steps",
+        terminal_step,
+        f64::from(final_valid),
+    )?)?;
+    println!("{}", train_learning.assert_learning()?);
+    println!("{}", validation_learning.assert_learning()?);
     println!("PASS: named-axis MLP learned on cuTile");
     Ok(())
 }

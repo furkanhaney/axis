@@ -96,6 +96,28 @@ fn main() -> Result<()> {
     let initial = loss(&model, &x, &y)?;
     let initial_valid = loss(&model, &vx, &vy)?;
     println!("initial train_mse={initial:.2e} validation_mse={initial_valid:.2e}");
+    let mut train_learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        LearningLimits::any_improvement(),
+        LearningObservation::new(
+            "mean squared error",
+            "fixed training set",
+            "optimizer steps",
+            0,
+            f64::from(initial),
+        )?,
+    )?;
+    let mut validation_learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        LearningLimits::any_improvement(),
+        LearningObservation::new(
+            "mean squared error",
+            "fixed validation set",
+            "optimizer steps",
+            0,
+            f64::from(initial_valid),
+        )?,
+    )?;
     for _ in 0..steps {
         let report = trainer.step(&mut model, |model| {
             model
@@ -114,13 +136,23 @@ fn main() -> Result<()> {
     let final_loss = loss(&model, &x, &y)?;
     let final_valid = loss(&model, &vx, &vy)?;
     println!("final train_mse={final_loss:.2e} validation_mse={final_valid:.2e}");
-    if !final_loss.is_finite()
-        || !final_valid.is_finite()
-        || final_loss >= initial
-        || final_valid >= initial_valid
-    {
-        return Err("attention training did not improve both losses".into());
-    }
+    let terminal_step = u64::try_from(steps)?;
+    train_learning.observe(LearningObservation::new(
+        "mean squared error",
+        "fixed training set",
+        "optimizer steps",
+        terminal_step,
+        f64::from(final_loss),
+    )?)?;
+    validation_learning.observe(LearningObservation::new(
+        "mean squared error",
+        "fixed validation set",
+        "optimizer steps",
+        terminal_step,
+        f64::from(final_valid),
+    )?)?;
+    println!("{}", train_learning.assert_learning()?);
+    println!("{}", validation_learning.assert_learning()?);
     println!("PASS: causal attention learned prefix means on cuTile");
     Ok(())
 }

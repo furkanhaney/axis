@@ -11,6 +11,8 @@ mod backend;
 mod data;
 #[path = "research/disjointness.rs"]
 mod disjointness;
+#[path = "research/learning.rs"]
+mod learning;
 #[path = "model/metrics.rs"]
 mod metrics;
 #[path = "research/monotonicity.rs"]
@@ -35,6 +37,10 @@ pub use data::{
 pub use disjointness::{
     Disjointness, DisjointnessEvidence, DisjointnessReceipt, IdentityScheme, PopulationMode,
     PopulationReceipt, PopulationSpec,
+};
+pub use learning::{
+    LearningDirection, LearningEvidence, LearningLimits, LearningObservation, LearningProgress,
+    LearningProgressReceipt,
 };
 pub use metrics::CategoricalAccuracy;
 pub use monotonicity::{
@@ -67,9 +73,10 @@ pub mod prelude {
         DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness, DisjointnessEvidence,
         DisjointnessReceipt, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, FinitePasses,
         FinitePassesLoader, FinitePassesReceipt, GELU, IdentityScheme, Idr, IdrLimits, IdrReceipt,
-        InMemoryDataset, LayerNorm, Linear, Module, MonotoneDirection, MonotonicityLimits,
-        Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode, PopulationReceipt,
-        PopulationSpec, ReLU, RegimeSnapshot, Result, SGD, Sample, Sequential, Shape, SinglePass,
-        Standardizer, Tensor, TrainStep, Trainer,
+        InMemoryDataset, LayerNorm, LearningDirection, LearningEvidence, LearningLimits,
+        LearningObservation, LearningProgress, LearningProgressReceipt, Linear, Module,
+        MonotoneDirection, MonotonicityLimits, Optimizer, ParamId, Parameter, PopulationLinear,
+        PopulationMode, PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, SGD,
+        Sample, Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
     };
 }

@@ -123,6 +123,8 @@ throughput success claim.
   IDR guards, and train/evaluation identity separation.
 - Empirical increasing/decreasing checks over explicitly ordered input pairs,
   with declared tolerance and violation-rate limits and scoped receipts.
+- Empirical learning-progress checks for one named metric and evaluation
+  population, with explicit budget and `VerifiedObservations` receipts.
 - A `Trainer` that fixes update order: clear gradients, construct a fresh loss,
   backpropagate, then update once.
 

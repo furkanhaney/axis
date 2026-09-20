@@ -38,14 +38,21 @@ optimizer
 
 evaluation
     train/evaluation ID overlap           0 VERIFIED
+
+learning progress
+    held-out cross entropy                 2.31 -> 1.84
+    budget                                 0 -> 50,000 samples
+    claim level                            VERIFIED OBSERVATIONS
 ```
 
-`IdrReceipt`, `FinitePassesReceipt`, and `DisjointnessReceipt` are the first
-certificate fragments. None uses a broad PASS to imply unmeasured properties.
-Disjointness records the versioned identity scheme and says
+`IdrReceipt`, `FinitePassesReceipt`, `DisjointnessReceipt`, and
+`LearningProgressReceipt` are the first certificate fragments. None uses a
+broad PASS to imply unmeasured properties. Disjointness records the versioned
+identity scheme and says
 `VerifiedObservations`; exact canonical-key separation does not prove
 distributional independence, and finite-pass accounting does not prove shuffle
-quality.
+quality. Learning progress verifies a declared comparison of caller-supplied
+evaluations; it does not prove convergence or generalization.
 
 ## Claims declare prerequisites
 

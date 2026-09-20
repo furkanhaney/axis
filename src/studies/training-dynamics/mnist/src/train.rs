@@ -209,6 +209,22 @@ fn main() -> Result<()> {
 
     let initial_accuracy = accuracy(&model, &test, batch_axis, input_axis, class_axis, &device)?;
     println!("initial test_acc {initial_accuracy:.4}");
+    let mut learning = config
+        .train_limit
+        .map(|_| {
+            LearningProgress::new(
+                LearningDirection::Increase,
+                LearningLimits::any_improvement(),
+                LearningObservation::new(
+                    "categorical accuracy",
+                    "bounded held-out test split",
+                    "training samples",
+                    0,
+                    f64::from(initial_accuracy),
+                )?,
+            )
+        })
+        .transpose()?;
     let mut trainer = Trainer::new(Adam::new(config.learning_rate)?);
     let train_len = train.len();
     let mut loader = FinitePassesLoader::new(train, config.batch, config.epochs, config.seed)?;
@@ -251,9 +267,15 @@ fn main() -> Result<()> {
     );
     if config.train_limit.is_some() {
         let final_accuracy = accuracy(&model, &test, batch_axis, input_axis, class_axis, &device)?;
-        if final_accuracy <= initial_accuracy {
-            return Err("smoke run did not improve held-out accuracy".into());
-        }
+        let learning = learning.as_mut().expect("bounded smoke learning contract");
+        learning.observe(LearningObservation::new(
+            "categorical accuracy",
+            "bounded held-out test split",
+            "training samples",
+            u64::try_from(receipt.observations)?,
+            f64::from(final_accuracy),
+        )?)?;
+        println!("{}", learning.assert_learning()?);
         println!("PASS: held-out accuracy improved in the bounded migration smoke");
     }
     Ok(())
