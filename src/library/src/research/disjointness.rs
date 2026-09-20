@@ -256,13 +256,12 @@ where
             .checked_add(incoming.len())
             .ok_or("disjointness observation count overflow")?;
         if state.mode == PopulationMode::Retained {
-            state
-                .repeats
-                .checked_add(incoming.len())
-                .ok_or("disjointness repeat count overflow")?;
             for identity in incoming {
                 if !state.identities.insert(identity) {
-                    state.repeats += 1;
+                    state.repeats = state
+                        .repeats
+                        .checked_add(1)
+                        .ok_or("disjointness repeat count overflow")?;
                 }
             }
         }
@@ -475,6 +474,10 @@ mod tests {
         assert!(error.contains("sealed"), "{error}");
         let error = guard.observe("training", [10]).unwrap_err().to_string();
         assert!(error.contains("semantic contamination"), "{error}");
+        assert_eq!(
+            guard.receipt().population("training").unwrap().observations,
+            10_000
+        );
         Ok(())
     }
 
