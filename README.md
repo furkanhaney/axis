@@ -135,8 +135,9 @@ synchronizes once at the step boundary. Single-axis contractions use batched
 tiled GEMM; multi-axis contractions retain the generic gather/reduce path.
 Repeated shapes reuse their CPU and bounded device-side layout/reduction plans.
 FP32 is the default, with an explicit BF16-matrix/FP32-state device policy.
-Set `AXIS_PROFILE=1` to print coarse submission, read, and synchronization
-timings while investigating a workload.
+Set `AXIS_PROFILE=1` to print Trainer phases, tensor planning, submission, read,
+and synchronization timings while investigating a workload. These are host
+wall times, not CUDA kernel durations; see the [execution profile](docs/backend/execution.md).
 
 ## Measured programs
 

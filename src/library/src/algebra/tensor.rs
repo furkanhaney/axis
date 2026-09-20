@@ -42,6 +42,7 @@ struct ReductionPlans {
 }
 
 type GatherPlanKey = (u8, Shape, Layout, Shape, Layout);
+type MergePlanKey = (Shape, Layout, Vec<Axis>, Axis);
 type ReductionPlanKey = (u8, Shape, Layout, Vec<Axis>);
 type UnfoldPlanKey = (
     Shape,
@@ -57,6 +58,8 @@ type UnfoldPlanKey = (
 
 thread_local! {
     static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
+    static MERGE_PLANS: RefCell<HashMap<MergePlanKey, Option<GatherPlans>>> = RefCell::new(HashMap::new());
+    static MERGE_PLAN_BYTES: Cell<usize> = const { Cell::new(0) };
     static REDUCTION_PLANS: RefCell<HashMap<ReductionPlanKey, ReductionPlans>> = RefCell::new(HashMap::new());
     static UNFOLD_PLANS: RefCell<HashMap<UnfoldPlanKey, UnfoldPlans>> = RefCell::new(HashMap::new());
 }
@@ -65,6 +68,7 @@ thread_local! {
 thread_local! {
     static UNFOLD_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
     static UNFOLD_PLAN_METADATA_MAX: Cell<usize> = const { Cell::new(0) };
+    static MERGE_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
@@ -402,16 +406,26 @@ impl Tensor {
                 None,
             ));
         }
-        let forward = Rc::new(Plan::gather(&map)?);
-        let reverse = Rc::new(Plan::reverse(&map, self.shape().len())?);
+        let plans = GatherPlans {
+            forward: Rc::new(Plan::gather(&map)?),
+            reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
+        };
+        self.gathered_with_plans(shape, layout, plans)
+    }
+    fn gathered_with_plans(
+        &self,
+        shape: Shape,
+        layout: Layout,
+        plans: GatherPlans,
+    ) -> Result<Self> {
         let value = self
             .device()
-            .grouped(&self.0.value, None, forward.as_ref(), 1.0)?;
+            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
         let edges = self.requires_grad().then(|| {
             Edge::new(
                 self,
                 Rule::Group {
-                    plan: reverse,
+                    plan: plans.reverse,
                     rhs: None,
                     factor: 1.0,
                 },
@@ -469,6 +483,10 @@ impl Tensor {
     #[cfg(test)]
     pub(crate) fn unfold_plan_metadata_max() -> usize {
         UNFOLD_PLAN_METADATA_MAX.with(Cell::get)
+    }
+    #[cfg(test)]
+    pub(crate) fn merge_plan_build_count() -> usize {
+        MERGE_PLAN_BUILDS.with(Cell::get)
     }
     #[cfg(test)]
     pub(crate) fn layout_strides(&self) -> &[usize] {
@@ -1625,6 +1643,7 @@ impl Tensor {
     }
     /// Selected-axis order defines flattening; insert the merged axis at the first selected position.
     pub fn merge(&self, axes: impl IntoAxes, axis: Axis) -> Result<Self> {
+        let started = Instant::now();
         let axes = self.shape().select_axes(axes)?;
         if axes.is_empty() {
             return Err("merge requires at least one axis".into());
@@ -1646,6 +1665,30 @@ impl Tensor {
             }
         }
         let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape);
+        let key = (
+            self.shape().clone(),
+            self.0.layout.clone(),
+            axes.clone(),
+            axis,
+        );
+        let cached = MERGE_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        if let Some(plans) = cached {
+            let result = match plans {
+                Some(plans) => self.gathered_with_plans(shape, layout, plans),
+                None => Ok(Self::node(
+                    shape,
+                    layout,
+                    self.0.value.clone(),
+                    self.device(),
+                    vec![Edge::new(self, Rule::Identity)],
+                    false,
+                    None,
+                )),
+            }?;
+            profile("merge", started);
+            return Ok(result);
+        }
         let merged_index = shape.index(axis)?;
         let map = (0..shape.len())
             .map(|i| {
@@ -1665,8 +1708,53 @@ impl Tensor {
                     .collect();
                 self.0.layout.offset(&input)
             })
-            .collect();
-        self.gathered(shape.clone(), Layout::contiguous(&shape), map)
+            .collect::<Vec<_>>();
+        let plans = if map
+            .iter()
+            .enumerate()
+            .all(|(output, &input)| output == input)
+        {
+            None
+        } else {
+            Some(GatherPlans {
+                forward: Rc::new(Plan::gather(&map)?),
+                reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
+            })
+        };
+        let plan_bytes = plans.as_ref().map_or(0, |plans| {
+            [&plans.forward, &plans.reverse]
+                .into_iter()
+                .map(|plan| plan.retained_bytes())
+                .sum()
+        });
+        const MERGE_PLAN_CACHE_BYTES: usize = 256 * 1024 * 1024;
+        const MERGE_PLAN_CACHE_ENTRIES: usize = 128;
+        MERGE_PLANS.with(|cache| {
+            MERGE_PLAN_BYTES.with(|bytes| {
+                let next = bytes.get().saturating_add(plan_bytes);
+                let mut cache = cache.borrow_mut();
+                if cache.len() < MERGE_PLAN_CACHE_ENTRIES && next <= MERGE_PLAN_CACHE_BYTES {
+                    cache.insert(key, plans.clone());
+                    bytes.set(next);
+                }
+            });
+        });
+        #[cfg(test)]
+        MERGE_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        let result = match plans {
+            Some(plans) => self.gathered_with_plans(shape, layout, plans),
+            None => Ok(Self::node(
+                shape,
+                layout,
+                self.0.value.clone(),
+                self.device(),
+                vec![Edge::new(self, Rule::Identity)],
+                false,
+                None,
+            )),
+        }?;
+        profile("merge", started);
+        Ok(result)
     }
     /// Reverse mode from a scalar. Releases the graph after success; rebuild it for another backward.
     pub fn backward(&self) -> Result<()> {

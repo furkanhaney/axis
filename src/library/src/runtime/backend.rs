@@ -662,6 +662,13 @@ pub(crate) struct Plan {
     pub right: Vec<i32>,
 }
 impl Plan {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        [&self.offsets, &self.left, &self.right]
+            .into_iter()
+            .map(|values| values.capacity() * std::mem::size_of::<i32>())
+            .sum()
+    }
+
     pub fn groups(groups: Vec<Vec<(usize, usize)>>, product: bool) -> Result<Self> {
         let count: usize = groups.iter().map(Vec::len).sum();
         Self::check_size(count)?;

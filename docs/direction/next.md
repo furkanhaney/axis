@@ -80,7 +80,11 @@ owner's larger, partially unimplemented API sketch.
   now computes unfold/col2im indices from compact geometry; its exact
   128x32x32x32 depthwise acceptance completes forward and backward without a
   per-contribution index allocation. The materialized patch tensor and eager
-  launch/composition costs remain measured performance work.
+  launch/composition costs remain measured performance work. A later Perm
+  scale probe found repeated host construction of Conv2d merge plans rather
+  than the Trainer boundary as its dominant steady gap. Caching those plans
+  reduced the exact two-method smoke from 85.55 to 25.07 seconds on an RTX
+  5060 while preserving the recorded numerics; [profile](../backend/execution.md).
 - The outside Chess acceptance composes bidirectional attention,
   input-dependent geometric bias, policy and value heads, AdamW, exact finite
   passes, and game-disjoint evaluation. Its bounded smoke passes; it makes no
