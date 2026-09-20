@@ -186,9 +186,10 @@ fn accuracy(
     model: &Sequential,
     digits: &[Digit],
     batch_axis: Axis,
+    population_axis: Axis,
     input_axis: Axis,
     device: &Device,
-) -> Result<f32> {
+) -> Result<Vec<f32>> {
     let inputs: Vec<_> = digits.iter().flat_map(|digit| digit.input).collect();
     let input = Tensor::from_slice(
         &inputs,
@@ -196,28 +197,36 @@ fn accuracy(
         device,
     )?;
     let logits = model.forward(&input)?.to_vec()?;
-    let correct = logits
-        .chunks_exact(CLASSES)
-        .zip(digits)
-        .filter(|(row, digit)| {
-            row.iter()
+    let population = model
+        .output_shape(&Shape::new([
+            batch_axis.of(digits.len()),
+            input_axis.of(INPUTS),
+        ])?)?
+        .extent(population_axis)?;
+    let mut correct = vec![0; population];
+    for (batch, digit) in digits.iter().enumerate() {
+        for (member, member_correct) in correct.iter_mut().enumerate() {
+            let start = (batch * population + member) * CLASSES;
+            let prediction = logits[start..start + CLASSES]
+                .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.total_cmp(b.1))
-                .is_some_and(|(prediction, _)| prediction == usize::from(digit.label))
-        })
-        .count();
-    Ok(correct as f32 / digits.len() as f32)
+                .map(|(index, _)| index)
+                .unwrap();
+            *member_correct += usize::from(prediction == usize::from(digit.label));
+        }
+    }
+    Ok(correct
+        .into_iter()
+        .map(|count| count as f32 / digits.len() as f32)
+        .collect())
 }
 
 fn kaiming_initialize(model: &Sequential, rng: &mut Rng) -> Result<()> {
     for (name, parameter) in model.named_parameters() {
         let shape = parameter.tensor().shape().clone();
         let values = if name.ends_with(".weight") {
-            let fan_in = shape
-                .dims()
-                .first()
-                .ok_or("weight has no input axis")?
-                .extent;
+            let fan_in = if name == "0.weight" { INPUTS } else { HIDDEN };
             let scale = (2.0 / fan_in as f32).sqrt();
             (0..shape.len())
                 .map(|_| rng.normal() * scale)
@@ -230,41 +239,64 @@ fn kaiming_initialize(model: &Sequential, rng: &mut Rng) -> Result<()> {
     Ok(())
 }
 
-fn train_member(
+fn train_population(
     train: &[Digit],
     test: &[Digit],
     config: &Config,
-    learning_rate: f32,
-    member_seed: u64,
+    rates: Vec<f32>,
+    initialization_seed: u64,
     device: &Device,
-) -> Result<ResultRow> {
-    let (batch_axis, input_axis, hidden_axis, class_axis) = (
+) -> Result<Vec<ResultRow>> {
+    let (batch_axis, population_axis, input_axis, hidden_axis, class_axis) = (
         Axis::new("batch"),
+        Axis::new("population"),
         Axis::new("pixel"),
         Axis::new("hidden"),
         Axis::new("class"),
     );
     let mut model = Sequential::new((
-        Linear::new(input_axis, hidden_axis.of(HIDDEN)),
+        PopulationLinear::new(
+            population_axis.of(config.population),
+            input_axis,
+            hidden_axis.of(HIDDEN),
+        ),
         ReLU,
-        Linear::new(hidden_axis, class_axis.of(CLASSES)),
+        PopulationLinear::new(
+            population_axis.of(config.population),
+            hidden_axis,
+            class_axis.of(CLASSES),
+        ),
     ));
     model.build(
         &Shape::new([batch_axis.of(config.batch), input_axis.of(INPUTS)])?,
         device,
-        member_seed,
+        initialization_seed,
     )?;
     let parameters: usize = model
         .parameters()
         .iter()
         .map(|parameter| parameter.tensor().shape().len())
         .sum();
-    if parameters != 970 {
-        return Err(format!("parameter budget changed: expected 970, found {parameters}").into());
+    if parameters != 970 * config.population {
+        return Err(format!(
+            "parameter budget changed: expected {}, found {parameters}",
+            970 * config.population
+        )
+        .into());
     }
-    kaiming_initialize(&model, &mut Rng::new(member_seed))?;
-    let initial_accuracy = accuracy(&model, test, batch_axis, input_axis, device)?;
-    let mut trainer = Trainer::new(Adam::new(learning_rate)?);
+    kaiming_initialize(&model, &mut Rng::new(initialization_seed))?;
+    let initial_accuracy = accuracy(
+        &model,
+        test,
+        batch_axis,
+        population_axis,
+        input_axis,
+        device,
+    )?;
+    let mut trainer = Trainer::new(Adam::with_axis_learning_rates(
+        population_axis,
+        rates.clone(),
+    )?);
     let mut loader =
         FinitePassesLoader::new(train.to_vec(), config.batch, config.passes, config.seed)?;
     while let Some(batch) = loader.next_batch()? {
@@ -273,20 +305,37 @@ fn train_member(
             model
                 .forward(&input)?
                 .categorical_cross_entropy_with_logits(&target, class_axis)?
-                .mean(batch_axis)
+                .mean(batch_axis)?
+                .mean(population_axis)?
+                .scale(config.population as f32)
         })?;
     }
     let receipt = loader.receipt();
     if receipt.completed_passes != config.passes
         || receipt.observations != train.len() * config.passes
     {
-        return Err("population member did not complete its declared finite passes".into());
+        return Err("population did not complete its declared finite passes".into());
     }
-    Ok(ResultRow {
-        learning_rate,
-        initial_accuracy,
-        final_accuracy: accuracy(&model, test, batch_axis, input_axis, device)?,
-    })
+    let final_accuracy = accuracy(
+        &model,
+        test,
+        batch_axis,
+        population_axis,
+        input_axis,
+        device,
+    )?;
+    Ok(rates
+        .into_iter()
+        .zip(initial_accuracy)
+        .zip(final_accuracy)
+        .map(
+            |((learning_rate, initial_accuracy), final_accuracy)| ResultRow {
+                learning_rate,
+                initial_accuracy,
+                final_accuracy,
+            },
+        )
+        .collect())
 }
 
 fn parse() -> Result<Config> {
@@ -349,9 +398,8 @@ fn main() -> Result<()> {
         .map(|_| rng.log_uniform(LR_MIN, LR_MAX))
         .collect::<Vec<_>>();
     let started = Instant::now();
-    let mut rows = Vec::with_capacity(config.population);
-    for (member, learning_rate) in rates.into_iter().enumerate() {
-        let row = train_member(&train, &test, &config, learning_rate, rng.u64(), &device)?;
+    let mut rows = train_population(&train, &test, &config, rates, rng.u64(), &device)?;
+    for (member, row) in rows.iter().enumerate() {
         println!(
             "member {:4}/{:4} lr={:.3e} initial_acc={:.4} final_acc={:.4}",
             member + 1,
@@ -360,7 +408,6 @@ fn main() -> Result<()> {
             row.initial_accuracy,
             row.final_accuracy,
         );
-        rows.push(row);
     }
     let elapsed = started.elapsed().as_secs_f64();
     rows.sort_by(|a, b| a.learning_rate.total_cmp(&b.learning_rate));
@@ -381,7 +428,7 @@ fn main() -> Result<()> {
     sorted_accuracy.sort_by(f32::total_cmp);
     println!("population {} device cuda:0", config.population);
     println!(
-        "sequential fallback time {elapsed:.2}s -> {:.2} runs/s",
+        "fused population time {elapsed:.2}s -> {:.2} runs/s",
         config.population as f64 / elapsed
     );
     println!(

@@ -4,13 +4,13 @@
 MLP. It uses the same pinned cuTile 0.3.1 crate, lockfile, and local CUDA setup.
 It compiles as `cutile-cnn` in this node's own crate.
 
-From the research root:
+From the Axis repo root:
 
 ```bash
-bash cutile-mlp/src/cnn/scripts/train.sh --smoke
-bash cutile-mlp/src/cnn/scripts/train.sh
-bash cutile-mlp/src/cnn/scripts/train.sh --steps 1000 --lr 0.5 --seed 7
-bash cutile-mlp/src/cnn/scripts/train.sh --verify-only
+bash src/cnn/scripts/train.sh --smoke
+bash src/cnn/scripts/train.sh
+bash src/cnn/scripts/train.sh --steps 1000 --lr 0.5 --seed 7
+bash src/cnn/scripts/train.sh --verify-only
 ```
 
 ## Model and task

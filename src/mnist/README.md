@@ -14,7 +14,7 @@ training-dynamics/mlp-1k-rust/scripts/train.sh
 ```
 
 The input files are the same torchvision IDX files already downloaded beneath
-`training-dynamics/data/MNIST/raw/`. The port deliberately does not claim IDR:
+`../research/training-dynamics/data/MNIST/raw/`. The port deliberately does not claim IDR:
 twenty epochs mean each of the 60,000 training examples is reused twenty times.
 See [docs/migration.md](docs/migration.md) for the preserved contract and API
 findings.
@@ -24,4 +24,4 @@ Held-out accuracy rose from `10.16%` to `33.98%`; the complete receipt and curve
 are in [data/smoke.log](data/smoke.log).
 
 The launcher points Cargo at the study-local CUDA toolkit provisioned by
-`cutile-mlp/scripts/setup_cuda.py`; run that setup once if `.cuda/` is absent.
+`scripts/setup_cuda.py`; run that setup once if `.cuda/` is absent.

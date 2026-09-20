@@ -1,6 +1,6 @@
 //! Bounded axis mechanics witness for the country-year real-GDP MLP.
-use csv::StringRecord;
 use axis::prelude::*;
+use csv::StringRecord;
 use std::{
     collections::BTreeSet,
     env,

@@ -14,8 +14,8 @@ pub use data::{
     FinitePassesLoader, InMemoryDataset, Sample,
 };
 pub use nn::{
-    Adam, AdamW, Conv2d, IntoLayers, Linear, Module, ParamId, Parameter, PopulationLinear, ReLU,
-    SGD, Sequential,
+    Adam, AdamW, Conv2d, GELU, IntoLayers, LayerNorm, Linear, Module, ParamId, Parameter,
+    PopulationLinear, ReLU, SGD, Sequential,
 };
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
@@ -33,8 +33,8 @@ pub mod prelude {
     pub use crate::{
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, Conv2d, DataLoader,
         DataRegimeReceipt, DataSource, Device, Dim, FinitePasses, FinitePassesLoader,
-        FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, InMemoryDataset, Linear, Module,
-        Optimizer, ParamId, Parameter, PopulationLinear, ReLU, RegimeSnapshot, Result, SGD,
+        FinitePassesReceipt, GELU, Idr, IdrLimits, IdrReceipt, InMemoryDataset, LayerNorm, Linear,
+        Module, Optimizer, ParamId, Parameter, PopulationLinear, ReLU, RegimeSnapshot, Result, SGD,
         Sample, Sequential, Shape, SinglePass, Tensor, TrainEvalDisjoint, TrainEvalReceipt,
         TrainStep, Trainer,
     };

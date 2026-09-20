@@ -11,12 +11,12 @@ scatters and sums overlapping contributions, providing the `col2im` behavior
 needed to stack convolutions. Stable binary cross-entropy remains elementwise;
 the program explicitly averages batch and output axes.
 
-From the research root:
+From the Axis repo root:
 
 ```bash
-bash cutile-mlp/src/cnn/scripts/train.sh --smoke
-bash cutile-mlp/src/cnn/scripts/train.sh
-bash cutile-mlp/src/cnn/scripts/baseline.sh --verify-only
+bash src/cnn/scripts/train.sh --smoke
+bash src/cnn/scripts/train.sh
+bash src/cnn/scripts/baseline.sh --verify-only
 ```
 
 The library oracle test compares 4,096 activation values, pooled features,

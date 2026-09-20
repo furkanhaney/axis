@@ -83,10 +83,10 @@ slices; their presence in the owner's sketch does not imply implementation.
 Run from the research node:
 
 ```bash
-bash cutile-mlp/scripts/check.sh
-bash cutile-mlp/src/mlp/scripts/train.sh --smoke
-bash cutile-mlp/src/mlp/scripts/train.sh
-bash cutile-mlp/src/addition/scripts/train.sh --smoke
+bash scripts/check.sh
+bash src/mlp/scripts/train.sh --smoke
+bash src/mlp/scripts/train.sh
+bash src/addition/scripts/train.sh --smoke
 ```
 
 The verification script runs formatting, Clippy, the CPU shape test, and the

@@ -58,6 +58,39 @@ impl Device {
             .sync_on(&self.0.stream)?;
         Ok(Arc::new(out))
     }
+    pub(crate) fn gelu(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::gelu((&mut out).partition([128]), a.as_ref()).sync_on(&self.0.stream)?;
+        Ok(Arc::new(out))
+    }
+    pub(crate) fn gelu_backward(&self, gradient: &Buffer, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::gelu_backward((&mut out).partition([128]), gradient.as_ref(), a.as_ref())
+            .sync_on(&self.0.stream)?;
+        Ok(Arc::new(out))
+    }
+    pub(crate) fn inverse_sqrt(&self, a: &Buffer, epsilon: f32) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::inverse_sqrt((&mut out).partition([128]), a.as_ref(), epsilon)
+            .sync_on(&self.0.stream)?;
+        Ok(Arc::new(out))
+    }
+    pub(crate) fn inverse_sqrt_backward(
+        &self,
+        gradient: &Buffer,
+        a: &Buffer,
+        epsilon: f32,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::inverse_sqrt_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            a.as_ref(),
+            epsilon,
+        )
+        .sync_on(&self.0.stream)?;
+        Ok(Arc::new(out))
+    }
     pub(crate) fn binary_cross_entropy(&self, logits: &Buffer, targets: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(logits.shape()[0] as usize)?;
         kernels::binary_cross_entropy(
@@ -161,6 +194,7 @@ impl Device {
         first: &Buffer,
         second: &Buffer,
         learning_rate: f32,
+        learning_rates: Option<&Buffer>,
         beta1: f32,
         beta2: f32,
         correction1: f32,
@@ -195,12 +229,14 @@ impl Device {
             value.as_ref(),
             next_first.as_ref(),
             next_second.as_ref(),
+            learning_rates.unwrap_or(first).as_ref(),
             learning_rate,
             correction1,
             correction2,
             epsilon,
             weight_decay,
         )
+        .generics(vec![i32::from(learning_rates.is_some()).to_string()])
         .sync_on(&self.0.stream)?;
         Ok((Arc::new(updated), next_first, next_second))
     }
@@ -423,18 +459,23 @@ mod kernels {
         out.store(b * previous.load_like(out) + (one - b) * observation);
     }
     #[cutile::entry()]
-    fn adam_update(
+    fn adam_update<const PER_ELEMENT_RATE: i32>(
         out: &mut Tensor<f32, { [128] }>,
         value: &Tensor<f32, { [-1] }>,
         first: &Tensor<f32, { [-1] }>,
         second: &Tensor<f32, { [-1] }>,
+        learning_rates: &Tensor<f32, { [-1] }>,
         learning_rate: f32,
         correction1: f32,
         correction2: f32,
         epsilon: f32,
         weight_decay: f32,
     ) {
-        let lr = broadcast_scalar(learning_rate, shape![128]);
+        let lr = if PER_ELEMENT_RATE == 1 {
+            learning_rates.load_like(out)
+        } else {
+            broadcast_scalar(learning_rate, shape![128])
+        };
         let c1 = broadcast_scalar(correction1, shape![128]);
         let c2 = broadcast_scalar(correction2, shape![128]);
         let eps = broadcast_scalar(epsilon, shape![128]);
@@ -485,6 +526,50 @@ mod kernels {
             gradient.load_like(out),
             zero,
         ));
+    }
+    #[cutile::entry()]
+    fn gelu(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        let x = a.load_like(out);
+        let half = constant(0.5f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let c = constant(0.7978845608f32, shape![128]);
+        let cubic = constant(0.044715f32, shape![128]);
+        out.store(half * x * (one + tanh(c * (x + cubic * x * x * x))));
+    }
+    #[cutile::entry()]
+    fn gelu_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+    ) {
+        let x = a.load_like(out);
+        let half = constant(0.5f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let three = constant(3.0f32, shape![128]);
+        let c = constant(0.7978845608f32, shape![128]);
+        let cubic = constant(0.044715f32, shape![128]);
+        let t = tanh(c * (x + cubic * x * x * x));
+        let derivative =
+            half * (one + t) + half * x * (one - t * t) * c * (one + three * cubic * x * x);
+        out.store(gradient.load_like(out) * derivative);
+    }
+    #[cutile::entry()]
+    fn inverse_sqrt(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>, epsilon: f32) {
+        let eps = broadcast_scalar(epsilon, shape![128]);
+        let one: Tile<f32, { [128] }> = constant(1.0f32, shape![128]);
+        out.store(one / sqrt(a.load_like(out) + eps, rounding::NearestEven, ftz::Disabled));
+    }
+    #[cutile::entry()]
+    fn inverse_sqrt_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        epsilon: f32,
+    ) {
+        let eps = broadcast_scalar(epsilon, shape![128]);
+        let root = sqrt(a.load_like(out) + eps, rounding::NearestEven, ftz::Disabled);
+        let scale = broadcast_scalar(-0.5f32, shape![128]);
+        out.store(gradient.load_like(out) * scale / (root * root * root));
     }
     #[cutile::entry()]
     fn grouped<const PRODUCT: i32>(

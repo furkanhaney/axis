@@ -25,12 +25,12 @@ including their derivatives. Projections, parameter traversal, gradient
 clearing, loss reduction, and SGD are the same library machinery as the MLP.
 Named parameter slots include `query.weight`, `value.bias`, and `output.weight`.
 
-From the research root:
+From the Axis repo root:
 
 ```bash
-bash cutile-mlp/src/attention/scripts/train.sh --smoke
-bash cutile-mlp/src/attention/scripts/train.sh
-bash cutile-mlp/scripts/cargo.sh test --release --locked -p attention -- --ignored --test-threads=1 --nocapture
+bash src/attention/scripts/train.sh --smoke
+bash src/attention/scripts/train.sh
+bash scripts/cargo.sh test --release --locked -p attention -- --ignored --test-threads=1 --nocapture
 ```
 
 [The training script](src/train.rs) uses 16 sequences of length 5, two heads,

@@ -479,3 +479,134 @@ fn categorical_loss_and_device_adam_match_references() -> Result<()> {
     assert!(AdamW::new(0.1, -0.1).is_err());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn population_linear_and_axis_adam_keep_members_independent() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, population, input, output, class) = (
+        Axis::new("batch"),
+        Axis::new("population"),
+        Axis::new("input"),
+        Axis::new("output"),
+        Axis::new("class"),
+    );
+    let mut layer = PopulationLinear::new(population.of(2), input, output.of(2));
+    layer.build(&Shape::new([batch.of(2), input.of(2)])?, &device, 7)?;
+    layer
+        .parameter("weight")?
+        .set_values(&[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0])?;
+    layer.parameter("bias")?.set_values(&[0.0; 4])?;
+    let x =
+        Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], [batch.of(2), input.of(2)], &device)?.with_grad();
+    let prediction = layer.forward(&x)?;
+    assert_eq!(
+        prediction.shape(),
+        &Shape::new([batch.of(2), population.of(2), output.of(2)])?
+    );
+    close(
+        "population linear forward",
+        &prediction.to_vec()?,
+        &[1.0, 2.0, 2.0, 4.0, 3.0, 4.0, 6.0, 8.0],
+    );
+    prediction.mean([batch, population, output])?.backward()?;
+    close(
+        "population linear input gradient",
+        &x.grad().unwrap().to_vec()?,
+        &[0.375, 0.375, 0.375, 0.375],
+    );
+    close(
+        "population linear weight gradient",
+        &layer.parameter("weight")?.grad().unwrap().to_vec()?,
+        &[0.5, 0.5, 0.75, 0.75, 0.5, 0.5, 0.75, 0.75],
+    );
+    let mut adam = Adam::with_axis_learning_rates(population, vec![0.01, 0.1])?;
+    adam.step(&mut layer)?;
+    close(
+        "population Adam rates",
+        &layer.parameter("weight")?.tensor().to_vec()?,
+        &[0.99, -0.01, -0.01, 0.99, 1.9, -0.1, -0.1, 1.9],
+    );
+
+    // One target batch is intentionally shared across the population axis.
+    let logits = Tensor::from_slice(
+        &[2.0, 0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 0.0],
+        [batch.of(2), population.of(2), class.of(2)],
+        &device,
+    )?;
+    let targets = Tensor::from_slice(&[1.0, 0.0, 0.0, 1.0], [batch.of(2), class.of(2)], &device)?;
+    let losses = logits.categorical_cross_entropy_with_logits(&targets, class)?;
+    assert_eq!(
+        losses.shape(),
+        &Shape::new([batch.of(2), population.of(2)])?
+    );
+    close(
+        "population shared targets",
+        &losses.to_vec()?,
+        &[
+            (1.0_f64 + (-2.0_f64).exp()).ln(),
+            (1.0_f64 + 2.0_f64.exp()).ln(),
+            (1.0_f64 + (-2.0_f64).exp()).ln(),
+            (1.0_f64 + 2.0_f64.exp()).ln(),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn layer_norm_and_gelu_match_a_scalar_reference() -> Result<()> {
+    fn scalar(values: &[f64]) -> f64 {
+        let mut total = 0.0;
+        for row in values.chunks_exact(3) {
+            let mean = row.iter().sum::<f64>() / 3.0;
+            let variance = row.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / 3.0;
+            for value in row {
+                let x = (value - mean) / (variance + 1e-5).sqrt();
+                total += 0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh());
+            }
+        }
+        total / values.len() as f64
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    let values = [-1.5_f64, 0.25, 2.0, 3.0, -2.0, 0.5];
+    let input = Tensor::from_slice(
+        &values.map(|value| value as f32),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let mut norm = LayerNorm::new(feature, 1e-5)?;
+    norm.build(input.shape(), &device, 0)?;
+    let output = norm.forward(&input)?.gelu()?;
+
+    let mut expected = Vec::new();
+    for row in values.chunks_exact(3) {
+        let mean = row.iter().sum::<f64>() / 3.0;
+        let variance = row.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / 3.0;
+        for value in row {
+            let x = (value - mean) / (variance + 1e-5).sqrt();
+            expected.push(0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh()));
+        }
+    }
+    close("LayerNorm plus GELU forward", &output.to_vec()?, &expected);
+    output.mean([batch, feature])?.backward()?;
+    let epsilon = 1e-4;
+    let finite_difference = (0..values.len())
+        .map(|index| {
+            let mut plus = values;
+            let mut minus = values;
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            (scalar(&plus) - scalar(&minus)) / (2.0 * epsilon)
+        })
+        .collect::<Vec<_>>();
+    close(
+        "LayerNorm plus GELU gradient",
+        &input.grad().unwrap().to_vec()?,
+        &finite_difference,
+    );
+    Ok(())
+}

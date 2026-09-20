@@ -27,29 +27,29 @@ stream, so exact initial tensors, learning rates, and per-model accuracies do
 not match bit for bit. The initialization distribution, rate interval, model,
 data, optimizer, and evaluation contract are retained.
 
-## Capability the migration exposes
+## Capability the migration exposed and closed
 
 The Python implementation stores weights as `[population, input, output]` and
-computes every independent model in one batched contraction. The current
-library can attach unrelated axes to activations, but `Linear` owns one weight
-matrix and therefore shares it across those axes. Merely adding a `population`
-axis to inputs would silently train one model, not a population.
+computes every independent model in one batched contraction. That concrete
+consumer produced `PopulationLinear`: the population is a named axis on weights,
+biases, activations, gradients, and optimizer state. Shared input batches and
+targets broadcast over it explicitly. `Adam::with_axis_learning_rates` expands
+one rate per member over each parameter without changing moment estimation.
 
-This executable consequently trains one model after another and labels its
-timing `sequential fallback`. It must not be used to support the source claim
-about millions of runs per hour. A faithful performance migration needs a
-parameter-population axis whose initialization, gradients, Adam state, and
-evaluation remain independent while kernels batch the contractions. That is a
-concrete next abstraction derived from a real consumer rather than a generic
-vectorization feature.
+This closes the semantic migration gap. It does not close the performance gap.
+Axis still lowers contractions through correctness-first gather/reduce plans;
+the fused four-member smoke measured `0.31` complete runs/s, below the former
+sequential witness's `0.43` runs/s and far from the specialized source. The
+result identifies kernel lowering as the next bottleneck and supports no source
+throughput claim.
 
 `--smoke` reduces the population, corpus, held-out split, and pass count. It
 checks that the population contains finite accuracies, spans more than one
 learning rate, and that the best final accuracy exceeds the best untrained
 accuracy. It is a mechanics check, not a benchmark result.
 
-The 2026-09-20 smoke trained four members for five passes over 2,048 examples.
-The sampled rates spanned `1.00e-4` to `2.37e-2`; best held-out accuracy rose
-from an untrained population maximum of 9.18% to 74.61%. Sequential fallback
-throughput was 0.40 complete runs/s. These numbers establish an executable
-migration and explicitly do not establish fused-population performance.
+The 2026-09-20 fused smoke trained four members for five passes over 2,048
+examples. The sampled rates spanned `1.00e-4` to `2.37e-2`; best held-out
+accuracy rose from an untrained population maximum of 8.20% to 60.55%.
+Throughput was 0.31 complete runs/s. These numbers establish independent fused
+semantics and explicitly do not establish competitive population throughput.

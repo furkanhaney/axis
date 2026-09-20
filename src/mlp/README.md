@@ -5,13 +5,13 @@ Two implementations of the same regression task: `axis-mlp` uses the sibling
 Both share this node's scalar reference and deterministic data. The library
 has no dependency on this experiment; its full MLP oracle test lives here.
 
-From the research root:
+From the Axis repo root:
 
 ```bash
-bash cutile-mlp/src/mlp/scripts/train.sh --smoke
-bash cutile-mlp/src/mlp/scripts/train.sh
-bash cutile-mlp/src/mlp/scripts/baseline.sh --verify-only
-bash cutile-mlp/src/mlp/scripts/baseline.sh
+bash src/mlp/scripts/train.sh --smoke
+bash src/mlp/scripts/train.sh
+bash src/mlp/scripts/baseline.sh --verify-only
+bash src/mlp/scripts/baseline.sh
 ```
 
 ## Library MLP

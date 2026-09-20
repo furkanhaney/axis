@@ -390,6 +390,104 @@ impl Module for ReLU {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct GELU;
+impl Module for GELU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.gelu()
+    }
+}
+
+/// Affine layer normalization over one named feature axis.
+pub struct LayerNorm {
+    feature: Axis,
+    epsilon: f32,
+    bound: Option<(usize, Parameter, Parameter)>,
+}
+
+impl LayerNorm {
+    pub fn new(feature: Axis, epsilon: f32) -> Result<Self> {
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err("LayerNorm epsilon must be finite and positive".into());
+        }
+        Ok(Self {
+            feature,
+            epsilon,
+            bound: None,
+        })
+    }
+}
+
+impl Module for LayerNorm {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let extent = input.extent(self.feature)?;
+        if let Some((bound, _, _)) = &self.bound
+            && *bound != extent
+        {
+            return Err("LayerNorm feature extent differs from its built extent".into());
+        }
+        Ok(input.clone())
+    }
+
+    fn build(&mut self, input: &Shape, device: &Device, _: u64) -> Result<Shape> {
+        let shape = self.output_shape(input)?;
+        if let Some((_, scale, _)) = &self.bound {
+            if !scale.tensor().device().same(device) {
+                return Err("LayerNorm is already built on a different Device".into());
+            }
+            return Ok(shape);
+        }
+        let extent = input.extent(self.feature)?;
+        let scale = Parameter::new(Tensor::from_slice(
+            &vec![1.0; extent],
+            [self.feature.of(extent)],
+            device,
+        )?);
+        let bias = Parameter::new(Tensor::from_slice(
+            &vec![0.0; extent],
+            [self.feature.of(extent)],
+            device,
+        )?);
+        self.bound = Some((extent, scale, bias));
+        Ok(shape)
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        let (_, scale, bias) = self
+            .bound
+            .as_ref()
+            .ok_or("LayerNorm must be built before forward")?;
+        let centered = input.sub(&input.mean(self.feature)?)?;
+        let inverse_std = centered
+            .mul(&centered)?
+            .mean(self.feature)?
+            .inverse_sqrt(self.epsilon)?;
+        centered
+            .mul(&inverse_std)?
+            .mul(&scale.tensor())?
+            .add(&bias.tensor())
+    }
+
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.bound
+            .as_ref()
+            .map(|(_, scale, bias)| {
+                vec![
+                    ("scale".into(), scale.clone()),
+                    ("bias".into(), bias.clone()),
+                ]
+            })
+            .unwrap_or_default()
+    }
+}
+
 pub trait IntoLayers {
     fn into_layers(self) -> Vec<Box<dyn Module>>;
 }
@@ -463,17 +561,38 @@ pub struct SGD {
 /// Device-resident Adam with bias correction and one state pair per ParamId.
 pub struct Adam {
     learning_rate: f32,
+    axis_learning_rates: Option<(Axis, Vec<f32>)>,
     beta1: f32,
     beta2: f32,
     epsilon: f32,
     weight_decay: f32,
     step: i32,
-    states: HashMap<ParamId, (Buffer, Buffer)>,
+    states: HashMap<ParamId, AdamState>,
+}
+
+struct AdamState {
+    first: Buffer,
+    second: Buffer,
+    learning_rates: Option<Buffer>,
 }
 
 impl Adam {
     pub fn new(learning_rate: f32) -> Result<Self> {
         Self::with_hyperparameters(learning_rate, 0.9, 0.999, 1e-8)
+    }
+
+    /// Adam with one learning rate per member of a named parameter axis.
+    pub fn with_axis_learning_rates(axis: Axis, learning_rates: Vec<f32>) -> Result<Self> {
+        if learning_rates.is_empty()
+            || learning_rates
+                .iter()
+                .any(|rate| !rate.is_finite() || *rate <= 0.0)
+        {
+            return Err("Adam axis learning rates must be nonempty, finite, and positive".into());
+        }
+        let mut optimizer = Self::new(1.0)?;
+        optimizer.axis_learning_rates = Some((axis, learning_rates));
+        Ok(optimizer)
     }
 
     pub fn with_hyperparameters(
@@ -496,6 +615,7 @@ impl Adam {
         }
         Ok(Self {
             learning_rate,
+            axis_learning_rates: None,
             beta1,
             beta2,
             epsilon,
@@ -522,10 +642,18 @@ impl Adam {
             let id = parameter.id();
             if seen.insert(id) {
                 let state = self.states.get(&id);
+                let learning_rates = match (&self.axis_learning_rates, state) {
+                    (_, Some(state)) => state.learning_rates.clone(),
+                    (Some((axis, values)), None) => {
+                        Some(parameter.tensor().expanded_axis_values(*axis, values)?)
+                    }
+                    (None, None) => None,
+                };
                 let (tensor, first, second) = parameter.tensor().adam_updated(
-                    state.map(|state| &state.0),
-                    state.map(|state| &state.1),
+                    state.map(|state| &state.first),
+                    state.map(|state| &state.second),
                     self.learning_rate,
+                    learning_rates.as_ref(),
                     self.beta1,
                     self.beta2,
                     correction1,
@@ -533,12 +661,19 @@ impl Adam {
                     self.epsilon,
                     self.weight_decay,
                 )?;
-                updates.push((parameter, id, tensor, first, second));
+                updates.push((parameter, id, tensor, first, second, learning_rates));
             }
         }
-        for (parameter, id, tensor, first, second) in updates {
+        for (parameter, id, tensor, first, second, learning_rates) in updates {
             parameter.replace(tensor);
-            self.states.insert(id, (first, second));
+            self.states.insert(
+                id,
+                AdamState {
+                    first,
+                    second,
+                    learning_rates,
+                },
+            );
         }
         self.step = next_step;
         Ok(())

@@ -7,10 +7,10 @@ forward working primitives from the MLP; this is a reuse opportunity census,
 not a claim that two independent authors arrived at the same design. Both
 baselines now remain as oracles beside library-based consumers.
 
-Run from the research root:
+Run from the Axis root:
 
 ```bash
-python3 cutile-mlp/scripts/compare_trainers.py
+python3 scripts/compare_trainers.py
 ```
 
 The initial census finds **8 identical function definitions, containing 93

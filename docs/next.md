@@ -6,9 +6,9 @@ owner's larger, partially unimplemented API sketch.
 
 ## What exists and why
 
-- `src/axis/` is the reusable crate, with its own manifest. `src/mlp/`,
-  `src/cnn/`, `src/attention/`, and `src/addition/` are separate program crates. Launch from the
-  research or workspace node, not a `src/` corridor. Shared CUDA setup and
+- `src/axis/` is the reusable crate, with its own manifest. Every sibling under
+  `src/` is a separate program crate. Launch from the Axis node, not a `src/`
+  corridor. Shared CUDA setup and
   Cargo/check runners stay at the workspace's `scripts/`.
 - MLP, attention, and CNN consume the library. CNN also retains its explicit
   cuTile baseline; the two programs share only their independent scalar oracle.
@@ -57,9 +57,10 @@ owner's larger, partially unimplemented API sketch.
   `8.06e-1` to `3.88e-3`; [addition record](../src/addition/data/training.log).
 - The first outside consumer now preserves categorical cross-entropy, Adam, and
   exact finite passes; its smoke reaches `33.98%` held-out MNIST accuracy.
-  The population migration preserves accuracy-versus-learning-rate evidence but
-  exposes parameter population axes as the missing abstraction for fused
-  throughput. The panel migration drove device-resident AdamW and preserves its
+  The population migration now runs independent parameters, gradients, Adam
+  state, and learning rates along one named population axis. It exposed the
+  correctness-first contraction lowering as the remaining throughput limit.
+  The panel migration drove device-resident AdamW and preserves its
   preprocessing/split mechanics without claiming a completed GDP fit.
 - Current cuTile lowering uses synchronous f32 operations and CPU-built index
   plans. GPU arithmetic and derivatives are real, but no speed claim follows:
@@ -85,10 +86,7 @@ extents in acceptance checks; do not make tile-friendly dimensions an API
 rule. The current Conv2d deliberately promises only valid, stride-one
 cross-correlation.
 
-Run `bash cutile-mlp/scripts/check.sh` from the research root for formatting,
+Run `bash scripts/check.sh` from the Axis root for formatting,
 Clippy and CPU/GPU verification. Smoke a new program before 100/full-step
 runs. Record actual evidence in the owning member's `data/`; update the
-contract and this note when a capability or next step changes. After study
-commits, regenerate the research index with
-`python3 scripts/research_index.py --write` and commit that generated README
-separately, because it records study commit counts.
+contract and this note when a capability or next step changes.

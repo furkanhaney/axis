@@ -36,6 +36,11 @@ enum Rule {
     Scale(f32),
     Multiply(Buffer),
     Relu(Buffer),
+    Gelu(Buffer),
+    InverseSqrt {
+        input: Buffer,
+        epsilon: f32,
+    },
     BinaryCrossEntropy {
         logits: Buffer,
         targets: Buffer,
@@ -208,12 +213,31 @@ impl Tensor {
             None,
         ))
     }
+    pub(crate) fn expanded_axis_values(&self, axis: Axis, values: &[f32]) -> Result<Buffer> {
+        if self.extent(axis)? != values.len() {
+            return Err(format!(
+                "axis learning-rate count {} does not match {:?} extent {}",
+                values.len(),
+                axis,
+                self.extent(axis)?
+            )
+            .into());
+        }
+        Ok(
+            Tensor::from_slice(values, [axis.of(values.len())], self.device())?
+                .align(self.shape())?
+                .0
+                .value
+                .clone(),
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn adam_updated(
         &self,
         first: Option<&Buffer>,
         second: Option<&Buffer>,
         learning_rate: f32,
+        learning_rates: Option<&Buffer>,
         beta1: f32,
         beta2: f32,
         correction1: f32,
@@ -249,6 +273,7 @@ impl Tensor {
             first,
             second,
             learning_rate,
+            learning_rates,
             beta1,
             beta2,
             correction1,
@@ -433,16 +458,14 @@ impl Tensor {
         if targets.requires_grad() {
             return Err("categorical cross-entropy targets cannot require gradients".into());
         }
-        if self.shape().rank() != targets.shape().rank()
-            || self
+        if !targets.shape().contains(class)
+            || targets
                 .shape()
                 .axes()
                 .iter()
-                .any(|&axis| !targets.shape().contains(axis))
+                .any(|&axis| !self.shape().contains(axis))
         {
-            return Err(
-                "categorical_cross_entropy_with_logits requires identical axis sets".into(),
-            );
+            return Err("categorical_cross_entropy_with_logits targets must contain the class axis and may omit only broadcast axes".into());
         }
         self.compatible_device(targets)?;
         self.shared_extents(targets)?;
@@ -523,6 +546,41 @@ impl Tensor {
             value,
             self.device(),
             vec![Edge::new(self, Rule::Relu(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// Tanh-approximated GELU, matching the common transformer formulation.
+    pub fn gelu(&self) -> Result<Self> {
+        let value = self.device().gelu(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Gelu(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise `(x + epsilon)^-1/2`; inputs plus epsilon must be positive.
+    pub fn inverse_sqrt(&self, epsilon: f32) -> Result<Self> {
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err("inverse_sqrt epsilon must be finite and positive".into());
+        }
+        let value = self.device().inverse_sqrt(&self.0.value, epsilon)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::InverseSqrt {
+                    input: self.0.value.clone(),
+                    epsilon,
+                },
+            )],
             false,
             None,
         ))
@@ -962,6 +1020,10 @@ impl Tensor {
                         Rule::Scale(f) => self.device().scale(&gradient, *f)?,
                         Rule::Multiply(rhs) => self.device().binary(&gradient, rhs, 2)?,
                         Rule::Relu(x) => self.device().relu_backward(&gradient, x)?,
+                        Rule::Gelu(x) => self.device().gelu_backward(&gradient, x)?,
+                        Rule::InverseSqrt { input, epsilon } => self
+                            .device()
+                            .inverse_sqrt_backward(&gradient, input, *epsilon)?,
                         Rule::BinaryCrossEntropy { logits, targets } => self
                             .device()
                             .binary_cross_entropy_backward(&gradient, logits, targets)?,
