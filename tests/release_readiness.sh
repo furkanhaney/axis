@@ -82,16 +82,6 @@ expect_fail 'must be a positive pull-request number' run_check --allow-pr nope
 MOCK_FAIL=issue expect_fail 'GitHub issue query failed' run_check
 MOCK_FAIL=pr expect_fail 'GitHub pull-request query failed' run_check
 
-# An ordinary PR with no workspace-version change must not query GitHub at all.
-: > "$MOCK_CALLS"
-expect_pass 'SKIP (workspace version remains' run_check --base-ref HEAD
-[[ ! -s "$MOCK_CALLS" ]] || {
-    printf 'unchanged version unexpectedly queried GitHub:\n' >&2
-    cat "$MOCK_CALLS" >&2
-    exit 1
-}
-
-# A version change reaches the repository gate.
 fixture="$temporary/version-fixture"
 mkdir -p "$fixture/scripts/checks"
 cp "$checker" "$fixture/scripts/checks/release-readiness.sh"
@@ -107,6 +97,19 @@ EOF
 git -C "$fixture" add Cargo.toml scripts/checks/release-readiness.sh
 git -C "$fixture" commit -qm baseline
 base="$(git -C "$fixture" rev-parse HEAD)"
+
+# An ordinary PR with no workspace-version change must not query GitHub at all.
+: > "$MOCK_CALLS"
+expect_pass 'SKIP (workspace version remains 0.2.0)' \
+    bash "$fixture/scripts/checks/release-readiness.sh" \
+        --repository furkanhaney/axis --base-ref "$base"
+[[ ! -s "$MOCK_CALLS" ]] || {
+    printf 'unchanged version unexpectedly queried GitHub:\n' >&2
+    cat "$MOCK_CALLS" >&2
+    exit 1
+}
+
+# A version change reaches the repository gate.
 sed -i 's/version = "0.2.0"/version = "0.3.0"/' "$fixture/Cargo.toml"
 : > "$MOCK_CALLS"
 expect_pass 'Release candidate version: 0.2.0 -> 0.3.0' \
