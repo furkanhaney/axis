@@ -11,11 +11,12 @@ scripts/train.sh --steps 500
 ```
 
 Training is measured in samples and optimizer steps. There are no epochs. The
-evaluation source uses a separate seed namespace, and the final output includes
-the generated-stream IDR receipt. `TrainEvalDisjoint` also proves that no exact
-draw ID crossed between the observed training and evaluation populations. These
-receipts prove exact draw nonreuse; they do not claim that floating-point operand
-pairs cannot coincide.
+final output includes a generated-stream IDR receipt for raw draw IDs. A separate
+`Disjointness` ledger defines the scientific identity as the ordered pair of
+operand `f32` bit patterns and rejects that canonical problem if it crosses the
+observed training/evaluation boundary, even under a distinct draw ID. The
+receipt proves separation among delivered operand pairs; it does not imply IID
+sampling or a rich latent distribution.
 
 After training, the program holds the other operand fixed and perturbs each
 operand upward around all 256 evaluation contexts. `EmpiricalMonotonicity` requires
@@ -23,6 +24,7 @@ the predicted sum to be empirically increasing for every ordered pair within
 an absolute tolerance of `1e-6`. The receipt deliberately says this sampled
 audit is not a global architectural guarantee.
 
-The measured 500-step run consumed 128,000 unique training draws with zero
-observed reuse and zero overlap with 256 evaluation draws. Held-out MSE fell
-from `0.80632222` to `0.00387844`; see [data/runs/training.log](data/runs/training.log).
+The measured 500-step run consumed 128,000 unique training draws and 128,000
+unique canonical training problems, with zero overlap against 256 canonical
+evaluation problems. Held-out MSE fell from `0.80632222` to `0.00387844`; see
+[data/runs/training.log](data/runs/training.log).
