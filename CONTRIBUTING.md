@@ -6,10 +6,9 @@ reason, a reviewable implementation, and evidence proportional to the claim it
 makes.
 
 The project is experimental and its API is still moving. Before doing a large
-piece of work, open an issue or start a discussion with the problem, the
-consumer that needs it, and the evidence that would show it works. Small fixes,
-documentation improvements, and focused tests can go straight to a pull
-request.
+piece of work, open an issue with the problem, the consumer that needs it, and
+the evidence that would show it works. Small fixes, documentation improvements,
+and focused tests can go straight to a pull request.
 
 ## Choose work from a real experiment
 
