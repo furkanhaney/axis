@@ -73,17 +73,18 @@ The first backend is synchronous CUDA f32 using cuTile kernels. CPU code builds
 index plans; GPU kernels do forward arithmetic, derivatives, and SGD. These
 generic gather/reduction plans prioritize verifiable semantics. They are
 limited to 16,777,216 contributions per operation and are not a competitive
-GEMM implementation. Dense contiguous two-dimensional contractions, including
-the flattened leading dimensions used by `Linear`, take a tiled cuTile matrix
-multiplication path in forward and both derivatives. Tensors participating in
+GEMM implementation. Single-axis contractions take a batched tiled cuTile
+matrix multiplication path in forward and both derivatives. Axis reordering is
+materialized when the batch, row, reduction, and column groups are not already
+contiguous; this covers both `Linear` and attention. Tensors participating in
 an operation must share the same `Device` handle. There is no CPU fallback,
 higher-order differentiation, or retained-graph mode. Softmax forward and
-backward use one tiled reduction
-per contiguous row, padding non-power-of-two widths inside the tile; they no
+backward use one tiled reduction per contiguous row, padding non-power-of-two
+widths inside the tile; they no
 longer inherit the generic index-plan contribution bound. Attention still
 composes separate contraction, mask, softmax, and value-contraction operations
-rather than using a fused attention kernel. Batched contractions with retained
-shared axes still use the generic plan path.
+rather than using a fused attention kernel. Multi-axis contractions still use
+the generic plan path.
 Padding/stride variants, LSTM, and a full Transformer remain future
 slices; their presence in the owner's sketch does not imply implementation.
 

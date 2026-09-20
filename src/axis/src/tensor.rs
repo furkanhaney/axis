@@ -56,12 +56,14 @@ enum Rule {
     },
     MatmulLeft {
         rhs: Buffer,
+        batch: usize,
         m: usize,
         k: usize,
         n: usize,
     },
     MatmulRight {
         lhs: Buffer,
+        batch: usize,
         m: usize,
         k: usize,
         n: usize,
@@ -820,54 +822,97 @@ impl Tensor {
             }
         }
         let shape = Shape::new(dims)?;
-        let dense_matrix = axes.len() == 1
-            && self.shape().axes().last() == axes.first()
-            && rhs.shape().axes().first() == axes.first()
-            && self.0.layout.strides == Layout::contiguous(self.shape()).strides
-            && rhs.0.layout.strides == Layout::contiguous(rhs.shape()).strides
-            && self
+        if axes.len() == 1 {
+            let batch_axes: Vec<_> = self
                 .shape()
                 .axes()
-                .iter()
-                .filter(|axis| !axes.contains(axis))
-                .all(|axis| !rhs.shape().contains(*axis))
-            && rhs
+                .into_iter()
+                .filter(|axis| !axes.contains(axis) && rhs.shape().contains(*axis))
+                .collect();
+            let left_axes: Vec<_> = self
                 .shape()
                 .axes()
+                .into_iter()
+                .filter(|axis| !axes.contains(axis) && !rhs.shape().contains(*axis))
+                .collect();
+            let right_axes: Vec<_> = rhs
+                .shape()
+                .axes()
+                .into_iter()
+                .filter(|axis| !axes.contains(axis) && !self.shape().contains(*axis))
+                .collect();
+            let left_order: Vec<_> = batch_axes
                 .iter()
-                .filter(|axis| !axes.contains(axis))
-                .all(|axis| !self.shape().contains(*axis));
-        if dense_matrix {
+                .chain(&left_axes)
+                .chain(&axes)
+                .copied()
+                .collect();
+            let right_order: Vec<_> = batch_axes
+                .iter()
+                .chain(&axes)
+                .chain(&right_axes)
+                .copied()
+                .collect();
+            let ordered = |tensor: &Self, order: &[Axis]| -> Result<Self> {
+                let layout = Layout::new(tensor.shape(), order)?;
+                if tensor.0.layout.strides == layout.strides {
+                    Ok(tensor.clone())
+                } else {
+                    tensor.with_layout(order.to_vec())
+                }
+            };
+            let left = ordered(self, &left_order)?;
+            let right = ordered(rhs, &right_order)?;
             let k = reduction.len();
-            let m = self.shape().len() / k;
-            let n = rhs.shape().len() / k;
-            let value = self.device().matmul(&self.0.value, &rhs.0.value, m, k, n)?;
+            let batch = batch_axes
+                .iter()
+                .map(|axis| self.extent(*axis).expect("validated shared axis"))
+                .product();
+            let m = left_axes
+                .iter()
+                .map(|axis| self.extent(*axis).expect("validated left axis"))
+                .product();
+            let n = right_axes
+                .iter()
+                .map(|axis| rhs.extent(*axis).expect("validated right axis"))
+                .product();
+            let value = self
+                .device()
+                .matmul(&left.0.value, &right.0.value, batch, m, k, n)?;
             let mut edges = vec![];
-            if self.requires_grad() {
+            if left.requires_grad() {
                 edges.push(Edge::new(
-                    self,
+                    &left,
                     Rule::MatmulLeft {
-                        rhs: rhs.0.value.clone(),
+                        rhs: right.0.value.clone(),
+                        batch,
                         m,
                         k,
                         n,
                     },
                 ));
             }
-            if rhs.requires_grad() {
+            if right.requires_grad() {
                 edges.push(Edge::new(
-                    rhs,
+                    &right,
                     Rule::MatmulRight {
-                        lhs: self.0.value.clone(),
+                        lhs: left.0.value.clone(),
+                        batch,
                         m,
                         k,
                         n,
                     },
                 ));
             }
+            let output_order: Vec<_> = batch_axes
+                .iter()
+                .chain(&left_axes)
+                .chain(&right_axes)
+                .copied()
+                .collect();
             return Ok(Self::node(
                 shape.clone(),
-                Layout::contiguous(&shape),
+                Layout::new(&shape, &output_order)?,
                 value,
                 self.device(),
                 edges,
@@ -1135,12 +1180,24 @@ impl Tensor {
                             self.device()
                                 .softmax_backward(&gradient, probability, *width)?
                         }
-                        Rule::MatmulLeft { rhs, m, k, n } => self
+                        Rule::MatmulLeft {
+                            rhs,
+                            batch,
+                            m,
+                            k,
+                            n,
+                        } => self
                             .device()
-                            .matmul_left_backward(&gradient, rhs, *m, *k, *n)?,
-                        Rule::MatmulRight { lhs, m, k, n } => self
+                            .matmul_left_backward(&gradient, rhs, *batch, *m, *k, *n)?,
+                        Rule::MatmulRight {
+                            lhs,
+                            batch,
+                            m,
+                            k,
+                            n,
+                        } => self
                             .device()
-                            .matmul_right_backward(lhs, &gradient, *m, *k, *n)?,
+                            .matmul_right_backward(lhs, &gradient, *batch, *m, *k, *n)?,
                         Rule::Group { plan, rhs, factor } => {
                             self.device()
                                 .grouped(&gradient, rhs.as_ref(), plan, *factor)?

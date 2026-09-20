@@ -64,10 +64,9 @@ owner's larger, partially unimplemented API sketch.
   preprocessing/split mechanics without claiming a completed GDP fit.
 - Current cuTile lowering uses synchronous f32 operations and CPU-built index
   plans. GPU arithmetic and derivatives are real, but no broad speed claim
-  follows: dense contiguous contractions use tiled matrix multiplication, but
-  batched contractions with retained shared axes still use gather/reduce plans.
-  Softmax now performs
-  one tiled forward or backward reduction per row, including non-power-of-two
+  follows: single-axis contractions use batched tiled matrix multiplication;
+  multi-axis contractions still use gather/reduce plans. Softmax performs one
+  tiled forward or backward reduction per row, including non-power-of-two
   widths, instead of recomputing the row reduction for every output. Generic
   plans retain their 16,777,216-contribution cap. There is no retained graph,
   CPU fallback, mixed precision, or higher-order differentiation.
@@ -87,11 +86,10 @@ owner's larger, partially unimplemented API sketch.
 
 ## Next useful implementation
 
-Extend tiled matrix multiplication to contractions with retained shared axes,
-then rerun the recorded Sudoku shapes and report utilization and elapsed time.
-Chunked evaluation removed the immediate evaluation-size cliff, tiled softmax
-removed its redundant quadratic row work, and dense Linear projections now use
-GEMM; the two batched attention contractions remain on the CPU-planned path.
+Rerun the recorded Sudoku shapes and report utilization and elapsed time after
+the tiled contraction and softmax changes. The next implementation should be
+chosen from that profile: fuse attention if launch/materialization overhead now
+dominates, or improve GEMM tiling if the matrix kernels remain inefficient.
 
 After that, use the next consumer to choose between production-transformer work
 (mixed precision, fused normalization and attention, serialization) and the
