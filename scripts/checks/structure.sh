@@ -20,6 +20,7 @@ inspect_visible() {
 
     case "$path" in
         *.py|*.pyc|*/__pycache__/*) violations+=("Python artifacts are not part of Axis: $path") ;;
+        HUB.md|*/HUB.md) violations+=("Axis maintains AGENTS.md directly; HUB.md is not allowed: $path") ;;
     esac
     [[ "${parts[0]:-}" == runs ]] && violations+=("run records belong under data/runs/: $path")
 
@@ -41,6 +42,12 @@ inspect_visible() {
         parent="${parent:+$parent/}$part"
     done
 }
+
+if [[ ! -f "$root/AGENTS.md" ]]; then
+    violations+=("the manually maintained root AGENTS.md is missing")
+elif head -n 1 "$root/AGENTS.md" | grep -q '^# GENERATED'; then
+    violations+=("AGENTS.md must be maintained directly, not generated")
+fi
 
 inspect_tracked_data() {
     local path="$1" index lane
