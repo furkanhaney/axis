@@ -184,6 +184,44 @@ fn shared_axes_contract_and_both_input_derivatives() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn bf16_matrix_products_keep_fp32_state_and_gradients_close() -> Result<()> {
+    let m = Axis::new("row");
+    let k = Axis::new("reduction");
+    let n = Axis::new("column");
+    let left_values: Vec<_> = (0..5 * 16).map(|i| (i as f32 - 31.0) / 41.0).collect();
+    let right_values: Vec<_> = (0..16 * 7).map(|i| (i as f32 - 47.0) / 53.0).collect();
+    let run = |device: &Device| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let left = Tensor::from_slice(&left_values, [m.of(5), k.of(16)], device)?.with_grad();
+        let right = Tensor::from_slice(&right_values, [k.of(16), n.of(7)], device)?.with_grad();
+        let output = left.contract(&right, k)?;
+        let values = output.to_vec()?;
+        output.mean([m, n])?.backward()?;
+        Ok((
+            values,
+            left.grad().unwrap().to_vec()?,
+            right.grad().unwrap().to_vec()?,
+        ))
+    };
+    let reference = run(&Device::cuda(0)?)?;
+    let mixed = run(&Device::cuda_bf16(0)?)?;
+    for (name, actual, expected) in [
+        ("BF16 matrix product", &mixed.0, &reference.0),
+        ("BF16 left derivative", &mixed.1, &reference.1),
+        ("BF16 right derivative", &mixed.2, &reference.2),
+    ] {
+        let maximum = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, e)| (a - e).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(maximum < 2e-2, "{name} max error {maximum}");
+        println!("check {name}: PASS max_abs_error={maximum:.2e}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn algebra_and_errors_are_explicit() -> Result<()> {
     let device = Device::cuda(0)?;
     let (b, t, f, h, d) = (

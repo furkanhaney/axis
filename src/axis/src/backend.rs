@@ -9,13 +9,23 @@ pub(crate) type Buffer = Arc<cutile::tensor::Tensor<f32>>;
 pub struct Device(Rc<Context>);
 struct Context {
     stream: Arc<cutile::cuda_core::Stream>,
+    bf16_matmul: bool,
 }
 
 impl Device {
     pub fn cuda(ordinal: usize) -> Result<Self> {
+        Self::cuda_with_bf16(ordinal, false)
+    }
+    /// CUDA device with BF16 inputs and FP32 accumulation inside matrix products.
+    /// Parameters, activations outside GEMM, optimizer state, and reductions remain FP32.
+    pub fn cuda_bf16(ordinal: usize) -> Result<Self> {
+        Self::cuda_with_bf16(ordinal, true)
+    }
+    fn cuda_with_bf16(ordinal: usize, bf16_matmul: bool) -> Result<Self> {
         let device = cutile::cuda_core::Device::new(ordinal)?;
         Ok(Self(Rc::new(Context {
             stream: device.new_stream()?,
+            bf16_matmul,
         })))
     }
     pub(crate) fn same(&self, other: &Self) -> bool {
@@ -218,9 +228,15 @@ impl Device {
         let b = b.reshape(&[batch, k, n])?;
         let mut out = self.zeros(batch * m * n)?.reshape(&[batch, m, n])?;
         let bk = contraction_tile(k);
-        kernels::matmul((&mut out).partition([1, 64, 64]), a.as_ref(), b.as_ref())
-            .generics(vec![bk.to_string(), (k as i32).to_string()])
-            .sync_on(&self.0.stream)?;
+        if self.0.bf16_matmul {
+            kernels::matmul_bf16((&mut out).partition([1, 64, 64]), a.as_ref(), b.as_ref())
+                .generics(vec![bk.to_string(), (k as i32).to_string()])
+                .sync_on(&self.0.stream)?;
+        } else {
+            kernels::matmul((&mut out).partition([1, 64, 64]), a.as_ref(), b.as_ref())
+                .generics(vec![bk.to_string(), (k as i32).to_string()])
+                .sync_on(&self.0.stream)?;
+        }
         Ok(Arc::new(out.reshape(&[batch * m * n])?))
     }
     pub(crate) fn matmul_left_backward(
@@ -236,13 +252,23 @@ impl Device {
         let rhs = rhs.reshape(&[batch, k, n])?;
         let mut out = self.zeros(batch * m * k)?.reshape(&[batch, m, k])?;
         let bn = contraction_tile(n);
-        kernels::matmul_left_backward(
-            (&mut out).partition([1, 64, 64]),
-            gradient.as_ref(),
-            rhs.as_ref(),
-        )
-        .generics(vec![bn.to_string(), (n as i32).to_string()])
-        .sync_on(&self.0.stream)?;
+        if self.0.bf16_matmul {
+            kernels::matmul_left_backward_bf16(
+                (&mut out).partition([1, 64, 64]),
+                gradient.as_ref(),
+                rhs.as_ref(),
+            )
+            .generics(vec![bn.to_string(), (n as i32).to_string()])
+            .sync_on(&self.0.stream)?;
+        } else {
+            kernels::matmul_left_backward(
+                (&mut out).partition([1, 64, 64]),
+                gradient.as_ref(),
+                rhs.as_ref(),
+            )
+            .generics(vec![bn.to_string(), (n as i32).to_string()])
+            .sync_on(&self.0.stream)?;
+        }
         Ok(Arc::new(out.reshape(&[batch * m * k])?))
     }
     pub(crate) fn matmul_right_backward(
@@ -258,13 +284,23 @@ impl Device {
         let gradient = gradient.reshape(&[batch, m, n])?;
         let mut out = self.zeros(batch * k * n)?.reshape(&[batch, k, n])?;
         let bm = contraction_tile(m);
-        kernels::matmul_right_backward(
-            (&mut out).partition([1, 64, 64]),
-            lhs.as_ref(),
-            gradient.as_ref(),
-        )
-        .generics(vec![bm.to_string(), (m as i32).to_string()])
-        .sync_on(&self.0.stream)?;
+        if self.0.bf16_matmul {
+            kernels::matmul_right_backward_bf16(
+                (&mut out).partition([1, 64, 64]),
+                lhs.as_ref(),
+                gradient.as_ref(),
+            )
+            .generics(vec![bm.to_string(), (m as i32).to_string()])
+            .sync_on(&self.0.stream)?;
+        } else {
+            kernels::matmul_right_backward(
+                (&mut out).partition([1, 64, 64]),
+                lhs.as_ref(),
+                gradient.as_ref(),
+            )
+            .generics(vec![bm.to_string(), (m as i32).to_string()])
+            .sync_on(&self.0.stream)?;
+        }
         Ok(Arc::new(out.reshape(&[batch * k * n])?))
     }
     #[allow(clippy::too_many_arguments)]
@@ -437,6 +473,25 @@ mod kernels {
         out.store(value.reshape(shape![1, 64, 64]));
     }
     #[cutile::entry()]
+    fn matmul_bf16<const BK: i32, const K: i32>(
+        out: &mut Tensor<f32, { [1, 64, 64] }>,
+        a: &Tensor<f32, { [-1, -1, K] }>,
+        b: &Tensor<f32, { [-1, K, -1] }>,
+    ) {
+        let ap = a.partition(shape![1, 64, BK]);
+        let bp = b.partition(shape![1, BK, 64]);
+        let pid = get_tile_block_id();
+        let mut value = load_tile_mut(out).reshape(shape![64, 64]);
+        for block in 0i32..(K / BK) {
+            let left: Tile<bf16, { [64, BK] }> =
+                convert_tile(ap.load([pid.0, pid.1, block]).reshape(shape![64, BK]));
+            let right: Tile<bf16, { [BK, 64] }> =
+                convert_tile(bp.load([pid.0, block, pid.2]).reshape(shape![BK, 64]));
+            value = mma(left, right, value);
+        }
+        out.store(value.reshape(shape![1, 64, 64]));
+    }
+    #[cutile::entry()]
     fn matmul_left_backward<const BN: i32, const N: i32>(
         out: &mut Tensor<f32, { [1, 64, 64] }>,
         gradient: &Tensor<f32, { [-1, -1, N] }>,
@@ -458,6 +513,28 @@ mod kernels {
         out.store(value.reshape(shape![1, 64, 64]));
     }
     #[cutile::entry()]
+    fn matmul_left_backward_bf16<const BN: i32, const N: i32>(
+        out: &mut Tensor<f32, { [1, 64, 64] }>,
+        gradient: &Tensor<f32, { [-1, -1, N] }>,
+        rhs: &Tensor<f32, { [-1, -1, N] }>,
+    ) {
+        let gp = gradient.partition(shape![1, 64, BN]);
+        let rp = rhs.partition(shape![1, 64, BN]);
+        let pid = get_tile_block_id();
+        let mut value = load_tile_mut(out).reshape(shape![64, 64]);
+        for block in 0i32..(N / BN) {
+            let left: Tile<bf16, { [64, BN] }> =
+                convert_tile(gp.load([pid.0, pid.1, block]).reshape(shape![64, BN]));
+            let right: Tile<bf16, { [BN, 64] }> = convert_tile(
+                rp.load([pid.0, pid.2, block])
+                    .reshape(shape![64, BN])
+                    .transpose(),
+            );
+            value = mma(left, right, value);
+        }
+        out.store(value.reshape(shape![1, 64, 64]));
+    }
+    #[cutile::entry()]
     fn matmul_right_backward<const BM: i32, const M: i32>(
         out: &mut Tensor<f32, { [1, 64, 64] }>,
         lhs: &Tensor<f32, { [-1, M, -1] }>,
@@ -475,6 +552,28 @@ mod kernels {
                 gp.load([pid.0, block, pid.2]).reshape(shape![BM, 64]),
                 value,
             );
+        }
+        out.store(value.reshape(shape![1, 64, 64]));
+    }
+    #[cutile::entry()]
+    fn matmul_right_backward_bf16<const BM: i32, const M: i32>(
+        out: &mut Tensor<f32, { [1, 64, 64] }>,
+        lhs: &Tensor<f32, { [-1, M, -1] }>,
+        gradient: &Tensor<f32, { [-1, M, -1] }>,
+    ) {
+        let lp = lhs.partition(shape![1, BM, 64]);
+        let gp = gradient.partition(shape![1, BM, 64]);
+        let pid = get_tile_block_id();
+        let mut value = load_tile_mut(out).reshape(shape![64, 64]);
+        for block in 0i32..(M / BM) {
+            let left: Tile<bf16, { [64, BM] }> = convert_tile(
+                lp.load([pid.0, block, pid.1])
+                    .reshape(shape![BM, 64])
+                    .transpose(),
+            );
+            let right: Tile<bf16, { [BM, 64] }> =
+                convert_tile(gp.load([pid.0, block, pid.2]).reshape(shape![BM, 64]));
+            value = mma(left, right, value);
         }
         out.store(value.reshape(shape![1, 64, 64]));
     }

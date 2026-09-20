@@ -91,6 +91,13 @@ longer inherit the generic index-plan contribution bound. Attention still
 composes separate contraction, mask, softmax, and value-contraction operations
 rather than using a fused attention kernel. Multi-axis contractions still use
 the generic plan path.
+
+`Device::cuda_bf16` is an explicit mixed-precision policy: matrix-product
+inputs are rounded to BF16 inside the kernel and accumulated into FP32. Stored
+parameters, activations outside matrix products, reductions, gradients, and
+Adam state remain FP32. `Device::cuda` retains full FP32 matrix products. This
+keeps precision choice visible in the experiment rather than changing global
+semantics silently.
 Padding/stride variants, LSTM, and a full Transformer remain future
 slices; their presence in the owner's sketch does not imply implementation.
 
