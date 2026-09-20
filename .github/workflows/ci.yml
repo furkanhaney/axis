@@ -20,6 +20,22 @@ permissions:
   contents: read
 
 jobs:
+  documentation-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.89
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
+
+      - name: Verify the packaged docs.rs and CUDA boundaries
+        run: bash tests/docsrs.sh
+
   host-and-compile:
     runs-on: ubuntu-latest
     container:

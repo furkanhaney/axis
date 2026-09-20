@@ -12,7 +12,15 @@ documentation = "https://docs.rs/axis"
 readme = "README.md"
 keywords = ["machine-learning", "cuda", "tensor", "gpu", "research"]
 categories = ["science", "mathematics"]
-include = ["src/**", "README.md", "LICENSE.md"]
+include = ["src/**", "build.rs", "README.md", "LICENSE.md"]
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cutile"]
+
+[package.metadata.docs.rs]
+no-default-features = true
+targets = []
 
 [dependencies]
-cutile.workspace = true
+cutile = { workspace = true, optional = true }
