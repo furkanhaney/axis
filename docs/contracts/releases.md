@@ -10,8 +10,8 @@ and zero open pull requests. A release PR is the sole exception while it is
 being reviewed:
 
 ```bash
-# In release PR 12: issue count must be zero and PR 12 must be the only open PR.
-bash scripts/checks/release-readiness.sh --allow-pr 12
+# In release PR NNN: issue count must be zero and PR NNN must be the only open PR.
+bash scripts/checks/release-readiness.sh --allow-pr NNN
 
 # After merge, before tagging or publishing: nothing may remain open.
 bash scripts/checks/release-readiness.sh
