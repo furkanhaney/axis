@@ -7,6 +7,8 @@ mod backend;
 mod data;
 #[path = "model/metrics.rs"]
 mod metrics;
+#[path = "research/monotonicity.rs"]
+mod monotonicity;
 #[path = "model/nn.rs"]
 mod nn;
 #[path = "model/preprocess.rs"]
@@ -25,6 +27,9 @@ pub use data::{
     FinitePassesLoader, InMemoryDataset, Sample,
 };
 pub use metrics::CategoricalAccuracy;
+pub use monotonicity::{
+    EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
+};
 pub use nn::{
     Adam, AdamW, Conv2d, GELU, IntoLayers, LayerNorm, Linear, Module, ParamId, Parameter,
     PopulationLinear, ReLU, SGD, Sequential,
@@ -45,11 +50,11 @@ mod tests;
 pub mod prelude {
     pub use crate::{
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy, Conv2d,
-        DataLoader, DataRegimeReceipt, DataSource, Device, Dim, FinitePasses, FinitePassesLoader,
-        FinitePassesReceipt, GELU, Idr, IdrLimits, IdrReceipt, InMemoryDataset, LayerNorm, Linear,
-        Module, Optimizer, ParamId, Parameter, PopulationLinear, ReLU, RegimeSnapshot, Result, SGD,
-        Sample,
-        Sequential, Shape, SinglePass, Standardizer, Tensor, TrainEvalDisjoint, TrainEvalReceipt,
-        TrainStep, Trainer,
+        DataLoader, DataRegimeReceipt, DataSource, Device, Dim, EmpiricalMonotonicity,
+        EmpiricalMonotonicityReceipt, FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU,
+        Idr, IdrLimits, IdrReceipt, InMemoryDataset, LayerNorm, Linear, Module, MonotoneDirection,
+        MonotonicityLimits, Optimizer, ParamId, Parameter, PopulationLinear, ReLU, RegimeSnapshot,
+        Result, SGD, Sample, Sequential, Shape, SinglePass, Standardizer, Tensor,
+        TrainEvalDisjoint, TrainEvalReceipt, TrainStep, Trainer,
     };
 }

@@ -26,6 +26,106 @@ fn tensors(
     ))
 }
 
+fn monotonicity_audit(
+    model: &impl Module,
+    contexts: &[AdditionSample],
+    batch: Axis,
+    input: Axis,
+    output: Axis,
+    device: &Device,
+) -> Result<(EmpiricalMonotonicityReceipt, EmpiricalMonotonicityReceipt)> {
+    fn bounds(value: f32) -> (f32, f32) {
+        ((value - 0.05).max(-1.0), (value + 0.05).min(1.0))
+    }
+    fn predictions(
+        model: &impl Module,
+        samples: &[AdditionSample],
+        batch: Axis,
+        input: Axis,
+        output: Axis,
+        device: &Device,
+    ) -> Result<Vec<f32>> {
+        let (inputs, _) = tensors(samples, batch, input, output, device)?;
+        model.forward(&inputs)?.to_vec()
+    }
+
+    let mut left_lower = Vec::with_capacity(contexts.len());
+    let mut left_upper = Vec::with_capacity(contexts.len());
+    let mut right_lower = Vec::with_capacity(contexts.len());
+    let mut right_upper = Vec::with_capacity(contexts.len());
+    for sample in contexts {
+        let (lower, upper) = bounds(sample.left);
+        left_lower.push(AdditionSample {
+            left: lower,
+            right: sample.right,
+            sum: lower + sample.right,
+        });
+        left_upper.push(AdditionSample {
+            left: upper,
+            right: sample.right,
+            sum: upper + sample.right,
+        });
+        let (lower, upper) = bounds(sample.right);
+        right_lower.push(AdditionSample {
+            left: sample.left,
+            right: lower,
+            sum: sample.left + lower,
+        });
+        right_upper.push(AdditionSample {
+            left: sample.left,
+            right: upper,
+            sum: sample.left + upper,
+        });
+    }
+
+    let left_lower_predictions = predictions(model, &left_lower, batch, input, output, device)?;
+    let left_upper_predictions = predictions(model, &left_upper, batch, input, output, device)?;
+    let right_lower_predictions = predictions(model, &right_lower, batch, input, output, device)?;
+    let right_upper_predictions = predictions(model, &right_upper, batch, input, output, device)?;
+    let limits = MonotonicityLimits::strict(1e-6)?;
+    let mut left = EmpiricalMonotonicity::new(
+        "left operand",
+        "predicted sum",
+        MonotoneDirection::Increasing,
+        limits,
+    )?;
+    let mut right = EmpiricalMonotonicity::new(
+        "right operand",
+        "predicted sum",
+        MonotoneDirection::Increasing,
+        limits,
+    )?;
+    left.observe_ordered_batch(
+        left_lower
+            .iter()
+            .zip(&left_upper)
+            .zip(left_lower_predictions.iter().zip(&left_upper_predictions))
+            .map(|((lower, upper), (lower_output, upper_output))| {
+                (
+                    f64::from(lower.left),
+                    f64::from(upper.left),
+                    f64::from(*lower_output),
+                    f64::from(*upper_output),
+                )
+            }),
+    )?;
+    right.observe_ordered_batch(
+        right_lower
+            .iter()
+            .zip(&right_upper)
+            .zip(right_lower_predictions.iter().zip(&right_upper_predictions))
+            .map(|((lower, upper), (lower_output, upper_output))| {
+                (
+                    f64::from(lower.right),
+                    f64::from(upper.right),
+                    f64::from(*lower_output),
+                    f64::from(*upper_output),
+                )
+            }),
+    )?;
+    Ok((left.receipt(), right.receipt()))
+}
+
 fn main() -> Result<()> {
     let mut steps = 500;
     let mut args = env::args().skip(1);
@@ -116,6 +216,10 @@ fn main() -> Result<()> {
     );
     println!("{}", final_receipt.expect("positive step count"));
     println!("{}", disjoint.receipt());
+    let (left_monotonicity, right_monotonicity) =
+        monotonicity_audit(&model, &evaluation.samples, batch, input, output, &device)?;
+    println!("{left_monotonicity}");
+    println!("{right_monotonicity}");
     if !final_eval.is_finite() || final_eval >= initial_eval {
         return Err("training did not improve held-out generated addition loss".into());
     }

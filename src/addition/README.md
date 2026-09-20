@@ -17,6 +17,12 @@ draw ID crossed between the observed training and evaluation populations. These
 receipts prove exact draw nonreuse; they do not claim that floating-point operand
 pairs cannot coincide.
 
+After training, the program holds the other operand fixed and perturbs each
+operand upward around all 256 evaluation contexts. `EmpiricalMonotonicity` requires
+the predicted sum to be empirically increasing for every ordered pair within
+an absolute tolerance of `1e-6`. The receipt deliberately says this sampled
+audit is not a global architectural guarantee.
+
 The measured 500-step run consumed 128,000 unique training draws with zero
 observed reuse and zero overlap with 256 evaluation draws. Held-out MSE fell
 from `0.80632222` to `0.00387844`; see [data/runs/training.log](data/runs/training.log).

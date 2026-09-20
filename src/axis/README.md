@@ -15,8 +15,10 @@ The crate currently provides:
 - device-resident SGD, Adam, and AdamW;
 - generated and finite data loaders with executable single-pass, finite-pass,
   IDR, and train/evaluation-disjointness assertions;
-- exact, batch-composable categorical accuracy counts; and
-- train-fitted standardization with an explicit variance correction.
+- exact, batch-composable categorical accuracy counts;
+- train-fitted standardization with an explicit variance correction; and
+- empirical monotonicity checks over explicitly ordered input pairs, with
+  receipts that distinguish sampled evidence from a global guarantee.
 
 ```rust,no_run
 use axis::prelude::*;
@@ -43,7 +45,7 @@ Axis requires Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile,
 change as real training programs expose better defaults and abstractions.
 
 ```bash
-cargo add axis@0.1.0
+cargo add axis@0.2.0
 ```
 
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,

@@ -9,7 +9,7 @@
 ![Experimental](https://img.shields.io/badge/status-experimental-f59e0b)
 
 [crates.io](https://crates.io/crates/axis) · [v0.1.0 release](https://github.com/furkanhaney/axis/releases/tag/v0.1.0) ·
-[Why Axis](docs/direction/thesis.md) · [Library contract](docs/design/library.md) ·
+[Why Axis](docs/direction/thesis.md) · [Vision](docs/direction/vision.md) · [Library contract](docs/design/library.md) ·
 [Contributing](CONTRIBUTING.md) · [License](LICENSE.md) · [Trademarks](TRADEMARK.md)
 
 ![A generated Sudoku board used by the Axis acceptance test](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_generated_puzzle.png)
@@ -32,7 +32,7 @@ weights—and the loss still goes down. Axis treats those as executable contract
 Add the current crates.io release to a Rust project:
 
 ```bash
-cargo add axis@0.1.0
+cargo add axis@0.2.0
 ```
 
 ## A training loop
@@ -116,6 +116,8 @@ throughput success claim.
   each member of a named population axis.
 - Finite datasets, generated streams, exact shuffled passes, single-pass and
   IDR guards, and train/evaluation identity separation.
+- Empirical increasing/decreasing checks over explicitly ordered input pairs,
+  with declared tolerance and violation-rate limits and scoped receipts.
 - A `Trainer` that fixes update order: clear gradients, construct a fresh loss,
   backpropagate, then update once.
 
