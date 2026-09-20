@@ -811,6 +811,48 @@ impl Tensor {
         profile("mean", started);
         Ok(result)
     }
+    /// Reduce one named axis by its minimum, routing gradients to the first winner on ties.
+    ///
+    /// This correctness-first implementation synchronizes values to choose a constant winner
+    /// mask, then expresses the reduction through differentiable device operations.
+    pub fn min(&self, axis: Axis) -> Result<Self> {
+        let started = Instant::now();
+        let reduced_index = self.shape().index(axis)?;
+        let extent = self.extent(axis)?;
+        let output = Shape::new(
+            self.shape()
+                .dims()
+                .iter()
+                .copied()
+                .filter(|d| d.axis != axis),
+        )?;
+        let values = self.to_vec()?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("min requires finite values".into());
+        }
+        let mut winners = vec![usize::MAX; output.len()];
+        for logical in 0..self.shape().len() {
+            let coords = self.shape().coords(logical);
+            let mut group = 0;
+            for (index, dim) in self.shape().dims().iter().enumerate() {
+                if index != reduced_index {
+                    group = group * dim.extent + coords[index];
+                }
+            }
+            let current = winners[group];
+            if current == usize::MAX || values[logical] < values[current] {
+                winners[group] = logical;
+            }
+        }
+        let mut mask = vec![0.0; self.shape().len()];
+        for winner in winners {
+            mask[winner] = 1.0;
+        }
+        let mask = Tensor::from_slice(&mask, self.shape().dims().iter().copied(), self.device())?;
+        let result = self.mul(&mask)?.mean(axis)?.scale(extent as f32)?;
+        profile("min", started);
+        Ok(result)
+    }
     /// Reduce a tensor to the mean of elements selected by a constant binary mask.
     /// The mask must have the same named axes, and every axis must be reduced.
     pub fn masked_mean(&self, mask: &Self) -> Result<Self> {

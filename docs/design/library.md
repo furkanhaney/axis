@@ -182,6 +182,7 @@ shape checks first; compile-time axis types can be evaluated later.
 | `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. |
 | `x.squared_error(y)` | Align identical axis sets by identity, require equal extents, preserve the unreduced shape. |
 | `x.mean(axes)` | Remove precisely those axes; backward broadcasts and divides by their extent product. Scalar `.backward()` requires all loss axes to have been reduced. |
+| `x.min(axis)` | Remove one named axis, choose the first logical minimum on ties, and route backward only to that winner. The correctness-first implementation synchronizes to select winners; a device-resident lowering remains future work. |
 | Elementwise add/multiply | Align shared identities with equal extents. Permit scalar or subset-axis broadcasting, such as a `[hidden]` bias on `[batch, hidden]`. |
 | Incomparable axis sets | Require explicit expansion. `[batch, time] + [batch, hidden]` must not silently create `[batch, time, hidden]`. |
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
