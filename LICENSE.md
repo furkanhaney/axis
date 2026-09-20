@@ -36,3 +36,6 @@ downloads NVIDIA software governed by NVIDIA's terms.
 A file-level notice or accompanying license takes precedence for material that
 states separate terms. Links to external projects or artifacts do not place
 their contents under this license.
+
+The Axis project name and branding are governed separately by the
+[trademark policy](TRADEMARK.md).

@@ -9,7 +9,7 @@
 
 [crates.io](https://crates.io/crates/axis) · [v0.1.0 release](https://github.com/furkanhaney/axis/releases/tag/v0.1.0) ·
 [Why Axis](docs/thesis.md) · [Library contract](docs/library.md) ·
-[Contributing](CONTRIBUTING.md) · [License](LICENSE.md)
+[Contributing](CONTRIBUTING.md) · [License](LICENSE.md) · [Trademarks](TRADEMARK.md)
 
 ![A generated Sudoku board used by the Axis acceptance test](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_generated_puzzle.png)
 

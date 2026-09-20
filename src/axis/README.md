@@ -49,4 +49,6 @@ cargo add axis@0.1.0
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
 CNN, attention, generated-data, MNIST, and research-script migrations with
 independent numerical oracles. Contributions from humans and agents are both
-welcome under the repository's contribution contract.
+welcome under the repository's contribution contract. The project name and
+branding are covered by its
+[trademark policy](https://github.com/furkanhaney/axis/blob/main/TRADEMARK.md).
