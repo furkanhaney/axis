@@ -30,6 +30,11 @@ env -u CUDA_TOOLKIT_PATH -u CUDA_HOME \
     CARGO_TARGET_DIR="$proof_root/docs-target" \
     cargo doc --manifest-path "$manifest" --locked --no-default-features --no-deps
 
+env -u CUDA_TOOLKIT_PATH -u CUDA_HOME \
+    DOCS_RS=1 \
+    CARGO_TARGET_DIR="$proof_root/docs-target" \
+    cargo check --manifest-path "$manifest" --locked --no-default-features
+
 set +e
 CUDA_TOOLKIT_PATH="$proof_root/missing-cuda" \
     CUDA_HOME= \
