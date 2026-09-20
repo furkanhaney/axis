@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  host-and-compile:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:13.3.0-devel-ubuntu24.04
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    env:
+      CUDA_TOOLKIT_PATH: /usr/local/cuda
+    timeout-minutes: 30
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git libclang-dev pkg-config python3
+
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.89
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.89.0 \
+              --component rustfmt,clippy
+
+      - name: Verify setup helper
+        run: python3 -m unittest discover -s tests
+
+      - name: Check formatting
+        run: |
+          . "${HOME}/.cargo/env"
+          cargo fmt --all -- --check
+
+      - name: Lint workspace
+        run: |
+          . "${HOME}/.cargo/env"
+          cargo clippy --workspace --release --locked --all-targets -- -D warnings
+
+      - name: Run host tests
+        run: |
+          . "${HOME}/.cargo/env"
+          cargo test --workspace --release --locked
+
+      - name: Verify published package contents
+        run: |
+          . "${HOME}/.cargo/env"
+          cargo package -p axis --locked
