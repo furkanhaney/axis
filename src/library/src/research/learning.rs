@@ -264,15 +264,31 @@ impl LearningProgressReceipt {
     pub fn passed(&self) -> bool {
         self.observations >= 2
             && self.absolute_improvement > 0.0
-            && self.absolute_improvement >= self.limits.minimum_absolute_improvement
+            && meets_threshold(
+                self.absolute_improvement,
+                self.limits.minimum_absolute_improvement,
+            )
             && self
                 .limits
                 .minimum_relative_improvement
                 .is_none_or(|minimum| {
                     self.relative_improvement
-                        .is_some_and(|observed| observed >= minimum)
+                        .is_some_and(|observed| meets_threshold(observed, minimum))
                 })
     }
+}
+
+// A difference and an optional division separate an observation from its
+// declared threshold. Admit only their immediate representation noise: there
+// is deliberately no absolute epsilon that could erase a tiny threshold.
+const MAX_THRESHOLD_ULPS: u64 = 4;
+
+fn meets_threshold(observed: f64, minimum: f64) -> bool {
+    observed.is_finite()
+        && minimum.is_finite()
+        && (observed >= minimum
+            || (observed >= 0.0
+                && minimum.to_bits().saturating_sub(observed.to_bits()) <= MAX_THRESHOLD_ULPS))
 }
 
 impl fmt::Display for LearningProgressReceipt {
@@ -382,7 +398,46 @@ mod tests {
         )?;
         accuracy.observe(observation("accuracy", "test-v1", "samples", 2_000, 0.75)?)?;
         assert!(accuracy.assert_learning()?.passed());
+
+        let mut decimal_absolute = LearningProgress::new(
+            LearningDirection::Decrease,
+            LearningLimits::new(0.1, None)?,
+            observation("loss", "decimal-absolute", "steps", 0, 1.0)?,
+        )?;
+        decimal_absolute.observe(observation("loss", "decimal-absolute", "steps", 1, 0.9)?)?;
+        assert_eq!(
+            decimal_absolute.receipt().absolute_improvement,
+            0.09999999999999998
+        );
+        assert!(decimal_absolute.assert_learning()?.passed());
+
+        let mut decimal_relative = LearningProgress::new(
+            LearningDirection::Decrease,
+            LearningLimits::new(0.0, Some(0.1))?,
+            observation("loss", "decimal-relative", "steps", 0, 2.0)?,
+        )?;
+        decimal_relative.observe(observation("loss", "decimal-relative", "steps", 1, 1.8)?)?;
+        assert_eq!(
+            decimal_relative.receipt().relative_improvement,
+            Some(0.09999999999999998)
+        );
+        assert!(decimal_relative.assert_learning()?.passed());
         Ok(())
+    }
+
+    #[test]
+    fn threshold_slack_is_ulps_not_an_absolute_floor() {
+        let threshold = 0.1_f64;
+        assert!(meets_threshold(
+            f64::from_bits(threshold.to_bits() - MAX_THRESHOLD_ULPS),
+            threshold
+        ));
+        assert!(!meets_threshold(
+            f64::from_bits(threshold.to_bits() - MAX_THRESHOLD_ULPS - 1),
+            threshold
+        ));
+        assert!(!meets_threshold(5e-301, 1e-300));
+        assert!(!meets_threshold(f64::INFINITY, 1.0));
     }
 
     #[test]

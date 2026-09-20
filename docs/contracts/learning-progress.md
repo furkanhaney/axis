@@ -37,7 +37,10 @@ Axis rejects a mismatch rather than comparing two numbers that describe
 different evaluations. Budgets must increase strictly. Metric values and
 thresholds must be finite, and relative thresholds require a nonzero baseline.
 Any-improvement limits still require a strictly positive change; configured
-absolute and relative threshold boundaries are inclusive.
+absolute and relative threshold boundaries are inclusive. Threshold comparison
+admits at most four adjacent `f64` representations below the declared value to
+cover subtraction and division rounding. It uses no fixed epsilon, so this does
+not weaken thresholds at small scales.
 
 The terminal observation is the latest accepted observation. A rejected
 observation changes no state, so a malformed checkpoint cannot silently replace
