@@ -1,3 +1,5 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running `target/release/addition-train --steps 500`
 initial evaluation_mse=0.80632222
 step=1 samples=256 pre_update_mse=0.67623574
 step=100 samples=25600 pre_update_mse=0.00242190
@@ -5,7 +7,7 @@ step=200 samples=51200 pre_update_mse=0.01286712
 step=300 samples=76800 pre_update_mse=0.00441918
 step=400 samples=102400 pre_update_mse=0.00270582
 step=500 samples=128000 pre_update_mse=0.00372966
-final evaluation_mse=0.00387844 elapsed_s=5.39
+final evaluation_mse=0.00387844 elapsed_s=5.24
 IDR STATUS
 
 samples consumed:      128000
@@ -15,11 +17,14 @@ observed reuse:         0.0000%
 max observed reuse:     0.0000%
 
 PASS
-TRAIN/EVALUATION DISJOINTNESS
+SEMANTIC DISJOINTNESS
 
-unique training IDs:    128000
-unique evaluation IDs:  256
-observed overlap:        0
+identity scheme:       addition-operands@1
+identity unit:         ordered pair of f32 operand bit patterns
+evidence:              verified observed identities
+evaluation: observations=256 unique=256 repeats=0
+training: observations=128000 unique=128000 repeats=0
+observed cross-population overlap: 0
 
 PASS
 EMPIRICAL MONOTONICITY

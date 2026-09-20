@@ -14,7 +14,9 @@ The crate currently provides:
   sequential composition;
 - device-resident SGD, Adam, and AdamW;
 - generated and finite data loaders with executable single-pass, finite-pass,
-  IDR, and train/evaluation-disjointness assertions;
+  and IDR assertions;
+- versioned semantic identities with verified disjointness across any declared
+  research populations;
 - exact, batch-composable categorical accuracy counts;
 - train-fitted standardization with an explicit variance correction; and
 - empirical monotonicity checks over explicitly ordered input pairs, with
