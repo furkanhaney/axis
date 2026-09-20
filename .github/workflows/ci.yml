@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_pr:
+        description: "Open release PR to permit; leave empty for a strict check"
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -45,8 +51,9 @@ jobs:
 
       - name: Verify repository structure and setup helper
         run: |
-          bash scripts/check_structure.sh
+          bash scripts/checks/structure.sh
           bash tests/setup_cuda.sh
+          bash tests/release_readiness.sh
 
       - name: Check formatting
         run: |
@@ -67,3 +74,33 @@ jobs:
         run: |
           . "${HOME}/.cargo/env"
           cargo package -p axis --locked
+
+  release-readiness:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+
+    steps:
+      - name: Check out the repository and release comparison base
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Require a clear repository at the release boundary
+        env:
+          AXIS_EVENT: ${{ github.event_name }}
+          AXIS_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          AXIS_CURRENT_PR: ${{ github.event.pull_request.number || inputs.release_pr }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(--repository "$GITHUB_REPOSITORY")
+          if [[ "$AXIS_EVENT" == "pull_request" ]]; then
+            args+=(--base-ref "$AXIS_BASE_SHA" --allow-pr "$AXIS_CURRENT_PR")
+          elif [[ "$AXIS_EVENT" == "push" ]]; then
+            args+=(--base-ref "$AXIS_BASE_SHA")
+          elif [[ -n "$AXIS_CURRENT_PR" ]]; then
+            args+=(--allow-pr "$AXIS_CURRENT_PR")
+          fi
+          bash scripts/checks/release-readiness.sh "${args[@]}"

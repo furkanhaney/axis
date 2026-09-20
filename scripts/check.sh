@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 workspace_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-bash "$workspace_root/scripts/check_structure.sh"
+bash "$workspace_root/scripts/checks/structure.sh"
 bash "$workspace_root/tests/setup_cuda.sh"
+bash "$workspace_root/tests/release_readiness.sh"
 runner="$workspace_root/scripts/cargo.sh"
 bash "$runner" fmt --all -- --check
 bash "$runner" clippy --workspace --release --locked --all-targets -- -D warnings
