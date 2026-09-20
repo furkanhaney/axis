@@ -377,4 +377,67 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    #[ignore = "requires CUDA; workspace check enables this"]
+    fn mobilenet_style_depthwise_separable_block_composes() -> Result<()> {
+        let device = Device::cuda(0)?;
+        let (batch, channel, height, width, feature) = (
+            Axis::new("batch"),
+            Axis::new("channel"),
+            Axis::new("height"),
+            Axis::new("width"),
+            Axis::new("feature"),
+        );
+        let values: Vec<_> = (1..=9)
+            .map(|value| value as f32)
+            .chain((1..=9).map(|value| -(value as f32)))
+            .collect();
+        let input = Tensor::from_slice(
+            &values,
+            [batch.of(1), channel.of(2), height.of(3), width.of(3)],
+            &device,
+        )?
+        .with_grad();
+        let mut block = Sequential::new((
+            Conv2d::new(channel, channel.of(2), [height, width], [3, 3])
+                .padding([1, 1])
+                .groups(2),
+            ReLU,
+            Conv2d::new(channel, feature.of(3), [height, width], [1, 1]),
+        ));
+        assert_eq!(
+            block.build(input.shape(), &device, 31)?,
+            Shape::new([batch.of(1), height.of(3), width.of(3), feature.of(3),])?
+        );
+        let mut depthwise = vec![0.0; 18];
+        depthwise[4] = 1.0;
+        depthwise[9 + 4] = -1.0;
+        block.parameter("0.weight")?.set_values(&depthwise)?;
+        block.parameter("0.bias")?.set_values(&[0.0, 0.0])?;
+        block
+            .parameter("2.weight")?
+            .set_values(&[1.0, 0.5, -1.0, 0.25, -0.5, 2.0])?;
+        block.parameter("2.bias")?.set_values(&[0.1, -0.2, 0.3])?;
+
+        let output = block.forward(&input)?;
+        let expected: Vec<_> = (1..=9)
+            .flat_map(|value| {
+                let value = f64::from(value);
+                [1.25 * value + 0.1, -0.2, value + 0.3]
+            })
+            .collect();
+        close("depthwise-separable forward", &output.to_vec()?, &expected);
+        output.mean([batch, height, width, feature])?.backward()?;
+        assert!(input.grad().is_some());
+        for name in ["0.weight", "0.bias", "2.weight", "2.bias"] {
+            let gradient = block.parameter(name)?.grad().unwrap().to_vec()?;
+            assert!(
+                gradient.iter().all(|value| value.is_finite()),
+                "non-finite gradient for {name}"
+            );
+        }
+        println!("check MobileNet-style depthwise-separable block: PASS");
+        Ok(())
+    }
 }

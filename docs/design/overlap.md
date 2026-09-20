@@ -64,8 +64,10 @@ semantic contract they need to serve: named axes, explicit reductions,
 composable modules, and automatic differentiation. The implementation order
 and acceptance criteria are in [library.md](library.md).
 
-This census describes the retained explicit baselines. The `axis` member
-now supplies named axes, autodiff, layout handling, Linear, and valid
-stride-one Conv2d; see the [implementation scope](library.md). The library CNN
-matches its direct scalar oracle through overlapping input gradients. Stacked
-convolution and comparative performance remain unestablished.
+This census describes the retained explicit baselines. The `axis` member now
+supplies named axes, autodiff, layout handling, Linear, and Conv2d with stride,
+symmetric padding, and grouped/depthwise channels; see the
+[implementation scope](library.md). The library CNN matches direct scalar
+oracles through overlapping input and parameter gradients, and a compact
+depthwise-separable block composes. Comparative performance remains
+unestablished.

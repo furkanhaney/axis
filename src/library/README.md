@@ -11,8 +11,9 @@ The crate currently provides:
 
 - named-axis tensor algebra and reverse-mode differentiation, including
   deterministic finite minimum reductions;
-- `Linear`, `Conv2d`, `LayerNorm`, activations, attention primitives, and
-  sequential composition;
+- `Linear`, `Conv2d` with stride, symmetric padding, and grouped/depthwise
+  channels, `LayerNorm`, activations, attention primitives, and sequential
+  composition;
 - device-resident SGD, Adam, and AdamW;
 - generated and finite data loaders with executable single-pass, finite-pass,
   and IDR assertions;
@@ -46,6 +47,11 @@ fn main() -> Result<()> {
 Axis requires Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile,
 `libclang`, and CUDA 13.2 or newer. It is early research software: APIs may
 change as real training programs expose better defaults and abstractions.
+
+`Conv2d::new` defaults to stride one, no padding, and one group. Configure a
+depthwise layer by setting `groups` to the input channel count; both input and
+output channel extents must be divisible by that value. Padding is symmetric
+per named spatial axis. Dilation and asymmetric padding are not implemented.
 
 ```bash
 cargo add axis@0.2.0

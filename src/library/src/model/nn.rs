@@ -307,26 +307,78 @@ impl Module for PopulationLinear {
     }
 }
 
-/// Valid, stride-one 2D cross-correlation followed by bias addition.
+/// Named-channel 2D cross-correlation followed by bias addition.
+///
+/// Stride defaults to `[1, 1]`, padding to `[0, 0]`, and groups to `1`.
+/// A depthwise convolution sets groups equal to both the input and output
+/// channel extents. Each spatial output extent is
+/// `floor((input + 2 * padding - kernel) / stride) + 1`.
+///
+/// Padding is symmetric and may produce windows containing only zeros.
+/// Dilation and asymmetric padding are not currently supported. The cuTile
+/// backend materializes a generic indexed patch tensor before its tiled
+/// grouped contraction, so this is a correctness path rather than a fused or
+/// throughput-competitive convolution kernel.
 pub struct Conv2d {
     input: Axis,
+    output: Dim,
     spatial: [Axis; 2],
     kernel: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+    groups: usize,
+    group: Axis,
     patch: Axis,
-    linear: Linear,
+    output_in_group: Axis,
+    output_role: Axis,
+    bound: Option<BoundConv2d>,
+}
+
+struct BoundConv2d {
+    input_channels: usize,
+    groups: usize,
+    patch: usize,
+    output_in_group: usize,
+    weight: Parameter,
+    bias: Parameter,
 }
 impl Conv2d {
     pub fn new(input: Axis, output: Dim, spatial: [Axis; 2], kernel: [usize; 2]) -> Self {
-        let patch = input.role("conv_patch");
         Self {
             input,
+            output,
             spatial,
             kernel,
-            patch,
-            linear: Linear::new(patch, output),
+            stride: [1, 1],
+            padding: [0, 0],
+            groups: 1,
+            group: input.role("conv_group"),
+            patch: input.role("conv_patch_in_group"),
+            output_in_group: output.axis.role("conv_output_in_group"),
+            output_role: output.axis.role("conv_output"),
+            bound: None,
         }
     }
-    fn patch_shape(&self, input: &Shape) -> Result<Shape> {
+
+    /// Set vertical and horizontal stride. Zero is rejected by shape validation.
+    pub fn stride(mut self, stride: [usize; 2]) -> Self {
+        self.stride = stride;
+        self
+    }
+
+    /// Set symmetric vertical and horizontal zero-padding.
+    pub fn padding(mut self, padding: [usize; 2]) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Partition input and output channels into independent convolution groups.
+    pub fn groups(mut self, groups: usize) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    fn geometry(&self, input: &Shape) -> Result<(Shape, usize, usize, usize)> {
         if self.spatial[0] == self.spatial[1]
             || self.input == self.spatial[0]
             || self.input == self.spatial[1]
@@ -336,49 +388,154 @@ impl Conv2d {
         let channels = input.extent(self.input)?;
         let height = input.extent(self.spatial[0])?;
         let width = input.extent(self.spatial[1])?;
-        if self.kernel.contains(&0) || self.kernel[0] > height || self.kernel[1] > width {
-            return Err("Conv2d kernel must be positive and fit both spatial axes".into());
+        if self.kernel.contains(&0) {
+            return Err("Conv2d kernel extents must be positive".into());
         }
-        let patch = channels
+        if self.stride.contains(&0) {
+            return Err("Conv2d stride extents must be positive".into());
+        }
+        if self.groups == 0 {
+            return Err("Conv2d groups must be positive".into());
+        }
+        if !channels.is_multiple_of(self.groups) {
+            return Err("Conv2d input channels must be divisible by groups".into());
+        }
+        if !self.output.extent.is_multiple_of(self.groups) {
+            return Err("Conv2d output channels must be divisible by groups".into());
+        }
+        let padded_height = height
+            .checked_add(
+                self.padding[0]
+                    .checked_mul(2)
+                    .ok_or("Conv2d padding overflow")?,
+            )
+            .ok_or("Conv2d padded height overflow")?;
+        let padded_width = width
+            .checked_add(
+                self.padding[1]
+                    .checked_mul(2)
+                    .ok_or("Conv2d padding overflow")?,
+            )
+            .ok_or("Conv2d padded width overflow")?;
+        if self.kernel[0] > padded_height || self.kernel[1] > padded_width {
+            return Err("Conv2d kernel must fit the padded spatial axes".into());
+        }
+        let output_height = (padded_height - self.kernel[0]) / self.stride[0] + 1;
+        let output_width = (padded_width - self.kernel[1]) / self.stride[1] + 1;
+        let channels_per_group = channels / self.groups;
+        let patch = channels_per_group
             .checked_mul(self.kernel[0])
             .and_then(|n| n.checked_mul(self.kernel[1]))
             .ok_or("Conv2d patch extent overflow")?;
-        Shape::new(input.dims().iter().map(|dim| {
-            if dim.axis == self.input {
-                self.patch.of(patch)
-            } else if dim.axis == self.spatial[0] {
-                self.spatial[0].of(height - self.kernel[0] + 1)
-            } else if dim.axis == self.spatial[1] {
-                self.spatial[1].of(width - self.kernel[1] + 1)
-            } else {
-                *dim
+        let output_in_group = self.output.extent / self.groups;
+        if let Some(bound) = &self.bound {
+            if bound.input_channels != channels {
+                return Err("Conv2d input channels differ from its built extent".into());
             }
-        }))
+            if bound.groups != self.groups
+                || bound.patch != patch
+                || bound.output_in_group != output_in_group
+            {
+                return Err("Conv2d group geometry differs from its built parameters".into());
+            }
+        }
+        let mut dims: Vec<_> = input
+            .dims()
+            .iter()
+            .filter_map(|dim| {
+                if dim.axis == self.input {
+                    None
+                } else if dim.axis == self.spatial[0] {
+                    Some(self.spatial[0].of(output_height))
+                } else if dim.axis == self.spatial[1] {
+                    Some(self.spatial[1].of(output_width))
+                } else {
+                    Some(*dim)
+                }
+            })
+            .collect();
+        dims.push(self.output);
+        Ok((Shape::new(dims)?, channels, patch, output_in_group))
     }
 }
 impl Module for Conv2d {
     fn output_shape(&self, input: &Shape) -> Result<Shape> {
-        self.linear.output_shape(&self.patch_shape(input)?)
+        Ok(self.geometry(input)?.0)
     }
     fn build(&mut self, input: &Shape, device: &Device, seed: u64) -> Result<Shape> {
-        self.linear.build(&self.patch_shape(input)?, device, seed)
+        let (shape, channels, patch, output_in_group) = self.geometry(input)?;
+        if let Some(bound) = &self.bound {
+            if !bound.weight.tensor().device().same(device) {
+                return Err("Conv2d is already built on a different Device".into());
+            }
+            return Ok(shape);
+        }
+        let weight_shape = Shape::new([
+            self.group.of(self.groups),
+            self.patch.of(patch),
+            self.output_in_group.of(output_in_group),
+        ])?;
+        let mut rng = seed.max(1);
+        let scale = (6.0 / (patch + output_in_group) as f32).sqrt();
+        let values: Vec<_> = (0..weight_shape.len())
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (((rng >> 40) as f32 / (1_u32 << 24) as f32) * 2.0 - 1.0) * scale
+            })
+            .collect();
+        let weight = Parameter::new(Tensor::from_slice(
+            &values,
+            weight_shape.dims().iter().copied(),
+            device,
+        )?);
+        let bias = Parameter::new(Tensor::from_slice(
+            &vec![0.0; self.output.extent],
+            [self.output_role.of(self.output.extent)],
+            device,
+        )?);
+        self.bound = Some(BoundConv2d {
+            input_channels: channels,
+            groups: self.groups,
+            patch,
+            output_in_group,
+            weight,
+            bias,
+        });
+        Ok(shape)
     }
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        self.output_shape(input.shape())?;
-        let patch_extent = input
-            .extent(self.input)?
-            .checked_mul(self.kernel[0])
-            .and_then(|n| n.checked_mul(self.kernel[1]))
-            .ok_or("Conv2d patch extent overflow")?;
-        self.linear.forward(&input.unfold2d(
-            self.input,
-            self.spatial,
-            self.patch.of(patch_extent),
-            self.kernel,
-        )?)
+        let (_, _, patch, _) = self.geometry(input.shape())?;
+        let bound = self
+            .bound
+            .as_ref()
+            .ok_or("Conv2d must be built before forward")?;
+        input
+            .unfold2d_grouped(
+                self.input,
+                self.spatial,
+                self.group.of(self.groups),
+                self.patch.of(patch),
+                self.kernel,
+                self.stride,
+                self.padding,
+            )?
+            .contract(&bound.weight.tensor(), self.patch)?
+            .merge([self.group, self.output_in_group], self.output_role)?
+            .add(&bound.bias.tensor())?
+            .rename(self.output_role, self.output.axis)
     }
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
-        self.linear.named_parameters()
+        self.bound
+            .as_ref()
+            .map(|bound| {
+                vec![
+                    ("weight".into(), bound.weight.clone()),
+                    ("bias".into(), bound.bias.clone()),
+                ]
+            })
+            .unwrap_or_default()
     }
 }
 
