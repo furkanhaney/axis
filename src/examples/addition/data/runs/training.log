@@ -1,4 +1,6 @@
-    Finished `release` profile [optimized] target(s) in 0.07s
+   Compiling axis v0.2.0 (/mnt/fast980/projects/src/rasat/src/axis/src/library)
+   Compiling addition v0.2.0 (/mnt/fast980/projects/src/rasat/src/axis/src/examples/addition)
+    Finished `release` profile [optimized] target(s) in 7.34s
      Running `target/release/addition-train --steps 500`
 initial evaluation_mse=0.80632222
 step=1 samples=256 pre_update_mse=0.67623574
@@ -7,7 +9,7 @@ step=200 samples=51200 pre_update_mse=0.01286712
 step=300 samples=76800 pre_update_mse=0.00441918
 step=400 samples=102400 pre_update_mse=0.00270582
 step=500 samples=128000 pre_update_mse=0.00372966
-final evaluation_mse=0.00387844 elapsed_s=5.24
+final evaluation_mse=0.00387844 elapsed_s=5.49
 IDR STATUS
 
 samples consumed:      128000
@@ -22,8 +24,8 @@ SEMANTIC DISJOINTNESS
 identity scheme:       addition-operands@1
 identity unit:         ordered pair of f32 operand bit patterns
 evidence:              verified observed identities
-evaluation: observations=256 unique=256 repeats=0
-training: observations=128000 unique=128000 repeats=0
+evaluation: mode=retained observations=256 unique=256 repeats=0
+training: mode=streaming observations=128000 unique=not-retained repeats=not-measured
 observed cross-population overlap: 0
 
 PASS

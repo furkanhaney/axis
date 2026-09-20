@@ -62,7 +62,8 @@ let mut trainer = Trainer::new(SGD::new(0.25)?);
 There are no epochs in this example because the source never ends. If a draw ID
 repeats, IDR fails. A separate `Disjointness` ledger compares canonical problem
 identities across training and evaluation, so the run also fails when distinct
-draw IDs encode the same problem.
+draw IDs encode the same reference problem. Streaming mode discards training
+keys after comparison, keeping memory bounded by the retained evaluation data.
 
 ## Sudoku as an acceptance test
 
