@@ -162,8 +162,11 @@ a compatible toolkit:
 python3 scripts/setup_cuda.py
 ```
 
-The generated `.cuda/` and Cargo `target/` directories stay local. The only
-external direct Rust dependency is pinned `cutile = "=0.3.1"`.
+The generated `.cuda/` and Cargo `target/` directories stay local. CUDA's six
+library aliases are materialized as independent regular files after every
+setup invocation, including when all package markers already match. The setup
+rejects any other symlink in the local toolkit. The only external direct Rust
+dependency is pinned `cutile = "=0.3.1"`.
 
 ## Run
 

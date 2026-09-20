@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-runner="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/cargo.sh"
+workspace_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 -m unittest discover -s "$workspace_root/tests"
+runner="$workspace_root/scripts/cargo.sh"
 bash "$runner" fmt --all -- --check
 bash "$runner" clippy --workspace --release --locked --all-targets -- -D warnings
 bash "$runner" test --workspace --release --locked
