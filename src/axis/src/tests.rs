@@ -447,6 +447,11 @@ fn categorical_loss_and_device_adam_match_references() -> Result<()> {
     assert_eq!(accuracy.total(), 2);
     assert_eq!(accuracy.fraction(), 1.0);
     assert_eq!(accuracy.merge(accuracy).total(), 4);
+    let selected = Tensor::from_slice(&[1.0, 0.0], [batch.of(2)], &device)?;
+    let masked = logits.masked_categorical_accuracy(&targets, &selected, class)?;
+    assert_eq!(masked.correct(), 1);
+    assert_eq!(masked.total(), 1);
+    assert_eq!(masked.fraction(), 1.0);
     assert_eq!(losses.shape(), &Shape::new([batch.of(2)])?);
     let expected_loss = (1.0_f64 + (-1.0_f64).exp() + (-2.0_f64).exp()).ln();
     close(
