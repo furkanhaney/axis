@@ -85,4 +85,4 @@ runtime. This lets the framework accumulate research methodology without
 turning speculative rules into restrictive abstractions.
 
 How these narrow checks compose into evidence and constrain scientific claims
-is described in [run certificates](run-certificates.md).
+is described in [run certificates](../contracts/run-certificates.md).

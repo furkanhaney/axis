@@ -26,5 +26,5 @@ storage is reordered independently of the logical axes.
 
 At 100 steps on 16 training and 16 held-out images, held-out BCE falls from
 `7.04e-1` to `7.40e-2` and accuracy reaches `100.00%`.
-[Measured library run](data/library-training.log). See the original
+[Measured library run](data/runs/library-training.log). See the original
 [baseline training contract and results](docs/training.md).

@@ -1,0 +1,26 @@
+GPU: NVIDIA GeForce RTX 5060
+cuTile 0.3.1 | MLP 16 -> 32 ReLU -> 16 | f32 | SGD
+check finite differences: PASS 16 parameters max_abs_error=3.59e-11
+check prediction: PASS max_abs_error=2.89e-7
+check dW1: PASS max_abs_error=4.11e-9
+check db1: PASS max_abs_error=3.59e-9
+check dW2: PASS max_abs_error=7.63e-9
+check db2: PASS max_abs_error=6.17e-9
+check updated W1: PASS max_abs_error=2.99e-8
+check updated b1: PASS max_abs_error=3.29e-9
+check updated W2: PASS max_abs_error=1.43e-8
+check updated b2: PASS max_abs_error=3.72e-9
+setup_and_verification_seconds=1.75 steps=100 lr=0.50 seed=42
+step,train_mse,validation_mse,elapsed_seconds
+0,7.51e-1,6.93e-1,0.00
+10,3.05e-1,2.87e-1,0.00
+20,2.33e-1,2.25e-1,0.00
+30,1.91e-1,1.90e-1,0.01
+40,1.63e-1,1.67e-1,0.01
+50,1.44e-1,1.51e-1,0.01
+60,1.30e-1,1.39e-1,0.01
+70,1.20e-1,1.29e-1,0.02
+80,1.12e-1,1.22e-1,0.02
+90,1.05e-1,1.15e-1,0.02
+100,9.91e-2,1.10e-1,0.02
+PASS train_reduction=86.81% validation_reduction=84.12% elapsed_seconds=0.02

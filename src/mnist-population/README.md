@@ -24,6 +24,6 @@ does not reproduce its throughput claim. See
 [docs/migration.md](docs/migration.md).
 
 The fused four-member smoke raised the best held-out accuracy from `8.20%`
-before training to `60.55%`; [data/smoke.log](data/smoke.log) records the full
+before training to `60.55%`; [data/runs/smoke.log](data/runs/smoke.log) records the full
 learning-rate sweep. Its measured `0.31` runs/s is evidence that kernel lowering,
 not the public population model, is now the throughput bottleneck.

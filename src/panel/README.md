@@ -18,5 +18,5 @@ preserved contracts and current differences.
 
 With AdamW enabled, the bounded country split reduced normalized validation MSE
 from `1.657922` to `0.178666`; the future split reduced it from `1.962119` to
-`0.107304`. These are mechanics witnesses recorded in [data](data/), not study
+`0.107304`. These are mechanics witnesses recorded in [run evidence](data/runs/), not study
 results.

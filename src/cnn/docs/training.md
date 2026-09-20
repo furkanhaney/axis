@@ -74,10 +74,10 @@ Training BCE decreased 99.36%; validation BCE decreased 99.31%. Maximum
 absolute parameter-gradient error against the CPU reference was 2.27e-8;
 finite-difference error was at most 8.08e-11. Setup/JIT/verification took
 4.01 seconds; the small 500-step loop with evaluation took 0.22 seconds in
-this run. [Captured output](../data/cnn-verification.log).
+this run. [Captured output](../data/evidence/cnn-verification.log).
 
 These results establish learning on this simple synthetic classification
 task. They do not measure natural-image accuracy or comparative throughput.
 Geometry and tile sizes remain explicit constraints of this prototype.
-The [overlap census](../../../docs/overlap.md) and [library proposal](../../../docs/library.md) describe
+The [overlap census](../../../docs/design/overlap.md) and [library proposal](../../../docs/design/library.md) describe
 what these two programs suggest extracting next.

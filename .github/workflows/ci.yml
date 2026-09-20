@@ -40,8 +40,10 @@ jobs:
             | sh -s -- -y --default-toolchain 1.89.0 \
               --component rustfmt,clippy
 
-      - name: Verify setup helper
-        run: python3 -m unittest discover -s tests
+      - name: Verify repository structure and setup helper
+        run: |
+          python3 scripts/check_structure.py
+          python3 -m unittest discover -s tests
 
       - name: Check formatting
         run: |

@@ -21,7 +21,7 @@ findings.
 
 The categorical-loss smoke consumed five verified passes over 2,048 examples.
 Held-out accuracy rose from `10.16%` to `33.98%`; the complete receipt and curve
-are in [data/smoke.log](data/smoke.log).
+are in [data/runs/smoke.log](data/runs/smoke.log).
 
 The launcher points Cargo at the study-local CUDA toolkit provisioned by
 `scripts/setup_cuda.py`; run that setup once if `.cuda/` is absent.

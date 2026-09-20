@@ -41,8 +41,13 @@ archives by SHA-256:
 
 ```bash
 python3 scripts/setup_cuda.py
+bash scripts/install_hooks.sh
 bash scripts/check.sh
 ```
+
+The pre-commit hook enforces the repository's filesystem shape. Git hooks are
+local by design, so GitHub CI runs the same structure check as a required
+backstop.
 
 Use `bash scripts/cargo.sh ...` for individual Cargo commands so the local CUDA
 toolkit is selected consistently. The full check runs formatting, Clippy, CPU

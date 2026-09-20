@@ -12,7 +12,7 @@ scientific parity.
 
 Read the relevant spoke in `docs/` before changing its contract. Put durable
 cross-consumer reasoning there as the context grows. Keep launchers in each
-consumer's `scripts/`, Rust in its `src/`, and measured output in `data/`.
+consumer's `scripts/`, Rust in its `src/`, and measured output in `data/evidence/` or `data/runs/`.
 
 Run `bash scripts/check.sh` before pushing. Use `bash scripts/cargo.sh` for Cargo
 so the local CUDA toolkit and library path are selected consistently. Smoke a

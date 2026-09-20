@@ -1,12 +1,21 @@
 //! Experimental training with named axes on a stream-ordered cuTile GPU backend.
+#[path = "algebra/axis.rs"]
 mod axis;
+#[path = "runtime/backend.rs"]
 mod backend;
+#[path = "research/data.rs"]
 mod data;
+#[path = "model/metrics.rs"]
 mod metrics;
+#[path = "model/nn.rs"]
 mod nn;
+#[path = "model/preprocess.rs"]
 mod preprocess;
+#[path = "research/regime.rs"]
 mod regime;
+#[path = "algebra/tensor.rs"]
 mod tensor;
+#[path = "runtime/train.rs"]
 mod train;
 
 pub use axis::{Axis, Dim, IntoAxes, Shape};
@@ -39,7 +48,8 @@ pub mod prelude {
         DataLoader, DataRegimeReceipt, DataSource, Device, Dim, FinitePasses, FinitePassesLoader,
         FinitePassesReceipt, GELU, Idr, IdrLimits, IdrReceipt, InMemoryDataset, LayerNorm, Linear,
         Module, Optimizer, ParamId, Parameter, PopulationLinear, ReLU, RegimeSnapshot, Result, SGD,
-        Sample, Sequential, Shape, SinglePass, Standardizer, Tensor, TrainEvalDisjoint,
-        TrainEvalReceipt, TrainStep, Trainer,
+        Sample,
+        Sequential, Shape, SinglePass, Standardizer, Tensor, TrainEvalDisjoint, TrainEvalReceipt,
+        TrainStep, Trainer,
     };
 }

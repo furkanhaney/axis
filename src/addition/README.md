@@ -19,4 +19,4 @@ pairs cannot coincide.
 
 The measured 500-step run consumed 128,000 unique training draws with zero
 observed reuse and zero overlap with 256 evaluation draws. Held-out MSE fell
-from `0.80632222` to `0.00387844`; see [data/training.log](data/training.log).
+from `0.80632222` to `0.00387844`; see [data/runs/training.log](data/runs/training.log).

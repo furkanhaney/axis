@@ -45,7 +45,7 @@ f64 arithmetic. The largest MLP parameter-gradient error was `1.24e-8`, and the
 largest input-gradient error was `2.32e-9`. The same Linear passes with 17 input
 features, a three-sample batch, an extra time axis, a leading logical feature
 axis, and reordered physical storage. Tied parameters and stale graphs are
-checked explicitly. [Captured checks](../../data/library-verification.log).
+checked explicitly. [Captured checks](../../data/evidence/library-verification.log).
 
 The 10-, 100-, and 500-step library runs passed. After 500 steps, training MSE
 was `4.10e-2` (from `7.51e-1`), and held-out MSE was `5.74e-2` (from
@@ -53,14 +53,14 @@ was `4.10e-2` (from `7.51e-1`), and held-out MSE was `5.74e-2` (from
 precision. The library loop took 10.05 seconds in this single run,
 including its first backward/update JIT and final evaluation. Intermediate
 `step` lines report the loss used for that update; `final` evaluates the updated
-weights. [Full run](data/library-training.log), [100 steps](data/library-100.log).
+weights. [Full run](data/runs/library-training.log), [100 steps](data/runs/library-100.log).
 The standalone MLP's 500-step run and the CNN's 10-step smoke run also pass
-after adding the library. [Regression output](../../data/library-baseline-regression.log).
+after adding the library. [Regression output](../../data/evidence/library-baseline-regression.log).
 
 This is an experimental CUDA f32 backend using explicit index plans, with a
 16,777,216-contribution limit per plan. It is substantially slower than the
 baseline's specialized tiled matrix multiplies. CNN layers and optimizers
-beyond SGD remain the next concrete additions; see the [scope and contracts](../../docs/library.md).
+beyond SGD remain the next concrete additions; see the [scope and contracts](../../docs/design/library.md).
 
 ## Standalone MLP baseline
 
@@ -117,5 +117,5 @@ The largest absolute GPU gradient error against the CPU oracle was 7.63e-9;
 the finite-difference error was at most 3.59e-11. Setup, verification, and JIT
 took 1.79 seconds; the small 500-step loop including evaluation took 0.10
 seconds in this run. These are single-run wall times, not a performance
-comparison. [Captured default-run output](data/verification.log).
+comparison. [Captured default-run output](data/evidence/verification.log).
 

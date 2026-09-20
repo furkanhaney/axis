@@ -37,7 +37,7 @@ bash scripts/cargo.sh test --release --locked -p attention -- --ignored --test-t
 and three features per head. Training and held-out inputs come from distinct
 fixed seeds. At 200 SGD steps, training MSE falls from `4.30e-1` to `1.81e-2`,
 and held-out MSE from `5.12e-1` to `2.39e-2`. The 10-step smoke and 100-step
-intermediate run also pass. [Recorded runs](data/training.log).
+intermediate run also pass. [Recorded runs](data/runs/training.log).
 
 [Verification](src/tests.rs) uses an independent [scalar f64 forward](src/reference.rs)
 and central differences for every Q/K/V element. It covers odd sequence/head

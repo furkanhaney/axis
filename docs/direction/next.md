@@ -1,7 +1,7 @@
 # Continue from the working examples
 
 Updated 2026-09-20. This note preserves the decisions and next useful work;
-[library.md](library.md) is the contract, and [sample.rs](sample.rs) is the
+[library.md](../design/library.md) is the contract, and [api-sketch.md](../design/api-sketch.md) is the
 owner's larger, partially unimplemented API sketch.
 
 ## What exists and why
@@ -27,7 +27,7 @@ owner's larger, partially unimplemented API sketch.
 - `SinglePass` and `Idr` make data-regime assumptions executable without
   pretending exact identity proves statistical independence. IDR observes caller-defined stable IDs; it does not
   infer semantic duplicates from tensor values. Exact tracking grows with the
-  number of unique samples. See [data regimes](data-regimes.md).
+  number of unique samples. See [data regimes](../contracts/data-regimes.md).
 - `DataLoader` accepts finite or generated `DataSource`s and withholds a batch
   when its regime fails. `AdditionDataset` is the first inexhaustible source.
   `Trainer` captures only update ordering; MLP, attention, and CNN still state
@@ -39,22 +39,22 @@ owner's larger, partially unimplemented API sketch.
 ## Evidence and limits
 
 - MLP's 500-step held-out MSE matched the retained baseline at `5.74e-2`;
-  [MLP records](../src/mlp/README.md#library-mlp). Named loading and pre-update
-  logging passed the subsequent [feedback checks](../data/feedback-verification.log).
+  [MLP records](../../src/mlp/README.md#library-mlp). Named loading and pre-update
+  logging passed the subsequent [feedback checks](../../data/evidence/feedback-verification.log).
 - Attention's independent f64 forward and central differences pass for every
   Q/K/V element, including reordered physical storage and a leading logical
   feature axis. Causality and large-logit softmax checks pass. Its 200-step
   held-out MSE falls from `5.12e-1` to `2.39e-2` on toy prefix means;
-  [training record](../src/attention/data/training.log).
+  [training record](../../src/attention/data/runs/training.log).
 - CNN matches 4,096 scalar activation values, pooled features, logits, every
   parameter gradient, overlapping input gradients, and one update. At 100
   steps its held-out BCE falls from `7.04e-1` to `7.40e-2` with `100.00%`
-  accuracy; [CNN record](../src/cnn/data/library-training.log). Its Conv2d is
+  accuracy; [CNN record](../../src/cnn/data/runs/library-training.log). Its Conv2d is
   `unfold2d` plus Linear, so `col2im` is the reverse of the gather rather than
   a separate special-case kernel.
 - Addition consumes 128,000 generated samples with zero observed identity
   reuse and zero train/evaluation overlap. Its held-out MSE falls from
-  `8.06e-1` to `3.88e-3`; [addition record](../src/addition/data/training.log).
+  `8.06e-1` to `3.88e-3`; [addition record](../../src/addition/data/runs/training.log).
 - The first outside consumer now preserves categorical cross-entropy, Adam, and
   exact finite passes; its smoke reaches `33.98%` held-out MNIST accuracy.
   The population migration now runs independent parameters, gradients, Adam
@@ -101,5 +101,5 @@ the scalar or trusted reference.
 
 Run `bash scripts/check.sh` from the Axis root for formatting,
 Clippy and CPU/GPU verification. Smoke a new program before 100/full-step
-runs. Record actual evidence in the owning member's `data/`; update the
+runs. Record actual evidence in the owning member's `data/evidence/` or `data/runs/`; update the
 contract and this note when a capability or next step changes.

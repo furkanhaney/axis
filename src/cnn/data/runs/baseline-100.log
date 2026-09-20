@@ -1,0 +1,28 @@
+GPU: NVIDIA GeForce RTX 5060
+cuTile 0.3.1 | CNN 1x10x10 -> conv3x3/16 -> ReLU -> mean -> linear/1 | BCE | SGD
+check finite differences: PASS 13 parameters max_abs_error=8.08e-11
+check conv+ReLU: PASS max_abs_error=2.65e-7
+check mean pooling: PASS max_abs_error=2.89e-8
+check logits: PASS max_abs_error=2.60e-8
+check d conv weight: PASS max_abs_error=2.97e-9
+check d conv bias: PASS max_abs_error=2.64e-9
+check d head weight: PASS max_abs_error=3.59e-9
+check d head bias: PASS max_abs_error=2.27e-8
+check updated conv weight: PASS max_abs_error=2.85e-8
+check updated conv bias: PASS max_abs_error=3.33e-9
+check updated head weight: PASS max_abs_error=1.30e-8
+check updated head bias: PASS max_abs_error=3.77e-9
+setup_and_verification_seconds=4.24 steps=100 lr=1.00 seed=42
+step,train_bce,validation_bce,train_accuracy,validation_accuracy,elapsed_seconds
+0,7.01e-1,7.04e-1,50.00,50.00,0.00
+10,6.63e-1,6.65e-1,100.00,100.00,0.00
+20,6.08e-1,6.10e-1,100.00,100.00,0.01
+30,5.22e-1,5.23e-1,100.00,100.00,0.01
+40,4.06e-1,4.07e-1,100.00,100.00,0.02
+50,2.96e-1,2.96e-1,100.00,100.00,0.02
+60,2.12e-1,2.12e-1,100.00,100.00,0.03
+70,1.53e-1,1.53e-1,100.00,100.00,0.03
+80,1.13e-1,1.14e-1,100.00,100.00,0.04
+90,8.72e-2,8.79e-2,100.00,100.00,0.05
+100,6.92e-2,7.00e-2,100.00,100.00,0.05
+PASS train_reduction=90.13% validation_reduction=90.06% validation_accuracy=100.00% elapsed_seconds=0.05

@@ -1,3 +1,10 @@
+# API sketch
+
+This historical, non-compiling sketch supplied the four golden programs that
+shaped Axis. Current contracts and implemented behavior live in
+[library.md](library.md); this document preserves design intent rather than an
+alternate source tree.
+
 ```rust
 use axis::prelude::*;
 

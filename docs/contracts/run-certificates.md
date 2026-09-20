@@ -91,5 +91,5 @@ precede new presets; frequency alone does not make a scientifically meaningful
 choice safe to hide.
 
 The current descriptive baseline is generated at
-[data/default-census.md](../data/default-census.md). It covers more than 436,000
+[data/default-census.md](../../data/evidence/default-census.md). It covers more than 436,000
 active Python lines and reports extraction limits beside the counts.

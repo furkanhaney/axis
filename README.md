@@ -9,7 +9,7 @@
 ![Experimental](https://img.shields.io/badge/status-experimental-f59e0b)
 
 [crates.io](https://crates.io/crates/axis) · [v0.1.0 release](https://github.com/furkanhaney/axis/releases/tag/v0.1.0) ·
-[Why Axis](docs/thesis.md) · [Library contract](docs/library.md) ·
+[Why Axis](docs/direction/thesis.md) · [Library contract](docs/design/library.md) ·
 [Contributing](CONTRIBUTING.md) · [License](LICENSE.md) · [Trademarks](TRADEMARK.md)
 
 ![A generated Sudoku board used by the Axis acceptance test](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_generated_puzzle.png)
@@ -158,7 +158,7 @@ axis/
 │   ├── mnist-population/     migrated population learning-rate probe
 │   └── panel/                migrated country-year regression mechanics
 ├── docs/                     shared contracts, assumptions, and next work
-├── data/                     workspace-wide verification records
+├── data/                     tracked evidence and selected runs; other contents ignored
 ├── scripts/                  CUDA setup, Cargo runner, checks, and censuses
 ├── Cargo.toml                workspace and shared dependency versions
 └── Cargo.lock                one resolved dependency graph
@@ -227,16 +227,16 @@ distribution. It proves the declared operational conditions and produces a
 receipt. The broader rule is that an experimental assumption should fail in the
 program when the run stops satisfying it.
 
-The [project thesis](docs/thesis.md) is to give coordinates to the whole
+The [project thesis](docs/direction/thesis.md) is to give coordinates to the whole
 experiment, not only its tensors. It grows against an [acceptance
-ladder](docs/acceptance.md): the
+ladder](docs/contracts/acceptance.md): the
 Sudoku and Chess transformers are current, and running the sub-30B model behind
 `ask_bro` is the long-range systems test.
 
-The detailed contracts are in [library design](docs/library.md),
-[data regimes](docs/data-regimes.md), [static guarantees](docs/static-guarantees.md),
-and [run certificates](docs/run-certificates.md). The current implementation
-frontier is recorded in [next work](docs/next.md).
+The detailed contracts are in [library design](docs/design/library.md),
+[data regimes](docs/contracts/data-regimes.md), [static guarantees](docs/design/static-guarantees.md),
+and [run certificates](docs/contracts/run-certificates.md). The current implementation
+frontier is recorded in [next work](docs/direction/next.md).
 
 ## Contributing and license
 

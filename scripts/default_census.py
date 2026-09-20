@@ -89,7 +89,7 @@ def format_counts(counts: collections.Counter[object], limit: int = 12) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     default_root = pathlib.Path(__file__).resolve().parents[2]
-    default_output = pathlib.Path(__file__).resolve().parents[1] / "data/default-census.md"
+    default_output = pathlib.Path(__file__).resolve().parents[1] / "data/evidence/default-census.md"
     parser.add_argument("--root", type=pathlib.Path, default=default_root)
     parser.add_argument("--output", type=pathlib.Path, default=default_output)
     args = parser.parse_args()

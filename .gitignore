@@ -1,6 +1,13 @@
 /.cuda/
 /target/
-/runs/
+
+# Data is local by default. Only compact verification receipts and selected,
+# reproducible run records are repository artifacts.
+**/data/*
+!**/data/evidence/
+!**/data/evidence/**
+!**/data/runs/
+!**/data/runs/**
 
 __pycache__/
 *.pyc
