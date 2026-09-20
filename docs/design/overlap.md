@@ -65,7 +65,7 @@ composable modules, and automatic differentiation. The implementation order
 and acceptance criteria are in [library.md](library.md).
 
 This census describes the retained explicit baselines. The `axis` member
-now supplies named axes, autodiff, layout handling, Linear, and valid
-stride-one Conv2d; see the [implementation scope](library.md). The library CNN
-matches its direct scalar oracle through overlapping input gradients. Stacked
-convolution and comparative performance remain unestablished.
+now supplies named axes, autodiff, layout handling, Linear, and strided,
+symmetrically padded Conv2d; see the [implementation scope](library.md). The
+library CNN matches its direct scalar oracle through overlapping input gradients.
+Stacked convolution and comparative performance remain unestablished.

@@ -307,11 +307,13 @@ impl Module for PopulationLinear {
     }
 }
 
-/// Valid, stride-one 2D cross-correlation followed by bias addition.
+/// Strided, symmetrically padded 2D cross-correlation followed by bias addition.
 pub struct Conv2d {
     input: Axis,
     spatial: [Axis; 2],
     kernel: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
     patch: Axis,
     linear: Linear,
 }
@@ -322,9 +324,24 @@ impl Conv2d {
             input,
             spatial,
             kernel,
+            stride: [1, 1],
+            padding: [0, 0],
             patch,
             linear: Linear::new(patch, output),
         }
+    }
+    pub fn with_stride_padding(
+        input: Axis,
+        output: Dim,
+        spatial: [Axis; 2],
+        kernel: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Self {
+        let mut convolution = Self::new(input, output, spatial, kernel);
+        convolution.stride = stride;
+        convolution.padding = padding;
+        convolution
     }
     fn patch_shape(&self, input: &Shape) -> Result<Shape> {
         if self.spatial[0] == self.spatial[1]
@@ -334,10 +351,31 @@ impl Conv2d {
             return Err("Conv2d requires distinct input-channel and spatial axes".into());
         }
         let channels = input.extent(self.input)?;
-        let height = input.extent(self.spatial[0])?;
-        let width = input.extent(self.spatial[1])?;
-        if self.kernel.contains(&0) || self.kernel[0] > height || self.kernel[1] > width {
-            return Err("Conv2d kernel must be positive and fit both spatial axes".into());
+        let height = input
+            .extent(self.spatial[0])?
+            .checked_add(
+                self.padding[0]
+                    .checked_mul(2)
+                    .ok_or("Conv2d height overflow")?,
+            )
+            .ok_or("Conv2d height overflow")?;
+        let width = input
+            .extent(self.spatial[1])?
+            .checked_add(
+                self.padding[1]
+                    .checked_mul(2)
+                    .ok_or("Conv2d width overflow")?,
+            )
+            .ok_or("Conv2d width overflow")?;
+        if self.kernel.contains(&0)
+            || self.stride.contains(&0)
+            || self.kernel[0] > height
+            || self.kernel[1] > width
+        {
+            return Err(
+                "Conv2d kernel and stride must be positive and the kernel must fit the padded spatial axes"
+                    .into(),
+            );
         }
         let patch = channels
             .checked_mul(self.kernel[0])
@@ -347,9 +385,9 @@ impl Conv2d {
             if dim.axis == self.input {
                 self.patch.of(patch)
             } else if dim.axis == self.spatial[0] {
-                self.spatial[0].of(height - self.kernel[0] + 1)
+                self.spatial[0].of((height - self.kernel[0]) / self.stride[0] + 1)
             } else if dim.axis == self.spatial[1] {
-                self.spatial[1].of(width - self.kernel[1] + 1)
+                self.spatial[1].of((width - self.kernel[1]) / self.stride[1] + 1)
             } else {
                 *dim
             }
@@ -370,11 +408,13 @@ impl Module for Conv2d {
             .checked_mul(self.kernel[0])
             .and_then(|n| n.checked_mul(self.kernel[1]))
             .ok_or("Conv2d patch extent overflow")?;
-        self.linear.forward(&input.unfold2d(
+        let padded = input.pad2d(self.spatial, self.padding)?;
+        self.linear.forward(&padded.unfold2d_strided(
             self.input,
             self.spatial,
             self.patch.of(patch_extent),
             self.kernel,
+            self.stride,
         )?)
     }
     fn named_parameters(&self) -> Vec<(String, Parameter)> {

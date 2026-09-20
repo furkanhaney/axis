@@ -30,7 +30,7 @@ consumer. Its query/key/value and output projections reuse Linear, Module
 parameter traversal, and SGD. Attention composition stays in that program;
 only named-axis softmax and causal masking join the tensor algebra.
 
-[The CNN](../../src/examples/cnn/README.md) is the third consumer. Conv2d composes valid
+[The CNN](../../src/examples/cnn/README.md) is the third consumer. Conv2d composes
 patch extraction with Linear; global pooling is the existing named mean. Its
 explicit cuTile program remains beside it as a lower-level baseline.
 
@@ -188,8 +188,9 @@ shape checks first; compile-time axis types can be evaluated later.
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
 | `causal_mask(query, key)` | Require distinct axes with equal extents; replace key positions greater than query positions with negative infinity and give them zero derivative. Square, zero-offset self-attention only. |
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
-| `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |
-| `Conv2d(input, output, spatial, kernel)` | Compose `unfold2d` with Linear; shrink the named spatial extents, replace the input-channel axis, and preserve unrelated axes. |
+| `pad2d(spatial, padding)` | Symmetrically zero-pad two named spatial axes. Backward discards padded gradients and restores the original logical layout. |
+| `unfold2d_strided(channels, spatial, patch, kernel, stride)` | Extract valid strided patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. `unfold2d` is its stride-one form. |
+| `Conv2d(input, output, spatial, kernel)` | Compose optional symmetric padding, strided unfolding, and Linear; replace the input-channel axis and preserve unrelated axes. The basic constructor is valid stride-one; `with_stride_padding` declares other spatial geometry. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
 | `categorical_cross_entropy_with_logits(target, class)` | Accept constant one-hot/probability targets over the same axes, stably reduce the named class axis, and preserve all other axes. Backward is `softmax(logits) - target`. |
 | `Conv(input, output, spatial)` | Transform channels and spatial extents by the stated stride/padding/dilation rules. Preserve all unrelated axes. |
@@ -283,11 +284,11 @@ actual outside consumer.
    contraction, causal mask, softmax, value contraction, and merge. Verify
    against independent f64 forward/finite differences before considering a
    reusable attention module or a full Transformer.
-4. **Executable CNN slice (first stage implemented):** valid stride-one
-   convolution, ReLU, named global mean, Linear, and stable binary loss now
+4. **Executable CNN slice (first stage implemented):** strided, symmetrically
+   padded convolution, ReLU, named global mean, Linear, and stable binary loss now
    reproduce the concrete CNN, including overlapping input gradients. A
-   stacked-convolution witness remains before same-padding, stride, adaptive
-   pooling, collapse, and categorical cross-entropy.
+   stacked-convolution witness remains before adaptive pooling and collapse;
+   grouped/depthwise convolution remains a separate operator extension.
 5. **LSTM and Transformer:** add each as a concrete next program. Recurrence
    drives state/sequence lifetime decisions; attention drives role axes,
    masked softmax, split/merge, and shared-parameter behavior. `Repeat` must

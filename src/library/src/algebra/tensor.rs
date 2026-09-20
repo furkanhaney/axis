@@ -893,7 +893,74 @@ impl Tensor {
             None,
         ))
     }
-    /// Extract valid stride-one 2D patches, replacing channels with one flattened patch axis.
+    /// Symmetrically zero-pad two named spatial axes.
+    pub fn pad2d(&self, spatial: [Axis; 2], padding: [usize; 2]) -> Result<Self> {
+        if spatial[0] == spatial[1] {
+            return Err("pad2d requires distinct spatial axes".into());
+        }
+        let input_height = self.extent(spatial[0])?;
+        let input_width = self.extent(spatial[1])?;
+        if padding == [0, 0] {
+            return Ok(self.clone());
+        }
+        let output_height = input_height
+            .checked_add(padding[0].checked_mul(2).ok_or("pad2d height overflow")?)
+            .ok_or("pad2d height overflow")?;
+        let output_width = input_width
+            .checked_add(padding[1].checked_mul(2).ok_or("pad2d width overflow")?)
+            .ok_or("pad2d width overflow")?;
+        let shape = Shape::new(self.shape().dims().iter().map(|dim| {
+            if dim.axis == spatial[0] {
+                spatial[0].of(output_height)
+            } else if dim.axis == spatial[1] {
+                spatial[1].of(output_width)
+            } else {
+                *dim
+            }
+        }))?;
+        let height_index = shape.index(spatial[0])?;
+        let width_index = shape.index(spatial[1])?;
+        let mut forward = vec![vec![]; shape.len()];
+        let mut reverse = vec![vec![]; self.shape().len()];
+        for (output, group) in forward.iter_mut().enumerate() {
+            let mut coords = shape.coords(output);
+            let y = coords[height_index];
+            let x = coords[width_index];
+            if y >= padding[0]
+                && y < padding[0] + input_height
+                && x >= padding[1]
+                && x < padding[1] + input_width
+            {
+                coords[height_index] -= padding[0];
+                coords[width_index] -= padding[1];
+                let input = self.0.layout.offset(&coords);
+                group.push((input, 0));
+                reverse[input].push((output, 0));
+            }
+        }
+        let forward = Rc::new(Plan::groups(forward, false)?);
+        let reverse = Rc::new(Plan::groups(reverse, false)?);
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, forward.as_ref(), 1.0)?;
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Group {
+                    plan: reverse,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )],
+            false,
+            None,
+        ))
+    }
+    /// Extract valid 2D patches, replacing channels with one flattened patch axis.
     /// Reverse mode scatters and sums overlapping patch contributions into the input.
     pub fn unfold2d(
         &self,
@@ -902,11 +969,22 @@ impl Tensor {
         patch: Dim,
         kernel: [usize; 2],
     ) -> Result<Self> {
+        self.unfold2d_strided(channels, spatial, patch, kernel, [1, 1])
+    }
+    /// Extract valid strided 2D patches, replacing channels with one flattened patch axis.
+    pub fn unfold2d_strided(
+        &self,
+        channels: Axis,
+        spatial: [Axis; 2],
+        patch: Dim,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+    ) -> Result<Self> {
         if spatial[0] == spatial[1] || channels == spatial[0] || channels == spatial[1] {
             return Err("unfold2d requires distinct channel and spatial axes".into());
         }
-        if kernel.contains(&0) {
-            return Err("unfold2d kernel extents must be positive".into());
+        if kernel.contains(&0) || stride.contains(&0) {
+            return Err("unfold2d kernel and stride extents must be positive".into());
         }
         let channel_extent = self.extent(channels)?;
         let input_height = self.extent(spatial[0])?;
@@ -921,8 +999,8 @@ impl Tensor {
         if patch.extent != expected_patch {
             return Err("unfold2d patch extent must equal channels * kernel area".into());
         }
-        let output_height = input_height - kernel[0] + 1;
-        let output_width = input_width - kernel[1] + 1;
+        let output_height = (input_height - kernel[0]) / stride[0] + 1;
+        let output_width = (input_width - kernel[1]) / stride[1] + 1;
         let shape = Shape::new(self.shape().dims().iter().map(|dim| {
             if dim.axis == channels {
                 patch
@@ -953,9 +1031,9 @@ impl Tensor {
                         if dim.axis == channels {
                             channel
                         } else if dim.axis == spatial[0] {
-                            output[output_height_index] + ky
+                            output[output_height_index] * stride[0] + ky
                         } else if dim.axis == spatial[1] {
-                            output[output_width_index] + kx
+                            output[output_width_index] * stride[1] + kx
                         } else {
                             output[shape.index(dim.axis).expect("retained axis")]
                         }
