@@ -218,7 +218,7 @@ impl Device {
         let b = b.reshape(&[batch, k, n])?;
         let mut out = self.zeros(batch * m * n)?.reshape(&[batch, m, n])?;
         let bk = contraction_tile(k);
-        kernels::matmul((&mut out).partition([1, 16, 16]), a.as_ref(), b.as_ref())
+        kernels::matmul((&mut out).partition([1, 64, 64]), a.as_ref(), b.as_ref())
             .generics(vec![bk.to_string(), (k as i32).to_string()])
             .sync_on(&self.0.stream)?;
         Ok(Arc::new(out.reshape(&[batch * m * n])?))
@@ -237,7 +237,7 @@ impl Device {
         let mut out = self.zeros(batch * m * k)?.reshape(&[batch, m, k])?;
         let bn = contraction_tile(n);
         kernels::matmul_left_backward(
-            (&mut out).partition([1, 16, 16]),
+            (&mut out).partition([1, 64, 64]),
             gradient.as_ref(),
             rhs.as_ref(),
         )
@@ -259,7 +259,7 @@ impl Device {
         let mut out = self.zeros(batch * k * n)?.reshape(&[batch, k, n])?;
         let bm = contraction_tile(m);
         kernels::matmul_right_backward(
-            (&mut out).partition([1, 16, 16]),
+            (&mut out).partition([1, 64, 64]),
             lhs.as_ref(),
             gradient.as_ref(),
         )
@@ -419,64 +419,64 @@ mod kernels {
     use cutile::core::*;
     #[cutile::entry()]
     fn matmul<const BK: i32, const K: i32>(
-        out: &mut Tensor<f32, { [1, 16, 16] }>,
+        out: &mut Tensor<f32, { [1, 64, 64] }>,
         a: &Tensor<f32, { [-1, -1, K] }>,
         b: &Tensor<f32, { [-1, K, -1] }>,
     ) {
-        let ap = a.partition(shape![1, 16, BK]);
-        let bp = b.partition(shape![1, BK, 16]);
+        let ap = a.partition(shape![1, 64, BK]);
+        let bp = b.partition(shape![1, BK, 64]);
         let pid = get_tile_block_id();
-        let mut value = load_tile_mut(out).reshape(shape![16, 16]);
+        let mut value = load_tile_mut(out).reshape(shape![64, 64]);
         for block in 0i32..(K / BK) {
             value = mma(
-                ap.load([pid.0, pid.1, block]).reshape(shape![16, BK]),
-                bp.load([pid.0, block, pid.2]).reshape(shape![BK, 16]),
+                ap.load([pid.0, pid.1, block]).reshape(shape![64, BK]),
+                bp.load([pid.0, block, pid.2]).reshape(shape![BK, 64]),
                 value,
             );
         }
-        out.store(value.reshape(shape![1, 16, 16]));
+        out.store(value.reshape(shape![1, 64, 64]));
     }
     #[cutile::entry()]
     fn matmul_left_backward<const BN: i32, const N: i32>(
-        out: &mut Tensor<f32, { [1, 16, 16] }>,
+        out: &mut Tensor<f32, { [1, 64, 64] }>,
         gradient: &Tensor<f32, { [-1, -1, N] }>,
         rhs: &Tensor<f32, { [-1, -1, N] }>,
     ) {
-        let gp = gradient.partition(shape![1, 16, BN]);
-        let rp = rhs.partition(shape![1, 16, BN]);
+        let gp = gradient.partition(shape![1, 64, BN]);
+        let rp = rhs.partition(shape![1, 64, BN]);
         let pid = get_tile_block_id();
-        let mut value = load_tile_mut(out).reshape(shape![16, 16]);
+        let mut value = load_tile_mut(out).reshape(shape![64, 64]);
         for block in 0i32..(N / BN) {
             value = mma(
-                gp.load([pid.0, pid.1, block]).reshape(shape![16, BN]),
+                gp.load([pid.0, pid.1, block]).reshape(shape![64, BN]),
                 rp.load([pid.0, pid.2, block])
-                    .reshape(shape![16, BN])
+                    .reshape(shape![64, BN])
                     .transpose(),
                 value,
             );
         }
-        out.store(value.reshape(shape![1, 16, 16]));
+        out.store(value.reshape(shape![1, 64, 64]));
     }
     #[cutile::entry()]
     fn matmul_right_backward<const BM: i32, const M: i32>(
-        out: &mut Tensor<f32, { [1, 16, 16] }>,
+        out: &mut Tensor<f32, { [1, 64, 64] }>,
         lhs: &Tensor<f32, { [-1, M, -1] }>,
         gradient: &Tensor<f32, { [-1, M, -1] }>,
     ) {
-        let lp = lhs.partition(shape![1, BM, 16]);
-        let gp = gradient.partition(shape![1, BM, 16]);
+        let lp = lhs.partition(shape![1, BM, 64]);
+        let gp = gradient.partition(shape![1, BM, 64]);
         let pid = get_tile_block_id();
-        let mut value = load_tile_mut(out).reshape(shape![16, 16]);
+        let mut value = load_tile_mut(out).reshape(shape![64, 64]);
         for block in 0i32..(M / BM) {
             value = mma(
                 lp.load([pid.0, block, pid.1])
-                    .reshape(shape![BM, 16])
+                    .reshape(shape![BM, 64])
                     .transpose(),
-                gp.load([pid.0, block, pid.2]).reshape(shape![BM, 16]),
+                gp.load([pid.0, block, pid.2]).reshape(shape![BM, 64]),
                 value,
             );
         }
-        out.store(value.reshape(shape![1, 16, 16]));
+        out.store(value.reshape(shape![1, 64, 64]));
     }
     #[cutile::entry()]
     fn binary_cross_entropy(
