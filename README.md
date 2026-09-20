@@ -194,7 +194,9 @@ distribution. It proves the declared operational conditions and produces a
 receipt. The broader rule is that an experimental assumption should fail in the
 program when the run stops satisfying it.
 
-The project grows against an [acceptance ladder](docs/acceptance.md): the
+The [project thesis](docs/thesis.md) is to give coordinates to the whole
+experiment, not only its tensors. It grows against an [acceptance
+ladder](docs/acceptance.md): the
 Sudoku transformer is current, and running the sub-30B model behind `ask_bro` is
 the long-range systems test.
 

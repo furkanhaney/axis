@@ -610,3 +610,38 @@ fn layer_norm_and_gelu_match_a_scalar_reference() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn masked_mean_normalizes_only_selected_elements() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, position) = (Axis::new("batch"), Axis::new("position"));
+    let values = Tensor::from_slice(
+        &[1.0, 100.0, 3.0, 100.0],
+        [batch.of(2), position.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let mask = Tensor::from_slice(
+        &[1.0, 1.0, 0.0, 0.0],
+        [position.of(2), batch.of(2)],
+        &device,
+    )?;
+    let mean = values.masked_mean(&mask)?;
+    close("masked mean", &mean.to_vec()?, &[2.0]);
+    mean.backward()?;
+    close(
+        "masked mean gradient",
+        &values.grad().unwrap().to_vec()?,
+        &[0.5, 0.0, 0.5, 0.0],
+    );
+    let empty = Tensor::from_slice(&[0.0; 4], [batch.of(2), position.of(2)], &device)?;
+    assert!(values.detach().masked_mean(&empty).is_err());
+    let fractional = Tensor::from_slice(
+        &[1.0, 0.5, 1.0, 0.0],
+        [batch.of(2), position.of(2)],
+        &device,
+    )?;
+    assert!(values.detach().masked_mean(&fractional).is_err());
+    Ok(())
+}

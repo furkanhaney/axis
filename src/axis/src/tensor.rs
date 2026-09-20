@@ -630,6 +630,39 @@ impl Tensor {
             None,
         ))
     }
+    /// Reduce a tensor to the mean of elements selected by a constant binary mask.
+    /// The mask must have the same named axes, and every axis must be reduced.
+    pub fn masked_mean(&self, mask: &Self) -> Result<Self> {
+        if mask.requires_grad() {
+            return Err("masked_mean mask cannot require gradients".into());
+        }
+        if self.shape().rank() != mask.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !mask.shape().contains(axis))
+        {
+            return Err("masked_mean requires identical axis sets".into());
+        }
+        self.compatible_device(mask)?;
+        self.shared_extents(mask)?;
+        let mask = mask.align(self.shape())?;
+        let values = mask.to_vec()?;
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || (*value != 0.0 && *value != 1.0))
+        {
+            return Err("masked_mean mask must contain only finite zero or one values".into());
+        }
+        let selected = values.iter().filter(|&&value| value == 1.0).count();
+        if selected == 0 {
+            return Err("masked_mean mask selects no elements".into());
+        }
+        self.mul(&mask)?
+            .mean(self.shape().axes())?
+            .scale(self.shape().len() as f32 / selected as f32)
+    }
     /// Mask key positions greater than query positions with -infinity.
     /// This is square, zero-offset self-attention; cached/offset attention is not supported.
     pub fn causal_mask(&self, query: Axis, key: Axis) -> Result<Self> {
