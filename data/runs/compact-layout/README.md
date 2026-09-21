@@ -65,5 +65,41 @@ merge and selected reverse-mode gradients above the generic contribution ceiling
 Permutation metadata is at most nine integers for its three-axis source.
 
 Initial scoped Clippy exposed dead generic helpers after the migration. They
-were removed rather than suppressed. Full checks and the matched consumer
-comparison are pending; no consumer speedup is claimed by this initial receipt.
+were removed rather than suppressed. The complete `bash scripts/check.sh` finished
+with exit 0: structure, release readiness, docs.rs/package, formatting, Clippy,
+host tests and workspace GPU witnesses. All three hosted PR #57 checks also pass.
+The four focused tests pass on both RTX 5060 and RTX 5070 Ti. The tower executable
+SHA-256 is `b005620c9997f23c499b602e9b3ec34ba2325255ca08c47caf6512d3af5b4171`;
+its `focused.log` is `84b1975ecb384e9e30cec7b942b7c07a8397ff923363a1df82f7a60450473649`.
+
+## Matched unprofiled consumer replay
+
+Atlas combines implementation `2084ef0` with spatial-window `869dc66` as
+`2e763ac813078804a18ab062714f06ce4c8a9b90`, branch `codex/atlas-layout-preview`.
+No weights, precision, gates, model arithmetic or synchronization policy changed.
+The only Atlas source change is its provenance string. The binaries run sequentially
+on the same tower with the same fixture and `--mean-only`, without profiling.
+There was no listed compute process before candidate execution. Clocks/thermals
+are not normalized; these two observations are not a latency distribution.
+
+| Image | Baseline seconds | Candidate seconds | Ratio |
+| --- | --- | --- | --- |
+| First | 266.514451365 | 50.084398984 | 5.32x |
+| Second | 79.567415640 | 6.367503304 | 12.50x |
+
+Both means pass unchanged limits, with identical reported errors/sign agreement.
+The timer includes forward, first-use uploads and final checks, but not model
+construction or native image preparation/geometry. This is not cached-click latency
+or end-to-end product acceptance. Generic broadcast/reduction plans remain.
+
+Retained tower `ab-layout-001` SHA-256 identities:
+
+```text
+candidate binary ca0341d260edcc8ae1328cbd1f0b0bc54625a37df4c17555ebc548f7599f5f32
+reference.log    dcea66f8317009bdb57ae522b7c449b73f81d3ed5b8a44516c1d11d1c33d7b8b
+candidate.log    1aa812340eff11a76ad5cf6682097c8d3a75070cdb7eadf9c68bddfac6c19909
+```
+
+Candidate exited 0. Baseline's completed log records both passing outputs/timings;
+its old tool-session handle is unavailable for fresh exit-code observation.
+Member and encoder-boundary replay follows separately from this timing lane.
