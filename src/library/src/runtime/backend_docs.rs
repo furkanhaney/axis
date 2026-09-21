@@ -108,6 +108,14 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn gelu_exact(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn gelu_exact_backward(&self, _gradient: &Buffer, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn gelu_backward(&self, _gradient: &Buffer, _a: &Buffer) -> Result<Buffer> {
         unavailable()
     }

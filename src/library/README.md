@@ -53,6 +53,11 @@ Axis requires Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile,
 `libclang`, and CUDA 13.2 or newer. It is early research software: APIs may
 change as real training programs expose better defaults and abstractions.
 
+On the development branch, `Tensor::gelu_exact()` provides erf-form GELU for
+pretrained-model parity; `Tensor::gelu()` and `GELU` retain their tanh formulation.
+The exact-form operation uses FP32 normal-CDF evaluation and its analytic
+derivative, not bitwise libm equivalence. This addition is not in release 0.7.0.
+
 The Muon implementation's pinned upstream revision and MIT attribution are in
 [THIRD_PARTY.md](THIRD_PARTY.md), which is included in every published crate.
 
