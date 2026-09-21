@@ -365,7 +365,7 @@ impl Module for SiLU {
 }
 
 /// Parameter-free leaky ReLU with an explicit negative-region slope.
-/// The derivative at exactly zero is zero.
+/// The derivative at exactly zero is the negative slope, matching PyTorch.
 #[derive(Clone, Copy)]
 pub struct LeakyReLU {
     negative_slope: f32,
