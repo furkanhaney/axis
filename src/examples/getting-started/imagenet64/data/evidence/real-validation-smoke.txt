@@ -1,0 +1,41 @@
+Axis ImageNet64 real-pixel mechanics witness
+date: 2026-09-20
+device: local NVIDIA CUDA device through Device::cuda_bf16(0)
+
+Source boundary
+---------------
+Source dataset: benjamin-paine/imagenet-1k-64x64 validation parquet
+Source revision: f12246fedf1127d5b34bea760b61ef00e0f3d603
+Source parquet sha256: e7645a25fce9ca735fd34001c7181f39d0fe35fb08afdc6773f5379c2f7b289e
+Rows used: first two of 50,000
+Zero-based source labels: 65, 970
+
+The two PNG payloads were decoded to RGB, transposed to planar [channel,
+height, width], flattened, and written with one-based labels 66 and 971 using
+NumPy's ordinary savez NPZ representation. This temporary dataset is ignored
+and is not distributed by Axis.
+
+Temporary NPZ sha256: 96932f1b05d2b06920e87a9e4b5ef2356b6c1c7481118e9022a703ad4e0e410e
+Prepared record sha256: e1770c8b085c1c407454bcb115569fc9131b25e0406e91d24d1f64ca20ad2fcb
+
+Preparation
+-----------
+$ bash src/examples/getting-started/imagenet64/scripts/prepare.sh \
+    src/examples/getting-started/imagenet64/data/from-real-npz.bin \
+    src/examples/getting-started/imagenet64/data/real-val-2.npz
+prepared 2 labeled images at src/examples/getting-started/imagenet64/data/from-real-npz.bin
+
+GPU witness
+-----------
+$ bash src/examples/getting-started/imagenet64/scripts/train.sh \
+    --data src/examples/getting-started/imagenet64/data/from-real-npz.bin --smoke
+source=prepared ImageNet64 samples=2 batch=2 steps=1 params=88584
+step=1 pre_update_loss=6.9252
+PASS samples=2 unique_sample_positions=2 coverage=1.0000 first_loss=6.9252 last_loss=6.9252 online_top1=0.0000 elapsed_seconds=14.55
+
+Claim boundary
+--------------
+This witnesses real ImageNet64 pixel decoding, NPZ preparation, random-access
+records, a 1,000-class forward/backward pass, and one AdamW update. Two images,
+one update, and zero correct predictions establish no learning or accuracy
+result. ImageNet access terms govern the untracked source and temporary data.

@@ -165,6 +165,7 @@ research consumers. They are checks on a declared claim, not another kind of beg
 | [MNIST](src/examples/getting-started/mnist/README.md) | recognizable finite-pass categorical training | bounded smoke improves held-out accuracy from 10.16% to 33.98% |
 | [Fashion-MNIST](src/examples/getting-started/fashion-mnist/README.md) | train-fitted preprocessing and a less separable grayscale task | bounded smoke improves held-out accuracy from 9.77% to 47.66% |
 | [CIFAR-100](src/examples/getting-started/cifar100/README.md) | named-axis RGB convolution and 100-class training | bounded smoke lowers pass loss to 4.4359 and improves held-out accuracy to 2.54% |
+| [ImageNet64](src/examples/getting-started/imagenet64/README.md) | licensed large-data preparation and a compact 1,000-class CNN | deterministic parser tests plus a [real-pixel one-step GPU receipt](src/examples/getting-started/imagenet64/data/evidence/real-validation-smoke.txt); no accuracy claim |
 
 ### Training building blocks
 
@@ -207,6 +208,7 @@ axis/
 │   │   ├── getting-started/
 │   │   │   ├── cifar100/      100-class RGB convolution
 │   │   │   ├── fashion-mnist/ clothing classification
+│   │   │   ├── imagenet64/    licensed large-data CNN starting point
 │   │   │   ├── mnist/         approachable end-to-end training
 │   │   │   └── vision-data/   strict shared dataset and training adapters
 │   │   └── training/

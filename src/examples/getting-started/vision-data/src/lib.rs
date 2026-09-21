@@ -296,6 +296,59 @@ pub fn image_tensors(
     ))
 }
 
+/// Pack byte-backed images without making a streaming dataset retain a second,
+/// floating-point copy of every pixel.
+pub fn byte_image_tensors<T, P, L>(
+    samples: &[T],
+    geometry: (usize, usize, usize),
+    classes: usize,
+    axes: VisionAxes,
+    device: &Device,
+    pixels_of: P,
+    label_of: L,
+) -> Result<(Tensor, Tensor)>
+where
+    P: Fn(&T) -> &[u8],
+    L: Fn(&T) -> usize,
+{
+    let (channels, height, width) = geometry;
+    let pixels_per_image = channels
+        .checked_mul(height)
+        .and_then(|length| length.checked_mul(width))
+        .ok_or("image geometry overflow")?;
+    if samples.is_empty() {
+        return Err("classification batch must not be empty".into());
+    }
+    let mut pixels = Vec::with_capacity(samples.len() * pixels_per_image);
+    let mut targets = vec![0.0; samples.len() * classes];
+    for (row, sample) in samples.iter().enumerate() {
+        let image = pixels_of(sample);
+        let label = label_of(sample);
+        if image.len() != pixels_per_image || label >= classes {
+            return Err("classification sample does not match declared geometry or classes".into());
+        }
+        pixels.extend(image.iter().map(|&value| f32::from(value) / 127.5 - 1.0));
+        targets[row * classes + label] = 1.0;
+    }
+    Ok((
+        Tensor::from_slice(
+            &pixels,
+            [
+                axes.batch.of(samples.len()),
+                axes.channel.of(channels),
+                axes.height.of(height),
+                axes.width.of(width),
+            ],
+            device,
+        )?,
+        Tensor::from_slice(
+            &targets,
+            [axes.batch.of(samples.len()), axes.class.of(classes)],
+            device,
+        )?,
+    ))
+}
+
 pub fn flat_tensors(
     samples: &[ImageSample],
     features: usize,

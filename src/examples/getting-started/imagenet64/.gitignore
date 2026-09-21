@@ -1,0 +1,3 @@
+/data/*
+!/data/evidence/
+!/data/evidence/**
