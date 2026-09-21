@@ -30,10 +30,10 @@ consumer. Its query/key/value and output projections reuse Linear, Module
 parameter traversal, and SGD. Attention composition stays in that program;
 only named-axis softmax and causal masking join the tensor algebra.
 
-[The CNN](../../src/examples/training/cnn/README.md) is the third consumer. Conv2d
-composes named patch extraction with a channel-grouped contraction; global
-pooling is the existing named mean. Its explicit cuTile program remains beside
-it as a lower-level baseline.
+[The CNN](../../src/examples/training/cnn/README.md) is the third consumer. Conv2d and
+Conv3d compose named patch extraction with a channel-grouped contraction;
+global pooling is the existing named mean. Its explicit cuTile program remains
+beside it as a lower-level baseline.
 
 Implemented algebra includes identity/extent binding, strict subset-axis
 broadcasting, contraction with shared batch axes, physical layout changes,
@@ -136,25 +136,29 @@ contraction, mask, softmax, and value-contraction operations rather than using
 a fused attention kernel. Multi-axis contractions still use the generic plan
 path.
 
-Configured convolution lowers padding and stride through a compact
-`Unfold2dSpec`, then lowers each channel group to the batched single-axis
-contraction. The 128-lane patch kernel computes source indices from O(rank)
-metadata and writes group-major, matrix-ready storage while preserving the
-logical named shape. Reverse mode is an input-centric deterministic col2im:
-each physical input element enumerates its contributing windows and is written
-once, without atomics or a reverse index allocation. The contraction and both
-of its derivatives use tiled matrix multiplication.
+Configured 2D and 3D convolution lower padding and stride through one compact,
+rank-tagged unfold specification, then lower each channel group to the batched
+single-axis contraction. Rank-specialized 128-lane patch kernels compute source
+indices from O(rank) metadata and write group-major, matrix-ready storage while
+preserving the logical named shape. Reverse mode is an input-centric
+deterministic col2im: each physical input element enumerates its contributing
+windows and is written once, without atomics or a reverse index allocation.
+The contraction and both of its derivatives use tiled matrix multiplication.
 
 This removes convolution's former 16,777,216-contribution plan limit and the
 much larger host/device index allocations behind it. The materialized patch
 tensor remains: for example, `[batch=128, channel=32, height=32, width=32]`
 with a 3x3 depthwise kernel contains 37,748,736 FP32 patch values (144 MiB).
 The path establishes exact semantics and autodiff; it is not a fused or direct
-convolution implementation and has not established competitive CNN throughput.
+convolution implementation and has not established competitive convolution
+throughput. A 3D patch tensor grows with output volume times input channels and
+kernel volume, so it can dominate memory. Patch extraction itself bypasses the
+generic plan ceiling, but following merge and broadcast operations still retain
+their own 16,777,216-contribution limit.
 Fully padded windows produce exact zeros without indexing the input. Because
-the cuTile kernels use signed 32-bit coordinates, both composite padded spatial
-extents must fit `i32`; larger geometry is rejected before a plan is cached or
-a patch output is allocated.
+the cuTile kernels use signed 32-bit coordinates, every composite padded
+spatial extent must fit `i32`; larger geometry is rejected before a plan is
+cached or a patch output is allocated.
 
 `Device::cuda_bf16` is an explicit mixed-precision policy: matrix-product
 inputs are rounded to BF16 inside the kernel and accumulated into FP32. Stored
@@ -252,6 +256,7 @@ shape checks first; compile-time axis types can be evaluated later.
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
 | `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |
 | `Conv2d(input, output, spatial, kernel)` | Cross-correlate named spatial axes with configurable positive stride, finite symmetric zero-padding, and positive channel groups. Require both channel extents to divide evenly by groups; preserve unrelated axes and append the output-channel axis. |
+| `Conv3d(input, output, spatial, kernel)` | Apply the same contract to three ordered named spatial axes. Flatten patches by input channel, then the three kernel coordinates with the final coordinate fastest. |
 | Named normalization | Normalize only the declared axes. Layer/RMS affine parameters span the declared normalized shape; group/instance affine parameters span the channel axis. Preserve every input axis and reject changed built extents or group geometry. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
 | `categorical_cross_entropy_with_logits(target, class)` | Accept constant one-hot/probability targets over the same axes, stably reduce the named class axis, and preserve all other axes. Backward is `softmax(logits) - target`. |
@@ -276,6 +281,12 @@ Depthwise convolution is the grouped case where `g` equals the input channel
 count (and commonly the output channel count). Reconfiguring a built layer to
 a different group geometry is rejected before execution. Dilation and
 asymmetric padding are not yet supported.
+
+`Conv3d::new` applies the same contract to three supplied spatial axes,
+conventionally `[depth, height, width]`. Its kernel, stride, and padding arrays
+follow that exact order, and its flattened grouped weights order each patch as
+input channel, kernel depth, kernel height, then kernel width. Axis identity,
+not the conventional name, selects each coordinate.
 
 Attention makes role axes public: query-time and key-time must be distinct
 identities even when both derive from time. Prefer a name such as

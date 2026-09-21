@@ -1,7 +1,7 @@
 use crate::{
     Axis, Device, Dim, IntoAxes, Result, Shape,
     axis::Layout,
-    backend::{Buffer, Plan, Unfold2dSpec},
+    backend::{Buffer, Plan, UnfoldSpec},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -28,7 +28,7 @@ struct GatherPlans {
 
 #[derive(Clone)]
 enum UnfoldPlans {
-    Implicit(Rc<Unfold2dSpec>),
+    Implicit(Rc<UnfoldSpec>),
     Zero,
 }
 
@@ -44,17 +44,19 @@ struct ReductionPlans {
 type GatherPlanKey = (u8, Shape, Layout, Shape, Layout);
 type MergePlanKey = (Shape, Layout, Vec<Axis>, Axis);
 type ReductionPlanKey = (u8, Shape, Layout, Vec<Axis>);
-type UnfoldPlanKey = (
-    Shape,
-    Layout,
-    Shape,
-    Axis,
-    [Axis; 2],
-    [usize; 2],
-    [usize; 2],
-    [usize; 2],
-    Option<Dim>,
-);
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct UnfoldPlanKey {
+    input_shape: Shape,
+    input_layout: Layout,
+    output_shape: Shape,
+    channels: Axis,
+    spatial_rank: usize,
+    spatial: [Option<Axis>; 3],
+    kernel: [usize; 3],
+    stride: [usize; 3],
+    padding: [usize; 3],
+    group: Option<Dim>,
+}
 
 thread_local! {
     static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
@@ -139,7 +141,7 @@ enum Rule {
         plan: Rc<Plan>,
         winners: Buffer,
     },
-    Unfold2d(Rc<Unfold2dSpec>),
+    Unfold(Rc<UnfoldSpec>),
 }
 impl Edge {
     fn new(input: &Tensor, rule: Rule) -> Self {
@@ -445,12 +447,12 @@ impl Tensor {
         &self,
         shape: Shape,
         layout: Layout,
-        spec: Rc<Unfold2dSpec>,
+        spec: Rc<UnfoldSpec>,
     ) -> Result<Self> {
-        let value = self.device().unfold2d(&self.0.value, spec.as_ref())?;
+        let value = self.device().unfold(&self.0.value, spec.as_ref())?;
         let edges = self
             .requires_grad()
-            .then(|| Edge::new(self, Rule::Unfold2d(spec)));
+            .then(|| Edge::new(self, Rule::Unfold(spec)));
         Ok(Self::node(
             shape,
             layout,
@@ -1142,24 +1144,24 @@ impl Tensor {
         patch: Dim,
         kernel: [usize; 2],
     ) -> Result<Self> {
-        self.unfold2d_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0])
+        self.unfold_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0])
     }
 
-    /// Lower a configured convolution to grouped patches. The group and patch
-    /// axes are appended so merging group/output channels restores Conv2d's
-    /// public rule that output channels are the final logical axis.
+    /// Lower a configured 2D or 3D convolution to grouped patches. The group
+    /// and patch axes are appended so merging grouped output channels restores
+    /// convolution's public rule that output channels are the final logical axis.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn unfold2d_grouped(
+    pub(crate) fn unfold_grouped<const N: usize>(
         &self,
         channels: Axis,
-        spatial: [Axis; 2],
+        spatial: [Axis; N],
         group: Dim,
         patch: Dim,
-        kernel: [usize; 2],
-        stride: [usize; 2],
-        padding: [usize; 2],
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
     ) -> Result<Self> {
-        self.unfold2d_configured(
+        self.unfold_configured(
             channels,
             spatial,
             Some(group),
@@ -1171,72 +1173,85 @@ impl Tensor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn unfold2d_configured(
+    fn unfold_configured<const N: usize>(
         &self,
         channels: Axis,
-        spatial: [Axis; 2],
+        spatial: [Axis; N],
         group: Option<Dim>,
         patch: Dim,
-        kernel: [usize; 2],
-        stride: [usize; 2],
-        padding: [usize; 2],
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
     ) -> Result<Self> {
-        if spatial[0] == spatial[1] || channels == spatial[0] || channels == spatial[1] {
-            return Err("unfold2d requires distinct channel and spatial axes".into());
+        let name = format!("unfold{N}d");
+        if !(N == 2 || N == 3) {
+            return Err("Axis unfold supports exactly two or three spatial axes".into());
+        }
+        for (index, &axis) in spatial.iter().enumerate() {
+            if axis == channels || spatial[..index].contains(&axis) {
+                return Err(format!("{name} requires distinct channel and spatial axes").into());
+            }
         }
         if kernel.contains(&0) {
-            return Err("unfold2d kernel extents must be positive".into());
+            return Err(format!("{name} kernel extents must be positive").into());
         }
         if stride.contains(&0) {
-            return Err("unfold2d stride extents must be positive".into());
+            return Err(format!("{name} stride extents must be positive").into());
         }
         let channel_extent = self.extent(channels)?;
-        let input_height = self.extent(spatial[0])?;
-        let input_width = self.extent(spatial[1])?;
+        let mut input_spatial = [0; N];
+        for index in 0..N {
+            input_spatial[index] = self.extent(spatial[index])?;
+        }
         let groups = group.map_or(1, |dim| dim.extent);
+        if groups == 0 {
+            return Err(format!("{name} groups must be positive").into());
+        }
         if !channel_extent.is_multiple_of(groups) {
-            return Err("unfold2d channels must be divisible by groups".into());
+            return Err(format!("{name} channels must be divisible by groups").into());
         }
-        let padded_height = input_height
-            .checked_add(
-                padding[0]
-                    .checked_mul(2)
-                    .ok_or("unfold2d padding overflow")?,
-            )
-            .ok_or("unfold2d padded height overflow")?;
-        let padded_width = input_width
-            .checked_add(
-                padding[1]
-                    .checked_mul(2)
-                    .ok_or("unfold2d padding overflow")?,
-            )
-            .ok_or("unfold2d padded width overflow")?;
-        if padded_height > i32::MAX as usize || padded_width > i32::MAX as usize {
-            return Err("unfold2d padded spatial extent exceeds the i32 kernel index range".into());
-        }
-        if kernel[0] > padded_height || kernel[1] > padded_width {
-            return Err("unfold2d kernel exceeds the padded spatial extent".into());
+        let mut output_spatial = [0; N];
+        for index in 0..N {
+            let doubled_padding = padding[index]
+                .checked_mul(2)
+                .ok_or_else(|| format!("{name} padding overflow"))?;
+            let padded = input_spatial[index]
+                .checked_add(doubled_padding)
+                .ok_or_else(|| format!("{name} padded spatial extent overflow"))?;
+            if padded > i32::MAX as usize {
+                return Err(format!(
+                    "{name} padded spatial extent exceeds the i32 kernel index range"
+                )
+                .into());
+            }
+            if kernel[index] > padded {
+                return Err(format!("{name} kernel exceeds the padded spatial extent").into());
+            }
+            output_spatial[index] = (padded - kernel[index]) / stride[index] + 1;
         }
         let channels_per_group = channel_extent / groups;
-        let expected_patch = channels_per_group
-            .checked_mul(kernel[0])
-            .and_then(|n| n.checked_mul(kernel[1]))
-            .ok_or("unfold2d patch extent overflow")?;
+        let expected_patch = kernel
+            .iter()
+            .try_fold(channels_per_group, |extent, &kernel| {
+                extent.checked_mul(kernel)
+            });
+        let expected_patch =
+            expected_patch.ok_or_else(|| format!("{name} patch extent overflow"))?;
         if patch.extent != expected_patch {
-            return Err("unfold2d patch extent must equal channels per group * kernel area".into());
+            return Err(format!(
+                "{name} patch extent must equal channels per group * kernel volume"
+            )
+            .into());
         }
-        let output_height = (padded_height - kernel[0]) / stride[0] + 1;
-        let output_width = (padded_width - kernel[1]) / stride[1] + 1;
+
         let mut dims = Vec::with_capacity(self.shape().rank() + usize::from(group.is_some()));
         for dim in self.shape().dims() {
             if dim.axis == channels {
                 if group.is_none() {
                     dims.push(patch);
                 }
-            } else if dim.axis == spatial[0] {
-                dims.push(spatial[0].of(output_height));
-            } else if dim.axis == spatial[1] {
-                dims.push(spatial[1].of(output_width));
+            } else if let Some(index) = spatial.iter().position(|&axis| axis == dim.axis) {
+                dims.push(dim.axis.of(output_spatial[index]));
             } else {
                 dims.push(*dim);
             }
@@ -1245,17 +1260,28 @@ impl Tensor {
             dims.extend([group, patch]);
         }
         let shape = Shape::new(dims)?;
-        let key = (
-            self.shape().clone(),
-            self.0.layout.clone(),
-            shape.clone(),
+        let mut spatial_key = [None; 3];
+        let mut kernel_key = [1; 3];
+        let mut stride_key = [1; 3];
+        let mut padding_key = [0; 3];
+        for index in 0..N {
+            spatial_key[index] = Some(spatial[index]);
+            kernel_key[index] = kernel[index];
+            stride_key[index] = stride[index];
+            padding_key[index] = padding[index];
+        }
+        let key = UnfoldPlanKey {
+            input_shape: self.shape().clone(),
+            input_layout: self.0.layout.clone(),
+            output_shape: shape.clone(),
             channels,
-            spatial,
-            kernel,
-            stride,
-            padding,
+            spatial_rank: N,
+            spatial: spatial_key,
+            kernel: kernel_key,
+            stride: stride_key,
+            padding: padding_key,
             group,
-        );
+        };
         let mut output_order = vec![];
         if let Some(group) = group {
             output_order.push(group.axis);
@@ -1272,7 +1298,9 @@ impl Tensor {
         if self.shape().len() > i32::MAX as usize - TILE_TAIL
             || shape.len() > i32::MAX as usize - TILE_TAIL
         {
-            return Err("unfold2d tensor is too large for its 128-lane index arithmetic".into());
+            return Err(
+                format!("{name} tensor is too large for its 128-lane index arithmetic").into(),
+            );
         }
         if let Some(plans) = UNFOLD_PLANS.with(|cache| cache.borrow().get(&key).cloned()) {
             return match plans {
@@ -1280,21 +1308,17 @@ impl Tensor {
                 UnfoldPlans::Zero => self.zero_gathered(shape, output_layout),
             };
         }
-        let y_has_input = (0..output_height).any(|output| {
-            (0..kernel[0]).any(|offset| {
-                (output * stride[0] + offset)
-                    .checked_sub(padding[0])
-                    .is_some_and(|input| input < input_height)
+
+        let has_input = (0..N).all(|dimension| {
+            (0..output_spatial[dimension]).any(|output| {
+                (0..kernel[dimension]).any(|offset| {
+                    (output * stride[dimension] + offset)
+                        .checked_sub(padding[dimension])
+                        .is_some_and(|input| input < input_spatial[dimension])
+                })
             })
         });
-        let x_has_input = (0..output_width).any(|output| {
-            (0..kernel[1]).any(|offset| {
-                (output * stride[1] + offset)
-                    .checked_sub(padding[1])
-                    .is_some_and(|input| input < input_width)
-            })
-        });
-        if !y_has_input || !x_has_input {
+        if !has_input {
             let result = self.zero_gathered(shape, output_layout)?;
             UNFOLD_PLANS.with(|cache| {
                 cache.borrow_mut().insert(key, UnfoldPlans::Zero);
@@ -1307,18 +1331,17 @@ impl Tensor {
         let to_i32 = |value: usize| -> Result<i32> { Ok(i32::try_from(value)?) };
         let mut forward_metadata = Vec::with_capacity(shape.rank() * 4);
         for (index, dim) in shape.dims().iter().enumerate() {
-            let (input_stride, role) = if dim.axis == spatial[0] {
-                (0, 1)
-            } else if dim.axis == spatial[1] {
-                (0, 2)
-            } else if group.is_some_and(|group| dim.axis == group.axis) {
-                (0, 3)
-            } else if dim.axis == patch.axis {
-                (0, 4)
-            } else {
-                let input_index = self.shape().index(dim.axis)?;
-                (to_i32(self.0.layout.strides[input_index])?, 0)
-            };
+            let (input_stride, role) =
+                if let Some(spatial_index) = spatial.iter().position(|&axis| axis == dim.axis) {
+                    (0, to_i32(spatial_index + 1)?)
+                } else if group.is_some_and(|group| dim.axis == group.axis) {
+                    (0, to_i32(N + 1)?)
+                } else if dim.axis == patch.axis {
+                    (0, to_i32(N + 2)?)
+                } else {
+                    let input_index = self.shape().index(dim.axis)?;
+                    (to_i32(self.0.layout.strides[input_index])?, 0)
+                };
             forward_metadata.extend([
                 to_i32(dim.extent)?,
                 to_i32(output_layout.strides[index])?,
@@ -1330,10 +1353,8 @@ impl Tensor {
         for (index, dim) in self.shape().dims().iter().enumerate() {
             let (output_stride, role) = if dim.axis == channels {
                 (0, 1)
-            } else if dim.axis == spatial[0] {
-                (0, 2)
-            } else if dim.axis == spatial[1] {
-                (0, 3)
+            } else if let Some(spatial_index) = spatial.iter().position(|&axis| axis == dim.axis) {
+                (0, to_i32(spatial_index + 2)?)
             } else {
                 let output_index = shape.index(dim.axis)?;
                 (to_i32(output_layout.strides[output_index])?, 0)
@@ -1349,7 +1370,27 @@ impl Tensor {
             |axis| -> Result<i32> { to_i32(self.0.layout.strides[self.shape().index(axis)?]) };
         let output_stride =
             |axis| -> Result<i32> { to_i32(output_layout.strides[shape.index(axis)?]) };
-        let spec = Rc::new(Unfold2dSpec {
+        let mut kernel_spec = [1; 3];
+        let mut stride_spec = [1; 3];
+        let mut padding_spec = [0; 3];
+        let mut input_spatial_spec = [1; 3];
+        let mut output_spatial_spec = [1; 3];
+        let mut input_special_strides = [0; 4];
+        let mut output_special_strides = [0; 5];
+        input_special_strides[0] = input_stride(channels)?;
+        for index in 0..N {
+            kernel_spec[index] = to_i32(kernel[index])?;
+            stride_spec[index] = to_i32(stride[index])?;
+            padding_spec[index] = to_i32(padding[index])?;
+            input_spatial_spec[index] = to_i32(input_spatial[index])?;
+            output_spatial_spec[index] = to_i32(output_spatial[index])?;
+            input_special_strides[index + 1] = input_stride(spatial[index])?;
+            output_special_strides[index] = output_stride(spatial[index])?;
+        }
+        output_special_strides[3] = group.map_or(Ok(0), |group| output_stride(group.axis))?;
+        output_special_strides[4] = output_stride(patch.axis)?;
+        let spec = Rc::new(UnfoldSpec {
+            spatial_rank: to_i32(N)?,
             input_len: self.shape().len(),
             output_len: shape.len(),
             input_rank: to_i32(self.shape().rank())?,
@@ -1357,22 +1398,13 @@ impl Tensor {
             forward_metadata,
             backward_metadata,
             channels_per_group: to_i32(channels_per_group)?,
-            kernel: [to_i32(kernel[0])?, to_i32(kernel[1])?],
-            stride: [to_i32(stride[0])?, to_i32(stride[1])?],
-            padding: [to_i32(padding[0])?, to_i32(padding[1])?],
-            input_spatial: [to_i32(input_height)?, to_i32(input_width)?],
-            output_spatial: [to_i32(output_height)?, to_i32(output_width)?],
-            input_special_strides: [
-                input_stride(channels)?,
-                input_stride(spatial[0])?,
-                input_stride(spatial[1])?,
-            ],
-            output_special_strides: [
-                output_stride(spatial[0])?,
-                output_stride(spatial[1])?,
-                group.map_or(Ok(0), |group| output_stride(group.axis))?,
-                output_stride(patch.axis)?,
-            ],
+            kernel: kernel_spec,
+            stride: stride_spec,
+            padding: padding_spec,
+            input_spatial: input_spatial_spec,
+            output_spatial: output_spatial_spec,
+            input_special_strides,
+            output_special_strides,
         });
         let result = self.unfolded_with_spec(shape, output_layout, spec.clone())?;
         UNFOLD_PLANS.with(|cache| {
@@ -1925,8 +1957,8 @@ impl Tensor {
                                 self.device().grouped(&gradient, None, plan.as_ref(), 1.0)?;
                             self.device().mask_gradient(&expanded, winners)?
                         }
-                        Rule::Unfold2d(spec) => {
-                            self.device().unfold2d_backward(&gradient, spec.as_ref())?
+                        Rule::Unfold(spec) => {
+                            self.device().unfold_backward(&gradient, spec.as_ref())?
                         }
                     };
                     let id = edge.input.0.id;

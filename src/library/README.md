@@ -12,9 +12,10 @@ The crate currently provides:
 
 - named-axis tensor algebra and reverse-mode differentiation, including
   deterministic finite minimum reductions;
-- `Linear`, `Conv2d` with stride, symmetric padding, and grouped/depthwise
-  channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`, and stateless
-  `InstanceNorm`, activations, attention primitives, and sequential composition;
+- `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
+  grouped/depthwise channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
+  and stateless `InstanceNorm`, activations, attention primitives, and
+  sequential composition;
 - device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
   exact AdamW remainder;
 - generated and finite data loaders with executable single-pass, finite-pass,
@@ -55,10 +56,14 @@ change as real training programs expose better defaults and abstractions.
 The Muon implementation's pinned upstream revision and MIT attribution are in
 [THIRD_PARTY.md](THIRD_PARTY.md), which is included in every published crate.
 
-`Conv2d::new` defaults to stride one, no padding, and one group. Configure a
-depthwise layer by setting `groups` to the input channel count; both input and
-output channel extents must be divisible by that value. Padding is symmetric
-per named spatial axis. Dilation and asymmetric padding are not implemented.
+`Conv2d::new` and `Conv3d::new` default to stride one, no padding, and one
+group. Configure a depthwise layer by setting `groups` to the input channel
+count; both input and output channel extents must be divisible by that value.
+Kernel, stride, and padding entries correspond positionally to the supplied
+named spatial axes. Padding is symmetric per axis. Dilation and asymmetric
+padding are not implemented. Both paths materialize FP32 patches before
+contraction; 3D kernel volumes can make that intermediate large, while later
+generic layout and broadcast operations retain their index-plan limits.
 
 ```bash
 cargo add axis@0.5.0
