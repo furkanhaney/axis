@@ -334,6 +334,62 @@ impl Module for GELU {
     }
 }
 
+/// Parameter-free erf-form GELU for checkpoints trained with exact GELU.
+#[derive(Clone, Copy)]
+pub struct ExactGELU;
+impl Module for ExactGELU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.gelu_exact()
+    }
+}
+
+/// Parameter-free sigmoid linear unit, `x * sigmoid(x)`.
+#[derive(Clone, Copy)]
+pub struct SiLU;
+impl Module for SiLU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.silu()
+    }
+}
+
+/// Parameter-free leaky ReLU with an explicit negative-region slope.
+/// The derivative at exactly zero is zero.
+#[derive(Clone, Copy)]
+pub struct LeakyReLU {
+    negative_slope: f32,
+}
+impl LeakyReLU {
+    pub fn new(negative_slope: f32) -> Result<Self> {
+        if !negative_slope.is_finite() || negative_slope < 0.0 {
+            return Err("LeakyReLU negative slope must be finite and non-negative".into());
+        }
+        Ok(Self { negative_slope })
+    }
+}
+impl Module for LeakyReLU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.leaky_relu(self.negative_slope)
+    }
+}
+
 /// Parameter-free elementwise hyperbolic tangent module.
 #[derive(Clone, Copy)]
 pub struct Tanh;

@@ -2211,7 +2211,7 @@ fn exact_gelu_matches_independent_quadrature_and_gradient() -> Result<()> {
     values[1] = 1000.0;
     values[2] = -0.0;
     let input = Tensor::from_slice(&values, [row.of(3), col.of(2731)], &device)?.with_grad();
-    let output = input.with_layout([col, row])?.gelu_exact()?;
+    let output = ExactGELU.forward(&input.with_layout([col, row])?)?;
     assert_eq!(output.extent(row)?, 3);
     assert_eq!(output.extent(col)?, 2731);
     let observed = output.to_vec()?;
@@ -2248,6 +2248,80 @@ fn exact_gelu_matches_independent_quadrature_and_gradient() -> Result<()> {
         "exact GELU PASS n={} forward={max_forward:.3e} derivative={max_backward:.3e} tanh_gap={max_tanh_difference:.3e}",
         values.len()
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn silu_and_leaky_relu_modules_match_independent_oracles() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("activation_row"), Axis::new("activation_col"));
+    let values = (0..2051)
+        .map(|index| (index as f64 - 1025.0) / 137.0)
+        .collect::<Vec<_>>();
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&value| value as f32).collect::<Vec<_>>(),
+        [row.of(7), col.of(293)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([col, row])?;
+
+    let silu = SiLU.forward(&input)?;
+    let expected_silu = values
+        .iter()
+        .map(|&x| x / (1.0 + (-x).exp()))
+        .collect::<Vec<_>>();
+    close("SiLU module forward", &silu.to_vec()?, &expected_silu);
+    silu.mean([row, col])?.backward()?;
+    let expected_silu_gradient = values
+        .iter()
+        .map(|&x| {
+            let sigmoid = 1.0 / (1.0 + (-x).exp());
+            (sigmoid + x * sigmoid * (1.0 - sigmoid)) / values.len() as f64
+        })
+        .collect::<Vec<_>>();
+    close(
+        "SiLU module derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_silu_gradient,
+    );
+
+    let leaky_leaf = input.detach().with_layout([row, col])?.with_grad();
+    let leaky_input = leaky_leaf.with_layout([col, row])?;
+    let leaky = LeakyReLU::new(0.125)?.forward(&leaky_input)?;
+    let expected_leaky = values
+        .iter()
+        .map(|&x| if x > 0.0 { x } else { 0.125 * x })
+        .collect::<Vec<_>>();
+    close(
+        "LeakyReLU module forward",
+        &leaky.to_vec()?,
+        &expected_leaky,
+    );
+    leaky.mean([row, col])?.backward()?;
+    let expected_leaky_gradient = values
+        .iter()
+        .map(|&x| {
+            let derivative = if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                0.125
+            } else {
+                0.0
+            };
+            derivative / values.len() as f64
+        })
+        .collect::<Vec<_>>();
+    close(
+        "LeakyReLU module derivative",
+        &leaky_leaf.grad().unwrap().to_vec()?,
+        &expected_leaky_gradient,
+    );
+
+    assert!(LeakyReLU::new(-0.1).is_err());
+    assert!(LeakyReLU::new(f32::NAN).is_err());
+    assert!(input.leaky_relu(f32::INFINITY).is_err());
     Ok(())
 }
 

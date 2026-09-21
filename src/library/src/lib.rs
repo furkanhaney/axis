@@ -65,7 +65,8 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    GELU, IntoLayers, Linear, Module, ParamId, Parameter, PopulationLinear, ReLU, Sequential, Tanh,
+    ExactGELU, GELU, IntoLayers, LeakyReLU, Linear, Module, ParamId, Parameter, PopulationLinear,
+    ReLU, Sequential, SiLU, Tanh,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
@@ -99,15 +100,15 @@ pub mod prelude {
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
         CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
         Disjointness, DisjointnessEvidence, DisjointnessReceipt, EmpiricalMonotonicity,
-        EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, FinitePasses,
-        FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme, Idr, IdrLimits,
-        IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm, LearningDirection,
-        LearningEvidence, LearningLimits, LearningObservation, LearningProgress,
-        LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState, Module,
-        MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
+        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
+        Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
+        LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
+        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
+        Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
         MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
         PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, ResidualClaim, ResidualEvidence,
-        ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential, Shape, SinglePass,
-        Standardizer, Tanh, Tensor, TrainStep, Trainer,
+        ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential, Shape, SiLU,
+        SinglePass, Standardizer, Tanh, Tensor, TrainStep, Trainer,
     };
 }

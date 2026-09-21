@@ -70,7 +70,8 @@ commits. The orientation, scalar oracles, mixed-precision behavior, and current
 limits are documented in [the Muon contract](muon.md).
 
 `Tensor::gelu()` and the `GELU` module retain the tanh formulation. The explicit
-`Tensor::gelu_exact()` operation instead evaluates `x * Phi(x)` (erf-form GELU),
+`Tensor::gelu_exact()` operation and `ExactGELU` module instead evaluate
+`x * Phi(x)` (erf-form GELU),
 with analytic derivative `Phi(x) + x * phi(x)`, for imported models such as
 MobileSAM that were trained with exact GELU. This is the distinction documented by
 [PyTorch's GELU contract](https://docs.pytorch.org/docs/main/generated/torch.nn.modules.activation.GELU.html).
@@ -87,6 +88,13 @@ forward error below 2e-6 and derivative error below 5e-7 over 8,193 inputs spann
 [-8,8], signed zero and large finite tails, with noncontiguous storage and partial
 kernel tiles. Nonfinite inputs and bitwise cross-backend parity are not certified.
 The existing tanh-GELU regression remains unchanged.
+
+`SiLU` composes sigmoid and multiplication, while `LeakyReLU::new(slope)?`
+composes the established ReLU primitives. Leaky-ReLU slopes must be finite and
+non-negative; the derivative at exactly zero is zero. The independent f64 oracle
+covers 2,051 values, reordered storage, odd partial tiles, both forward paths and
+both reverse-mode derivatives. These are correctness paths rather than fused
+activation kernels.
 
 Normalization follows the named axes that define the statistic rather than a
 rank suffix. `LayerNorm::new(feature)?` remains the ordinary single-axis form;
