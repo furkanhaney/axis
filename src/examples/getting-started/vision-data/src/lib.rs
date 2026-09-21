@@ -447,6 +447,13 @@ where
         }
     }
     let receipt = loader.receipt();
+    if receipt.completed_passes != config.epochs || receipt.samples_in_current_pass != 0 {
+        return Err(format!(
+            "finite-pass training ended at pass {} with {} samples in the next pass; expected {} complete passes",
+            receipt.completed_passes, receipt.samples_in_current_pass, config.epochs
+        )
+        .into());
+    }
     let final_accuracy = evaluate(model, held_out, config.batch, config.class_axis, &tensorize)?;
     println!(
         "train time: {:.2}s\n{}",
