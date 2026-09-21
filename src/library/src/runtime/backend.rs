@@ -254,6 +254,17 @@ impl Device {
         kernels::gelu((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn gelu_exact(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::gelu_exact((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn gelu_exact_backward(&self, gradient: &Buffer, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::gelu_exact_backward((&mut out).partition([128]), gradient.as_ref(), a.as_ref())
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn gelu_backward(&self, gradient: &Buffer, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::gelu_backward((&mut out).partition([128]), gradient.as_ref(), a.as_ref())
@@ -1951,6 +1962,44 @@ mod kernels {
         let c = constant(0.7978845608f32, shape![128]);
         let cubic = constant(0.044715f32, shape![128]);
         out.store(half * x * (one + tanh(c * (x + cubic * x * x * x))));
+    }
+    // Normal-CDF evaluation (Abramowitz & Stegun 26.2.17). Evaluate the small
+    // tail directly for negative x rather than subtracting nearly equal values.
+    // Mathematical approximation error is < 7.5e-8 for the CDF; FP32 rounding
+    // is additional and covered by the independent quadrature CUDA oracle.
+    fn normal_cdf(x: Tile<f32, { [128] }>) -> Tile<f32, { [128] }> {
+        let one = constant(1.0f32, shape![128]);
+        let zero = constant(0.0f32, shape![128]);
+        let half = constant(0.5f32, shape![128]);
+        let t = one / (one + constant(0.2316419f32, shape![128]) * absf(x));
+        let polynomial = (((constant(1.330274429f32, shape![128]) * t
+            + constant(-1.821255978f32, shape![128]))
+            * t
+            + constant(1.781477937f32, shape![128]))
+            * t
+            + constant(-0.356563782f32, shape![128]))
+            * t
+            + constant(0.319381530f32, shape![128]);
+        let density = constant(0.3989422804f32, shape![128]) * exp(zero - half * x * x);
+        let tail = density * t * polynomial;
+        let cdf = select(lt_tile(x, zero), tail, one - tail);
+        select(eq_tile(x, zero), half, cdf)
+    }
+    #[cutile::entry()]
+    fn gelu_exact(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        let x = a.load_like(out);
+        out.store(x * normal_cdf(x));
+    }
+    #[cutile::entry()]
+    fn gelu_exact_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+    ) {
+        let x = a.load_like(out);
+        let half = constant(-0.5f32, shape![128]);
+        let density = constant(0.3989422804f32, shape![128]) * exp(half * x * x);
+        out.store(gradient.load_like(out) * (normal_cdf(x) + x * density));
     }
     #[cutile::entry()]
     fn gelu_backward(

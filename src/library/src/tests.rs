@@ -2185,6 +2185,74 @@ fn layer_norm_and_gelu_match_a_scalar_reference() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn exact_gelu_matches_independent_quadrature_and_gradient() -> Result<()> {
+    // Simpson quadrature of the normal density: deliberately independent of
+    // the backend's rational CDF evaluation and the existing tanh GELU oracle.
+    fn cdf(x: f64) -> f64 {
+        if x.abs() > 10.0 {
+            return if x > 0.0 { 1.0 } else { 0.0 };
+        }
+        let step = x / 2048.0;
+        let density = |z: f64| (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let mut sum = density(0.0) + density(x);
+        for i in 1..2048 {
+            sum += (if i % 2 == 0 { 2.0 } else { 4.0 }) * density(i as f64 * step);
+        }
+        0.5 + step * sum / 3.0
+    }
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("row"), Axis::new("col"));
+    // Odd extent, partial CUDA tiles, dense central/tail coverage, signed zero,
+    // very large finite values, and physical order different from logical order.
+    let mut values = (0..8193)
+        .map(|i| (i as f32 - 4096.0) / 512.0)
+        .collect::<Vec<_>>();
+    values[0] = -1000.0;
+    values[1] = 1000.0;
+    values[2] = -0.0;
+    let input = Tensor::from_slice(&values, [row.of(3), col.of(2731)], &device)?.with_grad();
+    let output = input.with_layout([col, row])?.gelu_exact()?;
+    assert_eq!(output.extent(row)?, 3);
+    assert_eq!(output.extent(col)?, 2731);
+    let observed = output.to_vec()?;
+    output.mean([row, col])?.backward()?;
+    let gradients = input.grad().unwrap().to_vec()?;
+    let mut max_forward = 0.0_f64;
+    let mut max_backward = 0.0_f64;
+    let mut max_tanh_difference = 0.0_f64;
+    for ((&x, &y), &g) in values.iter().zip(&observed).zip(&gradients) {
+        let x = f64::from(x);
+        let p = cdf(x);
+        let expected = x * p;
+        let derivative = p + x * (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let forward = (f64::from(y) - expected).abs();
+        let backward = (f64::from(g) * values.len() as f64 - derivative).abs();
+        assert!(
+            y.is_finite() && forward < 2e-6,
+            "exact GELU({x}): {y} != {expected}"
+        );
+        assert!(
+            g.is_finite() && backward < 5e-7,
+            "exact GELU derivative({x}): error {backward}"
+        );
+        max_forward = max_forward.max(forward);
+        max_backward = max_backward.max(backward);
+        let tanh = 0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh());
+        max_tanh_difference = max_tanh_difference.max((tanh - expected).abs());
+    }
+    assert!(
+        max_tanh_difference > 4e-4,
+        "oracle must distinguish tanh and erf GELU"
+    );
+    println!(
+        "exact GELU PASS n={} forward={max_forward:.3e} derivative={max_backward:.3e} tanh_gap={max_tanh_difference:.3e}",
+        values.len()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn multi_axis_layer_and_rms_norm_match_scalar_forward_and_gradient_oracles() -> Result<()> {
     fn layer_reference(
         values: &[f64],

@@ -104,6 +104,7 @@ enum Rule {
     Tanh(Buffer),
     Sin(Buffer),
     Gelu(Buffer),
+    GeluExact(Buffer),
     InverseSqrt {
         input: Buffer,
         epsilon: f32,
@@ -916,6 +917,23 @@ impl Tensor {
             value,
             self.device(),
             vec![Edge::new(self, Rule::Gelu(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// Erf-form GELU, `x * Phi(x)`, rather than the tanh formulation of [`Self::gelu`].
+    ///
+    /// The CUDA backend numerically evaluates the normal CDF in FP32 (not bitwise
+    /// identical to a particular libm). Backward uses `Phi(x) + x * phi(x)`.
+    /// This distinction matters when importing pretrained exact-GELU models.
+    pub fn gelu_exact(&self) -> Result<Self> {
+        let value = self.device().gelu_exact(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::GeluExact(self.0.value.clone()))],
             false,
             None,
         ))
@@ -2067,6 +2085,7 @@ impl Tensor {
                         Rule::Tanh(output) => self.device().tanh_backward(&gradient, output)?,
                         Rule::Sin(input) => self.device().sin_backward(&gradient, input)?,
                         Rule::Gelu(x) => self.device().gelu_backward(&gradient, x)?,
+                        Rule::GeluExact(x) => self.device().gelu_exact_backward(&gradient, x)?,
                         Rule::InverseSqrt { input, epsilon } => self
                             .device()
                             .inverse_sqrt_backward(&gradient, input, *epsilon)?,

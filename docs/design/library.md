@@ -69,6 +69,25 @@ exact deduplicated remainder to AdamW. Both partitions prepare before either
 commits. The orientation, scalar oracles, mixed-precision behavior, and current
 limits are documented in [the Muon contract](muon.md).
 
+`Tensor::gelu()` and the `GELU` module retain the tanh formulation. The explicit
+`Tensor::gelu_exact()` operation instead evaluates `x * Phi(x)` (erf-form GELU),
+with analytic derivative `Phi(x) + x * phi(x)`, for imported models such as
+MobileSAM that were trained with exact GELU. This is the distinction documented by
+[PyTorch's GELU contract](https://docs.pytorch.org/docs/main/generated/torch.nn.modules.activation.GELU.html).
+It does not promise bitwise identity with a particular PyTorch/libm implementation.
+
+cuTile 0.3.1 exposes no erf primitive. The implementation evaluates the normal CDF
+using the five-coefficient rational approximation in Abramowitz and Stegun 26.2.17
+(also reproduced in [NASA's normal-distribution reference](https://ntrs.nasa.gov/api/citations/19980045313/downloads/19980045313.pdf)).
+Its mathematical CDF approximation error is below 7.5e-8; FP32 arithmetic adds
+rounding error. Negative inputs use the small tail directly, avoiding cancellation.
+“Exact” names the GELU formulation, not exact real arithmetic. The CUDA test uses
+independent f64 Simpson integration, not the kernel's polynomial, and requires
+forward error below 2e-6 and derivative error below 5e-7 over 8,193 inputs spanning
+[-8,8], signed zero and large finite tails, with noncontiguous storage and partial
+kernel tiles. Nonfinite inputs and bitwise cross-backend parity are not certified.
+The existing tanh-GELU regression remains unchanged.
+
 Normalization follows the named axes that define the statistic rather than a
 rank suffix. `LayerNorm::new(feature)?` remains the ordinary single-axis form;
 `LayerNorm::new([row, feature])?` learns scale and bias over the complete
