@@ -53,6 +53,30 @@ construction still costs about 5.84 seconds per newly bound model in this
 probe, and mean utilization remains low. The result does not establish
 competitive convolution throughput or a general CUDA performance ratio.
 
+## Remaining Perm profile work
+
+A later Axis 0.6.0 trace on an RTX 5070 Ti measured 2,113 CUDA launches across
+six Perm optimizer updates, or about 352 launches per update including startup
+and JIT work. It also recorded 1,215 `cuMemAllocAsync`/`cuMemFreeAsync` pairs
+and 18 stream synchronizations. A steady-state trace still needs to attribute
+those launches to graph operations before Axis can justify fusion, allocation
+reuse, batched tiny work, or CUDA graph replay. Acceptance is fewer launches
+per update and lower unprofiled update time with the frozen scientific metrics
+unchanged; profiler wall time is diagnostic only.
+
+In that trace, 341 generated `grouped_entry` kernels accounted for 77.6% of
+sampled GPU kernel time. One selected launch used 168 registers per thread,
+reached 22.58% achieved occupancy against a 25% theoretical limit, 22.79%
+compute throughput, and 2.34% memory throughput. NVIDIA's profiler identified
+registers as that launch's occupancy limiter. This one selected kernel does not
+support a framework-wide Tensor Core or throughput claim. The next useful
+experiment is to inspect generated code, live ranges, inlining, spills, and
+tile choices, then repeat both `ncu` and unprofiled end-to-end measurements.
+
+These are documented optimization targets rather than release correctness
+failures. Axis 0.7 records them as explicit backend limits; it does not claim
+that launch fragmentation or `grouped_entry` register pressure is solved.
+
 A separate temporary consumer run observed one complete ordered `run()` over
 1,000 Adam steps at the same batch, image, and feature sizes. Its internal timer,
 which includes training and evaluation, reported 120.820 seconds; loss moved
