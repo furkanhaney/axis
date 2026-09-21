@@ -31,6 +31,8 @@ mod normalization;
 mod optim;
 #[path = "model/preprocess.rs"]
 mod preprocess;
+#[path = "model/recurrent.rs"]
+mod recurrent;
 #[path = "research/regime.rs"]
 mod regime;
 #[path = "algebra/tensor.rs"]
@@ -63,6 +65,7 @@ pub use nn::{
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
 pub use preprocess::Standardizer;
+pub use recurrent::{Lstm, LstmCell, LstmRun, LstmState};
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
 };
@@ -77,6 +80,9 @@ compile_error!(
 );
 
 #[cfg(test)]
+#[path = "model/recurrent_tests.rs"]
+mod recurrent_tests;
+#[cfg(test)]
 mod tests;
 
 pub mod prelude {
@@ -87,10 +93,10 @@ pub mod prelude {
         EmpiricalMonotonicityReceipt, FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU,
         GroupNorm, IdentityScheme, Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm,
         LayerNorm, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
-        LearningProgress, LearningProgressReceipt, Linear, Module, MonotoneDirection,
-        MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer,
-        ParamId, Parameter, PopulationLinear, PopulationMode, PopulationReceipt, PopulationSpec,
-        ReLU, RegimeSnapshot, Result, RmsNorm, SGD, Sample, Sequential, Shape, SinglePass,
-        Standardizer, Tensor, TrainStep, Trainer,
+        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
+        Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
+        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, RmsNorm, SGD, Sample,
+        Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
     };
 }

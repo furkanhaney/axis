@@ -1253,7 +1253,7 @@ mod tests {
         const COLUMNS: usize = 4_096;
         const { assert!(ROWS * COLUMNS > 16_777_216) };
         let device = Device::cuda(0)?;
-        let tensor = Tensor::zeros_for_test(
+        let tensor = Tensor::zeros(
             [Axis::new("row").of(ROWS), Axis::new("column").of(COLUMNS)],
             &device,
         )?;

@@ -199,6 +199,41 @@ impl Device {
             .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn sigmoid(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::sigmoid((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn sigmoid_backward(
+        &self,
+        gradient: &Buffer,
+        probability: &Buffer,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(probability.shape()[0] as usize)?;
+        kernels::sigmoid_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            probability.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn tanh(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::tanh_forward((&mut out).partition([128]), a.as_ref())
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn tanh_backward(&self, gradient: &Buffer, output: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(output.shape()[0] as usize)?;
+        kernels::tanh_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            output.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn gelu(&self, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::gelu((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
@@ -657,6 +692,99 @@ impl Device {
         Ok(self.track(out))
     }
 
+    pub(crate) fn select_axis(&self, input: &Buffer, spec: &SelectSpec) -> Result<Buffer> {
+        let metadata = self.upload_i32(&spec.metadata)?;
+        let mut out = self.zeros(spec.output_len)?;
+        unsafe {
+            kernels::select_axis(
+                (&mut out).partition([128]),
+                input.as_ref().device_pointer(),
+                metadata.as_ref(),
+                i32::try_from(spec.output_len)?,
+                spec.rank,
+                spec.coordinate,
+            )
+        }
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+
+    pub(crate) fn select_axis_backward(
+        &self,
+        gradient: &Buffer,
+        spec: &SelectSpec,
+    ) -> Result<Buffer> {
+        let metadata = self.upload_i32(&spec.metadata)?;
+        let mut out = self.zeros(spec.input_len)?;
+        unsafe {
+            kernels::select_axis_backward(
+                (&mut out).partition([128]),
+                gradient.as_ref().device_pointer(),
+                metadata.as_ref(),
+                i32::try_from(spec.input_len)?,
+                spec.rank,
+                spec.coordinate,
+            )
+        }
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+
+    /// Concatenate equally sized contiguous buffers. The caller describes the
+    /// resulting named layout; this backend operation only owns physical order.
+    pub(crate) fn stack_contiguous(&self, inputs: &[Buffer]) -> Result<Buffer> {
+        let first = inputs.first().ok_or("stack requires at least one tensor")?;
+        let slice_len = first.shape()[0] as usize;
+        let output_len = slice_len
+            .checked_mul(inputs.len())
+            .ok_or("stack size overflow")?;
+        let out = self.zeros(output_len)?;
+        let destination = out.device_pointer().cu_deviceptr();
+        for (index, input) in inputs.iter().enumerate() {
+            if input.shape()[0] as usize != slice_len {
+                return Err("stack buffers must have equal lengths".into());
+            }
+            let offset = index
+                .checked_mul(slice_len)
+                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or("stack byte offset overflow")?;
+            unsafe {
+                cutile::cuda_core::memcpy_dtod_async::<f32>(
+                    destination + u64::try_from(offset)?,
+                    input.device_pointer().cu_deviceptr(),
+                    slice_len,
+                    &self.0.stream,
+                )?;
+            }
+        }
+        Ok(self.track(out))
+    }
+
+    pub(crate) fn contiguous_slice(
+        &self,
+        input: &Buffer,
+        offset: usize,
+        len: usize,
+    ) -> Result<Buffer> {
+        let input_len = input.shape()[0] as usize;
+        if offset.checked_add(len).is_none_or(|end| end > input_len) {
+            return Err("contiguous slice is outside its input".into());
+        }
+        let out = self.zeros(len)?;
+        let byte_offset = offset
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or("slice byte offset overflow")?;
+        unsafe {
+            cutile::cuda_core::memcpy_dtod_async::<f32>(
+                out.device_pointer().cu_deviceptr(),
+                input.device_pointer().cu_deviceptr() + u64::try_from(byte_offset)?,
+                len,
+                &self.0.stream,
+            )?;
+        }
+        Ok(self.track(out))
+    }
+
     /// One minimum per CSR group plus a one-hot winner mask in input storage order.
     pub(crate) fn grouped_minimum(
         &self,
@@ -751,6 +879,18 @@ pub(crate) struct UnfoldSpec {
     pub output_spatial: [i32; 3],
     pub input_special_strides: [i32; 4],
     pub output_special_strides: [i32; 5],
+}
+
+/// Compact metadata for selecting one coordinate of one named axis.
+/// Each logical input dimension contributes `(extent, input_stride,
+/// output_stride)`, with `-1` marking the selected dimension.
+#[derive(Clone)]
+pub(crate) struct SelectSpec {
+    pub input_len: usize,
+    pub output_len: usize,
+    pub rank: i32,
+    pub coordinate: i32,
+    pub metadata: Vec<i32>,
 }
 
 impl UnfoldSpec {
@@ -1242,6 +1382,99 @@ mod kernels {
     }
 
     #[cutile::entry()]
+    unsafe fn select_axis(
+        out: &mut Tensor<f32, { [128] }>,
+        input: *const f32,
+        metadata: &Tensor<i32, { [-1] }>,
+        output_len: i32,
+        rank: i32,
+        selected: i32,
+    ) {
+        let output_index: Tile<i32, { [128] }> =
+            iota(shape![128]) + broadcast_scalar(get_tile_block_id().0 * 128i32, shape![128]);
+        let live = lt_tile(output_index, broadcast_scalar(output_len, shape![128]));
+        let mp = metadata.partition(shape![1]);
+        let mut input_index = constant(0i32, shape![128]);
+        for dimension in 0i32..rank {
+            let base = dimension * 3i32;
+            let extent: i32 = tile_to_scalar(mp.load([base]).reshape(shape![]));
+            let input_stride: i32 = tile_to_scalar(mp.load([base + 1i32]).reshape(shape![]));
+            let output_stride: i32 = tile_to_scalar(mp.load([base + 2i32]).reshape(shape![]));
+            if output_stride < 0i32 {
+                input_index = input_index + broadcast_scalar(selected * input_stride, shape![128]);
+            } else {
+                let coordinate = (output_index / broadcast_scalar(output_stride, shape![128]))
+                    % broadcast_scalar(extent, shape![128]);
+                input_index =
+                    input_index + coordinate * broadcast_scalar(input_stride, shape![128]);
+            }
+        }
+        let zero = constant(0i32, shape![128]);
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(input);
+        let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const f32, { [128] }> = base.broadcast(shape![128]);
+        let addresses = addptr_tile(base, select(live, input_index, zero));
+        let (values, _token): (Tile<f32, { [128] }>, Token) = unsafe {
+            load_ptr_tko(
+                addresses,
+                ordering::Relaxed,
+                Some(scope::Device),
+                Some(live),
+                Some(0.0f32),
+                None,
+                Latency::<0>,
+            )
+        };
+        out.store(values);
+    }
+
+    #[cutile::entry()]
+    unsafe fn select_axis_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: *const f32,
+        metadata: &Tensor<i32, { [-1] }>,
+        input_len: i32,
+        rank: i32,
+        selected: i32,
+    ) {
+        let input_index: Tile<i32, { [128] }> =
+            iota(shape![128]) + broadcast_scalar(get_tile_block_id().0 * 128i32, shape![128]);
+        let mut live = lt_tile(input_index, broadcast_scalar(input_len, shape![128]));
+        let mp = metadata.partition(shape![1]);
+        let mut gradient_index = constant(0i32, shape![128]);
+        for dimension in 0i32..rank {
+            let base = dimension * 3i32;
+            let extent: i32 = tile_to_scalar(mp.load([base]).reshape(shape![]));
+            let input_stride: i32 = tile_to_scalar(mp.load([base + 1i32]).reshape(shape![]));
+            let output_stride: i32 = tile_to_scalar(mp.load([base + 2i32]).reshape(shape![]));
+            let coordinate = (input_index / broadcast_scalar(input_stride, shape![128]))
+                % broadcast_scalar(extent, shape![128]);
+            if output_stride < 0i32 {
+                live = live & eq_tile(coordinate, broadcast_scalar(selected, shape![128]));
+            } else {
+                gradient_index =
+                    gradient_index + coordinate * broadcast_scalar(output_stride, shape![128]);
+            }
+        }
+        let zero = constant(0i32, shape![128]);
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(gradient);
+        let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const f32, { [128] }> = base.broadcast(shape![128]);
+        let addresses = addptr_tile(base, select(live, gradient_index, zero));
+        let (values, _token): (Tile<f32, { [128] }>, Token) = unsafe {
+            load_ptr_tko(
+                addresses,
+                ordering::Relaxed,
+                Some(scope::Device),
+                Some(live),
+                Some(0.0f32),
+                None,
+                Latency::<0>,
+            )
+        };
+        out.store(values);
+    }
+    #[cutile::entry()]
     fn sum_squares_tiles<const TILE_WIDTH: i32>(
         out: &mut Tensor<f32, { [1] }>,
         input: &Tensor<f32, { [-1] }>,
@@ -1649,6 +1882,39 @@ mod kernels {
             gradient.load_like(out),
             zero,
         ));
+    }
+    #[cutile::entry()]
+    fn sigmoid(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        let x = a.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let magnitude = max_tile(x, zero - x);
+        let e = exp(zero - magnitude);
+        out.store(select(gt_tile(x, zero), one / (one + e), e / (one + e)));
+    }
+    #[cutile::entry()]
+    fn sigmoid_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        probability: &Tensor<f32, { [-1] }>,
+    ) {
+        let p = probability.load_like(out);
+        let one = constant(1.0f32, shape![128]);
+        out.store(gradient.load_like(out) * p * (one - p));
+    }
+    #[cutile::entry()]
+    fn tanh_forward(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        out.store(tanh(a.load_like(out)));
+    }
+    #[cutile::entry()]
+    fn tanh_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        output: &Tensor<f32, { [-1] }>,
+    ) {
+        let y = output.load_like(out);
+        let one = constant(1.0f32, shape![128]);
+        out.store(gradient.load_like(out) * (one - y * y));
     }
     #[cutile::entry()]
     fn gelu(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {

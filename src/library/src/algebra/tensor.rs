@@ -1,7 +1,7 @@
 use crate::{
     Axis, Device, Dim, IntoAxes, Result, Shape,
     axis::Layout,
-    backend::{Buffer, Plan, UnfoldSpec},
+    backend::{Buffer, Plan, SelectSpec, UnfoldSpec},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -100,6 +100,8 @@ enum Rule {
     Scale(f32),
     Multiply(Buffer),
     Relu(Buffer),
+    Sigmoid(Buffer),
+    Tanh(Buffer),
     Gelu(Buffer),
     InverseSqrt {
         input: Buffer,
@@ -142,6 +144,11 @@ enum Rule {
         winners: Buffer,
     },
     Unfold(Rc<UnfoldSpec>),
+    Select(Rc<SelectSpec>),
+    StackSlice {
+        offset: usize,
+        len: usize,
+    },
 }
 impl Edge {
     fn new(input: &Tensor, rule: Rule) -> Self {
@@ -191,6 +198,20 @@ impl Tensor {
             return Err("data length does not match shape".into());
         }
         let value = device.upload(values.to_vec())?;
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            value,
+            device,
+            vec![],
+            false,
+            None,
+        ))
+    }
+    /// Allocate a device-resident zero tensor without constructing a host vector.
+    pub fn zeros(dims: impl IntoIterator<Item = Dim>, device: &Device) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let value = device.zeros_buffer(shape.len())?;
         Ok(Self::node(
             shape.clone(),
             Layout::contiguous(&shape),
@@ -834,23 +855,6 @@ impl Tensor {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) fn zeros_for_test(
-        dims: impl IntoIterator<Item = Dim>,
-        device: &Device,
-    ) -> Result<Self> {
-        let shape = Shape::new(dims)?;
-        let value = device.zeros_buffer(shape.len())?;
-        Ok(Self::node(
-            shape.clone(),
-            Layout::contiguous(&shape),
-            value,
-            device,
-            vec![],
-            false,
-            None,
-        ))
-    }
     pub fn relu(&self) -> Result<Self> {
         let value = self.device().relu(&self.0.value)?;
         Ok(Self::node(
@@ -859,6 +863,32 @@ impl Tensor {
             value,
             self.device(),
             vec![Edge::new(self, Rule::Relu(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// Stable elementwise logistic sigmoid.
+    pub fn sigmoid(&self) -> Result<Self> {
+        let value = self.device().sigmoid(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value.clone(),
+            self.device(),
+            vec![Edge::new(self, Rule::Sigmoid(value))],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise hyperbolic tangent.
+    pub fn tanh(&self) -> Result<Self> {
+        let value = self.device().tanh(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value.clone(),
+            self.device(),
+            vec![Edge::new(self, Rule::Tanh(value))],
             false,
             None,
         ))
@@ -1659,6 +1689,116 @@ impl Tensor {
             None,
         ))
     }
+    /// Select one logical coordinate of a named axis and remove that axis.
+    ///
+    /// The compact backend computes offsets from rank-sized metadata rather
+    /// than constructing one host index per tensor element.
+    pub fn select(&self, axis: Axis, coordinate: usize) -> Result<Self> {
+        let selected_index = self.shape().index(axis)?;
+        if coordinate >= self.shape().dims()[selected_index].extent {
+            return Err(format!(
+                "coordinate {coordinate} is outside {:?} extent {}",
+                axis,
+                self.shape().dims()[selected_index].extent
+            )
+            .into());
+        }
+        let shape = Shape::new(
+            self.shape()
+                .dims()
+                .iter()
+                .copied()
+                .filter(|dim| dim.axis != axis),
+        )?;
+        let output_layout = Layout::contiguous(&shape);
+        let mut output_index = 0;
+        let mut metadata = Vec::with_capacity(self.shape().rank() * 3);
+        for (index, dim) in self.shape().dims().iter().enumerate() {
+            metadata.push(i32::try_from(dim.extent)?);
+            metadata.push(i32::try_from(self.0.layout.strides[index])?);
+            if index == selected_index {
+                metadata.push(-1);
+            } else {
+                metadata.push(i32::try_from(output_layout.strides[output_index])?);
+                output_index += 1;
+            }
+        }
+        let spec = Rc::new(SelectSpec {
+            input_len: self.shape().len(),
+            output_len: shape.len(),
+            rank: i32::try_from(self.shape().rank())?,
+            coordinate: i32::try_from(coordinate)?,
+            metadata,
+        });
+        let value = self.device().select_axis(&self.0.value, spec.as_ref())?;
+        Ok(Self::node(
+            shape,
+            output_layout,
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Select(spec))],
+            false,
+            None,
+        ))
+    }
+
+    /// Stack equal named shapes, inserting a new logical axis at `position`.
+    /// Physical storage is stack-major so each source remains one contiguous copy.
+    pub fn stack(values: &[Self], axis: Axis, position: usize) -> Result<Self> {
+        let first = values.first().ok_or("stack requires at least one tensor")?;
+        if position > first.shape().rank() {
+            return Err("stack position is outside the output rank".into());
+        }
+        if first.shape().contains(axis) {
+            return Err(format!("stack axis {axis:?} already exists in its inputs").into());
+        }
+        let mut aligned = Vec::with_capacity(values.len());
+        for value in values {
+            first.compatible_device(value)?;
+            if value.shape().rank() != first.shape().rank()
+                || first
+                    .shape()
+                    .axes()
+                    .iter()
+                    .any(|candidate| !value.shape().contains(*candidate))
+            {
+                return Err("stack requires identical input axis sets".into());
+            }
+            first.shared_extents(value)?;
+            aligned.push(value.align(first.shape())?);
+        }
+        let mut dims = first.shape().dims().to_vec();
+        dims.insert(position, axis.of(values.len()));
+        let shape = Shape::new(dims)?;
+        let mut physical = vec![axis];
+        physical.extend(first.shape().axes());
+        let layout = Layout::new(&shape, &physical)?;
+        let buffers: Vec<_> = aligned.iter().map(|value| value.0.value.clone()).collect();
+        let value = first.device().stack_contiguous(&buffers)?;
+        let slice_len = first.shape().len();
+        let edges = aligned
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                Edge::new(
+                    input,
+                    Rule::StackSlice {
+                        offset: index * slice_len,
+                        len: slice_len,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self::node(
+            shape,
+            layout,
+            value,
+            first.device(),
+            edges,
+            false,
+            None,
+        ))
+    }
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
         let layout = Layout::new(self.shape(), &order.into_axes())?;
@@ -1907,6 +2047,10 @@ impl Tensor {
                         Rule::Scale(f) => self.device().scale(&gradient, *f)?,
                         Rule::Multiply(rhs) => self.device().binary(&gradient, rhs, 2)?,
                         Rule::Relu(x) => self.device().relu_backward(&gradient, x)?,
+                        Rule::Sigmoid(probability) => {
+                            self.device().sigmoid_backward(&gradient, probability)?
+                        }
+                        Rule::Tanh(output) => self.device().tanh_backward(&gradient, output)?,
                         Rule::Gelu(x) => self.device().gelu_backward(&gradient, x)?,
                         Rule::InverseSqrt { input, epsilon } => self
                             .device()
@@ -1959,6 +2103,12 @@ impl Tensor {
                         }
                         Rule::Unfold(spec) => {
                             self.device().unfold_backward(&gradient, spec.as_ref())?
+                        }
+                        Rule::Select(spec) => self
+                            .device()
+                            .select_axis_backward(&gradient, spec.as_ref())?,
+                        Rule::StackSlice { offset, len } => {
+                            self.device().contiguous_slice(&gradient, *offset, *len)?
                         }
                     };
                     let id = edge.input.0.id;

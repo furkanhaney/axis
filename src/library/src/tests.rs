@@ -176,6 +176,138 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
 
 #[test]
 #[ignore = "requires CUDA"]
+fn recurrent_tensor_primitives_match_scalar_values_and_gradients() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, time, feature) = (Axis::new("batch"), Axis::new("time"), Axis::new("feature"));
+    let values: Vec<_> = (0..12).map(|value| value as f32 - 5.0).collect();
+    let sequence = Tensor::from_slice(&values, [batch.of(2), time.of(3), feature.of(2)], &device)?
+        .with_layout([feature, time, batch])?
+        .with_grad();
+    let middle = sequence.select(time, 1)?;
+    close("named select", &middle.to_vec()?, &[-3.0, -2.0, 3.0, 4.0]);
+    middle.mean([batch, feature])?.backward()?;
+    close(
+        "named select gradient",
+        &sequence.grad().unwrap().to_vec()?,
+        &[
+            0.0, 0.0, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25, 0.0, 0.0,
+        ],
+    );
+
+    const LARGE_BATCH: usize = 7;
+    const LARGE_TIME: usize = 3;
+    const LARGE_FEATURE: usize = 23;
+    let large_values: Vec<_> = (0..LARGE_BATCH * LARGE_TIME * LARGE_FEATURE)
+        .map(|value| (value as f32 - 200.0) / 17.0)
+        .collect();
+    let large = Tensor::from_slice(
+        &large_values,
+        [
+            batch.of(LARGE_BATCH),
+            time.of(LARGE_TIME),
+            feature.of(LARGE_FEATURE),
+        ],
+        &device,
+    )?
+    .with_layout([feature, batch, time])?
+    .with_grad();
+    let large_middle = large.select(time, 1)?;
+    let mut large_expected = Vec::with_capacity(LARGE_BATCH * LARGE_FEATURE);
+    for batch_index in 0..LARGE_BATCH {
+        let start = (batch_index * LARGE_TIME + 1) * LARGE_FEATURE;
+        large_expected.extend(
+            large_values[start..start + LARGE_FEATURE]
+                .iter()
+                .copied()
+                .map(f64::from),
+        );
+    }
+    close(
+        "multi-tile named select",
+        &large_middle.to_vec()?,
+        &large_expected,
+    );
+    large_middle.mean([batch, feature])?.backward()?;
+    let selected_gradient = 1.0 / (LARGE_BATCH * LARGE_FEATURE) as f64;
+    let large_gradient: Vec<_> = (0..large_values.len())
+        .map(|index| {
+            let time_coordinate = (index / LARGE_FEATURE) % LARGE_TIME;
+            if time_coordinate == 1 {
+                selected_gradient
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    close(
+        "multi-tile named select gradient",
+        &large.grad().unwrap().to_vec()?,
+        &large_gradient,
+    );
+
+    let slices: Vec<_> = (0..3)
+        .map(|step| {
+            let tensor = Tensor::from_slice(
+                &values[step * 4..(step + 1) * 4],
+                [batch.of(2), feature.of(2)],
+                &device,
+            )?;
+            let tensor = if step % 2 == 0 {
+                tensor.with_layout([feature, batch])?
+            } else {
+                tensor
+            };
+            Ok(tensor.with_grad())
+        })
+        .collect::<Result<_>>()?;
+    let stacked = Tensor::stack(&slices, time, 1)?;
+    assert_eq!(
+        stacked.shape(),
+        &Shape::new([batch.of(2), time.of(3), feature.of(2)])?
+    );
+    close(
+        "named stack",
+        &stacked.to_vec()?,
+        &[
+            -5.0, -4.0, -1.0, 0.0, 3.0, 4.0, -3.0, -2.0, 1.0, 2.0, 5.0, 6.0,
+        ],
+    );
+    stacked.mean([batch, time, feature])?.backward()?;
+    for (index, slice) in slices.iter().enumerate() {
+        close(
+            &format!("stack gradient {index}"),
+            &slice.grad().unwrap().to_vec()?,
+            &[1.0 / 12.0; 4],
+        );
+    }
+
+    let activation_input =
+        Tensor::from_slice(&[-20.0, -1.0, 0.0, 2.0, 20.0], [feature.of(5)], &device)?.with_grad();
+    let activation = activation_input.sigmoid()?.add(&activation_input.tanh()?)?;
+    let expected: Vec<_> = [-20.0_f64, -1.0, 0.0, 2.0, 20.0]
+        .into_iter()
+        .map(|x| 1.0 / (1.0 + (-x).exp()) + x.tanh())
+        .collect();
+    close("sigmoid plus tanh", &activation.to_vec()?, &expected);
+    activation.mean(feature)?.backward()?;
+    let expected_gradient: Vec<_> = [-20.0_f64, -1.0, 0.0, 2.0, 20.0]
+        .into_iter()
+        .map(|x| {
+            let probability = 1.0 / (1.0 + (-x).exp());
+            (probability * (1.0 - probability) + 1.0 - x.tanh().powi(2)) / 5.0
+        })
+        .collect();
+    close(
+        "sigmoid plus tanh gradient",
+        &activation_input.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    assert!(sequence.select(time, 3).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn named_axis_minimum_preserves_axes_across_layouts_and_routes_ties() -> Result<()> {
     let device = Device::cuda(0)?;
     let (batch, candidate, time) = (
