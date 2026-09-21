@@ -1,4 +1,3 @@
-//! The training-dynamics 1K-parameter MNIST baseline on Axis.
 use axis::prelude::*;
 use axis_vision_data::{
     ChannelStandardizers, FiniteClassificationConfig, ImageDataset, average_pool, flat_tensors,
@@ -11,7 +10,7 @@ const TRAIN_LABELS: &str = "train-labels-idx1-ubyte";
 const TEST_IMAGES: &str = "t10k-images-idx3-ubyte";
 const TEST_LABELS: &str = "t10k-labels-idx1-ubyte";
 const FEATURES: usize = 49;
-const HIDDEN: usize = 16;
+const HIDDEN: usize = 32;
 const CLASSES: usize = 10;
 
 struct Config {
@@ -49,7 +48,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config> {
             "--batch" => config.batch = args.next().ok_or("--batch needs a value")?.parse()?,
             "--data" => config.data = args.next().ok_or("--data needs a path")?.into(),
             "--help" | "-h" => {
-                println!("train [--smoke] [--epochs N] [--batch N] [--data MNIST_RAW_DIR]");
+                println!("fashion-mnist [--smoke] [--epochs N] [--batch N] [--data RAW_DIR]");
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown option {arg}").into()),
@@ -63,7 +62,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config> {
 
 fn pooled(mut dataset: ImageDataset) -> Result<ImageDataset> {
     if (dataset.channels, dataset.height, dataset.width) != (1, 28, 28) {
-        return Err("MNIST must contain 28x28 single-channel images".into());
+        return Err("Fashion-MNIST must contain 28x28 single-channel images".into());
     }
     dataset.samples = dataset
         .samples
@@ -104,15 +103,14 @@ fn main() -> Result<()> {
         &device,
         config.seed,
     )?;
-    let parameters = model
-        .parameters()
-        .iter()
-        .map(|parameter| parameter.tensor().shape().len())
-        .sum::<usize>();
-    if parameters != 970 {
-        return Err(format!("parameter budget changed: expected 970, found {parameters}").into());
-    }
-    println!("MNIST | 7x7 -> {HIDDEN} -> {CLASSES} | params={parameters}");
+    println!(
+        "Fashion-MNIST | 7x7 -> {HIDDEN} -> {CLASSES} | params={}",
+        model
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.tensor().shape().len())
+            .sum::<usize>()
+    );
     let run = train_finite_classifier(
         &mut model,
         Adam::new(config.learning_rate)?,
@@ -140,7 +138,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smoke_defaults_preserve_the_bounded_migration() -> Result<()> {
+    fn smoke_defaults_are_deterministic_and_bounded() -> Result<()> {
         let config = parse_args(["--smoke".to_owned()])?;
         assert_eq!((config.epochs, config.batch), (5, 512));
         assert_eq!(

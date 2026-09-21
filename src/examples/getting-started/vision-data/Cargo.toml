@@ -1,5 +1,5 @@
 [package]
-name = "axis-mnist"
+name = "axis-vision-data"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,8 +7,3 @@ publish.workspace = true
 
 [dependencies]
 axis.workspace = true
-axis-vision-data = { path = "../vision-data" }
-
-[[bin]]
-name = "train"
-path = "src/train.rs"

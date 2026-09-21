@@ -1,5 +1,5 @@
 [package]
-name = "axis-mnist"
+name = "axis-cifar100"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,5 +10,5 @@ axis.workspace = true
 axis-vision-data = { path = "../vision-data" }
 
 [[bin]]
-name = "train"
+name = "cifar100"
 path = "src/train.rs"

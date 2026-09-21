@@ -1,0 +1,35 @@
+Fashion-MNIST | 7x7 -> 32 -> 10 | params=1930
+initial held_out_accuracy=0.0977
+epoch  1 train_loss 2.3987 held_out_accuracy 0.1719
+epoch  2 train_loss 2.0262 held_out_accuracy 0.3066
+epoch  3 train_loss 1.7883 held_out_accuracy 0.4004
+epoch  4 train_loss 1.6108 held_out_accuracy 0.4336
+epoch  5 train_loss 1.4737 held_out_accuracy 0.4766
+train time: 5.61s
+FINITE PASSES STATUS
+
+population:             2048
+declared passes:        5
+completed passes:       5
+samples in next pass:   0
+total observations:     10240
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       categorical accuracy
+evaluation population:        bounded held-out split
+direction:                    increase
+observations:                 2
+baseline:                     0.09765625 at 0 training samples
+terminal:                     0.47656250 at 10240 training samples
+absolute improvement:         0.37890625
+relative improvement:         388.0000%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 10240 training samples
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+final held_out_accuracy=0.4766 observations=10240

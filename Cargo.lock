@@ -54,10 +54,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "axis-cifar100"
+version = "0.6.0"
+dependencies = [
+ "axis",
+ "axis-vision-data",
+]
+
+[[package]]
+name = "axis-fashion-mnist"
+version = "0.6.0"
+dependencies = [
+ "axis",
+ "axis-vision-data",
+]
+
+[[package]]
 name = "axis-mnist"
 version = "0.6.0"
 dependencies = [
  "axis",
+ "axis-vision-data",
 ]
 
 [[package]]
@@ -80,6 +97,13 @@ version = "0.6.0"
 dependencies = [
  "axis",
  "csv",
+]
+
+[[package]]
+name = "axis-vision-data"
+version = "0.6.0"
+dependencies = [
+ "axis",
 ]
 
 [[package]]

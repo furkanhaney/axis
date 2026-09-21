@@ -239,6 +239,19 @@ Start with an ordinary method and keep the semantic contract independent of
 that spelling. Dynamic extents and fresh runtime identities suggest runtime
 shape checks first; compile-time axis types can be evaluated later.
 
+## Introductory vision boundary
+
+The getting-started vision programs share an internal `axis-vision-data`
+crate. It owns byte-format validation, train-only channel normalization,
+one-hot packing, exact finite-pass training, and batched held-out evaluation.
+Each program still constructs its own model and declares its own dataset path,
+budget, and claim. This keeps the examples consistent while leaving the
+scientific and architectural choices visible to a new reader.
+
+The helper is not published as framework API. A dataset adapter should move
+into `axis` only after outside consumers establish a stable representation and
+provenance contract; reading a file is not itself a research guarantee.
+
 ## Operation contracts to settle first
 
 | Operation | Contract |

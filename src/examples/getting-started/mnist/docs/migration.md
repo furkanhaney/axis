@@ -39,3 +39,9 @@ The port does not reproduce PyTorch's random-number generator or its exact
 parameter initialization, so individual curves and final accuracy are not
 claimed numerically identical. The objective, optimizer equations, data path,
 topology, iteration structure, and evaluation protocol now match.
+
+The later Fashion-MNIST and CIFAR-100 examples exposed which parts were task
+policy and which were ordinary vision plumbing. Strict binary parsing,
+train-fitted preprocessing, tensor packing, finite-pass training, and held-out
+categorical evaluation now live in the sibling `vision-data` support crate.
+MNIST still owns its 4x4 pooling choice, 970-parameter topology, and defaults.

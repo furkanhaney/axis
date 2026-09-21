@@ -1,7 +1,10 @@
 [workspace]
 members = [
     "src/library",
+    "src/examples/getting-started/vision-data",
     "src/examples/getting-started/mnist",
+    "src/examples/getting-started/fashion-mnist",
+    "src/examples/getting-started/cifar100",
     "src/examples/training/mlp",
     "src/examples/training/cnn",
     "src/examples/training/attention",
