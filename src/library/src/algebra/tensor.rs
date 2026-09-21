@@ -21,12 +21,6 @@ fn profile(label: &str, started: Instant) {
 }
 
 #[derive(Clone)]
-struct GatherPlans {
-    forward: Rc<Plan>,
-    reverse: Rc<Plan>,
-}
-
-#[derive(Clone)]
 enum UnfoldPlans {
     Implicit(Rc<UnfoldSpec>),
     Zero,
@@ -41,7 +35,6 @@ struct ReductionPlans {
     reverse: Rc<Plan>,
 }
 
-type GatherPlanKey = (u8, Shape, Layout, Shape, Layout);
 type ReductionPlanKey = (u8, Shape, Layout, Vec<Axis>);
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct UnfoldPlanKey {
@@ -58,7 +51,6 @@ struct UnfoldPlanKey {
 }
 
 thread_local! {
-    static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
     static REDUCTION_PLANS: RefCell<HashMap<ReductionPlanKey, ReductionPlans>> = RefCell::new(HashMap::new());
     static UNFOLD_PLANS: RefCell<HashMap<UnfoldPlanKey, UnfoldPlans>> = RefCell::new(HashMap::new());
 }
@@ -468,29 +460,61 @@ impl Tensor {
     pub(crate) fn shares_buffer(&self, other: &Self) -> bool {
         std::ptr::eq(self.0.value.as_ref(), other.0.value.as_ref())
     }
+    /// `self` presented in `shape`'s axis order, contiguous. Axes missing from `self`
+    /// broadcast. Both cases run the rank-sized compact copier: a permutation is
+    /// bijective and keeps the copier's inverse for its gradient; a broadcast reads
+    /// with stride 0 and, only when a gradient is required, builds the scatter-add
+    /// plan that sums over the broadcast axes. No element-sized plan is built or
+    /// uploaded in inference.
     fn align(&self, shape: &Shape) -> Result<Self> {
         let started = Instant::now();
         let layout = Layout::contiguous(shape);
         if self.shape() == shape && self.0.layout.strides == layout.strides {
             return Ok(self.clone());
         }
-        let key = (
-            0,
-            self.shape().clone(),
-            self.0.layout.clone(),
-            shape.clone(),
-            layout.clone(),
-        );
-        let cached = GATHER_PLANS.with(|cache| cache.borrow().get(&key).cloned());
-        let plans = match cached {
-            Some(plans) => plans,
-            None => {
-                let positions: Vec<_> = self
-                    .shape()
-                    .axes()
-                    .iter()
-                    .map(|&a| shape.index(a))
-                    .collect::<Result<_>>()?;
+        let positions: Vec<_> = self
+            .shape()
+            .axes()
+            .iter()
+            .map(|&a| shape.index(a))
+            .collect::<Result<_>>()?;
+        if self.shape().rank() == shape.rank() {
+            let ordered = self.with_layout(shape.axes())?;
+            let result = Self::node(
+                shape.clone(),
+                layout,
+                ordered.0.value.clone(),
+                self.device(),
+                vec![Edge::new(&ordered, Rule::Identity)],
+                false,
+                None,
+            );
+            profile("align", started);
+            return Ok(result);
+        }
+        let mut metadata = Vec::with_capacity(shape.rank() * 3);
+        for (index, dim) in shape.dims().iter().enumerate() {
+            let input_stride = positions
+                .iter()
+                .position(|&p| p == index)
+                .map_or(0, |own| self.0.layout.strides[own]);
+            metadata.extend([
+                i32::try_from(dim.extent)?,
+                i32::try_from(input_stride)?,
+                i32::try_from(layout.strides[index])?,
+            ]);
+        }
+        let spec = SelectSpec {
+            input_len: self.shape().len(),
+            output_len: shape.len(),
+            rank: i32::try_from(shape.rank())?,
+            coordinate: 0,
+            metadata,
+        };
+        let value = self.device().select_axis(&self.0.value, &spec)?;
+        let edges = self
+            .requires_grad()
+            .then(|| {
                 let map = (0..shape.len())
                     .map(|i| {
                         let coords = shape.coords(i);
@@ -499,44 +523,18 @@ impl Tensor {
                             .offset(&positions.iter().map(|&p| coords[p]).collect::<Vec<_>>())
                     })
                     .collect::<Vec<_>>();
-                if map
-                    .iter()
-                    .enumerate()
-                    .all(|(output, &input)| output == input)
-                {
-                    return Ok(Self::node(
-                        shape.clone(),
-                        layout,
-                        self.0.value.clone(),
-                        self.device(),
-                        vec![Edge::new(self, Rule::Identity)],
-                        false,
-                        None,
-                    ));
-                }
-                let plans = GatherPlans {
-                    forward: Rc::new(Plan::gather(&map)?),
-                    reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
-                };
-                GATHER_PLANS.with(|cache| {
-                    cache.borrow_mut().insert(key, plans.clone());
-                });
-                plans
-            }
-        };
-        let value = self
-            .device()
-            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
-        let edges = self.requires_grad().then(|| {
-            Edge::new(
-                self,
-                Rule::Group {
-                    plan: plans.reverse,
-                    rhs: None,
-                    factor: 1.0,
-                },
-            )
-        });
+                Plan::reverse(&map, self.shape().len()).map(|plan| {
+                    Edge::new(
+                        self,
+                        Rule::Group {
+                            plan: Rc::new(plan),
+                            rhs: None,
+                            factor: 1.0,
+                        },
+                    )
+                })
+            })
+            .transpose()?;
         let result = Self::node(
             shape.clone(),
             layout,

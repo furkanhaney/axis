@@ -2878,3 +2878,82 @@ fn sine_and_tanh_module_match_independent_forward_and_gradient_oracles() -> Resu
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn binary_alignment_of_permuted_layouts_matches_values_and_gradients() -> Result<()> {
+    // Operands that share axes in different orders and layouts are aligned through the
+    // compact copier plus a metadata view; there is no element-sized index plan.
+    let device = Device::cuda(0)?;
+    let (batch, time, unit) = (Axis::new("batch"), Axis::new("time"), Axis::new("unit"));
+    let lhs_values: Vec<_> = (0..12).map(|v| v as f32 * 0.5 - 2.0).collect();
+    let rhs_values: Vec<_> = (0..12).map(|v| 1.0 - v as f32 * 0.25).collect();
+    let lhs = Tensor::from_slice(&lhs_values, [batch.of(2), time.of(3), unit.of(2)], &device)?
+        .with_layout([unit, batch, time])?
+        .with_grad();
+    let rhs = Tensor::from_slice(&rhs_values, [time.of(3), unit.of(2), batch.of(2)], &device)?
+        .with_grad();
+    let sum = lhs.add(&rhs)?;
+    let out = sum.shape().clone();
+    let actual = sum.to_vec()?;
+    let mut expected = Vec::with_capacity(12);
+    for index in 0..out.len() {
+        let coords = out.coords(index);
+        let at = |axis: Axis| coords[out.index(axis).expect("shared axis")];
+        let (b, t, u) = (at(batch), at(time), at(unit));
+        expected.push(f64::from(
+            lhs_values[(b * 3 + t) * 2 + u] + rhs_values[(t * 2 + u) * 2 + b],
+        ));
+    }
+    close("aligned binary values", &actual, &expected);
+    sum.mean([batch, time, unit])?.backward()?;
+    close(
+        "aligned lhs gradient",
+        &lhs.grad().expect("lhs gradient").to_vec()?,
+        &[1.0 / 12.0; 12],
+    );
+    close(
+        "aligned rhs gradient",
+        &rhs.grad().expect("rhs gradient").to_vec()?,
+        &[1.0 / 12.0; 12],
+    );
+    // A singleton extent keeps the zero-copy identity view and still aligns.
+    let thin = Tensor::from_slice(&[1.0, 2.0, 3.0], [time.of(3), unit.of(1)], &device)?
+        .with_layout([unit, time])?;
+    let wide = Tensor::from_slice(&[10.0, 20.0, 30.0], [unit.of(1), time.of(3)], &device)?;
+    close(
+        "singleton alignment",
+        &thin.add(&wide)?.to_vec()?,
+        &[11.0, 22.0, 33.0],
+    );
+    // Broadcasting a bias over a larger, permuted operand: stride-0 forward, summed gradient.
+    let bias = Tensor::from_slice(&[0.5, -1.5], [unit.of(2)], &device)?.with_grad();
+    let field = Tensor::from_slice(
+        &(0..6).map(|v| v as f32).collect::<Vec<_>>(),
+        [batch.of(3), unit.of(2)],
+        &device,
+    )?
+    .with_layout([unit, batch])?
+    .with_grad();
+    let biased = field.add(&bias)?;
+    let out = biased.shape().clone();
+    let mut expected = Vec::with_capacity(6);
+    for index in 0..out.len() {
+        let coords = out.coords(index);
+        let (b, u) = (coords[out.index(batch)?], coords[out.index(unit)?]);
+        expected.push(f64::from((b * 2 + u) as f32 + [0.5f32, -1.5][u]));
+    }
+    close("broadcast alignment values", &biased.to_vec()?, &expected);
+    biased.mean([batch, unit])?.backward()?;
+    close(
+        "broadcast bias gradient",
+        &bias.grad().expect("bias gradient").to_vec()?,
+        &[0.5, 0.5],
+    );
+    close(
+        "broadcast field gradient",
+        &field.grad().expect("field gradient").to_vec()?,
+        &[1.0 / 6.0; 6],
+    );
+    Ok(())
+}
