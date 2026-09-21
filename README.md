@@ -163,6 +163,8 @@ research consumers. They are checks on a declared claim, not another kind of beg
 | Program | Purpose | Current witness |
 |---|---|---|
 | [MNIST](src/examples/getting-started/mnist/README.md) | recognizable finite-pass categorical training | bounded smoke improves held-out accuracy from 10.16% to 33.98% |
+| [Fashion-MNIST](src/examples/getting-started/fashion-mnist/README.md) | train-fitted preprocessing and a less separable grayscale task | bounded smoke improves held-out accuracy from 9.77% to 47.66% |
+| [CIFAR-100](src/examples/getting-started/cifar100/README.md) | named-axis RGB convolution and 100-class training | bounded smoke lowers pass loss to 4.4359 and improves held-out accuracy to 2.54% |
 
 ### Training building blocks
 
@@ -203,7 +205,10 @@ axis/
 │   ├── library/              published Axis framework crate
 │   ├── examples/
 │   │   ├── getting-started/
-│   │   │   └── mnist/        approachable end-to-end training
+│   │   │   ├── cifar100/      100-class RGB convolution
+│   │   │   ├── fashion-mnist/ clothing classification
+│   │   │   ├── mnist/         approachable end-to-end training
+│   │   │   └── vision-data/   strict shared dataset and training adapters
 │   │   └── training/
 │   │       ├── attention/    causal-attention consumer and oracle
 │   │       ├── cnn/          CNN consumer and scalar oracle

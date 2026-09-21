@@ -1,0 +1,35 @@
+CIFAR-100 | RGB 32x32 -> conv4/stride4/32 -> mean -> 100 | params=4868
+initial held_out_accuracy=0.0215
+epoch  1 train_loss 4.6292 held_out_accuracy 0.0293
+epoch  2 train_loss 4.5637 held_out_accuracy 0.0332
+epoch  3 train_loss 4.5199 held_out_accuracy 0.0293
+epoch  4 train_loss 4.4770 held_out_accuracy 0.0273
+epoch  5 train_loss 4.4359 held_out_accuracy 0.0254
+train time: 5.93s
+FINITE PASSES STATUS
+
+population:             2048
+declared passes:        5
+completed passes:       5
+samples in next pass:   0
+total observations:     10240
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       categorical accuracy
+evaluation population:        bounded held-out split
+direction:                    increase
+observations:                 2
+baseline:                     0.02148438 at 0 training samples
+terminal:                     0.02539062 at 10240 training samples
+absolute improvement:         0.00390625
+relative improvement:         18.1818%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 10240 training samples
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+final held_out_accuracy=0.0254 observations=10240

@@ -14,8 +14,8 @@ bash src/examples/getting-started/mnist/scripts/train.sh --smoke
 bash src/examples/getting-started/mnist/scripts/train.sh
 ```
 
-The input files are the same torchvision IDX files already downloaded beneath
-`../research/training-dynamics/data/MNIST/raw/`. The port deliberately does not claim IDR:
+Pass `--data /path/to/MNIST/raw` or place the four uncompressed IDX files in
+this example's ignored `data/raw/` directory. The port deliberately does not claim IDR:
 twenty epochs mean each of the 60,000 training examples is reused twenty times.
 See [docs/migration.md](docs/migration.md) for the preserved contract and API
 findings.
