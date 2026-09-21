@@ -81,7 +81,7 @@ and retains its activations. It is a numerical-correctness path, not a fused sca
 or a sequence-throughput claim.
 
 ```bash
-cargo add axis@0.8.0
+cargo add axis@0.9.0
 ```
 
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
