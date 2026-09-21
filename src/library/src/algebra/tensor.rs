@@ -102,6 +102,7 @@ enum Rule {
     Relu(Buffer),
     Sigmoid(Buffer),
     Tanh(Buffer),
+    Sin(Buffer),
     Gelu(Buffer),
     InverseSqrt {
         input: Buffer,
@@ -889,6 +890,19 @@ impl Tensor {
             value.clone(),
             self.device(),
             vec![Edge::new(self, Rule::Tanh(value))],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise sine in radians.
+    pub fn sin(&self) -> Result<Self> {
+        let value = self.device().sin(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Sin(self.0.value.clone()))],
             false,
             None,
         ))
@@ -2051,6 +2065,7 @@ impl Tensor {
                             self.device().sigmoid_backward(&gradient, probability)?
                         }
                         Rule::Tanh(output) => self.device().tanh_backward(&gradient, output)?,
+                        Rule::Sin(input) => self.device().sin_backward(&gradient, input)?,
                         Rule::Gelu(x) => self.device().gelu_backward(&gradient, x)?,
                         Rule::InverseSqrt { input, epsilon } => self
                             .device()

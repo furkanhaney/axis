@@ -22,9 +22,10 @@ unexercised surface area.
 
 ## Current surface
 
-Axis already has `Linear`, `PopulationLinear`, `Conv2d`, named-axis
+Axis already has `Linear`, `PopulationLinear`, `Conv2d`, `Conv3d`, named-axis
 `LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, `ReLU`, `GELU`,
-and `Sequential`, with tensor-level losses, softmax, causal masking, attention
+`Tanh`, and `Sequential`, with tensor-level losses, sine, differentiable central
+differences, softmax, causal masking, attention
 composition, named reductions, data regimes, metrics, trainers, and optimizers.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
@@ -33,8 +34,8 @@ and panel acceptances, but it is not yet a comfortable general module library.
 
 | Stage | Families | Why this order |
 | --- | --- | --- |
-| Active | `Conv3d` | It generalizes established convolution geometry and current research consumers already use it. |
-| Recurrent foundation | tensor `sigmoid`/`tanh`, sequence selection and stacking, `LstmCell`, then `Lstm` | The cell supplies a small complete gradient oracle; the sequence module then owns recurrence, state shape, direction, and layer composition. |
+| Active | physics-informed residual consumers and independent numerical oracles | Central differences and empirical residual receipts now provide the first honest path; ODE and pendulum studies must establish defaults and expose missing composition. |
+| Recurrent foundation | `LstmCell` and `Lstm` correctness are implemented; fused recurrence, direction, and layer composition remain | Independent forward and complete gradient oracles protect the eager IFGO implementation before performance work. |
 | Stateful foundation | explicit training/evaluation mode and persistent non-parameter state, then named-axis `BatchNorm` | Running statistics cannot be represented honestly by the current stateless `Module` contract. |
 | Common composition | `Conv1d` or rank-general convolution, pooling, `SiLU`, `LeakyReLU`, `ELU`, `Embedding`, dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. |
 | Architecture families | recurrent variants, transpose convolution, reusable transformer encoder/decoder modules | Add them around measured consumers after the lower-level contracts settle. |

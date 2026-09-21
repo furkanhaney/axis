@@ -15,6 +15,8 @@ mod backend;
 mod convolution;
 #[path = "research/data.rs"]
 mod data;
+#[path = "numerics/difference.rs"]
+mod difference;
 #[path = "research/disjointness.rs"]
 mod disjointness;
 #[path = "research/learning.rs"]
@@ -35,6 +37,8 @@ mod preprocess;
 mod recurrent;
 #[path = "research/regime.rs"]
 mod regime;
+#[path = "research/residual.rs"]
+mod residual;
 #[path = "algebra/tensor.rs"]
 mod tensor;
 #[path = "runtime/train.rs"]
@@ -47,6 +51,7 @@ pub use data::{
     AdditionDataset, AdditionSample, Batch, DataLoader, DataRegimeReceipt, DataSource,
     FinitePassesLoader, InMemoryDataset, Sample,
 };
+pub use difference::CentralDifference;
 pub use disjointness::{
     Disjointness, DisjointnessEvidence, DisjointnessReceipt, IdentityScheme, PopulationMode,
     PopulationReceipt, PopulationSpec,
@@ -60,7 +65,7 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    GELU, IntoLayers, Linear, Module, ParamId, Parameter, PopulationLinear, ReLU, Sequential,
+    GELU, IntoLayers, Linear, Module, ParamId, Parameter, PopulationLinear, ReLU, Sequential, Tanh,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
@@ -68,6 +73,10 @@ pub use preprocess::Standardizer;
 pub use recurrent::{Lstm, LstmCell, LstmRun, LstmState};
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
+};
+pub use residual::{
+    EmpiricalResidual, EmpiricalResidualReceipt, LawIdentity, ResidualClaim, ResidualEvidence,
+    ResidualLimits, ResidualScope,
 };
 pub use tensor::Tensor;
 pub use train::{Optimizer, TrainStep, Trainer};
@@ -87,16 +96,18 @@ mod tests;
 
 pub mod prelude {
     pub use crate::{
-        Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy, Conv2d,
-        Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness,
-        DisjointnessEvidence, DisjointnessReceipt, EmpiricalMonotonicity,
-        EmpiricalMonotonicityReceipt, FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU,
-        GroupNorm, IdentityScheme, Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm,
-        LayerNorm, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
-        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
+        CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
+        Disjointness, DisjointnessEvidence, DisjointnessReceipt, EmpiricalMonotonicity,
+        EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, FinitePasses,
+        FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme, Idr, IdrLimits,
+        IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm, LearningDirection,
+        LearningEvidence, LearningLimits, LearningObservation, LearningProgress,
+        LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState, Module,
+        MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
         MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
-        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, RmsNorm, SGD, Sample,
-        Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
+        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, ResidualClaim, ResidualEvidence,
+        ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential, Shape, SinglePass,
+        Standardizer, Tanh, Tensor, TrainStep, Trainer,
     };
 }

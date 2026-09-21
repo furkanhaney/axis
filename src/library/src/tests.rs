@@ -2684,3 +2684,65 @@ fn trainer_enforces_scalar_losses_and_drives_each_optimizer() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn sine_and_tanh_module_match_independent_forward_and_gradient_oracles() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let values = [
+        -std::f32::consts::FRAC_PI_2,
+        -0.4,
+        0.0,
+        0.7,
+        std::f32::consts::FRAC_PI_2,
+    ];
+    let input = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let sine = input.sin()?;
+    close(
+        "sine forward",
+        &sine.to_vec()?,
+        &values
+            .iter()
+            .map(|&value| f64::from(value).sin())
+            .collect::<Vec<_>>(),
+    );
+    sine.mean(sample)?.backward()?;
+    close(
+        "sine derivative",
+        &input.grad().unwrap().to_vec()?,
+        &values
+            .iter()
+            .map(|&value| f64::from(value).cos() / values.len() as f64)
+            .collect::<Vec<_>>(),
+    );
+
+    let tanh_input = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let mut tanh = Tanh;
+    assert_eq!(
+        tanh.build(tanh_input.shape(), &device, 0)?,
+        tanh_input.shape().clone()
+    );
+    let output = tanh.forward(&tanh_input)?;
+    close(
+        "Tanh module forward",
+        &output.to_vec()?,
+        &values
+            .iter()
+            .map(|&value| f64::from(value).tanh())
+            .collect::<Vec<_>>(),
+    );
+    output.mean(sample)?.backward()?;
+    close(
+        "Tanh module derivative",
+        &tanh_input.grad().unwrap().to_vec()?,
+        &values
+            .iter()
+            .map(|&value| {
+                let y = f64::from(value).tanh();
+                (1.0 - y * y) / values.len() as f64
+            })
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}

@@ -247,6 +247,8 @@ shape checks first; compile-time axis types can be evaluated later.
 | `x.squared_error(y)` | Align identical axis sets by identity, require equal extents, preserve the unreduced shape. |
 | `x.mean(axes)` | Remove precisely those axes; backward broadcasts and divides by their extent product. Scalar `.backward()` requires all loss axes to have been reduced. |
 | `x.moments(axes)` / `x.mean_square(axes)` | Require at least one named axis and return population statistics with precisely those axes removed. Gradients broadcast through the original logical axes. |
+| `x.sin()` | Apply elementwise sine in radians without changing axes or layout; backward multiplies by cosine of the saved input. |
+| `CentralDifference(coordinate, step)` | Record which coordinate was shifted, require a finite positive step and identically ordered shapes on one device, and construct differentiable first or second centered stencils. It does not prove the caller's sampling or discretization method. |
 | `x.min(axis)` | Remove one named axis and preserve unrelated axes. Ignore NaN and infinities, choose the first logical coordinate on finite ties, and route backward only to that winner. A group with no finite value returns NaN with zero derivative even under a non-finite upstream derivative. Forward and backward remain device-resident. |
 | Elementwise add/multiply | Align shared identities with equal extents. Permit scalar or subset-axis broadcasting, such as a `[hidden]` bias on `[batch, hidden]`. |
 | Incomparable axis sets | Require explicit expansion. `[batch, time] + [batch, hidden]` must not silently create `[batch, time, hidden]`. |
@@ -327,6 +329,13 @@ on the device and returns exact `(correct, total)` counts, so chunked evaluators
 merge counts instead of averaging percentages. `Standardizer` fits finite,
 train-only values with an explicit variance correction (sample standard
 deviation by default) and applies the frozen transform to any later split.
+
+Scientific residual checks follow the same ownership rule. `EmpiricalResidual`
+is equation-independent: it records a versioned law identity, residual
+expression, region, evaluator, limits, and stable observed statistics. The
+equation and its boundary conditions remain in the consumer. The receipt
+verifies supplied sampled discretized values and explicitly does not prove a
+global law. See [the PINN design](pinn.md).
 
 The first backend submits the existing cuTile kernels in stream order and
 synchronizes at explicit step/read boundaries. A small layout plan maps the
