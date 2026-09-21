@@ -14,8 +14,8 @@ The crate currently provides:
   deterministic finite minimum reductions;
 - `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
   grouped/depthwise channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
-  and stateless `InstanceNorm`, activations, attention primitives, and
-  sequential composition;
+  and stateless `InstanceNorm`, explicit-state `LstmCell`/`Lstm`, activations,
+  attention primitives, and sequential composition;
 - device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
   exact AdamW remainder;
 - generated and finite data loaders with executable single-pass, finite-pass,
@@ -64,6 +64,15 @@ named spatial axes. Padding is symmetric per axis. Dilation and asymmetric
 padding are not implemented. Both paths materialize FP32 patches before
 contraction; 3D kernel volumes can make that intermediate large, while later
 generic layout and broadcast operations retain their index-plan limits.
+
+`Lstm` names its time, input, and hidden axes and preserves every unrelated
+stream axis. `run` starts from device-resident zero state; `run_from` accepts an
+explicit `LstmState` and returns both the complete sequence and terminal hidden
+and cell state. Returned states stay connected to reverse mode until the caller
+uses `LstmState::detach`. The current implementation projects the full input
+sequence once, then submits one eager recurrent transition per time coordinate
+and retains its activations. It is a numerical-correctness path, not a fused scan
+or a sequence-throughput claim.
 
 ```bash
 cargo add axis@0.5.0

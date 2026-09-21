@@ -266,7 +266,7 @@ fn lstm() -> Result<()> {
     )?;
 
     let mut model = SequenceClassifier::new(
-        Lstm::new(input, hidden).over(time),
+        Lstm::new(input, hidden.of(512), time)?,
         Take::last(time),
         Linear::new(hidden, class),
     );
@@ -297,7 +297,7 @@ fn lstm() -> Result<()> {
 //
 //     [*, time, input]
 //
-// Lstm::new(input, hidden).over(time)
+// Lstm::new(input, hidden.of(512), time)
 //
 // output:
 //
@@ -847,7 +847,7 @@ fn final_lstm() -> Result<()> {
         Cuda(0),
     )?;
 
-    let mut lstm = Lstm::new(input, hidden(512)).over(time);
+    let mut lstm = Lstm::new(input, hidden.of(512), time)?;
     let mut classifier = Linear::new(hidden, class(20));
 
     let mut optimizer = AdamW::new(1e-3);
@@ -856,9 +856,9 @@ fn final_lstm() -> Result<()> {
         lstm.zero_grad();
         classifier.zero_grad();
 
-        let sequence = lstm.forward(&x);
+        let run = lstm.run(&x)?;
 
-        let state = sequence.select(time, Last);
+        let state = run.state.hidden;
 
         let logits = classifier.forward(&state);
 

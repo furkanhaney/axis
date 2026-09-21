@@ -76,6 +76,26 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn sigmoid(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn sigmoid_backward(
+        &self,
+        _gradient: &Buffer,
+        _probability: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn tanh(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn tanh_backward(&self, _gradient: &Buffer, _output: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn gelu(&self, _a: &Buffer) -> Result<Buffer> {
         unavailable()
     }
@@ -232,6 +252,31 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn select_axis(&self, _input: &Buffer, _spec: &SelectSpec) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn select_axis_backward(
+        &self,
+        _gradient: &Buffer,
+        _spec: &SelectSpec,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn stack_contiguous(&self, _inputs: &[Buffer]) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn contiguous_slice(
+        &self,
+        _input: &Buffer,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn grouped_minimum(
         &self,
         _a: &Buffer,
@@ -260,6 +305,16 @@ pub(crate) struct UnfoldSpec {
     pub output_spatial: [i32; 3],
     pub input_special_strides: [i32; 4],
     pub output_special_strides: [i32; 5],
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct SelectSpec {
+    pub input_len: usize,
+    pub output_len: usize,
+    pub rank: i32,
+    pub coordinate: i32,
+    pub metadata: Vec<i32>,
 }
 
 impl UnfoldSpec {

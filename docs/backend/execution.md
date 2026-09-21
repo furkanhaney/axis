@@ -1,5 +1,22 @@
 # Eager execution profile
 
+## Recurrent correctness path
+
+The first `Lstm` lowering projects the complete input sequence in one contraction,
+with the named time axis intact, and adds input bias once. It then walks time in
+logical coordinate order and submits one recurrent projection and `LstmCell`
+transition per coordinate. Each operation is ordinary Axis algebra, so reverse
+mode retains the connected hidden/cell chain and an explicit `LstmState::detach`
+is the truncation boundary. Named selection uses rank-sized device metadata
+rather than a host index for every element; stacking stores each hidden state as
+one contiguous physical slice while preserving the declared logical axis order.
+
+The graph and retained transition activations grow linearly with sequence length,
+and kernel-launch count does too. This establishes the bounded eager semantics
+tested by the independent scalar oracle. It does not establish competitive
+sequence throughput. A later measured consumer can justify a fused recurrent
+scan and backward lowering.
+
 Axis submits one eager training step to one CUDA stream and synchronizes at the
 Trainer boundary. `AXIS_PROFILE=1` reports the major host stages as
 `train_zero_grad`, `train_loss`, `train_backward`, `train_optimizer`, and

@@ -185,9 +185,9 @@ still enters cuTile and reports a missing toolkit, and a no-default-features
 build outside docs.rs is rejected. CI runs this contract on an ordinary Ubuntu
 runner without installing CUDA.
 
-Convolution dilation, asymmetric padding, LSTM, and a full Transformer remain
-future slices; their presence in the owner's sketch does not imply
-implementation.
+Convolution dilation, asymmetric padding, and a full Transformer remain future
+slices. The single-layer forward LSTM is an eager correctness path with explicit
+state; it is not a fused recurrent kernel or a sequence-throughput result.
 
 Run from the research node:
 
@@ -252,12 +252,15 @@ shape checks first; compile-time axis types can be evaluated later.
 | Incomparable axis sets | Require explicit expansion. `[batch, time] + [batch, hidden]` must not silently create `[batch, time, hidden]`. |
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
+| `select(axis, coordinate)` | Remove one named axis at a checked logical coordinate. Compute offsets from compact rank-sized geometry and scatter its derivative back into the original physical layout. |
+| `Tensor::stack(values, axis, position)` | Require identical named input shapes and devices; insert the new logical axis at the declared position. Store sources contiguously under a stack-major physical layout and slice each derivative back to its source. |
 | `causal_mask(query, key)` | Require distinct axes with equal extents; replace key positions greater than query positions with negative infinity and give them zero derivative. Square, zero-offset self-attention only. |
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
 | `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |
 | `Conv2d(input, output, spatial, kernel)` | Cross-correlate named spatial axes with configurable positive stride, finite symmetric zero-padding, and positive channel groups. Require both channel extents to divide evenly by groups; preserve unrelated axes and append the output-channel axis. |
 | `Conv3d(input, output, spatial, kernel)` | Apply the same contract to three ordered named spatial axes. Flatten patches by input channel, then the three kernel coordinates with the final coordinate fastest. |
 | Named normalization | Normalize only the declared axes. Layer/RMS affine parameters span the declared normalized shape; group/instance affine parameters span the channel axis. Preserve every input axis and reject changed built extents or group geometry. |
+| `Lstm(input, hidden, time)` | Apply a standard IFGO transition in logical time-coordinate order. Preserve unrelated stream axes, replace input with hidden, accept explicit hidden/cell state, and return both the complete sequence and connected terminal state. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
 | `categorical_cross_entropy_with_logits(target, class)` | Accept constant one-hot/probability targets over the same axes, stably reduce the named class axis, and preserve all other axes. Backward is `softmax(logits) - target`. |
 | `Conv(input, output, spatial)` | Transform channels and spatial extents by the stated stride/padding/dilation rules. Preserve all unrelated axes. |
@@ -376,10 +379,13 @@ actual outside consumer.
    Linear, and stable binary loss reproduce the concrete CNN and a compact
    depthwise-separable block. Adaptive pooling, collapse, categorical
    cross-entropy, dilation, and an optimized convolution kernel remain.
-5. **LSTM and Transformer:** add each as a concrete next program. Recurrence
-   drives state/sequence lifetime decisions; attention drives role axes,
-   masked softmax, split/merge, and shared-parameter behavior. `Repeat` must
-   create independent blocks unless weight tying is explicit.
+5. **LSTM (implemented correctness slice):** stable sigmoid/tanh, compact named
+   selection, stack, explicit connected or detached state, and an eager IFGO
+   recurrence. Its independent f64 oracle covers every input, initial-state,
+   weight, and bias derivative. The O(T) transition/activation graph is not a
+   fused scan and establishes no sequence-scale performance claim.
+6. **Transformer:** admit a concrete program before promoting a composed module.
+   `Repeat` must create independent blocks unless weight tying is explicit.
 
 The first two library trainers must work with reordered physical axes and
 with unrelated axes added. For example, the same Linear must accept
