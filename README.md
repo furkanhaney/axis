@@ -140,20 +140,48 @@ Set `AXIS_PROFILE=1` to print Trainer phases, tensor planning, submission, read,
 and synchronization timings while investigating a workload. These are host
 wall times, not CUDA kernel durations; see the [execution profile](docs/backend/execution.md).
 
-## Measured programs
+## Learning paths and measured programs
+
+Programs are grouped by the background needed to understand their claim. This is an audience
+ladder, not a leaderboard: verification, monotonicity, and data-regime contracts do not sit beside
+introductory training merely because all of them are executable.
+
+Framework verification stays with its owner in `src/library/` tests, repository `tests/`, and
+`data/evidence/`. Empirical monotonicity and IDR belong to research-contract programs or outside
+research consumers. They are checks on a declared claim, not another kind of beginner example.
+
+### Getting started
 
 | Program | Purpose | Current witness |
 |---|---|---|
-| [MLP](src/examples/mlp/README.md) | library and explicit cuTile baseline | both reach `5.74e-2` held-out MSE after 500 steps |
-| [CNN](src/examples/cnn/README.md) | convolution forward/backward and learning | configured grouped convolution matches a scalar oracle; a depthwise-separable block composes; smoke reaches 100% accuracy |
-| [Attention](src/examples/attention/README.md) | causal attention and prefix-mean learning | central differences pass; held-out MSE falls to `2.39e-2` |
-| [Generated addition](src/examples/addition/README.md) | endless data with executable IDR assumptions | 128,000 fresh samples, zero observed reuse; held-out MSE falls to `3.88e-3` |
-| [Muon](src/examples/muon/README.md) | explicit Muon/AdamW partition and paired learning | both identically initialized arms reduce held-out MSE by more than 99% in 100 steps; no winner claim |
-| [MNIST](src/studies/training-dynamics/mnist/README.md) | finite-pass categorical training migration | bounded smoke improves held-out accuracy from 10.16% to 33.98% |
-| [MNIST population](src/studies/training-dynamics/mnist-population/README.md) | independent models and rates on one population axis | fused four-member smoke improves best accuracy from 8.20% to 60.55% |
-| [Country panel](src/studies/energy-output/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
+| [MNIST](src/examples/getting-started/mnist/README.md) | recognizable finite-pass categorical training | bounded smoke improves held-out accuracy from 10.16% to 33.98% |
+
+### Training building blocks
+
+These are ordinary model and optimizer flows. “Training” is broader and more accurate than
+“layers”: Muon is an optimizer, while CNN, MLP, and attention are compositions.
+
+| Program | Purpose | Current witness |
+|---|---|---|
+| [MLP](src/examples/training/mlp/README.md) | library and explicit cuTile baseline | both reach `5.74e-2` held-out MSE after 500 steps |
+| [CNN](src/examples/training/cnn/README.md) | convolution forward/backward and learning | configured grouped convolution matches a scalar oracle; a depthwise-separable block composes; smoke reaches 100% accuracy |
+| [Attention](src/examples/training/attention/README.md) | causal attention and prefix-mean learning | central differences pass; held-out MSE falls to `2.39e-2` |
+| [Muon](src/examples/training/muon/README.md) | explicit Muon/AdamW partition and paired learning | both identically initialized arms reduce held-out MSE by more than 99% in 100 steps; no winner claim |
+
+### Research contracts
+
+| Program | Purpose | Current witness |
+|---|---|---|
+| [Generated addition](src/studies/contracts/generated-addition/README.md) | endless data with executable IDR assumptions | 128,000 fresh samples, zero observed reuse; held-out MSE falls to `3.88e-3` |
+| [MNIST population](src/studies/contracts/mnist-population/README.md) | independent models and rates on one population axis | fused four-member smoke improves best accuracy from 8.20% to 60.55% |
 | [Sudoku transformer](https://github.com/furkanhaney/sudoku-transformer) | bidirectional transformer plus generated IDR acceptance | 50 unique training boards, zero evaluation overlap, finite forward/backward/update |
 | [Chess transformer](https://gitlab.com/furkanhaney/chess-transformer) | geometric attention, joint policy/value learning, finite game-disjoint data | two AdamW updates, exact pass receipt, zero train/evaluation overlap |
+
+### Applied studies
+
+| Program | Purpose | Current witness |
+|---|---|---|
+| [Country panel](src/studies/energy-output/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
 
 These numbers are repository witnesses with different tasks and budgets. They
 show that the exercised path works; they are not a benchmark leaderboard.
@@ -165,15 +193,17 @@ axis/
 ├── src/
 │   ├── library/              published Axis framework crate
 │   ├── examples/
-│   │   ├── addition/         generated-data IDR training
-│   │   ├── attention/        causal-attention consumer and oracle
-│   │   ├── cnn/              CNN consumer and scalar oracle
-│   │   ├── mlp/              MLP consumer and explicit cuTile baseline
-│   │   └── muon/             paired Muon and AdamW learning acceptance
+│   │   ├── getting-started/
+│   │   │   └── mnist/        approachable end-to-end training
+│   │   └── training/
+│   │       ├── attention/    causal-attention consumer and oracle
+│   │       ├── cnn/          CNN consumer and scalar oracle
+│   │       ├── mlp/          MLP consumer and explicit cuTile baseline
+│   │       └── muon/         paired Muon and AdamW learning acceptance
 │   └── studies/
-│       ├── training-dynamics/
-│       │   ├── mnist/        finite-pass MNIST migration
-│       │   └── mnist-population/
+│       ├── contracts/
+│       │   ├── generated-addition/  generated-data IDR training
+│       │   └── mnist-population/    population-axis research contract
 │       └── energy-output/
 │           └── panel/        country-year regression migration
 ├── docs/                     shared contracts, assumptions, and next work
@@ -216,13 +246,13 @@ Run commands from the repository root:
 ```bash
 bash scripts/check.sh
 
-bash src/examples/mlp/scripts/train.sh --smoke
-bash src/examples/cnn/scripts/train.sh --smoke
-bash src/examples/attention/scripts/train.sh --smoke
-bash src/examples/addition/scripts/train.sh --smoke
-bash src/examples/muon/scripts/train.sh --smoke
-bash src/studies/training-dynamics/mnist/scripts/train.sh --smoke
-bash src/studies/training-dynamics/mnist-population/scripts/train.sh --smoke
+bash src/examples/getting-started/mnist/scripts/train.sh --smoke
+bash src/examples/training/mlp/scripts/train.sh --smoke
+bash src/examples/training/cnn/scripts/train.sh --smoke
+bash src/examples/training/attention/scripts/train.sh --smoke
+bash src/examples/training/muon/scripts/train.sh --smoke
+bash src/studies/contracts/generated-addition/scripts/train.sh --smoke
+bash src/studies/contracts/mnist-population/scripts/train.sh --smoke
 bash src/studies/energy-output/panel/scripts/train.sh --smoke --split country
 ```
 

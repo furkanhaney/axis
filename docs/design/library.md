@@ -7,8 +7,8 @@ status: experimental implementation
 
 The intended interface began with the owner's [API sketch](api-sketch.md). It is an API
 sketch with four target programs, not a compiled library. The first two
-concrete implementations are [the MLP](../../src/examples/mlp/src/baseline.rs) and
-[the CNN](../../src/examples/cnn/src/train.rs). Their jobs are to establish working math,
+concrete implementations are [the MLP](../../src/examples/training/mlp/src/baseline.rs) and
+[the CNN](../../src/examples/training/cnn/src/train.rs). Their jobs are to establish working math,
 gradients, and execution behavior before those mechanics move behind the API.
 
 The central boundary is **users manipulate named axes; the backend maps those
@@ -20,17 +20,17 @@ documented in [static guarantees](static-guarantees.md).
 ## Implemented first slice
 
 The `axis` package now exposes `axis` from [src/library/src/lib.rs](../../src/library/src/lib.rs).
-[src/examples/mlp/src/train.rs](../../src/examples/mlp/src/train.rs) is the first executable consumer: the
+[src/examples/training/mlp/src/train.rs](../../src/examples/training/mlp/src/train.rs) is the first executable consumer: the
 original MLP expressed with named axes, automatic derivatives, Linear/ReLU,
 explicit mean reduction, and SGD. The original standalone trainers and scalar
 oracles remain unchanged for comparison.
 
-[Causal attention](../../src/examples/attention/README.md) is the second executable
+[Causal attention](../../src/examples/training/attention/README.md) is the second executable
 consumer. Its query/key/value and output projections reuse Linear, Module
 parameter traversal, and SGD. Attention composition stays in that program;
 only named-axis softmax and causal masking join the tensor algebra.
 
-[The CNN](../../src/examples/cnn/README.md) is the third consumer. Conv2d
+[The CNN](../../src/examples/training/cnn/README.md) is the third consumer. Conv2d
 composes named patch extraction with a channel-grouped contraction; global
 pooling is the existing named mean. Its explicit cuTile program remains beside
 it as a lower-level baseline.
@@ -165,22 +165,22 @@ Run from the research node:
 
 ```bash
 bash scripts/check.sh
-bash src/examples/mlp/scripts/train.sh --smoke
-bash src/examples/mlp/scripts/train.sh
-bash src/examples/addition/scripts/train.sh --smoke
-bash src/examples/muon/scripts/train.sh --smoke
+bash src/examples/training/mlp/scripts/train.sh --smoke
+bash src/examples/training/mlp/scripts/train.sh
+bash src/studies/contracts/generated-addition/scripts/train.sh --smoke
+bash src/examples/training/muon/scripts/train.sh --smoke
 ```
 
 The verification script runs formatting, Clippy, the CPU shape test, and the
 explicitly enabled GPU tests in the library, MLP, attention, and CNN consumers.
 Algebra checks are in [src/library/src/tests.rs](../../src/library/src/tests.rs),
-and the [MLP checks](../../src/examples/mlp/src/tests.rs) compare
+and the [MLP checks](../../src/examples/training/mlp/src/tests.rs) compare
 all MLP predictions, parameter gradients, input gradients, and one update to
 the scalar f64 oracle. Separate checks cover odd extents, short batches, extra
 time axes, noncontiguous storage, both contraction derivatives, split/merge,
 broadcast gradients, tied modules, stale parameter versions, and invalid axes.
-The [measured MLP run](../../src/examples/mlp/README.md#library-mlp) establishes the first
-slice. [Attention checks](../../src/examples/attention/src/tests.rs) additionally compare
+The [measured MLP run](../../src/examples/training/mlp/README.md#library-mlp) establishes the first
+slice. [Attention checks](../../src/examples/training/attention/src/tests.rs) additionally compare
 every Q/K/V gradient against f64 central differences, verify causality and
 layout invariance, and exercise stable softmax with extreme finite logits.
 

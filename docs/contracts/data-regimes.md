@@ -119,7 +119,8 @@ when known, consumption, unique and repeated IDs, coverage, repeat rate, and
 the declared limits. Empty observations are allowed; zero-sized corpora and
 limits outside `0..=1` are rejected.
 
-The addition demonstration consumes a new generated batch on every optimizer
+The researcher-level [addition contract](../../src/studies/contracts/generated-addition/README.md)
+consumes a new generated batch on every optimizer
 step and runs `assert_idr` in its loader. The existing MLP, CNN, and attention
 demonstrations intentionally optimize the same small synthetic batches
 repeatedly. They are finite-data learning checks, not IDR experiments, and do

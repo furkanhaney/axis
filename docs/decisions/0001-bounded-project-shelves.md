@@ -29,9 +29,11 @@ responsibility. Do not create compatibility paths after a move.
 
 Rust source does not live under any `docs/` directory. Non-compiling API
 sketches use Markdown code fences. Direct children of `src/` name roles at the
-same level: `library/` is the published crate, `examples/` holds compact
-teaching and acceptance consumers, and `studies/` holds research migrations
-grouped by research area. The reusable crate groups its own source into
+same level: `library/` is the published crate; `examples/getting-started/` owns
+approachable end-to-end teaching; `examples/training/` owns ordinary model and
+optimizer flows; and `studies/` holds researcher-level contracts and applied
+migrations. IDR, monotonicity, verification, and other research contracts do not
+share an introductory shelf merely because they are executable. The reusable crate groups its own source into
 `algebra/`, `model/`, `research/`, and `runtime/` while keeping their Rust
 modules private and re-exporting the public API from `lib.rs`.
 

@@ -96,7 +96,7 @@ copyright, and MIT notice ship with the crate in
 
 ## Acceptance and limits
 
-The [paired acceptance](../../src/examples/muon/README.md) initializes the same
+The [paired acceptance](../../src/examples/training/muon/README.md) initializes the same
 MLP twice, trains one arm with AdamW and one with an explicit
 `MuonWithAuxAdamW` partition, and requires independent held-out
 `LearningProgress` receipts. It establishes that both paths learn. It does not

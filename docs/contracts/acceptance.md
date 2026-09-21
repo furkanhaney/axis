@@ -6,7 +6,7 @@ acceptance tests.
 
 ## Paired Muon training — current
 
-The in-repository [Muon acceptance](../../src/examples/muon/README.md) trains
+The in-repository [Muon acceptance](../../src/examples/training/muon/README.md) trains
 identically initialized MLPs on the same deterministic regression populations.
 One uses AdamW throughout; the other explicitly assigns its first hidden
 weight to Muon and the exact remainder to AdamW. Both arms must emit separate

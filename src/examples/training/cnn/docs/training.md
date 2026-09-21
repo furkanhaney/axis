@@ -7,10 +7,10 @@ It compiles as `cutile-cnn` in this node's own crate.
 From the Axis repo root:
 
 ```bash
-bash src/examples/cnn/scripts/train.sh --smoke
-bash src/examples/cnn/scripts/train.sh
-bash src/examples/cnn/scripts/train.sh --steps 1000 --lr 0.5 --seed 7
-bash src/examples/cnn/scripts/train.sh --verify-only
+bash src/examples/training/cnn/scripts/train.sh --smoke
+bash src/examples/training/cnn/scripts/train.sh
+bash src/examples/training/cnn/scripts/train.sh --steps 1000 --lr 0.5 --seed 7
+bash src/examples/training/cnn/scripts/train.sh --verify-only
 ```
 
 ## Model and task
@@ -79,5 +79,5 @@ this run. [Captured output](../data/evidence/cnn-verification.log).
 These results establish learning on this simple synthetic classification
 task. They do not measure natural-image accuracy or comparative throughput.
 Geometry and tile sizes remain explicit constraints of this prototype.
-The [overlap census](../../../../docs/design/overlap.md) and [library proposal](../../../../docs/design/library.md) describe
+The [overlap census](../../../../../docs/design/overlap.md) and [library proposal](../../../../../docs/design/library.md) describe
 what these two programs suggest extracting next.

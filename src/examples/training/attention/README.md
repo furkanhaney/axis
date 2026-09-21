@@ -28,8 +28,8 @@ Named parameter slots include `query.weight`, `value.bias`, and `output.weight`.
 From the Axis repo root:
 
 ```bash
-bash src/examples/attention/scripts/train.sh --smoke
-bash src/examples/attention/scripts/train.sh
+bash src/examples/training/attention/scripts/train.sh --smoke
+bash src/examples/training/attention/scripts/train.sh
 bash scripts/cargo.sh test --release --locked -p attention -- --ignored --test-threads=1 --nocapture
 ```
 

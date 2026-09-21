@@ -12,10 +12,16 @@ run artifacts; distinguish mechanics witnesses from scientific results.
 
 - `src/library/` is the published `axis` crate and the owner of reusable tensor,
   module, optimizer, data, metric, and research-contract behavior.
-- `src/examples/` contains compact acceptance programs for shared framework
-  behavior.
-- `src/studies/` contains research ports whose task-specific architecture,
-  metrics, and evidence do not belong in the library.
+- `src/examples/getting-started/` contains approachable end-to-end programs;
+  MNIST is the first path for a new user.
+- `src/examples/training/` contains ordinary model and optimizer flows such as
+  MLP, CNN, attention, and Muon. They are building blocks, not research claims.
+- `src/studies/contracts/` contains researcher-level data-regime and execution
+  contracts such as IDR and population-axis training. Verification and
+  monotonicity work belongs here or in an outside research consumer, never in
+  the introductory shelf.
+- Other `src/studies/` families contain applied research ports whose
+  task-specific architecture, metrics, and evidence do not belong in the library.
 - `docs/` explains contracts, design decisions, and measured limits.
 - `scripts/` contains shell tooling. Axis contains no Python.
 - `tests/` contains repository and packaging gates.

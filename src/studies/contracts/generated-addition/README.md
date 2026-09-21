@@ -1,13 +1,13 @@
 # Addition stream
 
-This is the smallest end-to-end IDR experiment in the workspace. A deterministic
+This is a researcher-level data-regime contract, not a getting-started training example. A deterministic
 `AdditionDataset` emits fresh `(left, right, sum)` draws without exhaustion. A
 `DataLoader` rejects repeated draw identities before a batch can reach the
 optimizer, and `Trainer` performs the explicit scalar-loss update.
 
 ```bash
-scripts/train.sh --smoke
-scripts/train.sh --steps 500
+bash src/studies/contracts/generated-addition/scripts/train.sh --smoke
+bash src/studies/contracts/generated-addition/scripts/train.sh --steps 500
 ```
 
 Training is measured in samples and optimizer steps. There are no epochs. The
