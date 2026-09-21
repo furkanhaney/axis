@@ -1,5 +1,31 @@
 # Eager execution profile
 
+## Translated spatial windows
+
+`Tensor::pad_zeros` and `Tensor::narrow` map output coordinates to source
+coordinates with one integer translation along a named axis. One 128-lane cuTile
+kernel computes offsets from five integers per logical dimension: destination
+extent/stride, source extent/stride, and translation. Reverse mode invokes the
+same copy kernel with source/destination geometry exchanged and translation
+negated. Each output element has at most one source, so no reduction or atomic
+scatter is needed. Arbitrary physical input layouts are preserved by the inverse.
+
+Missing coordinates use masked loads with literal zero fill, not multiplication
+by a mask; NaN and infinity outside a retained interval cannot leak into padding.
+Per-dimension invalid coordinates are clamped before address arithmetic. Checked
+shape products and interval arithmetic enforce the signed 32-bit kernel limits
+before allocating output. Neither direction builds an element-sized index table
+or inherits the generic 16,777,216-contribution ceiling. Identity operations share
+the original tensor node and storage. Nonidentity operations materialize their
+output; multi-axis padding currently composes one operation per axis.
+
+The consumer motivating this addition is MobileSAM TinyViT window attention:
+128×128 is padded bottom/right to 133×133 for 7×7 windows; 64×64 is padded to
+70×70 for 14×14 or 7×7 windows, then cropped after attention. Model-specific
+partitioning, relative biases and masking policy remain in Atlas. The tests
+establish copying and derivative correctness, not complete model parity or
+an inference speedup. These operations are not present in released Axis 0.9.0.
+
 ## Recurrent correctness path
 
 The first `Lstm` lowering projects the complete input sequence in one contraction,

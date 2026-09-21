@@ -94,6 +94,9 @@ compile_error!(
 mod recurrent_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "algebra/window_tests.rs"]
+mod window_tests;
 
 pub mod prelude {
     pub use crate::{
