@@ -14,9 +14,9 @@ explicitly averages batch and output axes.
 From the Axis repo root:
 
 ```bash
-bash src/examples/cnn/scripts/train.sh --smoke
-bash src/examples/cnn/scripts/train.sh
-bash src/examples/cnn/scripts/baseline.sh --verify-only
+bash src/examples/training/cnn/scripts/train.sh --smoke
+bash src/examples/training/cnn/scripts/train.sh
+bash src/examples/training/cnn/scripts/baseline.sh --verify-only
 ```
 
 The library oracle test compares 4,096 activation values, pooled features,

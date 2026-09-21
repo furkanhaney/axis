@@ -6,7 +6,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # This deliberately small source census recognizes the Rust style used by the
 # two retained baseline trainers. It is evidence about these files, not a Rust
 # parser or a general duplication detector.
-perl - "$root/src/examples/mlp/src/baseline.rs" "$root/src/examples/cnn/src/train.rs" <<'PERL'
+perl - "$root/src/examples/training/mlp/src/baseline.rs" "$root/src/examples/training/cnn/src/train.rs" <<'PERL'
 use strict;
 use warnings;
 

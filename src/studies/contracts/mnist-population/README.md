@@ -1,13 +1,17 @@
 # Axis MNIST population
 
+This program assumes familiarity with ordinary MNIST training. It exists to exercise independent
+models, optimizer state, and learning rates on one named population axis; it is not the introductory
+MNIST example.
+
 Rust mechanics migration of [`research/training-dynamics/train_mlp_pop.py`](../../../../../research/training-dynamics/train_mlp_pop.py), the
 population MNIST probe. It trains independently initialized 970-parameter
 classifiers at log-uniform learning rates, then reports held-out accuracy by
 learning-rate quartile.
 
 ```sh
-src/studies/training-dynamics/mnist-population/scripts/train.sh --smoke
-src/studies/training-dynamics/mnist-population/scripts/train.sh --pop 512
+src/studies/contracts/mnist-population/scripts/train.sh --smoke
+src/studies/contracts/mnist-population/scripts/train.sh --pop 512
 ```
 
 The input is the canonical torchvision IDX data already stored under

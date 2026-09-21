@@ -1,6 +1,7 @@
-# Axis MNIST
+# Axis MNIST: start here
 
-Rust mechanics and architecture migration of
+This is the approachable end-to-end Axis example: recognizable data, one small MLP, categorical
+loss, finite shuffled passes, and held-out accuracy. It is a Rust mechanics and architecture migration of
 [`research/training-dynamics/train_mlp_1k.py`](../../../../../research/training-dynamics/train_mlp_1k.py), the small MNIST baseline used to
 check the training-dynamics machinery. It keeps the 4x4 average pool,
 train-only normalization, 49 -> 16 -> 10 network, 970-parameter budget,
@@ -9,8 +10,8 @@ parity because its deterministic shuffler and initialization differ from
 PyTorch, while its objective and Adam defaults now match the source.
 
 ```sh
-training-dynamics/mlp-1k-rust/scripts/train.sh --smoke
-training-dynamics/mlp-1k-rust/scripts/train.sh
+bash src/examples/getting-started/mnist/scripts/train.sh --smoke
+bash src/examples/getting-started/mnist/scripts/train.sh
 ```
 
 The input files are the same torchvision IDX files already downloaded beneath
@@ -23,5 +24,5 @@ The categorical-loss smoke consumed five verified passes over 2,048 examples.
 Held-out accuracy rose from `10.16%` to `33.98%`; the complete receipt and curve
 are in [data/runs/smoke.log](data/runs/smoke.log).
 
-The launcher points Cargo at the study-local CUDA toolkit provisioned by
+The launcher points Cargo at the repository-local CUDA toolkit provisioned by
 `scripts/setup_cuda.sh`; run that setup once if `build/cuda/` is absent.

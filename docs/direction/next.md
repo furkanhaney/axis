@@ -6,9 +6,10 @@ owner's larger, partially unimplemented API sketch.
 
 ## What exists and why
 
-- `src/library/` is the reusable crate. Compact consumers live under
-  `src/examples/`; ports of existing research live under `src/studies/` and
-  retain their research-area grouping. Launch from the Axis node, not a `src/`
+- `src/library/` is the reusable crate. Introductory programs live under
+  `src/examples/getting-started/`; ordinary model and optimizer flows live under
+  `src/examples/training/`; research contracts and ports live under `src/studies/`.
+  Launch from the Axis node, not a `src/`
   corridor. Shared CUDA setup and
   Cargo/check runners stay at the workspace's `scripts/`.
 - MLP, attention, and CNN consume the library. CNN also retains its explicit
@@ -33,29 +34,29 @@ owner's larger, partially unimplemented API sketch.
   when its regime fails. `AdditionDataset` is the first inexhaustible source.
   `Trainer` captures only update ordering; MLP, attention, and CNN still state
   their forward, loss, and named reductions directly.
-- Attention composition stays in `src/examples/attention/src/attention.rs`. Only its
+- Attention composition stays in `src/examples/training/attention/src/attention.rs`. Only its
   required tensor operations, causal mask and softmax, entered the library.
   A second consumer can justify promoting the composed module later.
 
 ## Evidence and limits
 
 - MLP's 500-step held-out MSE matched the retained baseline at `5.74e-2`;
-  [MLP records](../../src/examples/mlp/README.md#library-mlp). Named loading and pre-update
+  [MLP records](../../src/examples/training/mlp/README.md#library-mlp). Named loading and pre-update
   logging passed the subsequent [feedback checks](../../data/evidence/feedback-verification.log).
 - Attention's independent f64 forward and central differences pass for every
   Q/K/V element, including reordered physical storage and a leading logical
   feature axis. Causality and large-logit softmax checks pass. Its 200-step
   held-out MSE falls from `5.12e-1` to `2.39e-2` on toy prefix means;
-  [training record](../../src/examples/attention/data/runs/training.log).
+  [training record](../../src/examples/training/attention/data/runs/training.log).
 - CNN matches 4,096 scalar activation values, pooled features, logits, every
   parameter gradient, overlapping input gradients, and one update. At 100
   steps its held-out BCE falls from `7.04e-1` to `7.40e-2` with `100.00%`
-  accuracy; [CNN record](../../src/examples/cnn/data/runs/library-training.log). Its Conv2d is
+  accuracy; [CNN record](../../src/examples/training/cnn/data/runs/library-training.log). Its Conv2d is
   `unfold2d` plus Linear, so `col2im` is the reverse of the gather rather than
   a separate special-case kernel.
 - Addition consumes 128,000 generated samples with zero observed identity
   reuse and zero train/evaluation overlap. Its held-out MSE falls from
-  `8.06e-1` to `3.88e-3`; [addition record](../../src/examples/addition/data/runs/training.log).
+  `8.06e-1` to `3.88e-3`; [addition record](../../src/studies/contracts/generated-addition/data/runs/training.log).
 - The first outside consumer now preserves categorical cross-entropy, Adam, and
   exact finite passes; its smoke reaches `33.98%` held-out MNIST accuracy.
   The population migration now runs independent parameters, gradients, Adam
