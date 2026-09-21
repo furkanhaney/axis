@@ -882,6 +882,24 @@ impl Tensor {
             None,
         ))
     }
+    /// Elementwise sigmoid linear unit, `x * sigmoid(x)`.
+    ///
+    /// This is composed from the same verified elementwise primitives used by
+    /// the rest of the graph, so reverse mode preserves named axes and layout.
+    pub fn silu(&self) -> Result<Self> {
+        self.mul(&self.sigmoid()?)
+    }
+
+    /// Elementwise leaky ReLU with an explicit finite, non-negative slope.
+    /// Its derivative at exactly zero is zero, matching Axis's compositional
+    /// ReLU convention.
+    pub fn leaky_relu(&self, negative_slope: f32) -> Result<Self> {
+        if !negative_slope.is_finite() || negative_slope < 0.0 {
+            return Err("leaky_relu negative slope must be finite and non-negative".into());
+        }
+        self.relu()?
+            .add(&self.scale(-1.0)?.relu()?.scale(-negative_slope)?)
+    }
     /// Elementwise hyperbolic tangent.
     pub fn tanh(&self) -> Result<Self> {
         let value = self.device().tanh(&self.0.value)?;
