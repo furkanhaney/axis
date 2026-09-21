@@ -29,6 +29,23 @@ impl CentralDifference {
         self.step
     }
 
+    fn first_scale(self) -> Result<f32> {
+        let scale = 0.5 / self.step;
+        if !scale.is_finite() || scale == 0.0 {
+            return Err("central first-difference scale is not representable in f32".into());
+        }
+        Ok(scale)
+    }
+
+    fn second_scale(self) -> Result<f32> {
+        let inverse = 1.0 / self.step;
+        let scale = inverse * inverse;
+        if !scale.is_finite() || scale == 0.0 {
+            return Err("central second-difference scale is not representable in f32".into());
+        }
+        Ok(scale)
+    }
+
     fn validate(&self, tensors: &[&Tensor]) -> Result<()> {
         let first = tensors
             .first()
@@ -57,17 +74,16 @@ impl CentralDifference {
     /// Approximate the first derivative as `(upper - lower) / (2 * step)`.
     pub fn first(&self, lower: &Tensor, upper: &Tensor) -> Result<Tensor> {
         self.validate(&[lower, upper])?;
-        upper.sub(lower)?.scale(0.5 / self.step)
+        upper.sub(lower)?.scale(self.first_scale()?)
     }
 
     /// Approximate the second derivative as `(lower - 2*center + upper) / step²`.
     pub fn second(&self, lower: &Tensor, center: &Tensor, upper: &Tensor) -> Result<Tensor> {
         self.validate(&[lower, center, upper])?;
-        let inverse_square = 1.0 / (self.step * self.step);
         lower
             .add(upper)?
             .sub(&center.scale(2.0)?)?
-            .scale(inverse_square)
+            .scale(self.second_scale()?)
     }
 }
 
@@ -96,6 +112,18 @@ mod tests {
         let stencil = CentralDifference::new(coordinate, 0.25).unwrap();
         assert_eq!(stencil.coordinate(), coordinate);
         assert_eq!(stencil.step(), 0.25);
+        assert!(
+            CentralDifference::new(coordinate, f32::MIN_POSITIVE)
+                .unwrap()
+                .second_scale()
+                .is_err()
+        );
+        assert!(
+            CentralDifference::new(coordinate, f32::MAX)
+                .unwrap()
+                .second_scale()
+                .is_err()
+        );
     }
 
     #[test]
@@ -167,6 +195,23 @@ mod tests {
         let wrong = Tensor::from_slice(&[1.0, 2.0, 3.0], [other.of(3)], &device)?;
         assert!(stencil.first(&lower.detach(), &wrong).is_err());
         assert_eq!(first.shape(), &Shape::new([sample.of(3)])?);
+
+        let x = 0.7_f32;
+        let second_error = |step: f32| -> Result<f64> {
+            let lower = Tensor::from_slice(&[(x - step).sin()], [sample.of(1)], &device)?;
+            let center = Tensor::from_slice(&[x.sin()], [sample.of(1)], &device)?;
+            let upper = Tensor::from_slice(&[(x + step).sin()], [sample.of(1)], &device)?;
+            let observed = CentralDifference::new(time, step)?
+                .second(&lower, &center, &upper)?
+                .to_vec()?[0];
+            Ok((f64::from(observed) + f64::from(x.sin())).abs())
+        };
+        let coarse_error = second_error(0.2)?;
+        let fine_error = second_error(0.1)?;
+        assert!(
+            fine_error * 3.5 < coarse_error,
+            "halving a centered-stencil step should approach fourfold error reduction: coarse={coarse_error}, fine={fine_error}"
+        );
         Ok(())
     }
 }

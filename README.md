@@ -190,7 +190,7 @@ These are ordinary model and optimizer flows. “Training” is broader and more
 | Program | Purpose | Current witness |
 |---|---|---|
 | [Country panel](src/studies/energy-output/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
-| [Damped pendulum](src/studies/physics/damped-pendulum/README.md) | physics-informed learning from a nonlinear ODE | RK4 state RMSE falls 99.10%; strict sampled residual limit passes on 255 held-out times |
+| [Damped pendulum](src/studies/physics/damped-pendulum/README.md) | physics-informed learning from a nonlinear ODE | RK4 angle/velocity RMSE reach `0.00291` rad and `0.00890` rad/s; strict sampled residual limit passes |
 
 These numbers are repository witnesses with different tasks and budgets. They
 show that the exercised path works; they are not a benchmark leaderboard.

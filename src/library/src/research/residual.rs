@@ -318,10 +318,12 @@ impl fmt::Display for ResidualViolation {
         let receipt = &self.0;
         write!(
             f,
-            "empirical residual limit violation\n\nlaw:                  {}\nlaw version:          {}\nregion:               {}\nobservations:         {}\nviolations:           {}\nviolation rate:       {:.4}%\nmaximum allowed rate: {:.4}%\nmaximum |residual|:   {:.8}\nRMS residual:         {:.8}\nabsolute tolerance:   {:.8}\n\nthe sampled discretized residual observations left their declared limits; no global law claim was established",
+            "empirical residual limit violation\n\nlaw:                  {}\nlaw version:          {}\nresidual:             {}\nregion:               {}\nevaluator:            {}\nobservations:         {}\nviolations:           {}\nviolation rate:       {:.4}%\nmaximum allowed rate: {:.4}%\nmaximum |residual|:   {:.8}\nRMS residual:         {:.8}\nabsolute tolerance:   {:.8}\n\nthe sampled discretized residual observations left their declared limits; no global law claim was established",
             receipt.scope.law.name,
             receipt.scope.law.version,
+            receipt.scope.expression,
             receipt.scope.region,
+            receipt.scope.evaluator,
             receipt.observations,
             receipt.violations,
             receipt.violation_rate() * 100.0,

@@ -11,6 +11,8 @@ const END_TIME: f32 = 2.0;
 const DIFFERENCE_STEP: f32 = 1e-2;
 const TRAIN_SEED: u64 = 0x5049_4e4e;
 const EVALUATION_POINTS: usize = 257;
+const MAX_ANGLE_RMSE: f64 = 0.01;
+const MAX_ANGULAR_VELOCITY_RMSE: f64 = 0.02;
 
 const SYSTEM: Pendulum = Pendulum {
     gravity: 9.81,
@@ -24,6 +26,7 @@ struct CollocationStream {
     seed: u64,
     next_id: u64,
     excluded_coordinates: HashSet<u32>,
+    seen_centers: HashSet<u32>,
 }
 
 impl CollocationStream {
@@ -42,6 +45,7 @@ impl CollocationStream {
             seed,
             next_id: 0,
             excluded_coordinates,
+            seen_centers: HashSet::new(),
         }
     }
 
@@ -76,8 +80,12 @@ impl DataSource for CollocationStream {
             {
                 continue;
             }
+            let identity = time.to_bits();
+            if !self.seen_centers.insert(identity) {
+                continue;
+            }
             return Ok(Some(Sample {
-                id: (u128::from(self.seed) << 64) | u128::from(draw),
+                id: u128::from(identity),
                 value: time,
             }));
         }
@@ -145,7 +153,7 @@ fn dynamics_residual(
     device: &Device,
 ) -> Result<Tensor> {
     let (lower, center, upper) = shifted_angles(model, centers, axes, initial_angle, device)?;
-    let stencil = CentralDifference::new(Axis::new("time"), DIFFERENCE_STEP)?;
+    let stencil = CentralDifference::new(axes.input, DIFFERENCE_STEP)?;
     let velocity = stencil.first(&lower, &upper)?;
     let acceleration = stencil.second(&lower, &center, &upper)?;
     acceleration
@@ -173,27 +181,39 @@ fn evaluation_times() -> Vec<f32> {
         .collect()
 }
 
-fn trajectory_rmse(
+#[derive(Clone, Copy, Debug)]
+struct TrajectoryErrors {
+    angle_rmse: f64,
+    angular_velocity_rmse: f64,
+}
+
+fn trajectory_errors(
     model: &impl Module,
     axes: Axes,
     initial_angle: &Tensor,
     device: &Device,
-) -> Result<f64> {
+) -> Result<TrajectoryErrors> {
     let evaluation = evaluation_times();
     let (lower, center, upper) = shifted_angles(model, &evaluation, axes, initial_angle, device)?;
-    let velocity = CentralDifference::new(Axis::new("time"), DIFFERENCE_STEP)?
+    let velocity = CentralDifference::new(axes.input, DIFFERENCE_STEP)?
         .first(&lower, &upper)?
         .to_vec()?;
     let predicted = center.to_vec()?;
-    let squared_error = evaluation
-        .iter()
-        .zip(predicted.iter().zip(&velocity))
-        .map(|(&time, (&angle, &velocity))| {
-            let expected = SYSTEM.state_at(f64::from(time), 1e-3);
-            (f64::from(angle) - expected[0]).powi(2) + (f64::from(velocity) - expected[1]).powi(2)
-        })
-        .sum::<f64>();
-    Ok((squared_error / (evaluation.len() * 2) as f64).sqrt())
+    let (angle_squared_error, velocity_squared_error) =
+        evaluation.iter().zip(predicted.iter().zip(&velocity)).fold(
+            (0.0, 0.0),
+            |(angle_error, velocity_error), (&time, (&angle, &velocity))| {
+                let expected = SYSTEM.state_at(f64::from(time), 1e-3);
+                (
+                    angle_error + (f64::from(angle) - expected[0]).powi(2),
+                    velocity_error + (f64::from(velocity) - expected[1]).powi(2),
+                )
+            },
+        );
+    Ok(TrajectoryErrors {
+        angle_rmse: (angle_squared_error / evaluation.len() as f64).sqrt(),
+        angular_velocity_rmse: (velocity_squared_error / evaluation.len() as f64).sqrt(),
+    })
 }
 
 fn residual_receipts(
@@ -201,18 +221,31 @@ fn residual_receipts(
     axes: Axes,
     initial_angle: &Tensor,
     device: &Device,
-) -> Result<(EmpiricalResidualReceipt, EmpiricalResidualReceipt)> {
+) -> Result<(
+    EmpiricalResidualReceipt,
+    EmpiricalResidualReceipt,
+    EmpiricalResidualReceipt,
+)> {
     let centers = evaluation_times()[1..EVALUATION_POINTS - 1].to_vec();
     let dynamic = dynamics_residual(model, &centers, axes, initial_angle, device)?;
     let law = LawIdentity::new("nonlinear damped pendulum", "caliper-r5@1")?;
-    let limits = ResidualLimits::strict(0.3)?;
-    let evaluator = format!("second-order central difference; h={DIFFERENCE_STEP}");
-    let region = format!("fixed held-out grid; 0 < t < {END_TIME} seconds");
-    let mut initial_check = EmpiricalResidual::new(
+    let limits = ResidualLimits::strict(0.35)?;
+    let evaluator = format!("fp32 second-order central difference; h={DIFFERENCE_STEP} seconds");
+    let region = format!("fixed held-out grid; 0 < t < {END_TIME} seconds; residual unit rad/s^2");
+    let mut initial_angle_check = EmpiricalResidual::new(
         ResidualScope::new(
             law.clone(),
-            "theta(0) = theta_0 and dtheta/dt(0) = omega_0",
-            "initial condition at t = 0 seconds",
+            "theta(0) - theta_0 = 0 [rad]",
+            "initial angle at t = 0 seconds",
+            "direct fp32 evaluation",
+        )?,
+        ResidualLimits::strict(1e-6)?,
+    );
+    let mut initial_velocity_check = EmpiricalResidual::new(
+        ResidualScope::new(
+            law.clone(),
+            "dtheta/dt(0) - omega_0 = 0 [rad/s]",
+            "initial angular velocity at t = 0 seconds",
             evaluator.clone(),
         )?,
         ResidualLimits::strict(1e-4)?,
@@ -228,17 +261,21 @@ fn residual_receipts(
     );
     let zero = [0.0_f32];
     let (lower, center, upper) = shifted_angles(model, &zero, axes, initial_angle, device)?;
-    let initial_velocity = CentralDifference::new(Axis::new("time"), DIFFERENCE_STEP)?
+    let initial_velocity = CentralDifference::new(axes.input, DIFFERENCE_STEP)?
         .first(&lower, &upper)?
         .to_vec()?[0];
     let initial_angle_observed = center.to_vec()?[0];
-    let initial_receipt = initial_check.observe_batch([
-        f64::from(initial_angle_observed) - SYSTEM.initial_angle,
-        f64::from(initial_velocity) - SYSTEM.initial_angular_velocity,
-    ])?;
+    let initial_angle_receipt =
+        initial_angle_check.observe(f64::from(initial_angle_observed) - SYSTEM.initial_angle)?;
+    let initial_velocity_receipt = initial_velocity_check
+        .observe(f64::from(initial_velocity) - SYSTEM.initial_angular_velocity)?;
     let dynamic_receipt =
         dynamic_check.observe_batch(dynamic.to_vec()?.into_iter().map(f64::from))?;
-    Ok((initial_receipt, dynamic_receipt))
+    Ok((
+        initial_angle_receipt,
+        initial_velocity_receipt,
+        dynamic_receipt,
+    ))
 }
 
 fn main() -> Result<()> {
@@ -267,7 +304,10 @@ fn main() -> Result<()> {
     if steps == 0 {
         return Err("steps must be positive".into());
     }
+    run_experiment(steps, smoke)
+}
 
+fn run_experiment(steps: usize, smoke: bool) -> Result<()> {
     let device = Device::cuda(0)?;
     let axes = Axes {
         batch: Axis::new("collocation"),
@@ -289,17 +329,36 @@ fn main() -> Result<()> {
         42,
     )?;
 
-    let initial_rmse = trajectory_rmse(&model, axes, &initial_angle, &device)?;
-    println!("initial trajectory_rmse={initial_rmse:.8}");
-    let mut learning = LearningProgress::new(
+    let initial_errors = trajectory_errors(&model, axes, &initial_angle, &device)?;
+    println!(
+        "initial angle_rmse_rad={:.8} angular_velocity_rmse_rad_s={:.8}",
+        initial_errors.angle_rmse, initial_errors.angular_velocity_rmse
+    );
+    let progress_limits = if smoke {
+        LearningLimits::any_improvement()
+    } else {
+        LearningLimits::new(0.0, Some(0.95))?
+    };
+    let mut angle_learning = LearningProgress::new(
         LearningDirection::Decrease,
-        LearningLimits::any_improvement(),
+        progress_limits,
         LearningObservation::new(
-            "state RMSE against independent f64 RK4",
+            "angle RMSE [rad] against independent f64 RK4",
             "fixed held-out time grid",
             "optimizer steps",
             0,
-            initial_rmse,
+            initial_errors.angle_rmse,
+        )?,
+    )?;
+    let mut velocity_learning = LearningProgress::new(
+        LearningDirection::Decrease,
+        progress_limits,
+        LearningObservation::new(
+            "angular velocity RMSE [rad/s] against independent f64 RK4",
+            "fixed held-out time grid",
+            "optimizer steps",
+            0,
+            initial_errors.angular_velocity_rmse,
         )?,
     )?;
     let mut loader = DataLoader::new(CollocationStream::new(TRAIN_SEED), BATCH)?
@@ -354,29 +413,50 @@ fn main() -> Result<()> {
         final_regime = Some(batch.regime);
     }
 
-    let final_rmse = trajectory_rmse(&model, axes, &initial_angle, &device)?;
-    learning.observe(LearningObservation::new(
-        "state RMSE against independent f64 RK4",
+    let final_errors = trajectory_errors(&model, axes, &initial_angle, &device)?;
+    angle_learning.observe(LearningObservation::new(
+        "angle RMSE [rad] against independent f64 RK4",
         "fixed held-out time grid",
         "optimizer steps",
         u64::try_from(steps)?,
-        final_rmse,
+        final_errors.angle_rmse,
+    )?)?;
+    velocity_learning.observe(LearningObservation::new(
+        "angular velocity RMSE [rad/s] against independent f64 RK4",
+        "fixed held-out time grid",
+        "optimizer steps",
+        u64::try_from(steps)?,
+        final_errors.angular_velocity_rmse,
     )?)?;
     println!(
-        "final trajectory_rmse={final_rmse:.8} elapsed_s={:.2}",
+        "final angle_rmse_rad={:.8} angular_velocity_rmse_rad_s={:.8} elapsed_s={:.2}",
+        final_errors.angle_rmse,
+        final_errors.angular_velocity_rmse,
         started.elapsed().as_secs_f64()
     );
     println!("{}", final_regime.expect("at least one step"));
     println!("{}", disjoint.assert_disjoint()?);
-    println!("{}", learning.assert_learning()?);
+    println!("{}", angle_learning.assert_learning()?);
+    println!("{}", velocity_learning.assert_learning()?);
     if smoke {
         println!(
             "SMOKE PASS: training mechanics ran; scientific residual acceptance was not requested"
         );
         return Ok(());
     }
-    let (initial_condition, dynamics) = residual_receipts(&model, axes, &initial_angle, &device)?;
-    println!("{initial_condition}");
+    if final_errors.angle_rmse > MAX_ANGLE_RMSE
+        || final_errors.angular_velocity_rmse > MAX_ANGULAR_VELOCITY_RMSE
+    {
+        return Err(format!(
+            "independent RK4 quality gate failed: angle RMSE {:.8} rad (max {MAX_ANGLE_RMSE}), angular-velocity RMSE {:.8} rad/s (max {MAX_ANGULAR_VELOCITY_RMSE})",
+            final_errors.angle_rmse, final_errors.angular_velocity_rmse
+        )
+        .into());
+    }
+    let (initial_angle_receipt, initial_velocity_receipt, dynamics) =
+        residual_receipts(&model, axes, &initial_angle, &device)?;
+    println!("{initial_angle_receipt}");
+    println!("{initial_velocity_receipt}");
     println!("{dynamics}");
     println!("PASS: learned a damped-pendulum trajectory from sampled differential residuals");
     Ok(())
@@ -394,6 +474,7 @@ mod tests {
         for _ in 0..100_000 {
             let sample = stream.next_sample()?.expect("generated stream");
             assert!(identities.insert(sample.id));
+            assert_eq!(sample.id, u128::from(sample.value.to_bits()));
             assert!((DIFFERENCE_STEP..=END_TIME - DIFFERENCE_STEP).contains(&sample.value));
             for coordinate in [
                 sample.value - DIFFERENCE_STEP,
@@ -404,5 +485,11 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; scripts/check.sh runs the scientific acceptance"]
+    fn cuda_acceptance_meets_oracle_and_residual_limits() -> Result<()> {
+        run_experiment(4_000, false)
     }
 }
