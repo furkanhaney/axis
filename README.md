@@ -33,7 +33,7 @@ weights—and the loss still goes down. Axis treats those as executable contract
 Add the current crates.io release to a Rust project:
 
 ```bash
-cargo add axis@0.6.0
+cargo add axis@0.7.0
 ```
 
 ## A training loop
