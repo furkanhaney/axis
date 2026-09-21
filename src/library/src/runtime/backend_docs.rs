@@ -224,15 +224,11 @@ impl Device {
         unavailable()
     }
 
-    pub(crate) fn unfold2d(&self, _input: &Buffer, _spec: &Unfold2dSpec) -> Result<Buffer> {
+    pub(crate) fn unfold(&self, _input: &Buffer, _spec: &UnfoldSpec) -> Result<Buffer> {
         unavailable()
     }
 
-    pub(crate) fn unfold2d_backward(
-        &self,
-        _gradient: &Buffer,
-        _spec: &Unfold2dSpec,
-    ) -> Result<Buffer> {
+    pub(crate) fn unfold_backward(&self, _gradient: &Buffer, _spec: &UnfoldSpec) -> Result<Buffer> {
         unavailable()
     }
 
@@ -248,7 +244,8 @@ impl Device {
 
 #[derive(Clone)]
 #[allow(dead_code)]
-pub(crate) struct Unfold2dSpec {
+pub(crate) struct UnfoldSpec {
+    pub spatial_rank: i32,
     pub input_len: usize,
     pub output_len: usize,
     pub input_rank: i32,
@@ -256,16 +253,16 @@ pub(crate) struct Unfold2dSpec {
     pub forward_metadata: Vec<i32>,
     pub backward_metadata: Vec<i32>,
     pub channels_per_group: i32,
-    pub kernel: [i32; 2],
-    pub stride: [i32; 2],
-    pub padding: [i32; 2],
-    pub input_spatial: [i32; 2],
-    pub output_spatial: [i32; 2],
-    pub input_special_strides: [i32; 3],
-    pub output_special_strides: [i32; 4],
+    pub kernel: [i32; 3],
+    pub stride: [i32; 3],
+    pub padding: [i32; 3],
+    pub input_spatial: [i32; 3],
+    pub output_spatial: [i32; 3],
+    pub input_special_strides: [i32; 4],
+    pub output_special_strides: [i32; 5],
 }
 
-impl Unfold2dSpec {
+impl UnfoldSpec {
     #[cfg(test)]
     pub(crate) fn metadata_len(&self) -> usize {
         self.forward_metadata.len() + self.backward_metadata.len()

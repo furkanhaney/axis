@@ -40,9 +40,10 @@ fn mean_squared(actual: &[f64], target: &[f64]) -> f64 {
 
 #[test]
 fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Result<()> {
-    let (batch, channel, height, width, output, population) = (
+    let (batch, channel, depth, height, width, output, population) = (
         Axis::new("batch"),
         Axis::new("channel"),
+        Axis::new("depth"),
         Axis::new("height"),
         Axis::new("width"),
         Axis::new("output"),
@@ -87,6 +88,45 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
     ] {
         assert!(invalid.output_shape(&image).is_err());
     }
+
+    let volume = Shape::new([
+        batch.of(2),
+        channel.of(4),
+        depth.of(3),
+        height.of(5),
+        width.of(7),
+    ])?;
+    let conv3d = Conv3d::new(channel, output.of(6), [depth, height, width], [2, 3, 2])
+        .stride([1, 2, 3])
+        .padding([1, 1, 0])
+        .groups(2);
+    assert_eq!(
+        conv3d.output_shape(&volume)?,
+        Shape::new([
+            batch.of(2),
+            depth.of(4),
+            height.of(3),
+            width.of(2),
+            output.of(6),
+        ])?
+    );
+    assert!(
+        Conv3d::new(channel, output.of(6), [depth, height, height], [2, 3, 2],)
+            .output_shape(&volume)
+            .is_err()
+    );
+    assert!(
+        Conv3d::new(channel, output.of(6), [depth, height, width], [2, 3, 2],)
+            .stride([1, 0, 1])
+            .output_shape(&volume)
+            .is_err()
+    );
+    assert!(
+        Conv3d::new(channel, output.of(5), [depth, height, width], [2, 3, 2],)
+            .groups(2)
+            .output_shape(&volume)
+            .is_err()
+    );
 
     let linear = Linear::new(channel, output.of(4));
     assert!(linear.output_shape(&Shape::new([batch.of(2)])?).is_err());
@@ -828,7 +868,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
         &device,
     )?;
     let builds = Tensor::unfold_plan_build_count();
-    let height_width = input.unfold2d_grouped(
+    let height_width = input.unfold_grouped(
         channel,
         [height, width],
         group.of(1),
@@ -838,7 +878,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
         [1, 1],
     )?;
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 1);
-    let height_time = input.unfold2d_grouped(
+    let height_time = input.unfold_grouped(
         channel,
         [height, time],
         group.of(1),
@@ -855,7 +895,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
     let probe = ((3 + 2) * 3) * 9 + 5;
     assert_eq!(height_width.to_vec()?[probe], 0.0);
     assert_eq!(height_time.to_vec()?[probe], 121.0);
-    let repeated = input.unfold2d_grouped(
+    let repeated = input.unfold_grouped(
         channel,
         [height, width],
         group.of(1),
@@ -879,7 +919,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
     let zero_patch = Axis::new("zero_patch");
     let zero_builds = Tensor::unfold_plan_build_count();
     for _ in 0..2 {
-        let all_padding = zero_input.unfold2d_grouped(
+        let all_padding = zero_input.unfold_grouped(
             channel,
             [height, width],
             zero_group.of(2),
@@ -1129,6 +1169,443 @@ fn configured_grouped_conv2d_matches_scalar_forward_and_all_gradients() -> Resul
         &padded.parameter("bias")?.grad().unwrap().to_vec()?,
         &[1.0],
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn configured_grouped_conv3d_matches_scalar_forward_and_all_gradients() -> Result<()> {
+    const BATCHES: usize = 1;
+    const CHANNELS: usize = 4;
+    const DEPTH: usize = 3;
+    const HEIGHT: usize = 4;
+    const WIDTH: usize = 5;
+    const OUTPUTS: usize = 6;
+    const GROUPS: usize = 2;
+    const KERNEL: [usize; 3] = [2, 2, 3];
+    const STRIDE: [usize; 3] = [1, 2, 1];
+    const PADDING: [usize; 3] = [1, 1, 2];
+    const OUTPUT_DEPTH: usize = 4;
+    const OUTPUT_HEIGHT: usize = 3;
+    const OUTPUT_WIDTH: usize = 7;
+    const CHANNELS_PER_GROUP: usize = CHANNELS / GROUPS;
+    const OUTPUTS_PER_GROUP: usize = OUTPUTS / GROUPS;
+    const PATCH: usize = CHANNELS_PER_GROUP * KERNEL[0] * KERNEL[1] * KERNEL[2];
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, depth, height, width, output) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let inputs: Vec<_> = (0..BATCHES * CHANNELS * DEPTH * HEIGHT * WIDTH)
+        .map(|i| ((i * 11 % 97) as f32 - 48.0) / 23.0)
+        .collect();
+    let weights: Vec<_> = (0..GROUPS * PATCH * OUTPUTS_PER_GROUP)
+        .map(|i| ((i * 13 % 41) as f32 - 20.0) / 29.0)
+        .collect();
+    let biases: Vec<_> = (0..OUTPUTS).map(|i| (i as f32 - 2.5) / 13.0).collect();
+    let input = Tensor::from_slice(
+        &inputs,
+        [
+            batch.of(BATCHES),
+            channel.of(CHANNELS),
+            depth.of(DEPTH),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+        ],
+        &device,
+    )?
+    .with_layout([width, batch, channel, depth, height])?
+    .with_grad();
+    let mut conv = Conv3d::new(channel, output.of(OUTPUTS), [depth, height, width], KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING)
+        .groups(GROUPS);
+    assert_eq!(
+        conv.build(input.shape(), &device, 41)?,
+        Shape::new([
+            batch.of(BATCHES),
+            depth.of(OUTPUT_DEPTH),
+            height.of(OUTPUT_HEIGHT),
+            width.of(OUTPUT_WIDTH),
+            output.of(OUTPUTS),
+        ])?
+    );
+    conv.parameter("weight")?.set_values(&weights)?;
+    conv.parameter("bias")?.set_values(&biases)?;
+
+    let mut expected =
+        vec![0.0_f64; BATCHES * OUTPUT_DEPTH * OUTPUT_HEIGHT * OUTPUT_WIDTH * OUTPUTS];
+    let mut input_gradient = vec![0.0_f64; inputs.len()];
+    let mut weight_gradient = vec![0.0_f64; weights.len()];
+    let mut bias_gradient = vec![0.0_f64; biases.len()];
+    let upstream = 1.0 / expected.len() as f64;
+    for n in 0..BATCHES {
+        for oz in 0..OUTPUT_DEPTH {
+            for oy in 0..OUTPUT_HEIGHT {
+                for ox in 0..OUTPUT_WIDTH {
+                    for oc in 0..OUTPUTS {
+                        let group = oc / OUTPUTS_PER_GROUP;
+                        let output_in_group = oc % OUTPUTS_PER_GROUP;
+                        let mut value = f64::from(biases[oc]);
+                        bias_gradient[oc] += upstream;
+                        for channel_in_group in 0..CHANNELS_PER_GROUP {
+                            let input_channel = group * CHANNELS_PER_GROUP + channel_in_group;
+                            for kz in 0..KERNEL[0] {
+                                for ky in 0..KERNEL[1] {
+                                    for kx in 0..KERNEL[2] {
+                                        let padded_z = oz * STRIDE[0] + kz;
+                                        let padded_y = oy * STRIDE[1] + ky;
+                                        let padded_x = ox * STRIDE[2] + kx;
+                                        let Some(iz) = padded_z.checked_sub(PADDING[0]) else {
+                                            continue;
+                                        };
+                                        let Some(iy) = padded_y.checked_sub(PADDING[1]) else {
+                                            continue;
+                                        };
+                                        let Some(ix) = padded_x.checked_sub(PADDING[2]) else {
+                                            continue;
+                                        };
+                                        if iz >= DEPTH || iy >= HEIGHT || ix >= WIDTH {
+                                            continue;
+                                        }
+                                        let input_index =
+                                            (((n * CHANNELS + input_channel) * DEPTH + iz)
+                                                * HEIGHT
+                                                + iy)
+                                                * WIDTH
+                                                + ix;
+                                        let patch =
+                                            ((channel_in_group * KERNEL[0] + kz) * KERNEL[1] + ky)
+                                                * KERNEL[2]
+                                                + kx;
+                                        let weight_index = (group * PATCH + patch)
+                                            * OUTPUTS_PER_GROUP
+                                            + output_in_group;
+                                        value += f64::from(inputs[input_index])
+                                            * f64::from(weights[weight_index]);
+                                        input_gradient[input_index] +=
+                                            upstream * f64::from(weights[weight_index]);
+                                        weight_gradient[weight_index] +=
+                                            upstream * f64::from(inputs[input_index]);
+                                    }
+                                }
+                            }
+                        }
+                        let output_index =
+                            ((((n * OUTPUT_DEPTH + oz) * OUTPUT_HEIGHT + oy) * OUTPUT_WIDTH + ox)
+                                * OUTPUTS)
+                                + oc;
+                        expected[output_index] = value;
+                    }
+                }
+            }
+        }
+    }
+
+    let plan_builds_before = Tensor::unfold_plan_build_count();
+    let actual = conv.forward(&input)?;
+    let plan_builds_after = Tensor::unfold_plan_build_count();
+    assert_eq!(plan_builds_after, plan_builds_before + 1);
+    close(
+        "configured grouped Conv3d forward",
+        &actual.to_vec()?,
+        &expected,
+    );
+    close(
+        "cached configured grouped Conv3d forward",
+        &conv.forward(&input)?.to_vec()?,
+        &expected,
+    );
+    assert_eq!(Tensor::unfold_plan_build_count(), plan_builds_after);
+    actual
+        .mean([batch, depth, height, width, output])?
+        .backward()?;
+    close(
+        "configured grouped Conv3d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &input_gradient,
+    );
+    close(
+        "configured grouped Conv3d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &weight_gradient,
+    );
+    close(
+        "configured grouped Conv3d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &bias_gradient,
+    );
+    let regrouped = conv.groups(1);
+    let error = regrouped
+        .output_shape(input.shape())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("built parameters"), "{error}");
+
+    // Every legal output window is wholly in padding, so the bias is the
+    // output and neither input nor weight receives a derivative.
+    let isolated = Tensor::from_slice(
+        &[3.0],
+        [channel.of(1), depth.of(1), height.of(1), width.of(1)],
+        &device,
+    )?
+    .with_grad();
+    let mut padded = Conv3d::new(channel, output.of(1), [depth, height, width], [1, 1, 1])
+        .stride([100, 100, 100])
+        .padding([10, 10, 10]);
+    padded.build(isolated.shape(), &device, 43)?;
+    padded.parameter("weight")?.set_values(&[2.0])?;
+    padded.parameter("bias")?.set_values(&[0.25])?;
+    let padded_result = padded.forward(&isolated)?;
+    close(
+        "all-padding Conv3d forward",
+        &padded_result.to_vec()?,
+        &[0.25],
+    );
+    padded_result
+        .mean([depth, height, width, output])?
+        .backward()?;
+    close(
+        "all-padding Conv3d input gradient",
+        &isolated.grad().unwrap().to_vec()?,
+        &[0.0],
+    );
+    close(
+        "all-padding Conv3d weight gradient",
+        &padded.parameter("weight")?.grad().unwrap().to_vec()?,
+        &[0.0],
+    );
+    close(
+        "all-padding Conv3d bias gradient",
+        &padded.parameter("bias")?.grad().unwrap().to_vec()?,
+        &[1.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn unfold3d_cache_distinguishes_equal_extent_spatial_axis_order() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width, time, group, patch) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("time"),
+        Axis::new("conv_group"),
+        Axis::new("conv_patch"),
+    );
+    let values: Vec<_> = (0..3)
+        .flat_map(|z| {
+            (0..3).flat_map(move |y| {
+                (0..3).flat_map(move |x| {
+                    (0..3).map(move |t| (1000 * z + 100 * y + 10 * x + t) as f32)
+                })
+            })
+        })
+        .collect();
+    let input = Tensor::from_slice(
+        &values,
+        [
+            channel.of(1),
+            depth.of(3),
+            height.of(3),
+            width.of(3),
+            time.of(3),
+        ],
+        &device,
+    )?;
+    let builds = Tensor::unfold_plan_build_count();
+    let depth_height_width = input.unfold_grouped(
+        channel,
+        [depth, height, width],
+        group.of(1),
+        patch.of(27),
+        [3, 3, 3],
+        [1, 1, 1],
+        [1, 1, 1],
+    )?;
+    assert_eq!(Tensor::unfold_plan_build_count(), builds + 1);
+    let depth_height_time = input.unfold_grouped(
+        channel,
+        [depth, height, time],
+        group.of(1),
+        patch.of(27),
+        [3, 3, 3],
+        [1, 1, 1],
+        [1, 1, 1],
+    )?;
+    assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
+
+    // Logical coordinate d=1,h=1,w=2,t=0 and patch kz=1,ky=1,kx=2.
+    // Selecting width reaches right padding; selecting time retains width=2
+    // and reads d=1,h=1,w=2,t=1.
+    let logical_index = |z: usize, y: usize, x: usize, t: usize, patch: usize| {
+        ((((z * 3 + y) * 3 + x) * 3 + t) * 27) + patch
+    };
+    let patch_index = 14; // kz=1, ky=1, kx=2
+    let probe = logical_index(1, 1, 2, 0, patch_index);
+    assert_eq!(depth_height_width.to_vec()?[probe], 0.0);
+    assert_eq!(depth_height_time.to_vec()?[probe], 1121.0);
+    let repeated = input.unfold_grouped(
+        channel,
+        [depth, height, width],
+        group.of(1),
+        patch.of(27),
+        [3, 3, 3],
+        [1, 1, 1],
+        [1, 1, 1],
+    )?;
+    assert_eq!(repeated.to_vec()?, depth_height_width.to_vec()?);
+    assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn conv3d_rejects_padded_extent_outside_kernel_index_range_atomically() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width, output) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 3.0],
+        [channel.of(1), depth.of(2), height.of(1), width.of(1)],
+        &device,
+    )?
+    .with_grad();
+    let mut overflowing = Conv3d::new(channel, output.of(1), [depth, height, width], [1, 1, 1])
+        .stride([1 << 30, 1, 1])
+        .padding([i32::MAX as usize, 0, 0]);
+    assert_eq!(
+        overflowing.build(input.shape(), &device, 47)?,
+        Shape::new([depth.of(4), height.of(1), width.of(1), output.of(1),])?
+    );
+    overflowing.parameter("weight")?.set_values(&[1.0])?;
+    let builds = Tensor::unfold_plan_build_count();
+    let error = overflowing.forward(&input).err().unwrap().to_string();
+    assert_eq!(
+        error,
+        "unfold3d padded spatial extent exceeds the i32 kernel index range"
+    );
+    assert_eq!(Tensor::unfold_plan_build_count(), builds);
+
+    let mut valid = Conv3d::new(channel, output.of(1), [depth, height, width], [1, 1, 1]);
+    valid.build(input.shape(), &device, 53)?;
+    valid.parameter("weight")?.set_values(&[1.0])?;
+    valid.parameter("bias")?.set_values(&[0.0])?;
+    let result = valid.forward(&input)?;
+    close(
+        "post-rejection Conv3d forward",
+        &result.to_vec()?,
+        &[1.0, 3.0],
+    );
+    result.mean([depth, height, width, output])?.backward()?;
+    close(
+        "post-rejection Conv3d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.5, 0.5],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn depthwise_conv3d_large_implicit_plan_completes_forward_and_backward() -> Result<()> {
+    const BATCHES: usize = 20;
+    const DEPTH: usize = 32;
+    const HEIGHT: usize = 32;
+    const WIDTH: usize = 32;
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, depth, height, width) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &vec![1.0; BATCHES * DEPTH * HEIGHT * WIDTH],
+        [
+            batch.of(BATCHES),
+            channel.of(1),
+            depth.of(DEPTH),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+        ],
+        &device,
+    )?
+    .with_grad();
+    let mut conv =
+        Conv3d::new(channel, channel.of(1), [depth, height, width], [3, 3, 3]).padding([1, 1, 1]);
+    conv.build(input.shape(), &device, 59)?;
+    conv.parameter("weight")?.set_values(&[1.0; 27])?;
+    conv.parameter("bias")?.set_values(&[0.25])?;
+
+    // The indexed lowering would need 20 * 32^3 * 27 = 17,694,720
+    // contributions and fail at the generic 16,777,216-plan cap.
+    let output = conv.forward(&input)?;
+    assert!(
+        Tensor::unfold_plan_metadata_max() <= 4 * (5 + 6),
+        "implicit unfold metadata must stay O(rank)"
+    );
+    assert_eq!(
+        output.shape(),
+        &Shape::new([
+            batch.of(BATCHES),
+            depth.of(DEPTH),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+            channel.of(1),
+        ])?
+    );
+    let values = output.to_vec()?;
+    for n in 0..BATCHES {
+        for z in 0..DEPTH {
+            let z_uses = if z == 0 || z + 1 == DEPTH { 2 } else { 3 };
+            for y in 0..HEIGHT {
+                let y_uses = if y == 0 || y + 1 == HEIGHT { 2 } else { 3 };
+                for x in 0..WIDTH {
+                    let x_uses = if x == 0 || x + 1 == WIDTH { 2 } else { 3 };
+                    let index = ((n * DEPTH + z) * HEIGHT + y) * WIDTH + x;
+                    assert_eq!(
+                        values[index],
+                        (z_uses * y_uses * x_uses) as f32 + 0.25,
+                        "output[{index}]"
+                    );
+                }
+            }
+        }
+    }
+    let loss = output.mean([batch, depth, height, width, channel])?;
+    assert!(loss.item()?.is_finite());
+    loss.backward()?;
+    // This stress witness checks bounded plan-free execution. The smaller
+    // scalar oracle above carries the precise all-gradient comparison; this
+    // generic FP32 reduction sums 655,360 contributions in one group.
+    let bias_gradient = conv.parameter("bias")?.grad().unwrap().to_vec()?[0];
+    assert!(
+        (bias_gradient - 1.0).abs() < 0.01,
+        "large depthwise Conv3d bias gradient: {bias_gradient}"
+    );
+    let input_gradient = input.grad().unwrap().to_vec()?;
+    let denominator = (BATCHES * DEPTH * HEIGHT * WIDTH) as f64;
+    for (index, &gradient) in input_gradient.iter().enumerate() {
+        assert!(gradient.is_finite(), "input gradient[{index}]");
+        assert!(f64::from(gradient) >= 8.0 / denominator);
+        assert!(f64::from(gradient) <= 27.0 / denominator);
+    }
     Ok(())
 }
 

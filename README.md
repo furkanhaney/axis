@@ -115,11 +115,11 @@ throughput success claim.
   and squared error.
 - Reverse-mode differentiation with parameter version checks and explicit
   scalar loss reduction.
-- `Linear`, `PopulationLinear`, `Conv2d` with stride, symmetric padding, and
-  grouped/depthwise channels; named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
-  and stateless `InstanceNorm`; `ReLU`, `GELU`, and `Sequential`.
-- Compact implicit Conv2d patch extraction and deterministic col2im, including
-  plans larger than the generic 16,777,216-contribution ceiling.
+- `Linear`, `PopulationLinear`, `Conv2d`, and `Conv3d` with stride, symmetric
+  padding, and grouped/depthwise channels; named-axis `LayerNorm`, `RmsNorm`,
+  `GroupNorm`, and stateless `InstanceNorm`; `ReLU`, `GELU`, and `Sequential`.
+- Compact implicit 2D/3D patch extraction and deterministic col2im, including
+  patch tensors larger than the generic 16,777,216-contribution ceiling.
 - Device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon. Adam
   can assign one learning rate to each member of a named population axis; Muon
   partitions are explicit and send the exact remainder to AdamW.
@@ -137,6 +137,9 @@ synchronizes once at the step boundary. Single-axis contractions use batched
 tiled GEMM; multi-axis contractions retain the generic gather/reduce path.
 Repeated shapes reuse their CPU and bounded device-side layout/reduction plans.
 FP32 is the default, with an explicit BF16-matrix/FP32-state device policy.
+Convolution materializes FP32 patch tensors before contraction; volumetric
+patches can therefore dominate memory, and later generic layout/broadcast
+operations retain their own index-plan limits.
 Set `AXIS_PROFILE=1` to print Trainer phases, tensor planning, submission, read,
 and synchronization timings while investigating a workload. These are host
 wall times, not CUDA kernel durations; see the [execution profile](docs/backend/execution.md).

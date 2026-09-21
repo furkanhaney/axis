@@ -11,6 +11,8 @@ mod backend;
 #[cfg(all(not(feature = "cuda"), axis_docs_rs))]
 #[path = "runtime/backend_docs.rs"]
 mod backend;
+#[path = "model/convolution.rs"]
+mod convolution;
 #[path = "research/data.rs"]
 mod data;
 #[path = "research/disjointness.rs"]
@@ -38,6 +40,7 @@ mod train;
 
 pub use axis::{Axis, Dim, IntoAxes, Shape};
 pub use backend::Device;
+pub use convolution::{Conv2d, Conv3d};
 pub use data::{
     AdditionDataset, AdditionSample, Batch, DataLoader, DataRegimeReceipt, DataSource,
     FinitePassesLoader, InMemoryDataset, Sample,
@@ -55,8 +58,7 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    Conv2d, GELU, IntoLayers, Linear, Module, ParamId, Parameter, PopulationLinear, ReLU,
-    Sequential,
+    GELU, IntoLayers, Linear, Module, ParamId, Parameter, PopulationLinear, ReLU, Sequential,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
@@ -80,14 +82,15 @@ mod tests;
 pub mod prelude {
     pub use crate::{
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy, Conv2d,
-        DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness, DisjointnessEvidence,
-        DisjointnessReceipt, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, FinitePasses,
-        FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme, Idr, IdrLimits,
-        IdrReceipt, InMemoryDataset, InstanceNorm, LayerNorm, LearningDirection, LearningEvidence,
-        LearningLimits, LearningObservation, LearningProgress, LearningProgressReceipt, Linear,
-        Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
-        MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
-        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, RmsNorm, SGD, Sample,
-        Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
+        Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness,
+        DisjointnessEvidence, DisjointnessReceipt, EmpiricalMonotonicity,
+        EmpiricalMonotonicityReceipt, FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU,
+        GroupNorm, IdentityScheme, Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm,
+        LayerNorm, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
+        LearningProgress, LearningProgressReceipt, Linear, Module, MonotoneDirection,
+        MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer,
+        ParamId, Parameter, PopulationLinear, PopulationMode, PopulationReceipt, PopulationSpec,
+        ReLU, RegimeSnapshot, Result, RmsNorm, SGD, Sample, Sequential, Shape, SinglePass,
+        Standardizer, Tensor, TrainStep, Trainer,
     };
 }

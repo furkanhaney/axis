@@ -531,64 +531,129 @@ impl Device {
         Ok(self.track(out))
     }
 
-    pub(crate) fn unfold2d(&self, input: &Buffer, spec: &Unfold2dSpec) -> Result<Buffer> {
+    pub(crate) fn unfold(&self, input: &Buffer, spec: &UnfoldSpec) -> Result<Buffer> {
         let metadata = self.upload_i32(&spec.forward_metadata)?;
         let mut out = self.zeros(spec.output_len)?;
-        unsafe {
-            kernels::unfold2d(
-                (&mut out).partition([128]),
-                input.as_ref().device_pointer(),
-                metadata.as_ref(),
-                spec.output_len as i32,
-                spec.output_rank,
-                spec.channels_per_group,
-                spec.kernel[0],
-                spec.kernel[1],
-                spec.stride[0],
-                spec.stride[1],
-                spec.padding[0],
-                spec.padding[1],
-                spec.input_spatial[0],
-                spec.input_spatial[1],
-                spec.input_special_strides[0],
-                spec.input_special_strides[1],
-                spec.input_special_strides[2],
-            )
+        match spec.spatial_rank {
+            2 => {
+                unsafe {
+                    kernels::unfold2d(
+                        (&mut out).partition([128]),
+                        input.as_ref().device_pointer(),
+                        metadata.as_ref(),
+                        spec.output_len as i32,
+                        spec.output_rank,
+                        spec.channels_per_group,
+                        spec.kernel[0],
+                        spec.kernel[1],
+                        spec.stride[0],
+                        spec.stride[1],
+                        spec.padding[0],
+                        spec.padding[1],
+                        spec.input_spatial[0],
+                        spec.input_spatial[1],
+                        spec.input_special_strides[0],
+                        spec.input_special_strides[1],
+                        spec.input_special_strides[2],
+                    )
+                }
+                .enqueue_on(&self.0.stream)?;
+            }
+            3 => {
+                unsafe {
+                    kernels::unfold3d(
+                        (&mut out).partition([128]),
+                        input.as_ref().device_pointer(),
+                        metadata.as_ref(),
+                        spec.output_len as i32,
+                        spec.output_rank,
+                        spec.channels_per_group,
+                        spec.kernel[0],
+                        spec.kernel[1],
+                        spec.kernel[2],
+                        spec.stride[0],
+                        spec.stride[1],
+                        spec.stride[2],
+                        spec.padding[0],
+                        spec.padding[1],
+                        spec.padding[2],
+                        spec.input_spatial[0],
+                        spec.input_spatial[1],
+                        spec.input_spatial[2],
+                        spec.input_special_strides[0],
+                        spec.input_special_strides[1],
+                        spec.input_special_strides[2],
+                        spec.input_special_strides[3],
+                    )
+                }
+                .enqueue_on(&self.0.stream)?;
+            }
+            _ => return Err("unfold supports exactly two or three spatial axes".into()),
         }
-        .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
 
-    pub(crate) fn unfold2d_backward(
-        &self,
-        gradient: &Buffer,
-        spec: &Unfold2dSpec,
-    ) -> Result<Buffer> {
+    pub(crate) fn unfold_backward(&self, gradient: &Buffer, spec: &UnfoldSpec) -> Result<Buffer> {
         let metadata = self.upload_i32(&spec.backward_metadata)?;
         let mut out = self.zeros(spec.input_len)?;
-        unsafe {
-            kernels::unfold2d_backward(
-                (&mut out).partition([128]),
-                gradient.as_ref().device_pointer(),
-                metadata.as_ref(),
-                spec.input_len as i32,
-                spec.input_rank,
-                spec.channels_per_group,
-                spec.kernel[0],
-                spec.kernel[1],
-                spec.stride[0],
-                spec.stride[1],
-                spec.padding[0],
-                spec.padding[1],
-                spec.output_spatial[0],
-                spec.output_spatial[1],
-                spec.output_special_strides[0],
-                spec.output_special_strides[1],
-                spec.output_special_strides[2],
-                spec.output_special_strides[3],
-            )
+        match spec.spatial_rank {
+            2 => {
+                unsafe {
+                    kernels::unfold2d_backward(
+                        (&mut out).partition([128]),
+                        gradient.as_ref().device_pointer(),
+                        metadata.as_ref(),
+                        spec.input_len as i32,
+                        spec.input_rank,
+                        spec.channels_per_group,
+                        spec.kernel[0],
+                        spec.kernel[1],
+                        spec.stride[0],
+                        spec.stride[1],
+                        spec.padding[0],
+                        spec.padding[1],
+                        spec.output_spatial[0],
+                        spec.output_spatial[1],
+                        spec.output_special_strides[0],
+                        spec.output_special_strides[1],
+                        spec.output_special_strides[3],
+                        spec.output_special_strides[4],
+                    )
+                }
+                .enqueue_on(&self.0.stream)?;
+            }
+            3 => {
+                unsafe {
+                    kernels::unfold3d_backward(
+                        (&mut out).partition([128]),
+                        gradient.as_ref().device_pointer(),
+                        metadata.as_ref(),
+                        spec.input_len as i32,
+                        spec.input_rank,
+                        spec.channels_per_group,
+                        spec.kernel[0],
+                        spec.kernel[1],
+                        spec.kernel[2],
+                        spec.stride[0],
+                        spec.stride[1],
+                        spec.stride[2],
+                        spec.padding[0],
+                        spec.padding[1],
+                        spec.padding[2],
+                        spec.output_spatial[0],
+                        spec.output_spatial[1],
+                        spec.output_spatial[2],
+                        spec.output_special_strides[0],
+                        spec.output_special_strides[1],
+                        spec.output_special_strides[2],
+                        spec.output_special_strides[3],
+                        spec.output_special_strides[4],
+                    )
+                }
+                .enqueue_on(&self.0.stream)?;
+            }
+            _ => return Err("unfold supports exactly two or three spatial axes".into()),
         }
-        .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
 
@@ -670,7 +735,8 @@ impl Device {
 /// Compact convolution patch geometry. Per-element source indices are computed
 /// by the kernels, so storage grows with tensor rank rather than patch count.
 #[derive(Clone)]
-pub(crate) struct Unfold2dSpec {
+pub(crate) struct UnfoldSpec {
+    pub spatial_rank: i32,
     pub input_len: usize,
     pub output_len: usize,
     pub input_rank: i32,
@@ -678,16 +744,16 @@ pub(crate) struct Unfold2dSpec {
     pub forward_metadata: Vec<i32>,
     pub backward_metadata: Vec<i32>,
     pub channels_per_group: i32,
-    pub kernel: [i32; 2],
-    pub stride: [i32; 2],
-    pub padding: [i32; 2],
-    pub input_spatial: [i32; 2],
-    pub output_spatial: [i32; 2],
-    pub input_special_strides: [i32; 3],
-    pub output_special_strides: [i32; 4],
+    pub kernel: [i32; 3],
+    pub stride: [i32; 3],
+    pub padding: [i32; 3],
+    pub input_spatial: [i32; 3],
+    pub output_spatial: [i32; 3],
+    pub input_special_strides: [i32; 4],
+    pub output_special_strides: [i32; 5],
 }
 
-impl Unfold2dSpec {
+impl UnfoldSpec {
     #[cfg(test)]
     pub(crate) fn metadata_len(&self) -> usize {
         self.forward_metadata.len() + self.backward_metadata.len()
@@ -861,6 +927,108 @@ mod kernels {
     }
 
     #[cutile::entry()]
+    unsafe fn unfold3d(
+        out: &mut Tensor<f32, { [128] }>,
+        input: *const f32,
+        metadata: &Tensor<i32, { [-1] }>,
+        output_len: i32,
+        rank: i32,
+        channels_per_group: i32,
+        kernel_z: i32,
+        kernel_y: i32,
+        kernel_x: i32,
+        stride_z: i32,
+        stride_y: i32,
+        stride_x: i32,
+        padding_z: i32,
+        padding_y: i32,
+        padding_x: i32,
+        input_depth: i32,
+        input_height: i32,
+        input_width: i32,
+        input_channel_stride: i32,
+        input_depth_stride: i32,
+        input_height_stride: i32,
+        input_width_stride: i32,
+    ) {
+        let output_index: Tile<i32, { [128] }> =
+            iota(shape![128]) + broadcast_scalar(get_tile_block_id().0 * 128i32, shape![128]);
+        let live = lt_tile(output_index, broadcast_scalar(output_len, shape![128]));
+        let mp = metadata.partition(shape![1]);
+        let mut input_index = constant(0i32, shape![128]);
+        let mut output_z = constant(0i32, shape![128]);
+        let mut output_y = constant(0i32, shape![128]);
+        let mut output_x = constant(0i32, shape![128]);
+        let mut group = constant(0i32, shape![128]);
+        let mut patch = constant(0i32, shape![128]);
+        for dimension in 0i32..rank {
+            let base = dimension * 4i32;
+            let extent: i32 = tile_to_scalar(mp.load([base]).reshape(shape![]));
+            let output_stride: i32 = tile_to_scalar(mp.load([base + 1i32]).reshape(shape![]));
+            let input_stride: i32 = tile_to_scalar(mp.load([base + 2i32]).reshape(shape![]));
+            let role: i32 = tile_to_scalar(mp.load([base + 3i32]).reshape(shape![]));
+            let coordinate = (output_index / broadcast_scalar(output_stride, shape![128]))
+                % broadcast_scalar(extent, shape![128]);
+            if role == 0i32 {
+                input_index =
+                    input_index + coordinate * broadcast_scalar(input_stride, shape![128]);
+            } else if role == 1i32 {
+                output_z = coordinate;
+            } else if role == 2i32 {
+                output_y = coordinate;
+            } else if role == 3i32 {
+                output_x = coordinate;
+            } else if role == 4i32 {
+                group = coordinate;
+            } else {
+                patch = coordinate;
+            }
+        }
+        let kernel_column = patch % broadcast_scalar(kernel_x, shape![128]);
+        let rest = patch / broadcast_scalar(kernel_x, shape![128]);
+        let kernel_row = rest % broadcast_scalar(kernel_y, shape![128]);
+        let rest = rest / broadcast_scalar(kernel_y, shape![128]);
+        let kernel_depth = rest % broadcast_scalar(kernel_z, shape![128]);
+        let channel_in_group = rest / broadcast_scalar(kernel_z, shape![128]);
+        let channel = group * broadcast_scalar(channels_per_group, shape![128]) + channel_in_group;
+        let input_z = output_z * broadcast_scalar(stride_z, shape![128]) + kernel_depth
+            - broadcast_scalar(padding_z, shape![128]);
+        let input_y = output_y * broadcast_scalar(stride_y, shape![128]) + kernel_row
+            - broadcast_scalar(padding_y, shape![128]);
+        let input_x = output_x * broadcast_scalar(stride_x, shape![128]) + kernel_column
+            - broadcast_scalar(padding_x, shape![128]);
+        let zero = constant(0i32, shape![128]);
+        let valid = live
+            & ge_tile(input_z, zero)
+            & lt_tile(input_z, broadcast_scalar(input_depth, shape![128]))
+            & ge_tile(input_y, zero)
+            & lt_tile(input_y, broadcast_scalar(input_height, shape![128]))
+            & ge_tile(input_x, zero)
+            & lt_tile(input_x, broadcast_scalar(input_width, shape![128]));
+        input_index = input_index
+            + channel * broadcast_scalar(input_channel_stride, shape![128])
+            + input_z * broadcast_scalar(input_depth_stride, shape![128])
+            + input_y * broadcast_scalar(input_height_stride, shape![128])
+            + input_x * broadcast_scalar(input_width_stride, shape![128]);
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(input);
+        let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const f32, { [128] }> = base.broadcast(shape![128]);
+        let addresses = addptr_tile(base, select(valid, input_index, zero));
+        let (values, _token): (Tile<f32, { [128] }>, Token) = unsafe {
+            load_ptr_tko(
+                addresses,
+                ordering::Relaxed,
+                Some(scope::Device),
+                Some(valid),
+                Some(0.0f32),
+                None,
+                Latency::<0>,
+            )
+        };
+        out.store(values);
+    }
+
+    #[cutile::entry()]
     unsafe fn unfold2d_backward(
         out: &mut Tensor<f32, { [128] }>,
         gradient: *const f32,
@@ -956,6 +1124,123 @@ mod kernels {
         }
         out.store(sum);
     }
+    #[cutile::entry()]
+    unsafe fn unfold3d_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: *const f32,
+        metadata: &Tensor<i32, { [-1] }>,
+        input_len: i32,
+        rank: i32,
+        channels_per_group: i32,
+        kernel_z: i32,
+        kernel_y: i32,
+        kernel_x: i32,
+        stride_z: i32,
+        stride_y: i32,
+        stride_x: i32,
+        padding_z: i32,
+        padding_y: i32,
+        padding_x: i32,
+        output_depth: i32,
+        output_height: i32,
+        output_width: i32,
+        output_depth_stride: i32,
+        output_height_stride: i32,
+        output_width_stride: i32,
+        output_group_stride: i32,
+        output_patch_stride: i32,
+    ) {
+        let input_index: Tile<i32, { [128] }> =
+            iota(shape![128]) + broadcast_scalar(get_tile_block_id().0 * 128i32, shape![128]);
+        let live = lt_tile(input_index, broadcast_scalar(input_len, shape![128]));
+        let mp = metadata.partition(shape![1]);
+        let mut output_base = constant(0i32, shape![128]);
+        let mut channel = constant(0i32, shape![128]);
+        let mut input_z = constant(0i32, shape![128]);
+        let mut input_y = constant(0i32, shape![128]);
+        let mut input_x = constant(0i32, shape![128]);
+        for dimension in 0i32..rank {
+            let base = dimension * 4i32;
+            let extent: i32 = tile_to_scalar(mp.load([base]).reshape(shape![]));
+            let input_stride: i32 = tile_to_scalar(mp.load([base + 1i32]).reshape(shape![]));
+            let output_stride: i32 = tile_to_scalar(mp.load([base + 2i32]).reshape(shape![]));
+            let role: i32 = tile_to_scalar(mp.load([base + 3i32]).reshape(shape![]));
+            let coordinate = (input_index / broadcast_scalar(input_stride, shape![128]))
+                % broadcast_scalar(extent, shape![128]);
+            if role == 0i32 {
+                output_base =
+                    output_base + coordinate * broadcast_scalar(output_stride, shape![128]);
+            } else if role == 1i32 {
+                channel = coordinate;
+            } else if role == 2i32 {
+                input_z = coordinate;
+            } else if role == 3i32 {
+                input_y = coordinate;
+            } else {
+                input_x = coordinate;
+            }
+        }
+        let group = channel / broadcast_scalar(channels_per_group, shape![128]);
+        let channel_in_group = channel % broadcast_scalar(channels_per_group, shape![128]);
+        let gradient_base: PointerTile<*const f32, { [] }> = pointer_to_tile(gradient);
+        let gradient_base: PointerTile<*const f32, { [1] }> = gradient_base.reshape(shape![1]);
+        let gradient_base: PointerTile<*const f32, { [128] }> =
+            gradient_base.broadcast(shape![128]);
+        let mut sum = constant(0.0f32, shape![128]);
+        let zero: Tile<i32, { [128] }> = constant(0i32, shape![128]);
+        for kernel_depth in 0i32..kernel_z {
+            let padded_z = input_z + broadcast_scalar(padding_z - kernel_depth, shape![128]);
+            let output_z = padded_z / broadcast_scalar(stride_z, shape![128]);
+            let valid_z = ge_tile(padded_z, zero)
+                & eq_tile(padded_z % broadcast_scalar(stride_z, shape![128]), zero)
+                & lt_tile(output_z, broadcast_scalar(output_depth, shape![128]));
+            for kernel_row in 0i32..kernel_y {
+                let padded_y = input_y + broadcast_scalar(padding_y - kernel_row, shape![128]);
+                let output_y = padded_y / broadcast_scalar(stride_y, shape![128]);
+                let valid_y = valid_z
+                    & ge_tile(padded_y, zero)
+                    & eq_tile(padded_y % broadcast_scalar(stride_y, shape![128]), zero)
+                    & lt_tile(output_y, broadcast_scalar(output_height, shape![128]));
+                for kernel_column in 0i32..kernel_x {
+                    let padded_x =
+                        input_x + broadcast_scalar(padding_x - kernel_column, shape![128]);
+                    let output_x = padded_x / broadcast_scalar(stride_x, shape![128]);
+                    let valid = live
+                        & valid_y
+                        & ge_tile(padded_x, zero)
+                        & eq_tile(padded_x % broadcast_scalar(stride_x, shape![128]), zero)
+                        & lt_tile(output_x, broadcast_scalar(output_width, shape![128]));
+                    let patch = ((channel_in_group * broadcast_scalar(kernel_z, shape![128])
+                        + broadcast_scalar(kernel_depth, shape![128]))
+                        * broadcast_scalar(kernel_y, shape![128])
+                        + broadcast_scalar(kernel_row, shape![128]))
+                        * broadcast_scalar(kernel_x, shape![128])
+                        + broadcast_scalar(kernel_column, shape![128]);
+                    let output_index = output_base
+                        + output_z * broadcast_scalar(output_depth_stride, shape![128])
+                        + output_y * broadcast_scalar(output_height_stride, shape![128])
+                        + output_x * broadcast_scalar(output_width_stride, shape![128])
+                        + group * broadcast_scalar(output_group_stride, shape![128])
+                        + patch * broadcast_scalar(output_patch_stride, shape![128]);
+                    let addresses = addptr_tile(gradient_base, select(valid, output_index, zero));
+                    let (values, _token): (Tile<f32, { [128] }>, Token) = unsafe {
+                        load_ptr_tko(
+                            addresses,
+                            ordering::Relaxed,
+                            Some(scope::Device),
+                            Some(valid),
+                            Some(0.0f32),
+                            None,
+                            Latency::<0>,
+                        )
+                    };
+                    sum = sum + values;
+                }
+            }
+        }
+        out.store(sum);
+    }
+
     #[cutile::entry()]
     fn sum_squares_tiles<const TILE_WIDTH: i32>(
         out: &mut Tensor<f32, { [1] }>,
