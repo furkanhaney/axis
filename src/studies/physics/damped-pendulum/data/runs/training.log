@@ -1,27 +1,29 @@
 initial angle_rmse_rad=1.62756939 angular_velocity_rmse_rad_s=1.60544326
-step=1 samples=64 pre_update_physics_loss=90.23743439
-step=250 samples=16000 pre_update_physics_loss=14.99226952
-step=500 samples=32000 pre_update_physics_loss=4.30715466
-step=750 samples=48000 pre_update_physics_loss=3.87323880
-step=1000 samples=64000 pre_update_physics_loss=2.67446733
-step=1250 samples=80000 pre_update_physics_loss=2.09825802
-step=1500 samples=96000 pre_update_physics_loss=1.34092426
-step=1750 samples=112000 pre_update_physics_loss=0.66649133
-step=2000 samples=128000 pre_update_physics_loss=0.23753853
-step=2250 samples=144000 pre_update_physics_loss=0.05419580
-step=2500 samples=160000 pre_update_physics_loss=0.01872090
-step=2750 samples=176000 pre_update_physics_loss=0.00890181
-step=3000 samples=192000 pre_update_physics_loss=0.00799689
-step=3250 samples=208000 pre_update_physics_loss=0.00773735
-step=3500 samples=224000 pre_update_physics_loss=0.00868825
-step=3750 samples=240000 pre_update_physics_loss=0.00733237
-step=4000 samples=256000 pre_update_physics_loss=0.00486915
-final angle_rmse_rad=0.00291016 angular_velocity_rmse_rad_s=0.00890289 elapsed_s=16.00
+step=1 samples=64 pre_update_physics_loss=90.07770538
+step=250 samples=16000 pre_update_physics_loss=44.91025162
+step=500 samples=32000 pre_update_physics_loss=4.18910360
+step=750 samples=48000 pre_update_physics_loss=2.83739781
+step=1000 samples=64000 pre_update_physics_loss=1.82541227
+step=1250 samples=80000 pre_update_physics_loss=0.86933362
+step=1500 samples=96000 pre_update_physics_loss=0.31744719
+step=1750 samples=112000 pre_update_physics_loss=0.16786692
+step=2000 samples=128000 pre_update_physics_loss=0.08013867
+step=2250 samples=144000 pre_update_physics_loss=0.04150757
+step=2500 samples=160000 pre_update_physics_loss=0.01847369
+step=2750 samples=176000 pre_update_physics_loss=0.00722458
+step=3000 samples=192000 pre_update_physics_loss=0.00318719
+step=3250 samples=208000 pre_update_physics_loss=0.00260809
+step=3500 samples=224000 pre_update_physics_loss=0.00239858
+step=3750 samples=240000 pre_update_physics_loss=0.00348914
+step=4000 samples=256000 pre_update_physics_loss=0.00201496
+final angle_rmse_rad=0.00749136 angular_velocity_rmse_rad_s=0.01102462 elapsed_s=15.66
 IDR STATUS
 
 samples consumed:      256000
 unique sample IDs:     256000
-available population:  generated stream
+available population:  4194100
+coverage:              6.10%
+max coverage:          10.00%
 observed reuse:         0.0000%
 max observed reuse:     0.0000%
 
@@ -43,9 +45,9 @@ evaluation population:        fixed held-out time grid
 direction:                    decrease
 observations:                 2
 baseline:                     1.62756939 at 0 optimizer steps
-terminal:                     0.00291016 at 4000 optimizer steps
-absolute improvement:         1.62465924
-relative improvement:         99.8212%
+terminal:                     0.00749136 at 4000 optimizer steps
+absolute improvement:         1.62007804
+relative improvement:         99.5397%
 minimum absolute improvement: 0.00000000
 minimum relative improvement: 95.0000%
 budget delta:                 4000 optimizer steps
@@ -60,9 +62,9 @@ evaluation population:        fixed held-out time grid
 direction:                    decrease
 observations:                 2
 baseline:                     1.60544326 at 0 optimizer steps
-terminal:                     0.00890289 at 4000 optimizer steps
-absolute improvement:         1.59654037
-relative improvement:         99.4455%
+terminal:                     0.01102462 at 4000 optimizer steps
+absolute improvement:         1.59441865
+relative improvement:         99.3133%
 minimum absolute improvement: 0.00000000
 minimum relative improvement: 95.0000%
 budget delta:                 4000 optimizer steps
@@ -101,8 +103,8 @@ observations:              1
 violations:                0
 violation rate:            0.0000%
 maximum allowed rate:      0.0000%
-maximum |residual|:        0.00007451
-RMS residual:              0.00007451
+maximum |residual|:        0.00004768
+RMS residual:              0.00004768
 absolute tolerance:        0.00010000
 claim:                     empirical
 evidence:                  verified sampled discretized observations
@@ -121,9 +123,9 @@ observations:              255
 violations:                0
 violation rate:            0.0000%
 maximum allowed rate:      0.0000%
-maximum |residual|:        0.29985142
-RMS residual:              0.07254200
-absolute tolerance:        0.35000000
+maximum |residual|:        0.19565988
+RMS residual:              0.07986000
+absolute tolerance:        0.25000000
 claim:                     empirical
 evidence:                  verified sampled discretized observations
 

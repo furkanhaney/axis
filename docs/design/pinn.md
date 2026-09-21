@@ -82,7 +82,10 @@ damped-pendulum law
   \theta''(t)+\gamma\theta'(t)+\frac{g}{L}\sin\theta(t)=0,
 \]
 
-using centered first and second derivatives over generated interior points.
+using centered first and second derivatives over a finite shuffled lattice of
+interior points. Exact `f32` center coordinates are the sample identities; the
+run remains below 10% declared coverage and excludes the held-out stencil
+support before training.
 The parameterization
 `theta(t) = theta_0 + omega_0*t + t^2*N(t)` supplies the initial conditions by
 construction. `Tanh` provides the smooth network activation and `Tensor::sin`

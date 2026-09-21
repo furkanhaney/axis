@@ -20,9 +20,11 @@ bash src/studies/physics/damped-pendulum/scripts/train.sh
 
 The smoke command checks the complete CUDA training path without claiming that
 five updates satisfy the scientific limits. The default run performs 4,000
-Adam updates over 256,000 fresh, exact `f32` center-coordinate identities, then
-applies the declared residual gates on a fixed 255-point interior grid. The
-generator rejects center reuse and every train/evaluation stencil overlap.
+Adam updates over 256,000 fresh, exact `f32` center-coordinate identities from
+an explicitly finite shuffled lattice, then applies the declared residual gates
+on a fixed 255-point interior grid. The source declares its available population
+and a 10% maximum coverage; the measured run uses about 6.1%. It rejects every
+train/evaluation stencil overlap and ends rather than wrapping at exhaustion.
 
 ```mermaid
 flowchart LR
@@ -49,12 +51,12 @@ the declared finite-difference evaluator. Neither silently promotes the
 construction into a claim about other laws.
 
 On the checked-in deterministic run, held-out angle RMSE fell from `1.62756939`
-to `0.00291016` radians and angular-velocity RMSE fell from `1.60544326` to
-`0.00890289` radians/second against an independent f64 RK4 solver. The executable
+to `0.00749136` radians and angular-velocity RMSE fell from `1.60544326` to
+`0.01102462` radians/second against an independent f64 RK4 solver. The executable
 requires at least 95% improvement plus absolute gates of `0.01` radians and
 `0.02` radians/second. The dynamics audit observed 255 points: RMS residual
-`0.07254200` radians/second², maximum absolute residual `0.29985142`, and no
-observation exceeded the strict `0.35` radians/second² tolerance. The receipt
+`0.07986000` radians/second², maximum absolute residual `0.19565988`, and no
+observation exceeded the strict `0.25` radians/second² tolerance. The receipt
 covers sampled discretized observations,
 not the continuous interval between them. See
 [the complete run](data/runs/training.log).

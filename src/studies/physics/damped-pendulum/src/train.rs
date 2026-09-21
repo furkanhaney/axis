@@ -11,6 +11,7 @@ const END_TIME: f32 = 2.0;
 const DIFFERENCE_STEP: f32 = 1e-2;
 const TRAIN_SEED: u64 = 0x5049_4e4e;
 const EVALUATION_POINTS: usize = 257;
+const COLLOCATION_POPULATION: u64 = 1 << 22;
 const MAX_ANGLE_RMSE: f64 = 0.01;
 const MAX_ANGULAR_VELOCITY_RMSE: f64 = 0.02;
 
@@ -26,12 +27,12 @@ struct CollocationStream {
     seed: u64,
     next_id: u64,
     excluded_coordinates: HashSet<u32>,
-    seen_centers: HashSet<u32>,
+    available: usize,
 }
 
 impl CollocationStream {
     fn new(seed: u64) -> Self {
-        let excluded_coordinates = evaluation_times()
+        let excluded_coordinates: HashSet<u32> = evaluation_times()
             .into_iter()
             .flat_map(|time| {
                 [
@@ -41,19 +42,32 @@ impl CollocationStream {
                 ]
             })
             .collect();
+        let excluded = (0..COLLOCATION_POPULATION)
+            .filter(|draw| {
+                let time = Self::coordinate(seed, *draw);
+                [
+                    (time - DIFFERENCE_STEP).to_bits(),
+                    time.to_bits(),
+                    (time + DIFFERENCE_STEP).to_bits(),
+                ]
+                .iter()
+                .any(|coordinate| excluded_coordinates.contains(coordinate))
+            })
+            .count();
         Self {
             seed,
             next_id: 0,
             excluded_coordinates,
-            seen_centers: HashSet::new(),
+            available: usize::try_from(COLLOCATION_POPULATION).expect("population fits usize")
+                - excluded,
         }
     }
 
-    fn mix(mut value: u64) -> u64 {
-        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
+    fn coordinate(seed: u64, draw: u64) -> f32 {
+        let mask = COLLOCATION_POPULATION - 1;
+        let lattice_index = draw.wrapping_mul(0x9e37_79b9).wrapping_add(seed) & mask;
+        let unit = lattice_index as f32 / mask as f32;
+        DIFFERENCE_STEP + unit * (END_TIME - 2.0 * DIFFERENCE_STEP)
     }
 }
 
@@ -62,13 +76,15 @@ impl DataSource for CollocationStream {
 
     fn next_sample(&mut self) -> Result<Option<Sample<Self::Item>>> {
         loop {
+            if self.next_id == COLLOCATION_POPULATION {
+                return Ok(None);
+            }
             let draw = self.next_id;
             self.next_id = self
                 .next_id
                 .checked_add(1)
                 .ok_or("collocation identity space exhausted")?;
-            let unit = (Self::mix(self.seed ^ draw) >> 40) as f32 / (1_u32 << 24) as f32;
-            let time = DIFFERENCE_STEP + unit * (END_TIME - 2.0 * DIFFERENCE_STEP);
+            let time = Self::coordinate(self.seed, draw);
             let support = [
                 (time - DIFFERENCE_STEP).to_bits(),
                 time.to_bits(),
@@ -80,19 +96,15 @@ impl DataSource for CollocationStream {
             {
                 continue;
             }
-            let identity = time.to_bits();
-            if !self.seen_centers.insert(identity) {
-                continue;
-            }
             return Ok(Some(Sample {
-                id: u128::from(identity),
+                id: u128::from(time.to_bits()),
                 value: time,
             }));
         }
     }
 
     fn available(&self) -> Option<usize> {
-        None
+        Some(self.available)
     }
 }
 
@@ -229,7 +241,7 @@ fn residual_receipts(
     let centers = evaluation_times()[1..EVALUATION_POINTS - 1].to_vec();
     let dynamic = dynamics_residual(model, &centers, axes, initial_angle, device)?;
     let law = LawIdentity::new("nonlinear damped pendulum", "caliper-r5@1")?;
-    let limits = ResidualLimits::strict(0.35)?;
+    let limits = ResidualLimits::strict(0.25)?;
     let evaluator = format!("fp32 second-order central difference; h={DIFFERENCE_STEP} seconds");
     let region = format!("fixed held-out grid; 0 < t < {END_TIME} seconds; residual unit rad/s^2");
     let mut initial_angle_check = EmpiricalResidual::new(
@@ -362,7 +374,7 @@ fn run_experiment(steps: usize, smoke: bool) -> Result<()> {
         )?,
     )?;
     let mut loader = DataLoader::new(CollocationStream::new(TRAIN_SEED), BATCH)?
-        .assert_idr(IdrLimits::generated(0.0)?)?;
+        .assert_idr(IdrLimits::fixed(0.1, 0.0)?)?;
     let mut disjoint = Disjointness::new(
         IdentityScheme::new(
             "pendulum-collocation-coordinate",
@@ -388,7 +400,9 @@ fn run_experiment(steps: usize, smoke: bool) -> Result<()> {
     let started = Instant::now();
     let mut final_regime = None;
     for _ in 0..steps {
-        let batch = loader.next_batch()?.expect("generated stream never ends");
+        let batch = loader
+            .next_batch()?
+            .ok_or("collocation population exhausted before the training budget")?;
         disjoint.observe(
             "training",
             batch.samples.iter().flat_map(|time| {
@@ -468,7 +482,9 @@ mod tests {
 
     #[test]
     fn generated_stencils_exclude_the_sealed_evaluation_support() -> Result<()> {
-        let excluded = CollocationStream::new(TRAIN_SEED).excluded_coordinates;
+        let declared = CollocationStream::new(TRAIN_SEED);
+        assert!(declared.available > 4_000_000);
+        let excluded = declared.excluded_coordinates;
         let mut stream = CollocationStream::new(TRAIN_SEED);
         let mut identities = HashSet::new();
         for _ in 0..100_000 {
