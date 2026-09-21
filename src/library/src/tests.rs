@@ -17,6 +17,27 @@ fn close(name: &str, actual: &[f32], expected: &[f64]) {
     );
 }
 
+fn central_difference(values: &[f64], epsilon: f64, evaluate: impl Fn(&[f64]) -> f64) -> Vec<f64> {
+    (0..values.len())
+        .map(|index| {
+            let mut plus = values.to_vec();
+            let mut minus = values.to_vec();
+            plus[index] += epsilon;
+            minus[index] -= epsilon;
+            (evaluate(&plus) - evaluate(&minus)) / (2.0 * epsilon)
+        })
+        .collect()
+}
+
+fn mean_squared(actual: &[f64], target: &[f64]) -> f64 {
+    actual
+        .iter()
+        .zip(target)
+        .map(|(actual, target)| (actual - target).powi(2))
+        .sum::<f64>()
+        / actual.len() as f64
+}
+
 #[test]
 fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Result<()> {
     let (batch, channel, height, width, output, population) = (
@@ -77,8 +98,39 @@ fn neural_module_shapes_reject_invalid_architectures_before_allocation() -> Resu
             )?)
             .is_err()
     );
-    assert!(LayerNorm::new(channel, 0.0).is_err());
-    assert!(LayerNorm::new(channel, f32::INFINITY).is_err());
+    assert!(LayerNorm::new(channel)?.epsilon(0.0).is_err());
+    assert!(LayerNorm::new(channel)?.epsilon(f32::INFINITY).is_err());
+    assert!(LayerNorm::new([channel, channel]).is_err());
+    assert!(LayerNorm::new([]).is_err());
+    assert!(RmsNorm::new(channel)?.epsilon(f32::NAN).is_err());
+    assert!(GroupNorm::new(channel, 0, [height, width]).is_err());
+    assert!(GroupNorm::new(channel, 2, [channel, width]).is_err());
+    assert!(
+        GroupNorm::new(channel, 1, [height, width])?
+            .epsilon(-1.0)
+            .is_err()
+    );
+    assert!(InstanceNorm::new(channel, []).is_err());
+    assert!(InstanceNorm::new(channel, [channel]).is_err());
+    assert!(
+        InstanceNorm::new(channel, [height, width])?
+            .epsilon(0.0)
+            .is_err()
+    );
+
+    let layer = LayerNorm::new([height, width])?;
+    assert_eq!(layer.output_shape(&image)?, image);
+    let rms = RmsNorm::new(Vec::from([height, width]))?;
+    assert_eq!(rms.output_shape(&image)?, image);
+    let group = GroupNorm::new(channel, 3, [height, width])?;
+    assert_eq!(group.output_shape(&image)?, image);
+    assert!(
+        GroupNorm::new(channel, 2, [height, width])?
+            .output_shape(&image)
+            .is_err()
+    );
+    let instance = InstanceNorm::new(channel, &[height, width][..])?;
+    assert_eq!(instance.output_shape(&image)?, image);
     Ok(())
 }
 
@@ -747,7 +799,7 @@ fn conv2d_lowers_valid_patches_and_sums_overlapping_gradients() -> Result<()> {
 
     let wrong_channels = Shape::new([channel.of(2), height.of(3), width.of(3)])?;
     assert!(conv.output_shape(&wrong_channels).is_err());
-    let normalization = LayerNorm::new(channel, 1e-5)?;
+    let normalization = LayerNorm::new(channel)?;
     assert!(normalization.forward(&input).is_err());
     let population = Axis::new("population");
     let unbuilt = PopulationLinear::new(population.of(2), channel, output.of(1));
@@ -1489,7 +1541,7 @@ fn layer_norm_and_gelu_match_a_scalar_reference() -> Result<()> {
         &device,
     )?
     .with_grad();
-    let mut norm = LayerNorm::new(feature, 1e-5)?;
+    let mut norm = LayerNorm::new(feature)?;
     norm.build(input.shape(), &device, 0)?;
     let output = norm.forward(&input)?.gelu()?;
 
@@ -1518,6 +1570,425 @@ fn layer_norm_and_gelu_match_a_scalar_reference() -> Result<()> {
         "LayerNorm plus GELU gradient",
         &input.grad().unwrap().to_vec()?,
         &finite_difference,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multi_axis_layer_and_rms_norm_match_scalar_forward_and_gradient_oracles() -> Result<()> {
+    fn layer_reference(
+        values: &[f64],
+        scale: &[f64],
+        bias: &[f64],
+        target: &[f64],
+    ) -> (Vec<f64>, f64) {
+        let mut output = vec![0.0; values.len()];
+        for (batch, row) in values.chunks_exact(6).enumerate() {
+            let mean = row.iter().sum::<f64>() / row.len() as f64;
+            let variance =
+                row.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / row.len() as f64;
+            let inverse_standard_deviation = (variance + 1e-5).sqrt().recip();
+            for (coordinate, value) in row.iter().enumerate() {
+                output[batch * 6 + coordinate] =
+                    (value - mean) * inverse_standard_deviation * scale[coordinate]
+                        + bias[coordinate];
+            }
+        }
+        let loss = mean_squared(&output, target);
+        (output, loss)
+    }
+
+    fn rms_reference(values: &[f64], scale: &[f64], target: &[f64]) -> (Vec<f64>, f64) {
+        let mut output = vec![0.0; values.len()];
+        for (batch, row) in values.chunks_exact(6).enumerate() {
+            let mean_square = row.iter().map(|value| value * value).sum::<f64>() / row.len() as f64;
+            let inverse_rms = (mean_square + 1e-6).sqrt().recip();
+            for (coordinate, value) in row.iter().enumerate() {
+                output[batch * 6 + coordinate] = value * inverse_rms * scale[coordinate];
+            }
+        }
+        let loss = mean_squared(&output, target);
+        (output, loss)
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, row, feature) = (Axis::new("batch"), Axis::new("row"), Axis::new("feature"));
+    let values = vec![
+        -1.5_f64, 0.25, 2.0, 3.0, -2.0, 0.5, 1.25, -0.75, 0.1, 2.5, 1.0, -3.0,
+    ];
+    let scale = vec![0.5_f64, -1.0, 1.5, 0.75, -0.25, 2.0];
+    let bias = vec![0.1_f64, -0.2, 0.3, -0.4, 0.5, -0.6];
+    let target = vec![
+        0.2_f64, -0.1, 0.4, 0.8, -0.3, 0.5, -0.7, 0.9, 0.6, -0.5, 0.25, -0.8,
+    ];
+    let dims = [batch.of(2), row.of(2), feature.of(3)];
+    let input = Tensor::from_slice(
+        &values.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?
+    .with_layout([feature, batch, row])?
+    .with_grad();
+    let mut layer = LayerNorm::new([row, feature])?;
+    layer.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        layer
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["scale", "bias"]
+    );
+    layer
+        .parameter("scale")?
+        .set_values(&scale.iter().map(|value| *value as f32).collect::<Vec<_>>())?;
+    layer
+        .parameter("bias")?
+        .set_values(&bias.iter().map(|value| *value as f32).collect::<Vec<_>>())?;
+    let output = layer.forward(&input)?;
+    let (expected, _) = layer_reference(&values, &scale, &bias, &target);
+    close("multi-axis LayerNorm forward", &output.to_vec()?, &expected);
+    let target_tensor = Tensor::from_slice(
+        &target.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    output
+        .squared_error(&target_tensor)?
+        .mean([batch, row, feature])?
+        .backward()?;
+    close(
+        "multi-axis LayerNorm input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &central_difference(&values, 1e-4, |candidate| {
+            layer_reference(candidate, &scale, &bias, &target).1
+        }),
+    );
+    close(
+        "multi-axis LayerNorm scale gradient",
+        &layer.parameter("scale")?.grad().unwrap().to_vec()?,
+        &central_difference(&scale, 1e-4, |candidate| {
+            layer_reference(&values, candidate, &bias, &target).1
+        }),
+    );
+    close(
+        "multi-axis LayerNorm bias gradient",
+        &layer.parameter("bias")?.grad().unwrap().to_vec()?,
+        &central_difference(&bias, 1e-4, |candidate| {
+            layer_reference(&values, &scale, candidate, &target).1
+        }),
+    );
+
+    let rms_input = Tensor::from_slice(
+        &values.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?
+    .with_layout([row, feature, batch])?
+    .with_grad();
+    let mut rms = RmsNorm::new(vec![row, feature])?;
+    rms.build(rms_input.shape(), &device, 0)?;
+    assert_eq!(
+        rms.named_parameters()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["scale"]
+    );
+    rms.parameter("scale")?
+        .set_values(&scale.iter().map(|value| *value as f32).collect::<Vec<_>>())?;
+    let rms_output = rms.forward(&rms_input)?;
+    let (expected, _) = rms_reference(&values, &scale, &target);
+    close(
+        "multi-axis RmsNorm forward",
+        &rms_output.to_vec()?,
+        &expected,
+    );
+    rms_output
+        .squared_error(&target_tensor)?
+        .mean([batch, row, feature])?
+        .backward()?;
+    close(
+        "multi-axis RmsNorm input gradient",
+        &rms_input.grad().unwrap().to_vec()?,
+        &central_difference(&values, 1e-4, |candidate| {
+            rms_reference(candidate, &scale, &target).1
+        }),
+    );
+    close(
+        "multi-axis RmsNorm scale gradient",
+        &rms.parameter("scale")?.grad().unwrap().to_vec()?,
+        &central_difference(&scale, 1e-4, |candidate| {
+            rms_reference(&values, candidate, &target).1
+        }),
+    );
+
+    let constant = Tensor::from_slice(&[3.0; 12], dims, &device)?;
+    let mut centered = LayerNorm::new([row, feature])?.affine(false);
+    centered.build(constant.shape(), &device, 0)?;
+    assert!(centered.parameters().is_empty());
+    close(
+        "constant LayerNorm",
+        &centered.forward(&constant)?.to_vec()?,
+        &[0.0; 12],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn group_and_instance_norm_match_scalar_oracles_and_each_other() -> Result<()> {
+    fn group_reference(
+        values: &[f64],
+        groups: usize,
+        scale: &[f64],
+        bias: &[f64],
+        target: &[f64],
+    ) -> (Vec<f64>, f64) {
+        const CHANNELS: usize = 4;
+        const SAMPLE_SIZE: usize = 4;
+        let channels_per_group = CHANNELS / groups;
+        let mut output = vec![0.0; values.len()];
+        for batch in 0..2 {
+            for group in 0..groups {
+                let channels = group * channels_per_group..(group + 1) * channels_per_group;
+                let selected = channels
+                    .clone()
+                    .flat_map(|channel| {
+                        (0..SAMPLE_SIZE)
+                            .map(move |sample| (batch * CHANNELS + channel) * SAMPLE_SIZE + sample)
+                    })
+                    .collect::<Vec<_>>();
+                let mean = selected.iter().map(|&index| values[index]).sum::<f64>()
+                    / selected.len() as f64;
+                let variance = selected
+                    .iter()
+                    .map(|&index| (values[index] - mean).powi(2))
+                    .sum::<f64>()
+                    / selected.len() as f64;
+                let inverse_standard_deviation = (variance + 1e-5).sqrt().recip();
+                for index in selected {
+                    let channel = (index / SAMPLE_SIZE) % CHANNELS;
+                    output[index] =
+                        (values[index] - mean) * inverse_standard_deviation * scale[channel]
+                            + bias[channel];
+                }
+            }
+        }
+        let loss = mean_squared(&output, target);
+        (output, loss)
+    }
+
+    fn instance_reference(
+        values: &[f64],
+        scale: &[f64],
+        bias: &[f64],
+        target: &[f64],
+    ) -> (Vec<f64>, f64) {
+        const CHANNELS: usize = 4;
+        const SAMPLE_SIZE: usize = 4;
+        let mut output = vec![0.0; values.len()];
+        for batch in 0..2 {
+            for channel in 0..CHANNELS {
+                let start = (batch * CHANNELS + channel) * SAMPLE_SIZE;
+                let samples = &values[start..start + SAMPLE_SIZE];
+                let mean = samples.iter().sum::<f64>() / SAMPLE_SIZE as f64;
+                let variance = samples
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f64>()
+                    / SAMPLE_SIZE as f64;
+                let inverse_standard_deviation = (variance + 1e-5).sqrt().recip();
+                for sample in 0..SAMPLE_SIZE {
+                    output[start + sample] =
+                        (samples[sample] - mean) * inverse_standard_deviation * scale[channel]
+                            + bias[channel];
+                }
+            }
+        }
+        let loss = mean_squared(&output, target);
+        (output, loss)
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, height, width) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let values = vec![
+        -2.0_f64, -1.5, -1.0, -0.5, 0.25, 0.75, 1.25, 1.75, 2.0, -0.25, 0.5, -1.0, 3.0, 2.0, 1.0,
+        0.0, -0.2, 0.4, -0.6, 0.8, 1.1, -1.3, 1.5, -1.7, 2.2, 2.4, -2.6, -2.8, 0.3, 0.6, 0.9, 1.2,
+    ];
+    let scale = vec![0.5_f64, -1.25, 0.75, 1.5];
+    let bias = vec![0.1_f64, -0.2, 0.3, -0.4];
+    let target = (0..32)
+        .map(|index| (index as f64 * 0.17).sin() * 0.5)
+        .collect::<Vec<_>>();
+    let dims = [batch.of(2), channel.of(4), height.of(2), width.of(2)];
+    let input = Tensor::from_slice(
+        &values.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?
+    .with_layout([height, channel, width, batch])?
+    .with_grad();
+    let mut group = GroupNorm::new(channel, 2, [height, width])?;
+    group.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        group
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["scale", "bias"]
+    );
+    group
+        .parameter("scale")?
+        .set_values(&scale.iter().map(|value| *value as f32).collect::<Vec<_>>())?;
+    group
+        .parameter("bias")?
+        .set_values(&bias.iter().map(|value| *value as f32).collect::<Vec<_>>())?;
+    let output = group.forward(&input)?;
+    let (expected, _) = group_reference(&values, 2, &scale, &bias, &target);
+    close("GroupNorm forward", &output.to_vec()?, &expected);
+    let target_tensor = Tensor::from_slice(
+        &target.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    output
+        .squared_error(&target_tensor)?
+        .mean([batch, channel, height, width])?
+        .backward()?;
+    close(
+        "GroupNorm input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &central_difference(&values, 1e-4, |candidate| {
+            group_reference(candidate, 2, &scale, &bias, &target).1
+        }),
+    );
+    close(
+        "GroupNorm scale gradient",
+        &group.parameter("scale")?.grad().unwrap().to_vec()?,
+        &central_difference(&scale, 1e-4, |candidate| {
+            group_reference(&values, 2, candidate, &bias, &target).1
+        }),
+    );
+    close(
+        "GroupNorm bias gradient",
+        &group.parameter("bias")?.grad().unwrap().to_vec()?,
+        &central_difference(&bias, 1e-4, |candidate| {
+            group_reference(&values, 2, &scale, candidate, &target).1
+        }),
+    );
+
+    for groups in [1, 4] {
+        let mut norm = GroupNorm::new(channel, groups, [height, width])?.affine(false);
+        norm.build(input.shape(), &device, 0)?;
+        let actual = norm.forward(&input)?.to_vec()?;
+        let (expected, _) = group_reference(&values, groups, &[1.0; 4], &[0.0; 4], &target);
+        close(&format!("GroupNorm groups={groups}"), &actual, &expected);
+    }
+
+    let mut instance = InstanceNorm::new(channel, [height, width])?;
+    instance.build(input.shape(), &device, 0)?;
+    assert!(instance.parameters().is_empty());
+    let instance_output = instance.forward(&input)?;
+    let (expected, _) = instance_reference(&values, &[1.0; 4], &[0.0; 4], &target);
+    close(
+        "InstanceNorm independent scalar forward",
+        &instance_output.to_vec()?,
+        &expected,
+    );
+    let mut equivalent = GroupNorm::new(channel, 4, [height, width])?.affine(false);
+    equivalent.build(input.shape(), &device, 0)?;
+    close(
+        "InstanceNorm equals per-channel GroupNorm",
+        &instance_output.to_vec()?,
+        &equivalent
+            .forward(&input)?
+            .to_vec()?
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<_>>(),
+    );
+
+    let instance_input = Tensor::from_slice(
+        &values.iter().map(|value| *value as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?
+    .with_layout([width, batch, height, channel])?
+    .with_grad();
+    let mut affine_instance = InstanceNorm::new(channel, vec![height, width])?.affine(true);
+    affine_instance.build(instance_input.shape(), &device, 0)?;
+    assert_eq!(
+        affine_instance
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["scale", "bias"]
+    );
+    affine_instance
+        .parameter("scale")?
+        .set_values(&scale.iter().map(|value| *value as f32).collect::<Vec<_>>())?;
+    affine_instance
+        .parameter("bias")?
+        .set_values(&bias.iter().map(|value| *value as f32).collect::<Vec<_>>())?;
+    let affine_output = affine_instance.forward(&instance_input)?;
+    let (expected, _) = instance_reference(&values, &scale, &bias, &target);
+    close(
+        "affine InstanceNorm independent scalar forward",
+        &affine_output.to_vec()?,
+        &expected,
+    );
+    affine_output
+        .squared_error(&target_tensor)?
+        .mean([batch, channel, height, width])?
+        .backward()?;
+    close(
+        "affine InstanceNorm input gradient",
+        &instance_input.grad().unwrap().to_vec()?,
+        &central_difference(&values, 1e-4, |candidate| {
+            instance_reference(candidate, &scale, &bias, &target).1
+        }),
+    );
+    close(
+        "affine InstanceNorm scale gradient",
+        &affine_instance
+            .parameter("scale")?
+            .grad()
+            .unwrap()
+            .to_vec()?,
+        &central_difference(&scale, 1e-4, |candidate| {
+            instance_reference(&values, candidate, &bias, &target).1
+        }),
+    );
+    close(
+        "affine InstanceNorm bias gradient",
+        &affine_instance
+            .parameter("bias")?
+            .grad()
+            .unwrap()
+            .to_vec()?,
+        &central_difference(&bias, 1e-4, |candidate| {
+            instance_reference(&values, &scale, candidate, &target).1
+        }),
+    );
+
+    let constant_values = [
+        1.0, 1.0, 1.0, 1.0, -2.0, -2.0, -2.0, -2.0, 3.0, 3.0, 3.0, 3.0, 0.5, 0.5, 0.5, 0.5, 4.0,
+        4.0, 4.0, 4.0, -1.0, -1.0, -1.0, -1.0, 2.0, 2.0, 2.0, 2.0, -3.0, -3.0, -3.0, -3.0,
+    ];
+    let constant = Tensor::from_slice(&constant_values, dims, &device)?;
+    close(
+        "constant InstanceNorm",
+        &instance.forward(&constant)?.to_vec()?,
+        &[0.0; 32],
     );
     Ok(())
 }

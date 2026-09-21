@@ -13,8 +13,8 @@ The crate currently provides:
 - named-axis tensor algebra and reverse-mode differentiation, including
   deterministic finite minimum reductions;
 - `Linear`, `Conv2d` with stride, symmetric padding, and grouped/depthwise
-  channels, `LayerNorm`, activations, attention primitives, and sequential
-  composition;
+  channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`, and stateless
+  `InstanceNorm`, activations, attention primitives, and sequential composition;
 - device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
   exact AdamW remainder;
 - generated and finite data loaders with executable single-pass, finite-pass,
