@@ -32,7 +32,7 @@ while stream synchronization took at most 0.04 seconds. `Tensor::merge` was
 rebuilding the same million-entry forward and reverse index plans on every
 Conv2d forward.
 
-Axis now reuses merge plans for a stable named shape, physical layout, output
+The first optimization reused merge plans for a stable named shape, physical layout, output
 axis, and ordered list of merged axes. The ordered axes are part of the key:
 merging `[head, depth]` and `[depth, head]` can produce the same output shape
 with different values. Host retention is bounded to 128 signatures and 256 MiB
@@ -52,6 +52,32 @@ This is one stable-shape convolution witness on a shared desktop GPU. Cold plan
 construction still costs about 5.84 seconds per newly bound model in this
 probe, and mean utilization remains low. The result does not establish
 competitive convolution throughput or a general CUDA performance ratio.
+
+## Compact layout lowering after the Atlas inference profile
+
+The merge-cache result above is historical. A later two-image MobileSAM ensemble
+trace recorded 293 `merge` spans totaling 249.818 calling-thread seconds and
+16.824 seconds for the slowest call. The bounded cache did not avoid expensive
+cold/uncached element-wise map construction. Nsight Systems recorded only 6.095
+seconds of kernels and 8.462 seconds of combined kernel/copy activity over a
+340.821-second traced GPU span. The longest interkernel gap was 16.764 seconds;
+8,082 H2D copies transferred 30.791 GB. This is a profiling diagnosis, not an
+unprofiled performance benchmark. CPU sampling was unavailable under host policy.
+
+`with_layout` now reuses the compact device selection copier with no dimension
+removed. Its forward and inverse require three metadata integers per logical
+axis, not vectors proportional to element count. `split` materializes canonical
+order only if necessary and creates a shape view; `merge` expands the specified
+selected-axis order into physical order before creating its view. Identity maps,
+including extent-one axes with irrelevant stride differences, remain storage
+aliases. The element-sized merge cache and dead helpers are removed, not enlarged.
+Broadcast/reduction planning and pending-buffer lifetimes remain separate limits.
+
+The focused CUDA tests cover 72 independently indexed permutation/merge value and
+gradient cases, noncontiguous split, signed-zero/nonfinite copying, invalid axes,
+identity storage sharing and an actual 16,789,506-element tensor above the generic
+plan ceiling. Evidence and the consumer comparison belong in
+[`data/runs/compact-layout/`](../../data/runs/compact-layout/).
 
 ## Remaining Perm profile work
 

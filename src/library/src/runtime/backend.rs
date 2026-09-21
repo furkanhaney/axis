@@ -907,9 +907,10 @@ pub(crate) struct UnfoldSpec {
     pub output_special_strides: [i32; 5],
 }
 
-/// Compact metadata for selecting one coordinate of one named axis.
+/// Compact metadata for a layout permutation, optionally selecting one coordinate.
 /// Each logical input dimension contributes `(extent, input_stride,
 /// output_stride)`, with `-1` marking the selected dimension.
+/// If no dimension is selected, the same copier and inverse preserve all values.
 #[derive(Clone)]
 pub(crate) struct SelectSpec {
     pub input_len: usize,
@@ -944,13 +945,6 @@ pub(crate) struct Plan {
     pub right: Vec<i32>,
 }
 impl Plan {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        [&self.offsets, &self.left, &self.right]
-            .into_iter()
-            .map(|values| values.capacity() * std::mem::size_of::<i32>())
-            .sum()
-    }
-
     pub fn groups(groups: Vec<Vec<(usize, usize)>>, product: bool) -> Result<Self> {
         let count: usize = groups.iter().map(Vec::len).sum();
         Self::check_size(count)?;

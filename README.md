@@ -139,10 +139,12 @@ throughput success claim.
 The backend enqueues each eager training step on one CUDA stream and
 synchronizes once at the step boundary. Single-axis contractions use batched
 tiled GEMM; multi-axis contractions retain the generic gather/reduce path.
-Repeated shapes reuse their CPU and bounded device-side layout/reduction plans.
+Layout permutations and split/merge use rank-sized device indexing, retaining
+identity transforms as storage views. Broadcast/reduction operations reuse CPU
+and bounded device-side index plans.
 FP32 is the default, with an explicit BF16-matrix/FP32-state device policy.
 Convolution materializes FP32 patch tensors before contraction; volumetric
-patches can therefore dominate memory, and later generic layout/broadcast
+patches can therefore dominate memory, and later generic broadcast/reduction
 operations retain their own index-plan limits.
 Set `AXIS_PROFILE=1` to print Trainer phases, tensor planning, submission, read,
 and synchronization timings while investigating a workload. These are host
