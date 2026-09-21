@@ -1,0 +1,135 @@
+initial angle_rmse_rad=1.62756939 angular_velocity_rmse_rad_s=1.60544326
+step=1 samples=64 pre_update_physics_loss=90.07770538
+step=250 samples=16000 pre_update_physics_loss=44.91025162
+step=500 samples=32000 pre_update_physics_loss=4.18910360
+step=750 samples=48000 pre_update_physics_loss=2.83739781
+step=1000 samples=64000 pre_update_physics_loss=1.82541227
+step=1250 samples=80000 pre_update_physics_loss=0.86933362
+step=1500 samples=96000 pre_update_physics_loss=0.31744719
+step=1750 samples=112000 pre_update_physics_loss=0.16786692
+step=2000 samples=128000 pre_update_physics_loss=0.08013867
+step=2250 samples=144000 pre_update_physics_loss=0.04150757
+step=2500 samples=160000 pre_update_physics_loss=0.01847369
+step=2750 samples=176000 pre_update_physics_loss=0.00722458
+step=3000 samples=192000 pre_update_physics_loss=0.00318719
+step=3250 samples=208000 pre_update_physics_loss=0.00260809
+step=3500 samples=224000 pre_update_physics_loss=0.00239858
+step=3750 samples=240000 pre_update_physics_loss=0.00348914
+step=4000 samples=256000 pre_update_physics_loss=0.00201496
+final angle_rmse_rad=0.00749136 angular_velocity_rmse_rad_s=0.01102462 elapsed_s=15.66
+IDR STATUS
+
+samples consumed:      256000
+unique sample IDs:     256000
+available population:  4194100
+coverage:              6.10%
+max coverage:          10.00%
+observed reuse:         0.0000%
+max observed reuse:     0.0000%
+
+PASS
+SEMANTIC DISJOINTNESS
+
+identity scheme:       pendulum-collocation-coordinate@1
+identity unit:         f32 time-coordinate bits, including central-stencil support
+evidence:              verified observed identities
+evaluation: mode=retained observations=771 unique=771 repeats=0
+training: mode=streaming observations=768000 unique=not-retained repeats=not-measured
+observed cross-population overlap: 0
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       angle RMSE [rad] against independent f64 RK4
+evaluation population:        fixed held-out time grid
+direction:                    decrease
+observations:                 2
+baseline:                     1.62756939 at 0 optimizer steps
+terminal:                     0.00749136 at 4000 optimizer steps
+absolute improvement:         1.62007804
+relative improvement:         99.5397%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: 95.0000%
+budget delta:                 4000 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       angular velocity RMSE [rad/s] against independent f64 RK4
+evaluation population:        fixed held-out time grid
+direction:                    decrease
+observations:                 2
+baseline:                     1.60544326 at 0 optimizer steps
+terminal:                     0.01102462 at 4000 optimizer steps
+absolute improvement:         1.59441865
+relative improvement:         99.3133%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: 95.0000%
+budget delta:                 4000 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+EMPIRICAL RESIDUAL
+
+law:                       nonlinear damped pendulum
+law version:               caliper-r5@1
+residual:                  theta(0) - theta_0 = 0 [rad]
+region:                    initial angle at t = 0 seconds
+evaluator:                 direct fp32 evaluation
+observations:              1
+violations:                0
+violation rate:            0.0000%
+maximum allowed rate:      0.0000%
+maximum |residual|:        0.00000001
+RMS residual:              0.00000001
+absolute tolerance:        0.00000100
+claim:                     empirical
+evidence:                  verified sampled discretized observations
+
+These sampled discretized residual observations met their declared limits. This does not prove the law, evaluator accuracy, unsampled-domain behavior, boundary satisfaction, or a global guarantee.
+
+PASS
+EMPIRICAL RESIDUAL
+
+law:                       nonlinear damped pendulum
+law version:               caliper-r5@1
+residual:                  dtheta/dt(0) - omega_0 = 0 [rad/s]
+region:                    initial angular velocity at t = 0 seconds
+evaluator:                 fp32 second-order central difference; h=0.01 seconds
+observations:              1
+violations:                0
+violation rate:            0.0000%
+maximum allowed rate:      0.0000%
+maximum |residual|:        0.00004768
+RMS residual:              0.00004768
+absolute tolerance:        0.00010000
+claim:                     empirical
+evidence:                  verified sampled discretized observations
+
+These sampled discretized residual observations met their declared limits. This does not prove the law, evaluator accuracy, unsampled-domain behavior, boundary satisfaction, or a global guarantee.
+
+PASS
+EMPIRICAL RESIDUAL
+
+law:                       nonlinear damped pendulum
+law version:               caliper-r5@1
+residual:                  d2theta/dt2 + gamma*dtheta/dt + (g/L)*sin(theta) = 0
+region:                    fixed held-out grid; 0 < t < 2 seconds; residual unit rad/s^2
+evaluator:                 fp32 second-order central difference; h=0.01 seconds
+observations:              255
+violations:                0
+violation rate:            0.0000%
+maximum allowed rate:      0.0000%
+maximum |residual|:        0.19565988
+RMS residual:              0.07986000
+absolute tolerance:        0.25000000
+claim:                     empirical
+evidence:                  verified sampled discretized observations
+
+These sampled discretized residual observations met their declared limits. This does not prove the law, evaluator accuracy, unsampled-domain behavior, boundary satisfaction, or a global guarantee.
+
+PASS
+PASS: learned a damped-pendulum trajectory from sampled differential residuals

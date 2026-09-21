@@ -1,0 +1,15 @@
+[package]
+name = "damped-pendulum"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+default-run = "damped-pendulum"
+
+[dependencies]
+axis.workspace = true
+
+[[bin]]
+name = "damped-pendulum"
+path = "src/train.rs"
+

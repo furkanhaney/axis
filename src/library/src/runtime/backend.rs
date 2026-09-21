@@ -234,6 +234,21 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn sin(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::sin_forward((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn sin_backward(&self, gradient: &Buffer, input: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(input.shape()[0] as usize)?;
+        kernels::sin_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            input.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn gelu(&self, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::gelu((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
@@ -1915,6 +1930,18 @@ mod kernels {
         let y = output.load_like(out);
         let one = constant(1.0f32, shape![128]);
         out.store(gradient.load_like(out) * (one - y * y));
+    }
+    #[cutile::entry()]
+    fn sin_forward(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        out.store(sin(a.load_like(out)));
+    }
+    #[cutile::entry()]
+    fn sin_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        input: &Tensor<f32, { [-1] }>,
+    ) {
+        out.store(gradient.load_like(out) * cos(input.load_like(out)));
     }
     #[cutile::entry()]
     fn gelu(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {

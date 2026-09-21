@@ -9,6 +9,7 @@ members = [
     "src/studies/contracts/generated-addition",
     "src/studies/contracts/mnist-population",
     "src/studies/energy-output/panel",
+    "src/studies/physics/damped-pendulum",
 ]
 default-members = ["src/examples/getting-started/mnist"]
 resolver = "3"

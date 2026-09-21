@@ -334,6 +334,21 @@ impl Module for GELU {
     }
 }
 
+/// Parameter-free elementwise hyperbolic tangent module.
+#[derive(Clone, Copy)]
+pub struct Tanh;
+impl Module for Tanh {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.tanh()
+    }
+}
+
 pub trait IntoLayers {
     fn into_layers(self) -> Vec<Box<dyn Module>>;
 }

@@ -96,6 +96,14 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn sin(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn sin_backward(&self, _gradient: &Buffer, _input: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn gelu(&self, _a: &Buffer) -> Result<Buffer> {
         unavailable()
     }
