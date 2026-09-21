@@ -69,6 +69,30 @@ exact deduplicated remainder to AdamW. Both partitions prepare before either
 commits. The orientation, scalar oracles, mixed-precision behavior, and current
 limits are documented in [the Muon contract](muon.md).
 
+Normalization follows the named axes that define the statistic rather than a
+rank suffix. `LayerNorm::new(feature)?` remains the ordinary single-axis form;
+`LayerNorm::new([row, feature])?` learns scale and bias over the complete
+declared shape. `RmsNorm` has the same axis forms and learns scale without a
+bias. Their defaults are epsilon `1e-5` and `1e-6`, respectively.
+
+`GroupNorm::new(channel, groups, [height, width])?` divides the named channel
+extent into contiguous groups, computes population moments over each group's
+channels and the declared sample axes, then applies per-channel scale and bias.
+The channel extent must divide evenly by the positive group count.
+`InstanceNorm::new(channel, [height, width])?` is the groups-equal-channels
+case. It requires at least one sample axis and defaults to no affine parameters.
+Both use epsilon `1e-5`. `.epsilon(value)?` and `.affine(bool)` make departures
+from those defaults visible. Any unrelated axes remain independent instances;
+physical storage order does not change the statistic.
+
+All four modules are stateless: training and evaluation have identical
+behavior, and there are no running estimates. `Tensor::moments` and
+`Tensor::mean_square` provide their reusable population reductions. Batch
+normalization remains deliberately absent until `Module` can represent an
+explicit train/evaluation mode and persistent non-parameter state; silently
+substituting batch-local statistics would give it the wrong experimental
+meaning.
+
 `DataLoader` batches any `DataSource` and checks its regime before releasing a
 batch. Finite `InMemoryDataset` sources report corpus size; generated sources
 such as `AdditionDataset` do not invent one. Each guarded batch carries a
@@ -218,6 +242,7 @@ shape checks first; compile-time axis types can be evaluated later.
 | `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. |
 | `x.squared_error(y)` | Align identical axis sets by identity, require equal extents, preserve the unreduced shape. |
 | `x.mean(axes)` | Remove precisely those axes; backward broadcasts and divides by their extent product. Scalar `.backward()` requires all loss axes to have been reduced. |
+| `x.moments(axes)` / `x.mean_square(axes)` | Require at least one named axis and return population statistics with precisely those axes removed. Gradients broadcast through the original logical axes. |
 | `x.min(axis)` | Remove one named axis and preserve unrelated axes. Ignore NaN and infinities, choose the first logical coordinate on finite ties, and route backward only to that winner. A group with no finite value returns NaN with zero derivative even under a non-finite upstream derivative. Forward and backward remain device-resident. |
 | Elementwise add/multiply | Align shared identities with equal extents. Permit scalar or subset-axis broadcasting, such as a `[hidden]` bias on `[batch, hidden]`. |
 | Incomparable axis sets | Require explicit expansion. `[batch, time] + [batch, hidden]` must not silently create `[batch, time, hidden]`. |
@@ -227,6 +252,7 @@ shape checks first; compile-time axis types can be evaluated later.
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
 | `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |
 | `Conv2d(input, output, spatial, kernel)` | Cross-correlate named spatial axes with configurable positive stride, finite symmetric zero-padding, and positive channel groups. Require both channel extents to divide evenly by groups; preserve unrelated axes and append the output-channel axis. |
+| Named normalization | Normalize only the declared axes. Layer/RMS affine parameters span the declared normalized shape; group/instance affine parameters span the channel axis. Preserve every input axis and reject changed built extents or group geometry. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
 | `categorical_cross_entropy_with_logits(target, class)` | Accept constant one-hot/probability targets over the same axes, stably reduce the named class axis, and preserve all other axes. Backward is `softmax(logits) - target`. |
 | `Conv(input, output, spatial)` | Transform channels and spatial extents by the stated stride/padding/dilation rules. Preserve all unrelated axes. |

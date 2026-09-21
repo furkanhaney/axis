@@ -23,6 +23,8 @@ mod metrics;
 mod monotonicity;
 #[path = "model/nn.rs"]
 mod nn;
+#[path = "model/normalization.rs"]
+mod normalization;
 #[path = "model/optim.rs"]
 mod optim;
 #[path = "model/preprocess.rs"]
@@ -53,9 +55,10 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    Conv2d, GELU, IntoLayers, LayerNorm, Linear, Module, ParamId, Parameter, PopulationLinear,
-    ReLU, Sequential,
+    Conv2d, GELU, IntoLayers, Linear, Module, ParamId, Parameter, PopulationLinear, ReLU,
+    Sequential,
 };
+pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
 pub use preprocess::Standardizer;
 pub use regime::{
@@ -79,12 +82,12 @@ pub mod prelude {
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy, Conv2d,
         DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness, DisjointnessEvidence,
         DisjointnessReceipt, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, FinitePasses,
-        FinitePassesLoader, FinitePassesReceipt, GELU, IdentityScheme, Idr, IdrLimits, IdrReceipt,
-        InMemoryDataset, LayerNorm, LearningDirection, LearningEvidence, LearningLimits,
-        LearningObservation, LearningProgress, LearningProgressReceipt, Linear, Module,
-        MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme, Idr, IdrLimits,
+        IdrReceipt, InMemoryDataset, InstanceNorm, LayerNorm, LearningDirection, LearningEvidence,
+        LearningLimits, LearningObservation, LearningProgress, LearningProgressReceipt, Linear,
+        Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
         MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
-        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, SGD, Sample, Sequential,
-        Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
+        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, Result, RmsNorm, SGD, Sample,
+        Sequential, Shape, SinglePass, Standardizer, Tensor, TrainStep, Trainer,
     };
 }

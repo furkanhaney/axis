@@ -2,7 +2,10 @@
 
 Updated 2026-09-20. This note preserves the decisions and next useful work;
 [library.md](../design/library.md) is the contract, and [api-sketch.md](../design/api-sketch.md) is the
-owner's larger, partially unimplemented API sketch.
+owner's larger, partially unimplemented API sketch. The
+[module backlog](module-backlog.md) uses the `torch.nn` catalog to prevent
+ordinary layer families from being forgotten while retaining Axis's named-axis
+contracts and evidence bar.
 
 ## What exists and why
 
@@ -101,11 +104,12 @@ the tiled contraction and softmax changes. The next implementation should be
 chosen from that profile: fuse attention if launch/materialization overhead now
 dominates, or improve GEMM tiling if the matrix kernels remain inefficient.
 
-After that, use the next consumer to choose between production-transformer work
-(mixed precision, fused normalization and attention, serialization) and the
-still useful stacked-convolution composition witness. Do not grow either
-surface from an operator checklist: the accepting program must own the need and
-the scalar or trusted reference.
+After that, use the next consumer and the module backlog to choose between
+production-transformer work (mixed precision, fused normalization and
+attention, serialization), recurrent foundations, and the still useful
+stacked-convolution composition witness. The external catalog supplies
+discovery; each accepting program and independent oracle supply the reason to
+land an Axis abstraction.
 
 Run `bash scripts/check.sh` from the Axis root for formatting,
 Clippy and CPU/GPU verification. Smoke a new program before 100/full-step

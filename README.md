@@ -116,7 +116,8 @@ throughput success claim.
 - Reverse-mode differentiation with parameter version checks and explicit
   scalar loss reduction.
 - `Linear`, `PopulationLinear`, `Conv2d` with stride, symmetric padding, and
-  grouped/depthwise channels, `LayerNorm`, `ReLU`, `GELU`, and `Sequential`.
+  grouped/depthwise channels; named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
+  and stateless `InstanceNorm`; `ReLU`, `GELU`, and `Sequential`.
 - Compact implicit Conv2d patch extraction and deterministic col2im, including
   plans larger than the generic 16,777,216-contribution ceiling.
 - Device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon. Adam

@@ -959,6 +959,25 @@ impl Tensor {
         profile("mean", started);
         Ok(result)
     }
+    /// Population mean and variance over exactly the declared named axes.
+    pub fn moments(&self, axes: impl IntoAxes) -> Result<(Self, Self)> {
+        let axes = self.shape().select_axes(axes)?;
+        if axes.is_empty() {
+            return Err("moments requires at least one axis".into());
+        }
+        let mean = self.mean(axes.clone())?;
+        let centered = self.sub(&mean)?;
+        let variance = centered.mul(&centered)?.mean(axes)?;
+        Ok((mean, variance))
+    }
+    /// Population mean of squares over exactly the declared named axes.
+    pub fn mean_square(&self, axes: impl IntoAxes) -> Result<Self> {
+        let axes = self.shape().select_axes(axes)?;
+        if axes.is_empty() {
+            return Err("mean_square requires at least one axis".into());
+        }
+        self.mul(self)?.mean(axes)
+    }
     /// Reduce one named axis to its minimum finite value.
     ///
     /// Non-finite candidates are ignored. A group without a finite candidate returns NaN and
