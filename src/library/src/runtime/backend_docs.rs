@@ -355,10 +355,6 @@ impl UnfoldSpec {
 pub(crate) struct Plan;
 
 impl Plan {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        0
-    }
-
     pub fn groups(groups: Vec<Vec<(usize, usize)>>, _product: bool) -> Result<Self> {
         Self::check_size(groups.iter().map(Vec::len).sum())?;
         Ok(Self)

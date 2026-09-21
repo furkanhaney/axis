@@ -42,7 +42,6 @@ struct ReductionPlans {
 }
 
 type GatherPlanKey = (u8, Shape, Layout, Shape, Layout);
-type MergePlanKey = (Shape, Layout, Vec<Axis>, Axis);
 type ReductionPlanKey = (u8, Shape, Layout, Vec<Axis>);
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct UnfoldPlanKey {
@@ -60,8 +59,6 @@ struct UnfoldPlanKey {
 
 thread_local! {
     static GATHER_PLANS: RefCell<HashMap<GatherPlanKey, GatherPlans>> = RefCell::new(HashMap::new());
-    static MERGE_PLANS: RefCell<HashMap<MergePlanKey, Option<GatherPlans>>> = RefCell::new(HashMap::new());
-    static MERGE_PLAN_BYTES: Cell<usize> = const { Cell::new(0) };
     static REDUCTION_PLANS: RefCell<HashMap<ReductionPlanKey, ReductionPlans>> = RefCell::new(HashMap::new());
     static UNFOLD_PLANS: RefCell<HashMap<UnfoldPlanKey, UnfoldPlans>> = RefCell::new(HashMap::new());
 }
@@ -70,7 +67,7 @@ thread_local! {
 thread_local! {
     static UNFOLD_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
     static UNFOLD_PLAN_METADATA_MAX: Cell<usize> = const { Cell::new(0) };
-    static MERGE_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static LAYOUT_METADATA_MAX: Cell<usize> = const { Cell::new(0) };
 }
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
@@ -416,57 +413,6 @@ impl Tensor {
         }
         Ok(())
     }
-    fn gathered(&self, shape: Shape, layout: Layout, map: Vec<usize>) -> Result<Self> {
-        if map
-            .iter()
-            .enumerate()
-            .all(|(output, &input)| output == input)
-        {
-            return Ok(Self::node(
-                shape,
-                layout,
-                self.0.value.clone(),
-                self.device(),
-                vec![Edge::new(self, Rule::Identity)],
-                false,
-                None,
-            ));
-        }
-        let plans = GatherPlans {
-            forward: Rc::new(Plan::gather(&map)?),
-            reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
-        };
-        self.gathered_with_plans(shape, layout, plans)
-    }
-    fn gathered_with_plans(
-        &self,
-        shape: Shape,
-        layout: Layout,
-        plans: GatherPlans,
-    ) -> Result<Self> {
-        let value = self
-            .device()
-            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
-        let edges = self.requires_grad().then(|| {
-            Edge::new(
-                self,
-                Rule::Group {
-                    plan: plans.reverse,
-                    rhs: None,
-                    factor: 1.0,
-                },
-            )
-        });
-        Ok(Self::node(
-            shape,
-            layout,
-            value,
-            self.device(),
-            edges.into_iter().collect(),
-            false,
-            None,
-        ))
-    }
     fn unfolded_with_spec(
         &self,
         shape: Shape,
@@ -511,12 +457,16 @@ impl Tensor {
         UNFOLD_PLAN_METADATA_MAX.with(Cell::get)
     }
     #[cfg(test)]
-    pub(crate) fn merge_plan_build_count() -> usize {
-        MERGE_PLAN_BUILDS.with(Cell::get)
+    pub(crate) fn layout_metadata_max() -> usize {
+        LAYOUT_METADATA_MAX.with(Cell::get)
     }
     #[cfg(test)]
     pub(crate) fn layout_strides(&self) -> &[usize] {
         &self.0.layout.strides
+    }
+    #[cfg(test)]
+    pub(crate) fn shares_buffer(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0.value.as_ref(), other.0.value.as_ref())
     }
     fn align(&self, shape: &Shape) -> Result<Self> {
         let started = Instant::now();
@@ -1934,58 +1884,60 @@ impl Tensor {
     }
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
+        let started = Instant::now();
         let layout = Layout::new(self.shape(), &order.into_axes())?;
         if self.0.layout.strides == layout.strides {
             return Ok(self.clone());
         }
-        let key = (
-            1,
-            self.shape().clone(),
-            self.0.layout.clone(),
-            self.shape().clone(),
-            layout.clone(),
-        );
-        let cached = GATHER_PLANS.with(|cache| cache.borrow().get(&key).cloned());
-        let plans = match cached {
-            Some(plans) => plans,
-            None => {
-                let mut map = vec![0; self.shape().len()];
-                for i in 0..self.shape().len() {
-                    let coords = self.shape().coords(i);
-                    map[layout.offset(&coords)] = self.0.layout.offset(&coords);
-                }
-                let plans = GatherPlans {
-                    forward: Rc::new(Plan::gather(&map)?),
-                    reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
-                };
-                GATHER_PLANS.with(|cache| {
-                    cache.borrow_mut().insert(key, plans.clone());
-                });
-                plans
-            }
-        };
-        let value = self
-            .device()
-            .grouped(&self.0.value, None, plans.forward.as_ref(), 1.0)?;
-        let edges = self.requires_grad().then(|| {
-            Edge::new(
-                self,
-                Rule::Group {
-                    plan: plans.reverse,
-                    rhs: None,
-                    factor: 1.0,
-                },
-            )
+        if self
+            .shape()
+            .dims()
+            .iter()
+            .enumerate()
+            .all(|(i, dim)| dim.extent == 1 || self.0.layout.strides[i] == layout.strides[i])
+        {
+            return Ok(Self::node(
+                self.shape().clone(),
+                layout,
+                self.0.value.clone(),
+                self.device(),
+                vec![Edge::new(self, Rule::Identity)],
+                false,
+                None,
+            ));
+        }
+        // The existing compact selection copier also implements a permutation:
+        // no dimension is removed when all output strides are nonnegative.
+        // Forward/backward each compute one bijective offset per device element.
+        let mut metadata = Vec::with_capacity(self.shape().rank() * 3);
+        for (index, dim) in self.shape().dims().iter().enumerate() {
+            metadata.extend([
+                i32::try_from(dim.extent)?,
+                i32::try_from(self.0.layout.strides[index])?,
+                i32::try_from(layout.strides[index])?,
+            ]);
+        }
+        #[cfg(test)]
+        LAYOUT_METADATA_MAX.with(|max| max.set(max.get().max(metadata.len())));
+        let spec = Rc::new(SelectSpec {
+            input_len: self.shape().len(),
+            output_len: self.shape().len(),
+            rank: i32::try_from(self.shape().rank())?,
+            coordinate: 0,
+            metadata,
         });
-        Ok(Self::node(
+        let value = self.device().select_axis(&self.0.value, spec.as_ref())?;
+        let result = Self::node(
             self.shape().clone(),
             layout,
             value,
             self.device(),
-            edges.into_iter().collect(),
+            vec![Edge::new(self, Rule::Select(spec))],
             false,
             None,
-        ))
+        );
+        profile("with_layout", started);
+        Ok(result)
     }
     pub fn split(&self, axis: Axis, dims: impl IntoIterator<Item = Dim>) -> Result<Self> {
         let index = self.shape().index(axis)?;
@@ -1996,27 +1948,16 @@ impl Tensor {
         let mut dims = self.shape().dims().to_vec();
         dims.splice(index..=index, parts.dims().iter().copied());
         let shape = Shape::new(dims)?;
-        if self.0.layout == Layout::contiguous(self.shape()) {
-            return Ok(Self::node(
-                shape.clone(),
-                Layout::contiguous(&shape),
-                self.0.value.clone(),
-                self.device(),
-                vec![Edge::new(self, Rule::Identity)],
-                false,
-                None,
-            ));
-        }
-        let pl = Layout::contiguous(&parts);
-        let map = (0..shape.len())
-            .map(|i| {
-                let mut coords = shape.coords(i);
-                let merged = pl.offset(&coords[index..index + parts.rank()]);
-                coords.splice(index..index + parts.rank(), [merged]);
-                self.0.layout.offset(&coords)
-            })
-            .collect();
-        self.gathered(shape.clone(), Layout::contiguous(&shape), map)
+        let ordered = self.with_layout(self.shape().axes())?;
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            ordered.0.value.clone(),
+            self.device(),
+            vec![Edge::new(&ordered, Rule::Identity)],
+            false,
+            None,
+        ))
     }
     /// Selected-axis order defines flattening; insert the merged axis at the first selected position.
     pub fn merge(&self, axes: impl IntoAxes, axis: Axis) -> Result<Self> {
@@ -2043,93 +1984,24 @@ impl Tensor {
         }
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape);
-        let key = (
-            self.shape().clone(),
-            self.0.layout.clone(),
-            axes.clone(),
-            axis,
-        );
-        let cached = MERGE_PLANS.with(|cache| cache.borrow().get(&key).cloned());
-        if let Some(plans) = cached {
-            let result = match plans {
-                Some(plans) => self.gathered_with_plans(shape, layout, plans),
-                None => Ok(Self::node(
-                    shape,
-                    layout,
-                    self.0.value.clone(),
-                    self.device(),
-                    vec![Edge::new(self, Rule::Identity)],
-                    false,
-                    None,
-                )),
-            }?;
-            profile("merge", started);
-            return Ok(result);
-        }
-        let merged_index = shape.index(axis)?;
-        let map = (0..shape.len())
-            .map(|i| {
-                let output = shape.coords(i);
-                let part = parts.coords(output[merged_index]);
-                let input: Vec<_> = self
-                    .shape()
-                    .axes()
-                    .iter()
-                    .map(|&a| {
-                        if let Ok(p) = parts.index(a) {
-                            part[p]
-                        } else {
-                            output[shape.index(a).expect("retained axis")]
-                        }
-                    })
-                    .collect();
-                self.0.layout.offset(&input)
-            })
+        // Expand the desired merged physical order back into the input axes.
+        // This keeps selected-axis order significant, including nonadjacent axes,
+        // but costs O(rank) host metadata instead of O(elements) index vectors.
+        let order = shape
+            .axes()
+            .into_iter()
+            .flat_map(|a| if a == axis { axes.clone() } else { vec![a] })
             .collect::<Vec<_>>();
-        let plans = if map
-            .iter()
-            .enumerate()
-            .all(|(output, &input)| output == input)
-        {
-            None
-        } else {
-            Some(GatherPlans {
-                forward: Rc::new(Plan::gather(&map)?),
-                reverse: Rc::new(Plan::reverse(&map, self.shape().len())?),
-            })
-        };
-        let plan_bytes = plans.as_ref().map_or(0, |plans| {
-            [&plans.forward, &plans.reverse]
-                .into_iter()
-                .map(|plan| plan.retained_bytes())
-                .sum()
-        });
-        const MERGE_PLAN_CACHE_BYTES: usize = 256 * 1024 * 1024;
-        const MERGE_PLAN_CACHE_ENTRIES: usize = 128;
-        MERGE_PLANS.with(|cache| {
-            MERGE_PLAN_BYTES.with(|bytes| {
-                let next = bytes.get().saturating_add(plan_bytes);
-                let mut cache = cache.borrow_mut();
-                if cache.len() < MERGE_PLAN_CACHE_ENTRIES && next <= MERGE_PLAN_CACHE_BYTES {
-                    cache.insert(key, plans.clone());
-                    bytes.set(next);
-                }
-            });
-        });
-        #[cfg(test)]
-        MERGE_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
-        let result = match plans {
-            Some(plans) => self.gathered_with_plans(shape, layout, plans),
-            None => Ok(Self::node(
-                shape,
-                layout,
-                self.0.value.clone(),
-                self.device(),
-                vec![Edge::new(self, Rule::Identity)],
-                false,
-                None,
-            )),
-        }?;
+        let ordered = self.with_layout(order)?;
+        let result = Self::node(
+            shape,
+            layout,
+            ordered.0.value.clone(),
+            self.device(),
+            vec![Edge::new(&ordered, Rule::Identity)],
+            false,
+            None,
+        );
         profile("merge", started);
         Ok(result)
     }
