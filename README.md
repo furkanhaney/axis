@@ -117,7 +117,8 @@ throughput success claim.
   scalar loss reduction.
 - `Linear`, `PopulationLinear`, `Conv2d`, and `Conv3d` with stride, symmetric
   padding, and grouped/depthwise channels; named-axis `LayerNorm`, `RmsNorm`,
-  `GroupNorm`, and stateless `InstanceNorm`; `ReLU`, `GELU`, and `Sequential`.
+  `GroupNorm`, and stateless `InstanceNorm`; `ReLU`, `GELU`, `Tanh`, and
+  `Sequential`.
 - Compact implicit 2D/3D patch extraction and deterministic col2im, including
   patch tensors larger than the generic 16,777,216-contribution ceiling.
 - Device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon. Adam
@@ -129,6 +130,9 @@ throughput success claim.
   with declared tolerance and violation-rate limits and scoped receipts.
 - Empirical learning-progress checks for one named metric and evaluation
   population, with explicit budget and `VerifiedObservations` receipts.
+- Differentiable central first/second stencils, elementwise sine, and empirical
+  residual-law receipts with named equations, regions, evaluators, and explicit
+  sampled-evidence limits.
 - A `Trainer` that fixes update order: clear gradients, construct a fresh loss,
   backpropagate, then update once.
 
@@ -186,6 +190,7 @@ These are ordinary model and optimizer flows. “Training” is broader and more
 | Program | Purpose | Current witness |
 |---|---|---|
 | [Country panel](src/studies/energy-output/panel/README.md) | AdamW and split/preprocessing migration | bounded validation MSE falls on country and future splits; no GDP-fit claim |
+| [Damped pendulum](src/studies/physics/damped-pendulum/README.md) | physics-informed learning from a nonlinear ODE | RK4 state RMSE falls 99.10%; strict sampled residual limit passes on 255 held-out times |
 
 These numbers are repository witnesses with different tasks and budgets. They
 show that the exercised path works; they are not a benchmark leaderboard.
@@ -208,8 +213,10 @@ axis/
 │       ├── contracts/
 │       │   ├── generated-addition/  generated-data IDR training
 │       │   └── mnist-population/    population-axis research contract
-│       └── energy-output/
-│           └── panel/        country-year regression migration
+│       ├── energy-output/
+│       │   └── panel/        country-year regression migration
+│       └── physics/
+│           └── damped-pendulum/ nonlinear ODE residual acceptance
 ├── docs/                     shared contracts, assumptions, and next work
 ├── data/                     tracked evidence and selected runs; other contents ignored
 ├── scripts/                  CUDA setup, Cargo runner, checks, and censuses
@@ -217,7 +224,7 @@ axis/
 └── Cargo.lock                one resolved dependency graph
 ```
 
-The original Python programs behind the three migrations remain in the sibling
+The original Python programs behind the migrations remain in the sibling
 `research` repository. Each migration document names the source and separates
 preserved mechanics from claims it has not reproduced.
 
@@ -258,6 +265,7 @@ bash src/examples/training/muon/scripts/train.sh --smoke
 bash src/studies/contracts/generated-addition/scripts/train.sh --smoke
 bash src/studies/contracts/mnist-population/scripts/train.sh --smoke
 bash src/studies/energy-output/panel/scripts/train.sh --smoke --split country
+bash src/studies/physics/damped-pendulum/scripts/train.sh --smoke
 ```
 
 `check.sh` runs formatting, Clippy, CPU tests, and serialized CUDA tests. The

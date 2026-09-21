@@ -1,6 +1,6 @@
 ---
 title: Residual laws and the first physics-informed path
-status: implemented primitives; consumer pending
+status: implemented primitives and first consumer
 ---
 
 # Residual laws without overstating them
@@ -75,19 +75,22 @@ differentiation PINN loss containing `du/dx` or `d²u/dx²` would therefore fail
 to propagate the required mixed derivatives into model parameters. Pretending
 otherwise would create a plausible run with the wrong training objective.
 
-The first consumer should instead train a small smooth network on
+The first consumer trains a small smooth network on the archived Caliper R5
+damped-pendulum law
 
 \[
-  u'(t)+u(t)=0,\qquad u(0)=1,
+  \theta''(t)+\gamma\theta'(t)+\frac{g}{L}\sin\theta(t)=0,
 \]
 
-using a centered residual over generated interior points and an explicit
-initial-condition loss. `Tanh` supplies the smooth module activation and
-`Tensor::sin` supports the pendulum consumer that follows. Evaluation should
-compose separate interior and boundary residual receipts, data-regime and
-disjointness receipts, and an independent comparison with the analytic
-solution `exp(-t)`. None of those fragments alone implies a globally correct
-solution.
+using centered first and second derivatives over generated interior points.
+The parameterization
+`theta(t) = theta_0 + omega_0*t + t^2*N(t)` supplies the initial conditions by
+construction. `Tanh` provides the smooth network activation and `Tensor::sin`
+expresses the nonlinear restoring term. Evaluation composes separate dynamics
+and initial-condition residual receipts, an IDR receipt, learning progress, and
+an independent f64 RK4 comparison. None of those fragments alone implies a
+globally correct solution. The runnable study and its measured limits live in
+[`src/studies/physics/damped-pendulum`](../../src/studies/physics/damped-pendulum/README.md).
 
 Higher-order automatic differentiation is a later algebra project. It must
 retain a gradient graph and independently verify mixed and second derivatives

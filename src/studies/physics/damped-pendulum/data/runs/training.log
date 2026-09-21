@@ -1,0 +1,99 @@
+   Compiling damped-pendulum v0.6.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-pinn/src/studies/physics/damped-pendulum)
+    Finished `release` profile [optimized] target(s) in 0.60s
+     Running `target/release/damped-pendulum`
+initial trajectory_rmse=1.61654419
+step=1 samples=64 pre_update_physics_loss=90.23743439
+step=250 samples=16000 pre_update_physics_loss=15.81637669
+step=500 samples=32000 pre_update_physics_loss=3.88776755
+step=750 samples=48000 pre_update_physics_loss=3.98089647
+step=1000 samples=64000 pre_update_physics_loss=2.56732202
+step=1250 samples=80000 pre_update_physics_loss=2.07581925
+step=1500 samples=96000 pre_update_physics_loss=1.05448627
+step=1750 samples=112000 pre_update_physics_loss=0.59193408
+step=2000 samples=128000 pre_update_physics_loss=0.16650030
+step=2250 samples=144000 pre_update_physics_loss=0.04357219
+step=2500 samples=160000 pre_update_physics_loss=0.01430282
+step=2750 samples=176000 pre_update_physics_loss=0.01037977
+step=3000 samples=192000 pre_update_physics_loss=0.01079903
+step=3250 samples=208000 pre_update_physics_loss=0.00372922
+step=3500 samples=224000 pre_update_physics_loss=0.00465913
+step=3750 samples=240000 pre_update_physics_loss=0.00444545
+step=4000 samples=256000 pre_update_physics_loss=0.00609962
+final trajectory_rmse=0.01454714 elapsed_s=16.15
+IDR STATUS
+
+samples consumed:      256000
+unique sample IDs:     256000
+available population:  generated stream
+observed reuse:         0.0000%
+max observed reuse:     0.0000%
+
+PASS
+SEMANTIC DISJOINTNESS
+
+identity scheme:       pendulum-collocation-coordinate@1
+identity unit:         f32 time-coordinate bits, including central-stencil support
+evidence:              verified observed identities
+evaluation: mode=retained observations=771 unique=771 repeats=0
+training: mode=streaming observations=768000 unique=not-retained repeats=not-measured
+observed cross-population overlap: 0
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       state RMSE against independent f64 RK4
+evaluation population:        fixed held-out time grid
+direction:                    decrease
+observations:                 2
+baseline:                     1.61654419 at 0 optimizer steps
+terminal:                     0.01454714 at 4000 optimizer steps
+absolute improvement:         1.60199704
+relative improvement:         99.1001%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 4000 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+EMPIRICAL RESIDUAL
+
+law:                       nonlinear damped pendulum
+law version:               caliper-r5@1
+residual:                  theta(0) = theta_0 and dtheta/dt(0) = omega_0
+region:                    initial condition at t = 0 seconds
+evaluator:                 second-order central difference; h=0.01
+observations:              2
+violations:                0
+violation rate:            0.0000%
+maximum allowed rate:      0.0000%
+maximum |residual|:        0.00007749
+RMS residual:              0.00005479
+absolute tolerance:        0.00010000
+claim:                     empirical
+evidence:                  verified sampled discretized observations
+
+These sampled discretized residual observations met their declared limits. This does not prove the law, evaluator accuracy, unsampled-domain behavior, boundary satisfaction, or a global guarantee.
+
+PASS
+EMPIRICAL RESIDUAL
+
+law:                       nonlinear damped pendulum
+law version:               caliper-r5@1
+residual:                  d2theta/dt2 + gamma*dtheta/dt + (g/L)*sin(theta) = 0
+region:                    fixed held-out grid; 0 < t < 2 seconds
+evaluator:                 second-order central difference; h=0.01
+observations:              255
+violations:                0
+violation rate:            0.0000%
+maximum allowed rate:      0.0000%
+maximum |residual|:        0.29507351
+RMS residual:              0.12092431
+absolute tolerance:        0.30000000
+claim:                     empirical
+evidence:                  verified sampled discretized observations
+
+These sampled discretized residual observations met their declared limits. This does not prove the law, evaluator accuracy, unsampled-domain behavior, boundary satisfaction, or a global guarantee.
+
+PASS
+PASS: learned a damped-pendulum trajectory from sampled differential residuals

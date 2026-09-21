@@ -369,6 +369,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "damped-pendulum"
+version = "0.6.0"
+dependencies = [
+ "axis",
+]
+
+[[package]]
 name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
