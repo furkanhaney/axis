@@ -167,6 +167,15 @@ Adam state remain FP32. `Device::cuda` retains full FP32 matrix products. This
 keeps precision choice visible in the experiment rather than changing global
 semantics silently.
 
+The [ImageNet64 starter](../../src/examples/getting-started/imagenet64/README.md)
+adds the first large, access-controlled vision path. A Rust preparer validates
+the published NPZ arrays and writes labeled fixed-size records, allowing one
+sample to be sought without retaining a multi-gigabyte shard. Its compact
+three-block CNN is an end-to-end API witness. Current convolution still
+materializes patch tensors, so this is not a throughput or ImageNet-accuracy
+claim. The unlabeled RGB byte benchmark in the sibling research repository can
+verify pixels but cannot verify classification.
+
 ### Hosted API documentation
 
 Normal Axis builds require CUDA because the cuTile dependency generates its

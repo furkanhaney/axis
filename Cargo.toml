@@ -2,6 +2,7 @@
 members = [
     "src/library",
     "src/examples/getting-started/vision-data",
+    "src/examples/getting-started/imagenet64",
     "src/examples/getting-started/mnist",
     "src/examples/getting-started/fashion-mnist",
     "src/examples/getting-started/cifar100",
