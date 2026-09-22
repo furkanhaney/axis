@@ -90,10 +90,16 @@ compile_error!(
 );
 
 #[cfg(test)]
+#[path = "algebra/layout_tests.rs"]
+mod layout_tests;
+#[cfg(test)]
 #[path = "model/recurrent_tests.rs"]
 mod recurrent_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "algebra/window_tests.rs"]
+mod window_tests;
 
 pub mod prelude {
     pub use crate::{

@@ -46,8 +46,13 @@ cleared, and replacing a parameter starts a fresh leaf.
 
 Transforms whose physical index map is the identity are metadata views: an
 already-satisfied `with_layout`, a contiguous `split`, and the corresponding
-`merge` share storage and add no CUDA launch. A real permutation still
-materializes and records its inverse for backward.
+`merge` share storage and add no CUDA launch. Extent-one dimensions do not force
+a copy merely because their irrelevant strides differ. A real permutation
+materializes through the compact device selection copier with no axis removed;
+its inverse uses the same rank-sized extent/stride specification for backward.
+`split` and `merge` describe the required physical order, materialize it only
+when needed, then change shape metadata. No element-sized layout or merge index
+plan is built, cached or uploaded. Selected-axis order remains significant.
 
 Research assumptions can also fail executable checks. `SinglePass` guards the
 finite-corpus consumption budget. `Idr` consumes stable sample IDs and enforces
@@ -188,11 +193,10 @@ GEMM implementation. Single-axis contractions take a batched tiled cuTile
 matrix path. Axis caches host plans by named shape and layout, and retains up
 to 256 MiB of uploaded plans per device; larger and one-off plans remain
 step-local so a stable-shape speedup cannot grow device memory without bound.
-Merge plans additionally include the ordered selected axes in their identity
-and retain at most 128 signatures or 256 MiB of plan-vector payload on the host.
-Keys and container overhead are additional, and entries are not evicted. This avoids rebuilding
-large Conv2d channel-flattening maps on every stable-shape forward without
-conflating merges that have equal output shapes but different flattening order.
+Layout permutations and split/merge no longer use these generic plans. Their
+metadata contains three integers per logical input axis; no merge cache remains.
+Broadcast and reduction planning still have their own cache and contribution
+limits. This distinction matters for cold shapes and large convolution patches.
 The measured execution profile and claim boundary are recorded in
 [the eager execution profile](../backend/execution.md).
 Axis reordering is materialized when the batch, row, reduction, and column
@@ -223,8 +227,8 @@ The path establishes exact semantics and autodiff; it is not a fused or direct
 convolution implementation and has not established competitive convolution
 throughput. A 3D patch tensor grows with output volume times input channels and
 kernel volume, so it can dominate memory. Patch extraction itself bypasses the
-generic plan ceiling, but following merge and broadcast operations still retain
-their own 16,777,216-contribution limit.
+generic plan ceiling, as do layout permutations and split/merge, but following
+broadcast/reduction operations retain their own 16,777,216-contribution limit.
 Fully padded windows produce exact zeros without indexing the input. Because
 the cuTile kernels use signed 32-bit coordinates, every composite padded
 spatial extent must fit `i32`; larger geometry is rejected before a plan is
@@ -264,7 +268,7 @@ still enters cuTile and reports a missing toolkit, and a no-default-features
 build outside docs.rs is rejected. CI runs this contract on an ordinary Ubuntu
 runner without installing CUDA.
 
-Convolution dilation, asymmetric padding, and a full Transformer remain future
+Convolution dilation, built-in asymmetric convolution padding, and a full Transformer remain future
 slices. The single-layer forward LSTM is an eager correctness path with explicit
 state; it is not a fused recurrent kernel or a sequence-throughput result.
 
@@ -347,6 +351,8 @@ provenance contract; reading a file is not itself a research guarantee.
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
 | `select(axis, coordinate)` | Remove one named axis at a checked logical coordinate. Compute offsets from compact rank-sized geometry and scatter its derivative back into the original physical layout. |
+| `pad_zeros(axis, before, after)` | Preserve logical axis order and add exact zero-valued coordinates independently on each side. Backward crops to the original extent and layout. Zero/zero padding shares storage. |
+| `narrow(axis, start, length)` | Preserve the named axis and select a checked nonempty contiguous interval. Backward inserts exact zeros outside the interval. A full-axis interval shares storage. |
 | `Tensor::stack(values, axis, position)` | Require identical named input shapes and devices; insert the new logical axis at the declared position. Store sources contiguously under a stack-major physical layout and slice each derivative back to its source. |
 | `causal_mask(query, key)` | Require distinct axes with equal extents; replace key positions greater than query positions with negative infinity and give them zero derivative. Square, zero-offset self-attention only. |
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
@@ -377,7 +383,8 @@ with the flattened patch ordered by input channel, kernel y, then kernel x.
 Depthwise convolution is the grouped case where `g` equals the input channel
 count (and commonly the output channel count). Reconfiguring a built layer to
 a different group geometry is rejected before execution. Dilation and
-asymmetric padding are not yet supported.
+asymmetric padding are not yet built into convolution. Explicit `pad_zeros`
+can supply asymmetric input padding before a convolution with zero built-in padding.
 
 `Conv3d::new` applies the same contract to three supplied spatial axes,
 conventionally `[depth, height, width]`. Its kernel, stride, and padding arrays

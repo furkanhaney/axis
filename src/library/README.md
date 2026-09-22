@@ -66,10 +66,16 @@ The Muon implementation's pinned upstream revision and MIT attribution are in
 group. Configure a depthwise layer by setting `groups` to the input channel
 count; both input and output channel extents must be divisible by that value.
 Kernel, stride, and padding entries correspond positionally to the supplied
-named spatial axes. Padding is symmetric per axis. Dilation and asymmetric
-padding are not implemented. Both paths materialize FP32 patches before
+named spatial axes. Built-in padding is symmetric per axis. Dilation and built-in
+asymmetric convolution padding are not implemented. Both paths materialize FP32 patches before
 contraction; 3D kernel volumes can make that intermediate large, while later
 generic layout and broadcast operations retain their index-plan limits.
+
+The development API adds `tensor.pad_zeros(axis, before, after)` and
+`tensor.narrow(axis, start, length)` for asymmetric zero-padding and contiguous
+nonempty slicing. Both preserve named axes, keep values and gradients on-device,
+and use rank-sized metadata instead of element-sized index tables. Identity
+operations share storage. These APIs are not in the published 0.9.0 release.
 
 `Lstm` names its time, input, and hidden axes and preserves every unrelated
 stream axis. `run` starts from device-resident zero state; `run_from` accepts an
