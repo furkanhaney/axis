@@ -2465,6 +2465,49 @@ fn silu_and_leaky_relu_modules_match_independent_oracles() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires CUDA"]
+fn sign_straight_through_forward_and_gradient_match_independent_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let values = [-2.0_f32, -0.5, 0.0, 0.5, 2.0];
+    // Independent oracle: `+1` where `x > 0`, otherwise `-1`, so `x == 0` maps
+    // to `-1` -- this is bae's `torch.where(z > 0, 1.0, -1.0)`, not `torch.sign`.
+    let expected = [-1.0_f64, -1.0, -1.0, 1.0, 1.0];
+    // Straight-through backward: the gradient is the identity, so every element
+    // gets the same upstream gradient regardless of its own sign or magnitude.
+    let expected_gradient = [0.2_f64; 5];
+
+    let leaf = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let output = leaf.sign_straight_through()?;
+    close(
+        "sign_straight_through forward",
+        &output.to_vec()?,
+        &expected,
+    );
+    output.mean(feature)?.backward()?;
+    close(
+        "sign_straight_through straight-through derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    let module_leaf = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let module_output = SignStraightThrough.forward(&module_leaf)?;
+    close(
+        "SignStraightThrough module forward",
+        &module_output.to_vec()?,
+        &expected,
+    );
+    module_output.mean(feature)?.backward()?;
+    close(
+        "SignStraightThrough module straight-through derivative",
+        &module_leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUDA and AXIS_PYTHON with PyTorch"]
 fn pytorch_activation_forward_and_gradient_parity() -> Result<()> {
     let Ok(python) = std::env::var("AXIS_PYTHON") else {
