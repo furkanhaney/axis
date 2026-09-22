@@ -280,12 +280,11 @@ impl Tensor {
         ))
     }
     /// Deterministic uniform draw in `[low, high)` from the shared xorshift stream that
-    /// initializes parameters (see [`xorshift_unit_stream`]), generated host-side then
-    /// uploaded like [`Tensor::from_slice`]. A random draw has no upstream input, so the
-    /// result carries no gradient edge; it is a constant, not a parameter. The same seed,
-    /// shape and range reproduce identical values on any run or machine; distinct seeds
-    /// diverge. Inherits the shared stream's documented quirk: a seed below 2^40 draws
-    /// exactly `low` first.
+    /// initializes parameters, generated host-side then uploaded like [`Tensor::from_slice`].
+    /// A random draw has no upstream input, so the result carries no gradient edge; it is a
+    /// constant, not a parameter. The same seed, shape and range reproduce identical values on
+    /// any run or machine; distinct seeds diverge. Inherits the shared stream's documented
+    /// quirk: a seed below 2^40 draws exactly `low` first.
     pub fn uniform(
         dims: impl IntoIterator<Item = Dim>,
         seed: u64,
@@ -303,9 +302,12 @@ impl Tensor {
         Self::from_slice(&values, shape.dims().iter().copied(), device)
     }
     /// Deterministic normal draw with the given `mean` and standard deviation `std`, from the
-    /// same shared xorshift stream as [`Tensor::uniform`] via the Box-Muller transform (see
-    /// [`normal_host_values`] for the exact formula). Generated host-side then uploaded, with
-    /// no gradient edge, exactly like [`Tensor::uniform`].
+    /// same shared xorshift stream as [`Tensor::uniform`] via the Box-Muller transform: two raw
+    /// `[0, 1)` stream samples `u1, u2` become one pair `z0 = sqrt(-2 * ln(1 - u1)) *
+    /// cos(2*pi*u2)`, `z1 = sqrt(-2 * ln(1 - u1)) * sin(2*pi*u2)` of independent standard-normal
+    /// values, each scaled to `mean + std * z`; an odd element count drops the unused second
+    /// value of the final pair. Generated host-side then uploaded, with no gradient edge,
+    /// exactly like [`Tensor::uniform`].
     pub fn normal(
         dims: impl IntoIterator<Item = Dim>,
         seed: u64,
