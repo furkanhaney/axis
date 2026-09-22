@@ -7144,3 +7144,379 @@ fn softmax2d_normalizes_channel_axis_and_matches_hand_computed_oracle() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn piecewise_activation_modules_reject_invalid_configuration_before_launch() -> Result<()> {
+    assert!(
+        Hardtanh::new(1.0, -1.0).is_err(),
+        "min_val > max_val must be rejected"
+    );
+    assert!(
+        Hardtanh::new(f32::NAN, 1.0).is_err(),
+        "a NaN bound must be rejected"
+    );
+    assert!(
+        Hardtanh::new(0.0, f32::INFINITY).is_err(),
+        "a non-finite bound must be rejected"
+    );
+    assert!(
+        Hardshrink::new(-0.1).is_err(),
+        "a negative lambd must be rejected"
+    );
+    assert!(
+        Hardshrink::new(f32::NAN).is_err(),
+        "a NaN lambd must be rejected"
+    );
+    assert!(
+        Softshrink::new(-0.1).is_err(),
+        "a negative lambd must be rejected"
+    );
+    assert!(
+        Softshrink::new(f32::NAN).is_err(),
+        "a NaN lambd must be rejected"
+    );
+    assert!(
+        Threshold::new(f32::NAN, 0.0).is_err(),
+        "a non-finite threshold must be rejected"
+    );
+    assert!(
+        Threshold::new(0.0, f32::INFINITY).is_err(),
+        "a non-finite value must be rejected"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn relu6_and_hardtanh_modules_match_independent_oracles_at_the_kink() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("piecewise_row"), Axis::new("piecewise_col"));
+
+    // PyTorch's hardtanh_backward: zero AT as well as outside either bound
+    // (`self <= min_val || self >= max_val`), unlike clamp's inclusive-boundary rule.
+    let hardtanh_oracle = |x: f64, min_val: f64, max_val: f64| -> (f64, f64) {
+        let value = x.clamp(min_val, max_val);
+        let grad = if x > min_val && x < max_val { 1.0 } else { 0.0 };
+        (value, grad)
+    };
+
+    let relu6_values: Vec<f32> = vec![-3.0, -0.001, 0.0, 0.5, 3.0, 5.999, 6.0, 6.001, 9.0];
+    let n = relu6_values.len() as f64;
+    let relu6_leaf =
+        Tensor::from_slice(&relu6_values, [row.of(3), col.of(3)], &device)?.with_grad();
+    let relu6_input = relu6_leaf.with_layout([col, row])?;
+    let relu6_out = ReLU6.forward(&relu6_input)?;
+    let (expected_relu6, expected_relu6_grad): (Vec<f64>, Vec<f64>) = relu6_values
+        .iter()
+        .map(|&x| {
+            let (v, g) = hardtanh_oracle(f64::from(x), 0.0, 6.0);
+            (v, g / n)
+        })
+        .unzip();
+    close(
+        "ReLU6 module forward, below/at-min/interior/at-max/above",
+        &relu6_out.to_vec()?,
+        &expected_relu6,
+    );
+    relu6_out.mean([row, col])?.backward()?;
+    close(
+        "ReLU6 module derivative, strictly interior only",
+        &relu6_leaf.grad().unwrap().to_vec()?,
+        &expected_relu6_grad,
+    );
+
+    let hardtanh_values: Vec<f32> = vec![-5.0, -2.0, -1.5, 0.0, 1.0, 2.999, 3.0, 3.2, 6.0];
+    let hardtanh_leaf =
+        Tensor::from_slice(&hardtanh_values, [row.of(3), col.of(3)], &device)?.with_grad();
+    let hardtanh_input = hardtanh_leaf.with_layout([col, row])?;
+    let hardtanh_out = Hardtanh::new(-2.0, 3.0)?.forward(&hardtanh_input)?;
+    let (expected_hardtanh, expected_hardtanh_grad): (Vec<f64>, Vec<f64>) = hardtanh_values
+        .iter()
+        .map(|&x| {
+            let (v, g) = hardtanh_oracle(f64::from(x), -2.0, 3.0);
+            (v, g / n)
+        })
+        .unzip();
+    close(
+        "Hardtanh(-2, 3) module forward, below/at-min/interior/at-max/above",
+        &hardtanh_out.to_vec()?,
+        &expected_hardtanh,
+    );
+    hardtanh_out.mean([row, col])?.backward()?;
+    close(
+        "Hardtanh(-2, 3) module derivative, strictly interior only",
+        &hardtanh_leaf.grad().unwrap().to_vec()?,
+        &expected_hardtanh_grad,
+    );
+
+    assert!(hardtanh_input.hardtanh(1.0, -1.0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn hardsigmoid_and_hardswish_modules_match_independent_oracles_at_the_kink() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("piecewise_row2"), Axis::new("piecewise_col2"));
+    let values: Vec<f32> = vec![-5.0, -3.0, -1.5, 0.0, 1.0, 2.0, 3.0, 3.5, 6.0];
+    let n = values.len() as f64;
+
+    let hardsigmoid_leaf =
+        Tensor::from_slice(&values, [row.of(3), col.of(3)], &device)?.with_grad();
+    let hardsigmoid_input = hardsigmoid_leaf.with_layout([col, row])?;
+    let hardsigmoid_out = Hardsigmoid.forward(&hardsigmoid_input)?;
+    let expected_hardsigmoid: Vec<f64> = values
+        .iter()
+        .map(|&x| (f64::from(x) / 6.0 + 0.5).clamp(0.0, 1.0))
+        .collect();
+    close(
+        "Hardsigmoid module forward",
+        &hardsigmoid_out.to_vec()?,
+        &expected_hardsigmoid,
+    );
+    hardsigmoid_out.mean([row, col])?.backward()?;
+    // PyTorch's hardsigmoid_backward: grad/6 strictly inside (-3, 3), zero at and
+    // outside either bound (`self > -3 && self < 3`, both strict).
+    let expected_hardsigmoid_grad: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            if x > -3.0 && x < 3.0 {
+                (1.0 / 6.0) / n
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    close(
+        "Hardsigmoid module derivative, strictly interior only",
+        &hardsigmoid_leaf.grad().unwrap().to_vec()?,
+        &expected_hardsigmoid_grad,
+    );
+
+    let hardswish_leaf = Tensor::from_slice(&values, [row.of(3), col.of(3)], &device)?.with_grad();
+    let hardswish_input = hardswish_leaf.with_layout([col, row])?;
+    let hardswish_out = Hardswish.forward(&hardswish_input)?;
+    // PyTorch's Hardswish: x * clamp(x + 3, 0, 6) / 6.
+    let expected_hardswish: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            x * (x + 3.0).clamp(0.0, 6.0) / 6.0
+        })
+        .collect();
+    close(
+        "Hardswish module forward",
+        &hardswish_out.to_vec()?,
+        &expected_hardswish,
+    );
+    hardswish_out.mean([row, col])?.backward()?;
+    // PyTorch's hardswish_backward: zero for x <= -3, `x / 3 + 0.5` strictly inside
+    // (-3, 3), and exactly `1` (pass-through) for x >= 3 -- an ASYMMETRIC kink: x == -3
+    // routes to the zero branch, but x == 3 routes to the pass-through branch, not the
+    // interior formula's limit there (1.5).
+    let expected_hardswish_grad: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            let g = if x <= -3.0 {
+                0.0
+            } else if x < 3.0 {
+                x / 3.0 + 0.5
+            } else {
+                1.0
+            };
+            g / n
+        })
+        .collect();
+    close(
+        "Hardswish module derivative, asymmetric kinks",
+        &hardswish_leaf.grad().unwrap().to_vec()?,
+        &expected_hardswish_grad,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn hardshrink_and_softshrink_modules_match_independent_oracle_on_the_band() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("piecewise_row3"), Axis::new("piecewise_col3"));
+    let values: Vec<f32> = vec![-2.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0];
+    let n = values.len() as f64;
+    let lambd = 0.5f32;
+    // PyTorch's shared shrink_backward_kernel, behind both Hardshrink and Softshrink:
+    // zero on the CLOSED band [-lambd, lambd], grad outside it.
+    let shrink_grad = |x: f64, lambd: f64, n: f64| -> f64 {
+        if (-lambd..=lambd).contains(&x) {
+            0.0
+        } else {
+            1.0 / n
+        }
+    };
+
+    let hardshrink_leaf = Tensor::from_slice(&values, [row.of(2), col.of(4)], &device)?.with_grad();
+    let hardshrink_input = hardshrink_leaf.with_layout([col, row])?;
+    let hardshrink_out = Hardshrink::new(lambd)?.forward(&hardshrink_input)?;
+    let expected_hardshrink: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            if x.abs() <= f64::from(lambd) { 0.0 } else { x }
+        })
+        .collect();
+    close(
+        "Hardshrink(0.5) module forward",
+        &hardshrink_out.to_vec()?,
+        &expected_hardshrink,
+    );
+    hardshrink_out.mean([row, col])?.backward()?;
+    let expected_hardshrink_grad: Vec<f64> = values
+        .iter()
+        .map(|&x| shrink_grad(f64::from(x), f64::from(lambd), n))
+        .collect();
+    close(
+        "Hardshrink(0.5) module derivative, zero on the closed band",
+        &hardshrink_leaf.grad().unwrap().to_vec()?,
+        &expected_hardshrink_grad,
+    );
+    assert!(hardshrink_input.hardshrink(-0.1).is_err());
+
+    let softshrink_leaf = Tensor::from_slice(&values, [row.of(2), col.of(4)], &device)?.with_grad();
+    let softshrink_input = softshrink_leaf.with_layout([col, row])?;
+    let softshrink_out = Softshrink::new(lambd)?.forward(&softshrink_input)?;
+    let expected_softshrink: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            let lambd = f64::from(lambd);
+            if x > lambd {
+                x - lambd
+            } else if x < -lambd {
+                x + lambd
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    close(
+        "Softshrink(0.5) module forward",
+        &softshrink_out.to_vec()?,
+        &expected_softshrink,
+    );
+    softshrink_out.mean([row, col])?.backward()?;
+    let expected_softshrink_grad: Vec<f64> = values
+        .iter()
+        .map(|&x| shrink_grad(f64::from(x), f64::from(lambd), n))
+        .collect();
+    close(
+        "Softshrink(0.5) module derivative, zero on the closed band",
+        &softshrink_leaf.grad().unwrap().to_vec()?,
+        &expected_softshrink_grad,
+    );
+    assert!(softshrink_input.softshrink(-0.1).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn threshold_module_matches_independent_oracle_at_the_kink() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("piecewise_row4"), Axis::new("piecewise_col4"));
+    let values: Vec<f32> = vec![-2.0, 0.0, 0.999, 1.0, 1.001, 3.0];
+    let n = values.len() as f64;
+    let (threshold_value, replacement) = (1.0f32, -5.0f32);
+
+    let leaf = Tensor::from_slice(&values, [row.of(2), col.of(3)], &device)?.with_grad();
+    let input = leaf.with_layout([col, row])?;
+    let out = Threshold::new(threshold_value, replacement)?.forward(&input)?;
+    // PyTorch's Threshold: x where x > threshold, else the constant `value` -- the SAME
+    // `<=`/`>` split governs threshold_backward (grad where x > threshold, 0 at and
+    // below it, exactly matching the forward's own boundary).
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            if f64::from(x) > f64::from(threshold_value) {
+                f64::from(x)
+            } else {
+                f64::from(replacement)
+            }
+        })
+        .collect();
+    close("Threshold(1, -5) module forward", &out.to_vec()?, &expected);
+    out.mean([row, col])?.backward()?;
+    let expected_grad: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            if f64::from(x) > f64::from(threshold_value) {
+                1.0 / n
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    close(
+        "Threshold(1, -5) module derivative, zero at and below the threshold",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(input.threshold(f32::NAN, 0.0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn softsign_and_tanhshrink_modules_match_independent_oracles() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("piecewise_row5"), Axis::new("piecewise_col5"));
+    let values: Vec<f32> = vec![-4.0, -1.0, -0.1, 0.0, 0.1, 1.0, 2.0, 4.0];
+    let n = values.len() as f64;
+
+    let softsign_leaf = Tensor::from_slice(&values, [row.of(2), col.of(4)], &device)?.with_grad();
+    let softsign_input = softsign_leaf.with_layout([col, row])?;
+    let softsign_out = Softsign.forward(&softsign_input)?;
+    let expected_softsign: Vec<f64> = values
+        .iter()
+        .map(|&x| f64::from(x) / (1.0 + f64::from(x).abs()))
+        .collect();
+    close(
+        "Softsign module forward",
+        &softsign_out.to_vec()?,
+        &expected_softsign,
+    );
+    softsign_out.mean([row, col])?.backward()?;
+    let expected_softsign_grad: Vec<f64> = values
+        .iter()
+        .map(|&x| (1.0 / (1.0 + f64::from(x).abs()).powi(2)) / n)
+        .collect();
+    close(
+        "Softsign module derivative, smooth through x == 0",
+        &softsign_leaf.grad().unwrap().to_vec()?,
+        &expected_softsign_grad,
+    );
+
+    let tanhshrink_leaf = Tensor::from_slice(&values, [row.of(2), col.of(4)], &device)?.with_grad();
+    let tanhshrink_input = tanhshrink_leaf.with_layout([col, row])?;
+    let tanhshrink_out = Tanhshrink.forward(&tanhshrink_input)?;
+    let expected_tanhshrink: Vec<f64> = values
+        .iter()
+        .map(|&x| f64::from(x) - f64::from(x).tanh())
+        .collect();
+    close(
+        "Tanhshrink module forward",
+        &tanhshrink_out.to_vec()?,
+        &expected_tanhshrink,
+    );
+    tanhshrink_out.mean([row, col])?.backward()?;
+    let expected_tanhshrink_grad: Vec<f64> = values
+        .iter()
+        .map(|&x| f64::from(x).tanh().powi(2) / n)
+        .collect();
+    close(
+        "Tanhshrink module derivative",
+        &tanhshrink_leaf.grad().unwrap().to_vec()?,
+        &expected_tanhshrink_grad,
+    );
+    Ok(())
+}

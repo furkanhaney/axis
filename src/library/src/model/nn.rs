@@ -930,6 +930,199 @@ impl Module for Tanh {
     }
 }
 
+/// Parameter-free `ReLU6`: [`Hardtanh`] with fixed bounds `0` and `6`. See
+/// [`Tensor::relu6`] for the exact forward and (strictly-interior) backward semantics.
+#[derive(Clone, Copy)]
+pub struct ReLU6;
+impl Module for ReLU6 {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.relu6()
+    }
+}
+
+/// Parameter-free `Hardtanh` with explicit `min_val`/`max_val` bounds. See
+/// [`Tensor::hardtanh`] for the exact forward and gradient-at-the-kinks semantics.
+#[derive(Clone, Copy)]
+pub struct Hardtanh {
+    min_val: f32,
+    max_val: f32,
+}
+impl Hardtanh {
+    pub fn new(min_val: f32, max_val: f32) -> Result<Self> {
+        if !min_val.is_finite() || !max_val.is_finite() {
+            return Err("Hardtanh bounds must be finite".into());
+        }
+        if min_val > max_val {
+            return Err(format!(
+                "Hardtanh requires min_val <= max_val, got min_val={min_val} max_val={max_val}"
+            )
+            .into());
+        }
+        Ok(Self { min_val, max_val })
+    }
+}
+impl Module for Hardtanh {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.hardtanh(self.min_val, self.max_val)
+    }
+}
+
+/// Parameter-free `Hardsigmoid`. See [`Tensor::hardsigmoid`] for the exact forward and
+/// gradient-at-the-kinks semantics.
+#[derive(Clone, Copy)]
+pub struct Hardsigmoid;
+impl Module for Hardsigmoid {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.hardsigmoid()
+    }
+}
+
+/// Parameter-free `Hardswish`. See [`Tensor::hardswish`] for the exact forward and
+/// gradient-at-the-kinks semantics, including its asymmetric boundary convention.
+#[derive(Clone, Copy)]
+pub struct Hardswish;
+impl Module for Hardswish {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.hardswish()
+    }
+}
+
+/// Parameter-free `Hardshrink` with an explicit `lambd`. See [`Tensor::hardshrink`] for
+/// the exact forward and gradient-at-the-band semantics.
+#[derive(Clone, Copy)]
+pub struct Hardshrink {
+    lambd: f32,
+}
+impl Hardshrink {
+    pub fn new(lambd: f32) -> Result<Self> {
+        if !lambd.is_finite() || lambd < 0.0 {
+            return Err("Hardshrink lambd must be finite and non-negative".into());
+        }
+        Ok(Self { lambd })
+    }
+}
+impl Module for Hardshrink {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.hardshrink(self.lambd)
+    }
+}
+
+/// Parameter-free `Softshrink` with an explicit `lambd`. See [`Tensor::softshrink`] for
+/// the exact forward and gradient-at-the-band semantics.
+#[derive(Clone, Copy)]
+pub struct Softshrink {
+    lambd: f32,
+}
+impl Softshrink {
+    pub fn new(lambd: f32) -> Result<Self> {
+        if !lambd.is_finite() || lambd < 0.0 {
+            return Err("Softshrink lambd must be finite and non-negative".into());
+        }
+        Ok(Self { lambd })
+    }
+}
+impl Module for Softshrink {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.softshrink(self.lambd)
+    }
+}
+
+/// Parameter-free `Threshold` with an explicit `threshold`/`value`. PyTorch requires
+/// both explicitly (no defaults); see [`Tensor::threshold`] for the exact forward and
+/// gradient-at-the-kink semantics.
+#[derive(Clone, Copy)]
+pub struct Threshold {
+    threshold: f32,
+    value: f32,
+}
+impl Threshold {
+    pub fn new(threshold: f32, value: f32) -> Result<Self> {
+        if !threshold.is_finite() || !value.is_finite() {
+            return Err("Threshold threshold and value must both be finite".into());
+        }
+        Ok(Self { threshold, value })
+    }
+}
+impl Module for Threshold {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.threshold(self.threshold, self.value)
+    }
+}
+
+/// Parameter-free `Softsign`. See [`Tensor::softsign`] for the exact forward and
+/// backward semantics (smooth everywhere, no true kink).
+#[derive(Clone, Copy)]
+pub struct Softsign;
+impl Module for Softsign {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.softsign()
+    }
+}
+
+/// Parameter-free `Tanhshrink`. See [`Tensor::tanhshrink`] for the exact forward and
+/// backward semantics (smooth everywhere, no true kink).
+#[derive(Clone, Copy)]
+pub struct Tanhshrink;
+impl Module for Tanhshrink {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.tanhshrink()
+    }
+}
+
 /// Parameter-free sign quantization to `{-1, +1}` with a straight-through
 /// backward. See [`Tensor::sign_straight_through`] for the exact forward and
 /// backward semantics this reproduces from bae's `bitae.quantize`.
