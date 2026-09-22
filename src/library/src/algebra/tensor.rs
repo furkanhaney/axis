@@ -788,6 +788,286 @@ impl Tensor {
         }
         self.sub(rhs)?.abs()
     }
+    /// PyTorch-exact `HuberLoss` (default `delta = 1.0`): `0.5 * (self - rhs)^2` where
+    /// `|self - rhs| < delta`, else `delta * (|self - rhs| - 0.5 * delta)`. Composed as
+    /// `0.5 * min(|d|, delta)^2 + delta * relu(|d| - delta)` with `d = self - rhs` -- an exact
+    /// algebraic identity with PyTorch's two-branch definition, continuous and
+    /// differentiable at `|d| == delta` -- so no dedicated kernel or `Rule` is needed; backward
+    /// is `clamp(d, -delta, delta)`, the composition's own derivative. Same axis-agreement
+    /// contract as [`Tensor::squared_error`]/[`Tensor::absolute_error`]: identical axis sets,
+    /// unreduced shape, reduction left to the caller. `delta` must be finite and positive.
+    pub fn huber_loss(&self, rhs: &Self, delta: f32) -> Result<Self> {
+        if !delta.is_finite() || delta <= 0.0 {
+            return Err("huber_loss delta must be finite and positive".into());
+        }
+        if self.shape().rank() != rhs.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&a| !rhs.shape().contains(a))
+        {
+            return Err("huber_loss requires identical axis sets".into());
+        }
+        let magnitude = self.sub(rhs)?.abs()?;
+        let quadratic = magnitude.clamp(None, Some(delta))?;
+        let quadratic = quadratic.mul(&quadratic)?.scale(0.5)?;
+        let linear = magnitude
+            .clamp(Some(delta), None)?
+            .sub(&Self::from_slice(&[delta], [], self.device())?)?
+            .scale(delta)?;
+        quadratic.add(&linear)
+    }
+    /// PyTorch-exact `SmoothL1Loss` (default `beta = 1.0`), the family's own scaling of
+    /// [`Tensor::huber_loss`]: `SmoothL1Loss(beta) == HuberLoss(delta = beta) / beta` is an
+    /// exact algebraic identity (both branches divide out), so this composes `huber_loss`
+    /// rather than repeating its formula. `beta` must be finite and positive; morpheus's
+    /// RBC/WBC radius and offset regression heads call `F.smooth_l1_loss(..., beta=.02)`
+    /// throughout `research/src/vision/morpheus/mobilesam/scale10` (for example
+    /// `train_click_rbc.py:558`), the consumer for the non-default `beta` this test exercises.
+    pub fn smooth_l1_loss(&self, rhs: &Self, beta: f32) -> Result<Self> {
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err("smooth_l1_loss beta must be finite and positive".into());
+        }
+        self.huber_loss(rhs, beta)?.scale(1.0 / beta)
+    }
+    /// `NLLLoss` generalized to constant one-hot or probability targets over a named class
+    /// axis, exactly the way [`Tensor::categorical_cross_entropy_with_logits`] generalizes
+    /// `CrossEntropyLoss` -- the same target representation decision, mirrored here. `self`
+    /// must already hold log-probabilities (typically `logits.softmax(class)?.ln()?` or a
+    /// named-axis log-softmax composition); unlike `categorical_cross_entropy_with_logits`,
+    /// this op folds in no softmax of its own. The named class axis is reduced; every other
+    /// axis is preserved, and a target may omit axes `self` has (broadcasting one target row
+    /// over them, as `categorical_cross_entropy_with_logits` also allows). Loss is
+    /// `-sum(class, target * self)`, so backward is exactly `-target`, the composition's own
+    /// linear derivative -- no dedicated kernel or `Rule`. morpheus's partition classifier
+    /// calls `F.nll_loss(q[full].log(), lab[full].long(), weight=ce_weight)`
+    /// (`research/src/vision/morpheus/mobilesam/scale10/train_partition5.py:291`); Axis has no
+    /// per-class `weight` yet. Targets are constants in reverse mode.
+    pub fn nll_loss(&self, targets: &Self, class: Axis) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("nll_loss targets cannot require gradients".into());
+        }
+        if !targets.shape().contains(class)
+            || targets
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !self.shape().contains(axis))
+        {
+            return Err(
+                "nll_loss targets must contain the class axis and may omit only broadcast axes"
+                    .into(),
+            );
+        }
+        self.compatible_device(targets)?;
+        self.shared_extents(targets)?;
+        let width = self.extent(class)?;
+        let mut ordered_dims: Vec<_> = targets
+            .shape()
+            .dims()
+            .iter()
+            .copied()
+            .filter(|dim| dim.axis != class)
+            .collect();
+        ordered_dims.push(class.of(width));
+        let ordered = Shape::new(ordered_dims)?;
+        let checked = targets.align(&ordered)?;
+        for (row, distribution) in checked.to_vec()?.chunks_exact(width).enumerate() {
+            if distribution
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                return Err(format!(
+                    "nll_loss target row {row} must contain finite nonnegative probabilities"
+                )
+                .into());
+            }
+            let sum: f32 = distribution.iter().sum();
+            if (sum - 1.0).abs() > 1e-5 {
+                return Err(
+                    format!("nll_loss target row {row} must sum to 1; observed {sum}").into(),
+                );
+            }
+        }
+        self.mul(targets)?.sum(class)?.scale(-1.0)
+    }
+    /// Elementwise `BCELoss` for probability inputs: `-[y * log(x) + (1 - y) * log(1 - x)]`.
+    /// `self` holds probabilities in `[0, 1]` (already squashed by the caller, typically
+    /// `.sigmoid()`) -- unlike [`Tensor::binary_cross_entropy_with_logits`], this op fuses no
+    /// sigmoid. Matching PyTorch, the probability is floored before its logarithm is taken, so
+    /// a prediction of exactly `0` or `1` gives a finite loss rather than `NaN` -- but the
+    /// floor is applied to the *input*, at [`f32::MIN_POSITIVE`], rather than clamping `ln`'s
+    /// output to PyTorch's stated `-100` directly, and rather than flooring the input at
+    /// PyTorch's own `exp(-100)`. Both alternatives break backward in `f32`: `ln`'s own
+    /// backward divides by its saved input, so an output-side floor would still let backward
+    /// see `ln(0) -> g / 0 -> NaN` at `x == 0`; and `exp(-100)` itself only rounds to a
+    /// subnormal `f32` so small that `ln`'s backward `1 / x` overflows to infinity, which then
+    /// hits the input clamp's own zeroing multiplier as `inf * 0 -> NaN` right back. The
+    /// smallest *normal* `f32`, `f32::MIN_POSITIVE`, keeps `1 / x` finite (`~8.5e37`, inside
+    /// `f32::MAX`) while still flooring the logarithm at `~-87.3`, the closest approach to
+    /// PyTorch's `-100` this backward can support. Composed entirely from
+    /// [`Tensor::clamp`]/[`Tensor::ln`]; the gradient is that composition's own exact
+    /// derivative. Away from the floor it is the same `(x - y) / (x * (1 - x))` PyTorch's docs
+    /// give; at a saturated, wrong-side prediction where the active log term is floored (for
+    /// example `x == 0, y == 1`), it is exactly `0` rather than PyTorch's own large finite
+    /// value, since `clamp`'s boundary rule zeroes the gradient of whichever term it moved.
+    /// Same axis-agreement contract as [`Tensor::absolute_error`]. Targets are constants in
+    /// reverse mode.
+    pub fn binary_cross_entropy(&self, targets: &Self) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("binary_cross_entropy targets cannot require gradients".into());
+        }
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err("binary_cross_entropy requires identical axis sets".into());
+        }
+        let one = Self::from_slice(&[1.0], [], self.device())?;
+        let floor = f32::MIN_POSITIVE;
+        let log_probability = self.clamp(Some(floor), None)?.ln()?;
+        let log_complement = one.sub(self)?.clamp(Some(floor), None)?.ln()?;
+        let positive = targets.mul(&log_probability)?;
+        let negative = one.sub(targets)?.mul(&log_complement)?;
+        positive.add(&negative)?.scale(-1.0)
+    }
+    /// Elementwise `KLDivLoss` at PyTorch's default `log_target = false`: `self` holds
+    /// log-probabilities (as `NLLLoss`/`CrossEntropyLoss` do), `target` holds probabilities,
+    /// and the pointwise loss is `target * (log(target) - self)`. Matches PyTorch's `xlogy`
+    /// convention at `target == 0` -- contributes exactly `0`, never `NaN` from `0 * -inf` --
+    /// by substituting `1.0` for `log`'s input only where `target == 0`, a substitution whose
+    /// own `target` factor of `0` cancels it either way. `log_target = true` is not
+    /// implemented. Composed from [`Tensor::eq`]/[`Tensor::logical_not`]/[`Tensor::ln`]; no
+    /// dedicated kernel. morpheus's distillation heads call
+    /// `F.kl_div(F.log_softmax(logits / t, -1), F.softmax(teacher_logits / t, -1), ...)`
+    /// (`research/src/vision/morpheus/mobilesam/scale10/microtier/runs/wbc-edgepath-slice4m/train.py:124`),
+    /// the consumer for this exact `log_target = false` shape. Targets are constants in
+    /// reverse mode.
+    pub fn kl_div_loss(&self, targets: &Self) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("kl_div_loss targets cannot require gradients".into());
+        }
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err("kl_div_loss requires identical axis sets".into());
+        }
+        let is_zero = targets.eq(0.0)?;
+        let not_zero = is_zero.logical_not()?;
+        let safe_targets = targets.mul(&not_zero)?.add(&is_zero)?;
+        let target_log_target = targets.mul(&safe_targets.ln()?)?;
+        target_log_target.sub(&targets.mul(self)?)
+    }
+    /// `PoissonNLLLoss` at PyTorch's default `log_input = true, full = false`: `self` holds
+    /// the log of the predicted rate, and the pointwise loss is `exp(self) - target * self`.
+    /// The Stirling normalization term `full = true` would add, and the `log_input = false`
+    /// / `eps` branch, are not implemented. Composed from [`Tensor::exp`]; no dedicated
+    /// kernel. Targets are constants in reverse mode.
+    pub fn poisson_nll_loss(&self, targets: &Self) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("poisson_nll_loss targets cannot require gradients".into());
+        }
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err("poisson_nll_loss requires identical axis sets".into());
+        }
+        self.exp()?.sub(&targets.mul(self)?)
+    }
+    /// `GaussianNLLLoss` at PyTorch's default `full = false`: `self` is the predicted mean,
+    /// `var` the predicted variance (itself differentiable -- unlike `targets`, matching
+    /// PyTorch treating `var` as a second model output, not a label), and the pointwise loss
+    /// is `0.5 * (log(max(var, eps)) + (self - target)^2 / max(var, eps))`, composed from
+    /// [`Tensor::clamp`]/[`Tensor::ln`]/[`Tensor::squared_error`]/[`Tensor::div`] with no
+    /// dedicated kernel. The constant `0.5 * log(2*pi)` term `full = true` would add is not
+    /// implemented. `var` must be elementwise nonnegative before clamping, matching PyTorch's
+    /// own check; `eps` must be finite and positive. Unlike PyTorch, which clamps `var` inside
+    /// `no_grad` so its gradient passes straight through the clamp using the clamped value,
+    /// Axis composes this from the ordinary `clamp`, whose ordinary boundary rule zeroes
+    /// `var`'s own gradient at elements the clamp actually moved (`var < eps`); `self`'s
+    /// gradient is unaffected either way. Targets are constants in reverse mode.
+    pub fn gaussian_nll_loss(&self, targets: &Self, var: &Self, eps: f32) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("gaussian_nll_loss targets cannot require gradients".into());
+        }
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err("gaussian_nll_loss eps must be finite and positive".into());
+        }
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err(
+                "gaussian_nll_loss requires identical axis sets for the mean and the target".into(),
+            );
+        }
+        if self.shape().rank() != var.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !var.shape().contains(axis))
+        {
+            return Err(
+                "gaussian_nll_loss requires identical axis sets for the mean and var".into(),
+            );
+        }
+        if var.to_vec()?.iter().any(|value| *value < 0.0) {
+            return Err("gaussian_nll_loss var must be elementwise nonnegative".into());
+        }
+        let clamped_var = var.clamp(Some(eps), None)?;
+        let log_var = clamped_var.ln()?;
+        let term = self.squared_error(targets)?.div(&clamped_var)?;
+        log_var.add(&term)?.scale(0.5)
+    }
+    /// Elementwise `SoftMarginLoss`: `log(1 + exp(-target * self))` for `target` in
+    /// `{-1, +1}`, composed as `(-target * self).softplus(1.0, 20.0)` -- PyTorch's own default
+    /// `Softplus` threshold, reused here purely for the numerically stable linear seam, not as
+    /// a knob callers choose. Backward is the composition's own `-target *
+    /// sigmoid(-target * self)`; no dedicated kernel. Same axis-agreement contract as
+    /// [`Tensor::absolute_error`]. Targets are constants in reverse mode.
+    pub fn soft_margin_loss(&self, targets: &Self) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("soft_margin_loss targets cannot require gradients".into());
+        }
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err("soft_margin_loss requires identical axis sets".into());
+        }
+        targets.mul(self)?.scale(-1.0)?.softplus(1.0, 20.0)
+    }
+    /// `MultiLabelSoftMarginLoss` at PyTorch's default (no per-class `weight`): the mean, over
+    /// the named class axis, of [`Tensor::binary_cross_entropy_with_logits`]. PyTorch's own
+    /// formula `-1/C * sum_c [y_c*log(sigmoid(x_c)) + (1-y_c)*log(1-sigmoid(x_c))]` is exactly
+    /// that mean, since `binary_cross_entropy_with_logits` already computes the summand
+    /// elementwise -- no dedicated kernel or `Rule` is needed. Unlike Axis's other losses,
+    /// PyTorch's own unreduced (`reduction='none'`) form already reduces the class axis, so
+    /// the class axis is gone from the result before any caller reduction; every other axis is
+    /// preserved. Inherits `binary_cross_entropy_with_logits`'s constant-target requirement
+    /// and identical-axis-set contract.
+    pub fn multilabel_soft_margin_loss(&self, targets: &Self, class: Axis) -> Result<Self> {
+        self.binary_cross_entropy_with_logits(targets)?.mean(class)
+    }
     /// Stable elementwise binary cross-entropy. Targets are constants in reverse mode.
     pub fn binary_cross_entropy_with_logits(&self, targets: &Self) -> Result<Self> {
         if targets.requires_grad() {

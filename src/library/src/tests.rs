@@ -8436,3 +8436,697 @@ fn multi_label_margin_loss_handles_reordered_storage() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn l1_and_mse_losses_match_hand_computed_oracles_under_reordered_asymmetric_storage() -> Result<()>
+{
+    // L1Loss (`absolute_error`) and MSELoss (`squared_error`) already existed; this closes the
+    // remaining CUDA-coverage gap those catalog rows were waiting on: a reordered,
+    // asymmetric-extent case for both, exercised together the way `abs`'s own reordered test
+    // does (`abs_matches_hand_computed_oracle_under_reordered_asymmetric_cuda_storage`).
+    // `f64::signum` returns `1.0` at exactly `0.0` (not `0.0`), unlike `abs`'s documented
+    // zero-at-`x == 0` backward convention that `absolute_error` inherits, so the oracle below
+    // uses this helper instead of `.signum()`.
+    fn sign_or_zero(value: f64) -> f64 {
+        if value == 0.0 { 0.0 } else { value.signum() }
+    }
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (3, 2).
+    let pred_values = [1.0f32, -2.0, 0.5, 3.0, -1.5, 0.0];
+    let target_values = [0.0f32, -1.0, 0.5, 1.0, -3.0, 0.0];
+    let expected_l1: Vec<f64> = pred_values
+        .iter()
+        .zip(target_values)
+        .map(|(&p, t)| (f64::from(p) - f64::from(t)).abs())
+        .collect();
+    let expected_mse: Vec<f64> = pred_values
+        .iter()
+        .zip(target_values)
+        .map(|(&p, t)| (f64::from(p) - f64::from(t)).powi(2))
+        .collect();
+    let n = pred_values.len() as f64;
+    let expected_l1_grad_pred: Vec<f64> = pred_values
+        .iter()
+        .zip(target_values)
+        .map(|(&p, t)| sign_or_zero(f64::from(p) - f64::from(t)) / n)
+        .collect();
+    let expected_mse_grad_pred: Vec<f64> = pred_values
+        .iter()
+        .zip(target_values)
+        .map(|(&p, t)| 2.0 * (f64::from(p) - f64::from(t)) / n)
+        .collect();
+
+    let pred = Tensor::from_slice(&pred_values, [batch.of(3), feature.of(2)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(3), feature.of(2)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+
+    let l1 = pred.absolute_error(&target)?;
+    close(
+        "L1Loss forward under reordered, asymmetric storage",
+        &l1.to_vec()?,
+        &expected_l1,
+    );
+    l1.mean([batch, feature])?.backward()?;
+    close(
+        "L1Loss gradient wrt prediction under reordered storage",
+        &pred.grad().unwrap().to_vec()?,
+        &expected_l1_grad_pred,
+    );
+    close(
+        "L1Loss gradient wrt target under reordered storage",
+        &target.grad().unwrap().to_vec()?,
+        &expected_l1_grad_pred
+            .iter()
+            .map(|&g| -g)
+            .collect::<Vec<_>>(),
+    );
+
+    let pred2 = Tensor::from_slice(&pred_values, [batch.of(3), feature.of(2)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target2 = Tensor::from_slice(&target_values, [batch.of(3), feature.of(2)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let mse = pred2.squared_error(&target2)?;
+    close(
+        "MSELoss forward under reordered, asymmetric storage",
+        &mse.to_vec()?,
+        &expected_mse,
+    );
+    mse.mean([batch, feature])?.backward()?;
+    close(
+        "MSELoss gradient wrt prediction under reordered storage",
+        &pred2.grad().unwrap().to_vec()?,
+        &expected_mse_grad_pred,
+    );
+    close(
+        "MSELoss gradient wrt target under reordered storage",
+        &target2.grad().unwrap().to_vec()?,
+        &expected_mse_grad_pred
+            .iter()
+            .map(|&g| -g)
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn huber_and_smooth_l1_loss_match_hand_computed_oracle_and_pytorch_consumer_default() -> Result<()>
+{
+    // Hand oracle: HuberLoss(delta) = 0.5*min(|d|,delta)^2 + delta*relu(|d|-delta), an exact
+    // algebraic identity with PyTorch's two-branch definition; its derivative wrt d is
+    // clamp(d, -delta, delta). SmoothL1Loss(beta) == HuberLoss(delta=beta) / beta, another
+    // exact identity, checked directly below as well as against its own closed form.
+    fn huber(diff: f64, delta: f64) -> f64 {
+        if diff.abs() < delta {
+            0.5 * diff * diff
+        } else {
+            delta * (diff.abs() - 0.5 * delta)
+        }
+    }
+    fn huber_grad(diff: f64, delta: f64) -> f64 {
+        diff.clamp(-delta, delta)
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (2, 3).
+    // target is zero everywhere, so diff == pred.
+    let pred_values = [0.0f32, 2.0, -3.0, 0.3, 5.0, -0.5];
+    let target_values = [0.0f32; 6];
+    let n = pred_values.len() as f64;
+    let expected_huber: Vec<f64> = pred_values
+        .iter()
+        .map(|&p| huber(f64::from(p), 1.0))
+        .collect();
+    let expected_huber_grad: Vec<f64> = pred_values
+        .iter()
+        .map(|&p| huber_grad(f64::from(p), 1.0) / n)
+        .collect();
+
+    let pred = Tensor::from_slice(&pred_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+
+    let huber_loss = pred.huber_loss(&target, 1.0)?;
+    close(
+        "HuberLoss(delta=1) forward under reordered, asymmetric storage",
+        &huber_loss.to_vec()?,
+        &expected_huber,
+    );
+    // SmoothL1Loss(beta=1) must equal HuberLoss(delta=1) exactly (the algebraic identity at
+    // beta == delta == 1, where dividing by beta changes nothing).
+    let smooth_at_one = pred.smooth_l1_loss(&target, 1.0)?;
+    close(
+        "SmoothL1Loss(beta=1) matches HuberLoss(delta=1) exactly",
+        &smooth_at_one.to_vec()?,
+        &expected_huber,
+    );
+    huber_loss.mean([batch, feature])?.backward()?;
+    close(
+        "HuberLoss gradient under reordered storage",
+        &pred.grad().unwrap().to_vec()?,
+        &expected_huber_grad,
+    );
+
+    // morpheus's RBC/WBC radius and offset regression heads call
+    // `F.smooth_l1_loss(..., beta=.02)` throughout
+    // `research/src/vision/morpheus/mobilesam/scale10` (for example `train_click_rbc.py:558`);
+    // this is that non-default beta.
+    let beta = 0.02f32;
+    let small_pred_values = [0.0f32, 0.05, -0.1, 0.01, 0.03, -0.019];
+    let small_target_values = [0.0f32; 6];
+    let expected_smooth: Vec<f64> = small_pred_values
+        .iter()
+        .map(|&p| huber(f64::from(p), f64::from(beta)) / f64::from(beta))
+        .collect();
+    let expected_smooth_grad: Vec<f64> = small_pred_values
+        .iter()
+        .map(|&p| huber_grad(f64::from(p), f64::from(beta)) / f64::from(beta) / n)
+        .collect();
+    let small_pred =
+        Tensor::from_slice(&small_pred_values, [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let small_target =
+        Tensor::from_slice(&small_target_values, [batch.of(2), feature.of(3)], &device)?;
+    let smooth = small_pred.smooth_l1_loss(&small_target, beta)?;
+    close(
+        "SmoothL1Loss(beta=.02) matches morpheus's own default",
+        &smooth.to_vec()?,
+        &expected_smooth,
+    );
+    smooth.mean([batch, feature])?.backward()?;
+    close(
+        "SmoothL1Loss(beta=.02) gradient",
+        &small_pred.grad().unwrap().to_vec()?,
+        &expected_smooth_grad,
+    );
+
+    assert!(pred.huber_loss(&target, 0.0).is_err());
+    assert!(pred.huber_loss(&target, f32::NAN).is_err());
+    assert!(pred.smooth_l1_loss(&target, -1.0).is_err());
+    let other = Axis::new("other");
+    let wrong_axes = Tensor::from_slice(&[1.0f32], [other.of(1)], &device)?;
+    assert!(pred.huber_loss(&wrong_axes, 1.0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn nll_loss_matches_hand_computed_oracle_mirroring_cross_entropy_targets() -> Result<()> {
+    // `self` holds log-probabilities; targets follow the same constant one-hot/probability
+    // convention `categorical_cross_entropy_with_logits` uses (row 1 below is a genuinely soft
+    // target, demonstrating the generalization). Loss is -sum(class, target * log_prob);
+    // gradient wrt `self` is exactly -target (the expression is linear in `self`).
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("batch"), Axis::new("class"));
+    let probabilities = [[0.7f64, 0.2, 0.1], [0.2, 0.3, 0.5]];
+    let log_prob_values: Vec<f32> = probabilities
+        .iter()
+        .flat_map(|row| row.iter().map(|p| p.ln() as f32))
+        .collect();
+    let target_values = [1.0f32, 0.0, 0.0, 0.5, 0.5, 0.0];
+    let target_rows = [[1.0f64, 0.0, 0.0], [0.5, 0.5, 0.0]];
+    let expected_loss: Vec<f64> = probabilities
+        .iter()
+        .zip(target_rows)
+        .map(|(probs, targets)| {
+            -probs
+                .iter()
+                .zip(targets)
+                .map(|(&p, t)| t * p.ln())
+                .sum::<f64>()
+        })
+        .collect();
+    let n_rows = probabilities.len() as f64;
+    let expected_grad: Vec<f64> = target_values
+        .iter()
+        .map(|&t| -f64::from(t) / n_rows)
+        .collect();
+
+    // value(b, c) written in canonical (batch, class) order; asymmetric extents (2, 3).
+    let log_prob = Tensor::from_slice(&log_prob_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let targets = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+
+    let loss = log_prob.nll_loss(&targets, class)?;
+    assert_eq!(loss.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "NLLLoss forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean(batch)?.backward()?;
+    close(
+        "NLLLoss gradient (exactly -target)",
+        &log_prob.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        log_prob
+            .detach()
+            .nll_loss(&targets.with_grad(), class)
+            .is_err()
+    );
+    let invalid_targets = Tensor::from_slice(
+        &[1.0, 0.0, 0.0, 0.5, 0.6, 0.0],
+        [batch.of(2), class.of(3)],
+        &device,
+    )?;
+    let error = log_prob
+        .detach()
+        .nll_loss(&invalid_targets, class)
+        .err()
+        .expect("invalid NLL target")
+        .to_string();
+    assert!(error.contains("row 1 must sum to 1"), "{error}");
+    let missing_class = Tensor::from_slice(&[1.0, 0.0], [batch.of(2)], &device)?;
+    assert!(log_prob.detach().nll_loss(&missing_class, class).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn binary_cross_entropy_matches_hand_computed_oracle_with_pytorch_log_clamp() -> Result<()> {
+    // `binary_cross_entropy` takes probabilities (unlike the existing logits-based
+    // `binary_cross_entropy_with_logits`). Forward matches PyTorch's documented
+    // -[y*log(x) + (1-y)*log(1-x)] with the probability floored at `f32::MIN_POSITIVE` before
+    // its logarithm -- not PyTorch's own `exp(-100)` -- because `exp(-100)` rounds to an `f32`
+    // subnormal so small that `ln`'s backward `1 / x` overflows to infinity and then hits the
+    // clamp's zeroing multiplier as `inf * 0 -> NaN` (see the doc comment on
+    // `binary_cross_entropy` for the full trace and why an output-side `-100` clamp has the
+    // same NaN problem at `x == 0` for a different reason). This oracle uses that same
+    // achieved floor (`ln(f32::MIN_POSITIVE) ~ -87.3`) rather than PyTorch's literal `-100`.
+    // The composed gradient matches PyTorch's interior formula (x-y)/(x*(1-x)) away from the
+    // floor, but is exactly zero -- not PyTorch's own large finite value -- at a saturated
+    // wrong-side prediction (x == 0, y == 1 and its mirror x == 1, y == 0), since `clamp`'s
+    // ordinary boundary rule zeroes the moved term's gradient there.
+    let floor: f32 = f32::MIN_POSITIVE;
+    fn bce(x: f32, y: f32, floor: f32) -> f64 {
+        let log_x = x.max(floor).ln();
+        let log_1mx = (1.0 - x).max(floor).ln();
+        f64::from(-(y * log_x + (1.0 - y) * log_1mx))
+    }
+    fn bce_grad(x: f32, y: f32, floor: f32) -> f64 {
+        // Composition trace: term1 = y * ln(max(x, floor)), term2 = (1-y) * ln(max(1-x,
+        // floor)); the input-side clamp's own boundary rule zeroes a term's local derivative
+        // wherever its *own* value fell below the floor, independent of the other term's
+        // weight.
+        let d_term1 = if x >= floor {
+            f64::from(y) / f64::from(x)
+        } else {
+            0.0
+        };
+        let complement = 1.0 - x;
+        let d_term2 = if complement >= floor {
+            -f64::from(1.0 - y) / f64::from(complement)
+        } else {
+            0.0
+        };
+        -(d_term1 + d_term2)
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (2, 3).
+    let x_values = [0.5f32, 0.1, 0.0, 0.0, 1.0, 1.0];
+    let y_values = [1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0];
+    let n = x_values.len() as f64;
+    let expected_loss: Vec<f64> = x_values
+        .iter()
+        .zip(y_values)
+        .map(|(&x, y)| bce(x, y, floor))
+        .collect();
+    let expected_grad: Vec<f64> = x_values
+        .iter()
+        .zip(y_values)
+        .map(|(&x, y)| bce_grad(x, y, floor) / n)
+        .collect();
+
+    let x = Tensor::from_slice(&x_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let y = Tensor::from_slice(&y_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+
+    let loss = x.binary_cross_entropy(&y)?;
+    close(
+        "BCELoss forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "BCELoss gradient (exact zero at the floor boundary)",
+        &x.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(x.detach().binary_cross_entropy(&y.with_grad()).is_err());
+    let other = Axis::new("other");
+    let wrong_axes = Tensor::from_slice(&y_values, [other.of(6)], &device)?;
+    assert!(x.detach().binary_cross_entropy(&wrong_axes).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn kl_div_loss_matches_hand_computed_oracle_including_zero_target_convention() -> Result<()> {
+    // `self` holds log-probabilities (a student's `log_softmax`), `target` holds probabilities
+    // (a teacher's `softmax`) -- matching morpheus's distillation heads,
+    // `F.kl_div(F.log_softmax(logits / t, -1), F.softmax(teacher_logits / t, -1), ...)`
+    // (`research/src/vision/morpheus/mobilesam/scale10/microtier/runs/wbc-edgepath-slice4m/train.py:124`).
+    // Row 1 includes a zero target element to exercise the `xlogy` convention: `0 * log(0)`
+    // must contribute exactly `0`, not `NaN`.
+    fn kl_term(log_q: f64, p: f64) -> f64 {
+        if p == 0.0 { 0.0 } else { p * (p.ln() - log_q) }
+    }
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("batch"), Axis::new("class"));
+    // value(b, c) written in canonical (batch, class) order; asymmetric extents (2, 3).
+    let log_q_values = [
+        0.3f64.ln() as f32,
+        0.2f64.ln() as f32,
+        0.5f64.ln() as f32,
+        -0.5,
+        -1.0,
+        -2.0,
+    ];
+    let p_values = [0.6f32, 0.4, 0.0, 0.0, 0.3, 0.7];
+    let n = log_q_values.len() as f64;
+    let expected_loss: Vec<f64> = log_q_values
+        .iter()
+        .zip(p_values)
+        .map(|(&lq, p)| kl_term(f64::from(lq), f64::from(p)))
+        .collect();
+    let expected_grad: Vec<f64> = p_values.iter().map(|&p| -f64::from(p) / n).collect();
+
+    let log_q = Tensor::from_slice(&log_q_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let p = Tensor::from_slice(&p_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+
+    let loss = log_q.kl_div_loss(&p)?;
+    close(
+        "KLDivLoss forward under reordered, asymmetric storage, zero-target convention",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, class])?.backward()?;
+    close(
+        "KLDivLoss gradient (exactly -target)",
+        &log_q.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(log_q.detach().kl_div_loss(&p.with_grad()).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn poisson_nll_loss_matches_hand_computed_oracle_at_default_log_input() -> Result<()> {
+    // PyTorch's default `PoissonNLLLoss(log_input=True, full=False)`: loss = exp(self) -
+    // target * self. The Stirling `full=True` term and the `log_input=False`/`eps` branch are
+    // not implemented.
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (2, 3).
+    let log_rate_values = [0.0f32, 1.0, -0.5, 2.0, -1.0, 0.5];
+    let target_values = [1.0f32, 3.0, 0.5, 8.0, 0.2, 1.5];
+    let n = log_rate_values.len() as f64;
+    let expected_loss: Vec<f64> = log_rate_values
+        .iter()
+        .zip(target_values)
+        .map(|(&x, t)| f64::from(x).exp() - f64::from(t) * f64::from(x))
+        .collect();
+    let expected_grad: Vec<f64> = log_rate_values
+        .iter()
+        .zip(target_values)
+        .map(|(&x, t)| (f64::from(x).exp() - f64::from(t)) / n)
+        .collect();
+
+    let log_rate = Tensor::from_slice(&log_rate_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+
+    let loss = log_rate.poisson_nll_loss(&target)?;
+    close(
+        "PoissonNLLLoss forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "PoissonNLLLoss gradient (exp(input) - target)",
+        &log_rate.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        log_rate
+            .detach()
+            .poisson_nll_loss(&target.with_grad())
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gaussian_nll_loss_matches_hand_computed_oracle_and_rejects_negative_variance() -> Result<()> {
+    // PyTorch's default `GaussianNLLLoss(full=False)`: loss = 0.5*(ln(max(var,eps)) +
+    // (mean-target)^2/max(var,eps)). Element (0, 1) below has var below eps and exercises the
+    // documented deviation from PyTorch: Axis's ordinary `clamp` zeroes *var*'s own gradient
+    // there (PyTorch's no_grad-based clamp would instead pass it straight through).
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    let eps = 1e-3f32;
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (2, 3).
+    let mean_values = [0.0f32, 2.0, -1.0, 0.5, 1.0, -2.0];
+    let target_values = [1.0f32, 2.0, 0.0, 0.5, 1.5, -2.0];
+    let var_values = [0.5f32, 1e-8, 2.0, 1.0, 3.0, 0.25];
+    let n = mean_values.len() as f64;
+    let clamped_var: Vec<f64> = var_values
+        .iter()
+        .map(|&v| f64::from(v).max(f64::from(eps)))
+        .collect();
+    let expected_loss: Vec<f64> = mean_values
+        .iter()
+        .zip(target_values)
+        .zip(clamped_var.iter())
+        .map(|((&m, t), &v)| {
+            let diff = f64::from(m) - f64::from(t);
+            0.5 * (v.ln() + diff * diff / v)
+        })
+        .collect();
+    let expected_mean_grad: Vec<f64> = mean_values
+        .iter()
+        .zip(target_values)
+        .zip(clamped_var.iter())
+        .map(|((&m, t), &v)| (f64::from(m) - f64::from(t)) / v / n)
+        .collect();
+    let expected_var_grad: Vec<f64> = mean_values
+        .iter()
+        .zip(target_values)
+        .zip(var_values.iter())
+        .map(|((&m, t), &raw_var)| {
+            if f64::from(raw_var) < f64::from(eps) {
+                0.0 // clamped: Axis's ordinary `clamp` boundary rule, not PyTorch's no_grad passthrough
+            } else {
+                let diff = f64::from(m) - f64::from(t);
+                let v = f64::from(raw_var);
+                0.5 * (1.0 / v - diff * diff / (v * v)) / n
+            }
+        })
+        .collect();
+
+    let mean = Tensor::from_slice(&mean_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let var = Tensor::from_slice(&var_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+
+    let loss = mean.gaussian_nll_loss(&target, &var, eps)?;
+    close(
+        "GaussianNLLLoss forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "GaussianNLLLoss gradient wrt mean",
+        &mean.grad().unwrap().to_vec()?,
+        &expected_mean_grad,
+    );
+    close(
+        "GaussianNLLLoss gradient wrt var (clamp-zeroed below eps)",
+        &var.grad().unwrap().to_vec()?,
+        &expected_var_grad,
+    );
+
+    assert!(
+        mean.detach()
+            .gaussian_nll_loss(&target.with_grad(), &var.detach(), eps)
+            .is_err()
+    );
+    assert!(
+        mean.detach()
+            .gaussian_nll_loss(&target, &var.detach(), 0.0)
+            .is_err()
+    );
+    assert!(
+        mean.detach()
+            .gaussian_nll_loss(&target, &var.detach(), f32::NAN)
+            .is_err()
+    );
+    let negative_var = Tensor::from_slice(&[-1.0f32; 6], [batch.of(2), feature.of(3)], &device)?;
+    let error = mean
+        .detach()
+        .gaussian_nll_loss(&target, &negative_var, eps)
+        .err()
+        .expect("negative var")
+        .to_string();
+    assert!(error.contains("nonnegative"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn soft_margin_loss_matches_hand_computed_oracle_with_pm_one_targets() -> Result<()> {
+    // Unreduced `SoftMarginLoss`: log(1 + exp(-target * self)) for target in {-1, +1}.
+    // Gradient is -target * sigmoid(-target * self).
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (2, 3).
+    let logit_values = [0.0f32, 2.0, -1.0, 5.0, -3.0, 0.5];
+    let target_values = [1.0f32, -1.0, 1.0, -1.0, 1.0, -1.0];
+    let n = logit_values.len() as f64;
+    let expected_loss: Vec<f64> = logit_values
+        .iter()
+        .zip(target_values)
+        .map(|(&x, y)| {
+            let z = -f64::from(y) * f64::from(x);
+            z.max(0.0) + (-z.abs()).exp().ln_1p()
+        })
+        .collect();
+    let expected_grad: Vec<f64> = logit_values
+        .iter()
+        .zip(target_values)
+        .map(|(&x, y)| {
+            let z = -f64::from(y) * f64::from(x);
+            let sigmoid = 1.0 / (1.0 + (-z).exp());
+            -f64::from(y) * sigmoid / n
+        })
+        .collect();
+
+    let logits = Tensor::from_slice(&logit_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let targets = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+
+    let loss = logits.soft_margin_loss(&targets)?;
+    close(
+        "SoftMarginLoss forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "SoftMarginLoss gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        logits
+            .detach()
+            .soft_margin_loss(&targets.with_grad())
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multilabel_soft_margin_loss_matches_composition_of_bce_with_logits_and_mean() -> Result<()> {
+    // MultiLabelSoftMarginLoss's own formula, -1/C * sum_c [y_c*log(sigmoid(x_c)) +
+    // (1-y_c)*log(1-sigmoid(x_c))], is exactly the mean over `class` of
+    // `binary_cross_entropy_with_logits`'s own stable elementwise output -- reusing that
+    // already-tested kernel's stable form as the independent oracle here.
+    fn stable_bce_with_logits(x: f64, y: f64) -> f64 {
+        x.max(0.0) - x * y + (-x.abs()).exp().ln_1p()
+    }
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("batch"), Axis::new("class"));
+    // value(b, c) written in canonical (batch, class) order; asymmetric extents (2, 3).
+    let logit_values = [2.0f32, -1.0, 0.0, -3.0, 1.0, 4.0];
+    let target_values = [1.0f32, 0.0, 1.0, 0.0, 1.0, 1.0];
+    let width = 3usize;
+    let expected_loss: Vec<f64> = logit_values
+        .chunks_exact(width)
+        .zip(target_values.chunks_exact(width))
+        .map(|(logits, targets)| {
+            logits
+                .iter()
+                .zip(targets)
+                .map(|(&x, &y)| stable_bce_with_logits(f64::from(x), f64::from(y)))
+                .sum::<f64>()
+                / width as f64
+        })
+        .collect();
+    let batches = logit_values.len() / width;
+    let expected_grad: Vec<f64> = logit_values
+        .iter()
+        .zip(target_values)
+        .map(|(&x, y)| {
+            let sigmoid = 1.0 / (1.0 + (-f64::from(x)).exp());
+            (sigmoid - f64::from(y)) / width as f64 / batches as f64
+        })
+        .collect();
+
+    let logits = Tensor::from_slice(&logit_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let targets = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+
+    let loss = logits.multilabel_soft_margin_loss(&targets, class)?;
+    assert_eq!(loss.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "MultiLabelSoftMarginLoss forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean(batch)?.backward()?;
+    close(
+        "MultiLabelSoftMarginLoss gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        logits
+            .detach()
+            .multilabel_soft_margin_loss(&targets.with_grad(), class)
+            .is_err()
+    );
+    Ok(())
+}
