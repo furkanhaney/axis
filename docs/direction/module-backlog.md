@@ -37,7 +37,8 @@ option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
 `GELU` and erf-form `ExactGELU` (PyTorch's default `nn.GELU` is the exact form), `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
 `Sequential`, with tensor-level losses (including `abs`/`absolute_error`, PyTorch's
 unreduced `F.l1_loss`, zero gradient at exactly zero matching its `abs` backward
-convention), sine, differentiable central
+convention), sine, elementwise `exp`/`ln`, a PyTorch-exact
+`Tensor::softplus(beta, threshold)`, differentiable central
 differences, softmax, causal masking, named-axis nearest and bilinear
 resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
 composition, named reductions, an arbitrary-index `gather` (a host-side integer

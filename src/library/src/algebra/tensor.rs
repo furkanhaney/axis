@@ -212,6 +212,13 @@ enum Rule {
         offset: usize,
         len: usize,
     },
+    Exp(Buffer),
+    Ln(Buffer),
+    Softplus {
+        input: Buffer,
+        beta: f32,
+        threshold: f32,
+    },
 }
 impl Edge {
     fn new(input: &Tensor, rule: Rule) -> Self {
@@ -1193,6 +1200,73 @@ impl Tensor {
             value,
             self.device(),
             vec![Edge::new(self, Rule::Identity)],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise exponential, `exp(x)`. Backward is `g * exp(x)`, computed from
+    /// the already-produced output rather than re-evaluating `exp` from the input,
+    /// the same trade [`Self::tanh`] makes. Output has the same [`Shape`] as the
+    /// input.
+    pub fn exp(&self) -> Result<Self> {
+        let value = self.device().exp(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value.clone(),
+            self.device(),
+            vec![Edge::new(self, Rule::Exp(value))],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise natural logarithm, `ln(x)`. IEEE behaviour, no clamping: `ln`
+    /// of a non-positive input is `-inf` at exactly `x == 0` and `NaN` for
+    /// `x < 0`, matching `f32::ln`/PyTorch's `torch.log` rather than any epsilon
+    /// or absolute-value guard. Backward is `g / x`, which inherits the same
+    /// non-finite behaviour at and below zero. Output has the same [`Shape`] as
+    /// the input.
+    pub fn ln(&self) -> Result<Self> {
+        let value = self.device().ln(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Ln(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// PyTorch-exact `Softplus`: `(1 / beta) * ln(1 + exp(beta * x))`, except
+    /// where `beta * x > threshold`, which returns `x` itself (the identity
+    /// function's large-`x` asymptote, computed exactly rather than through the
+    /// logarithm) to keep both branches finite and match
+    /// `torch.nn.functional.softplus(x, beta, threshold)` bit for bit at the seam.
+    /// Backward is `sigmoid(beta * x)` on the logarithmic branch and exactly `1`
+    /// on the linear branch, mirroring the forward's own branch selection.
+    /// `beta` must be finite and positive; `threshold` must be finite.
+    pub fn softplus(&self, beta: f32, threshold: f32) -> Result<Self> {
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err("softplus beta must be finite and positive".into());
+        }
+        if !threshold.is_finite() {
+            return Err("softplus threshold must be finite".into());
+        }
+        let value = self.device().softplus(&self.0.value, beta, threshold)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Softplus {
+                    input: self.0.value.clone(),
+                    beta,
+                    threshold,
+                },
+            )],
             false,
             None,
         ))
@@ -2954,6 +3028,15 @@ impl Tensor {
                         Rule::StackSlice { offset, len } => {
                             self.device().contiguous_slice(&gradient, *offset, *len)?
                         }
+                        Rule::Exp(output) => self.device().exp_backward(&gradient, output)?,
+                        Rule::Ln(input) => self.device().ln_backward(&gradient, input)?,
+                        Rule::Softplus {
+                            input,
+                            beta,
+                            threshold,
+                        } => self
+                            .device()
+                            .softplus_backward(&gradient, input, *beta, *threshold)?,
                     };
                     let id = edge.input.0.id;
                     let sum = if let Some(existing) = adjoints.remove(&id) {
