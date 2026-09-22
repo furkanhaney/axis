@@ -259,6 +259,19 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn bce_loss(&self, _x: &Buffer, _y: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn bce_loss_backward(
+        &self,
+        _gradient: &Buffer,
+        _x: &Buffer,
+        _y: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn categorical_cross_entropy(
         &self,
         _logits: &Buffer,

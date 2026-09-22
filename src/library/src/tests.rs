@@ -6441,16 +6441,18 @@ fn smooth_activation_modules_reject_invalid_configuration() -> Result<()> {
         Axis::new("smooth_width"),
     );
 
+    // Negative alpha is PyTorch's own documented domain (any nonzero alpha) -- see
+    // `Tensor::elu`/`Tensor::celu` for the sign-algebra argument.
     assert!(ELU::new(0.0).is_err());
-    assert!(ELU::new(-1.0).is_err());
     assert!(ELU::new(f32::NAN).is_err());
     assert!(ELU::new(f32::INFINITY).is_err());
     assert!(ELU::new(1.0).is_ok());
+    assert!(ELU::new(-1.0).is_ok());
 
     assert!(CELU::new(0.0).is_err());
-    assert!(CELU::new(-0.5).is_err());
     assert!(CELU::new(f32::NAN).is_err());
     assert!(CELU::new(1.0).is_ok());
+    assert!(CELU::new(-0.5).is_ok());
 
     assert!(Softplus::new().beta(0.0).is_err());
     assert!(Softplus::new().beta(-1.0).is_err());
@@ -7600,7 +7602,7 @@ fn pairwise_distance_matches_hand_computed_oracle() -> Result<()> {
     let x2 =
         Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
 
-    let distance = x1.pairwise_distance(&x2, feature, eps as f32)?;
+    let distance = x1.pairwise_distance(&x2, feature, 2.0, eps as f32)?;
     close(
         "pairwise distance forward",
         &distance.to_vec()?,
@@ -7638,12 +7640,12 @@ fn pairwise_distance_matches_hand_computed_oracle() -> Result<()> {
     let wrong = Tensor::from_slice(&[1.0_f32, 2.0], [other.of(2)], &device)?;
     assert!(
         x1.detach()
-            .pairwise_distance(&wrong, feature, eps as f32)
+            .pairwise_distance(&wrong, feature, 2.0, eps as f32)
             .is_err()
     );
     assert!(
         x1.detach()
-            .pairwise_distance(&x2.detach(), feature, f32::NAN)
+            .pairwise_distance(&x2.detach(), feature, 2.0, f32::NAN)
             .is_err()
     );
     Ok(())
@@ -7678,7 +7680,7 @@ fn pairwise_distance_broadcasts_over_reordered_storage_and_asymmetric_extents() 
     let x2 = Tensor::from_slice(&to_f32(&x2_values), [batch.of(3), feature.of(4)], &device)?
         .with_layout([feature, batch])?;
 
-    let distance = x1.pairwise_distance(&x2, feature, eps as f32)?;
+    let distance = x1.pairwise_distance(&x2, feature, 2.0, eps as f32)?;
     fn pdist_row(a: &[f64], b: &[f64], eps: f64) -> f64 {
         a.iter()
             .zip(b)
@@ -7963,8 +7965,9 @@ fn triplet_margin_loss_matches_hand_computed_oracle_with_and_without_swap() -> R
             &device,
         )?
         .with_grad();
-        let loss =
-            anchor.triplet_margin_loss(&positive, &negative, feature, margin, eps as f32, false)?;
+        let loss = anchor.triplet_margin_loss(
+            &positive, &negative, feature, margin, 2.0, eps as f32, false,
+        )?;
         close(
             "triplet margin loss forward (no swap)",
             &loss.to_vec()?,
@@ -8036,8 +8039,8 @@ fn triplet_margin_loss_matches_hand_computed_oracle_with_and_without_swap() -> R
             &device,
         )?
         .with_grad();
-        let loss =
-            anchor.triplet_margin_loss(&positive, &negative, feature, margin, eps as f32, true)?;
+        let loss = anchor
+            .triplet_margin_loss(&positive, &negative, feature, margin, 2.0, eps as f32, true)?;
         close(
             "triplet margin loss forward (swap)",
             &loss.to_vec()?,
@@ -8101,12 +8104,12 @@ fn triplet_margin_loss_matches_hand_computed_oracle_with_and_without_swap() -> R
     let n_err = Tensor::from_slice(&[1.0_f32, 2.0], [Axis::new("triplet_bad").of(2)], &device)?;
     assert!(
         a_err
-            .triplet_margin_loss(&p_err, &n_err, feature, margin, eps as f32, false)
+            .triplet_margin_loss(&p_err, &n_err, feature, margin, 2.0, eps as f32, false)
             .is_err()
     );
     assert!(
         a_err
-            .triplet_margin_loss(&p_err, &n_err, feature, f32::NAN, eps as f32, false)
+            .triplet_margin_loss(&p_err, &n_err, feature, f32::NAN, 2.0, eps as f32, false)
             .is_err()
     );
     Ok(())
@@ -8239,10 +8242,10 @@ fn triplet_margin_with_distance_loss_uses_the_supplied_distance_closure() -> Res
         &negative2,
         1.0,
         false,
-        |a: &Tensor, b: &Tensor| a.pairwise_distance(b, feature, eps),
+        |a: &Tensor, b: &Tensor| a.pairwise_distance(b, feature, 2.0, eps),
     )?;
     let via_direct =
-        anchor2.triplet_margin_loss(&positive2, &negative2, feature, 1.0, eps, false)?;
+        anchor2.triplet_margin_loss(&positive2, &negative2, feature, 1.0, 2.0, eps, false)?;
     close(
         "triplet margin with distance loss matches triplet_margin_loss under the default closure",
         &via_closure.to_vec()?,
@@ -8260,7 +8263,7 @@ fn triplet_margin_with_distance_loss_uses_the_supplied_distance_closure() -> Res
                 &negative2,
                 f32::NAN,
                 false,
-                |a: &Tensor, b: &Tensor| { a.pairwise_distance(b, feature, eps) }
+                |a: &Tensor, b: &Tensor| { a.pairwise_distance(b, feature, 2.0, eps) }
             )
             .is_err()
     );
@@ -8279,7 +8282,7 @@ fn multi_margin_loss_matches_hand_computed_oracle() -> Result<()> {
         Tensor::from_slice(&to_f32(&x_values), [batch.of(2), class.of(3)], &device)?.with_grad();
     let target = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?;
 
-    let loss = x.multi_margin_loss(&target, class, margin)?;
+    let loss = x.multi_margin_loss(&target, class, 1.0, margin, None)?;
     close(
         "multi margin loss forward",
         &loss.to_vec()?,
@@ -8314,13 +8317,13 @@ fn multi_margin_loss_matches_hand_computed_oracle() -> Result<()> {
 
     assert!(
         x.detach()
-            .multi_margin_loss(&target.with_grad(), class, margin)
+            .multi_margin_loss(&target.with_grad(), class, 1.0, margin, None)
             .is_err()
     );
     let bad_target = Tensor::from_slice(&[0.5_f32; 6], [batch.of(2), class.of(3)], &device)?;
     assert!(
         x.detach()
-            .multi_margin_loss(&bad_target, class, margin)
+            .multi_margin_loss(&bad_target, class, 1.0, margin, None)
             .is_err()
     );
     let solo_class = Axis::new("mml_solo_class");
@@ -8328,7 +8331,7 @@ fn multi_margin_loss_matches_hand_computed_oracle() -> Result<()> {
     let solo_t = Tensor::from_slice(&[1.0_f32, 1.0], [batch.of(2), solo_class.of(1)], &device)?;
     assert!(
         solo_x
-            .multi_margin_loss(&solo_t, solo_class, margin)
+            .multi_margin_loss(&solo_t, solo_class, 1.0, margin, None)
             .is_err()
     );
     Ok(())
@@ -8720,40 +8723,21 @@ fn nll_loss_matches_hand_computed_oracle_mirroring_cross_entropy_targets() -> Re
 fn binary_cross_entropy_matches_hand_computed_oracle_with_pytorch_log_clamp() -> Result<()> {
     // `binary_cross_entropy` takes probabilities (unlike the existing logits-based
     // `binary_cross_entropy_with_logits`). Forward matches PyTorch's documented
-    // -[y*log(x) + (1-y)*log(1-x)] with the probability floored at `f32::MIN_POSITIVE` before
-    // its logarithm -- not PyTorch's own `exp(-100)` -- because `exp(-100)` rounds to an `f32`
-    // subnormal so small that `ln`'s backward `1 / x` overflows to infinity and then hits the
-    // clamp's zeroing multiplier as `inf * 0 -> NaN` (see the doc comment on
-    // `binary_cross_entropy` for the full trace and why an output-side `-100` clamp has the
-    // same NaN problem at `x == 0` for a different reason). This oracle uses that same
-    // achieved floor (`ln(f32::MIN_POSITIVE) ~ -87.3`) rather than PyTorch's literal `-100`.
-    // The composed gradient matches PyTorch's interior formula (x-y)/(x*(1-x)) away from the
-    // floor, but is exactly zero -- not PyTorch's own large finite value -- at a saturated
-    // wrong-side prediction (x == 0, y == 1 and its mirror x == 1, y == 0), since `clamp`'s
-    // ordinary boundary rule zeroes the moved term's gradient there.
-    let floor: f32 = f32::MIN_POSITIVE;
-    fn bce(x: f32, y: f32, floor: f32) -> f64 {
-        let log_x = x.max(floor).ln();
-        let log_1mx = (1.0 - x).max(floor).ln();
-        f64::from(-(y * log_x + (1.0 - y) * log_1mx))
+    // -[y*log(x) + (1-y)*log(1-x)] with each logarithm floored at PyTorch's own exact literal
+    // `-100`, computed by a dedicated kernel pair (`bce_loss`/`bce_loss_backward`) rather than
+    // composed from `Tensor::clamp`/`Tensor::ln`, so backward stays finite at x == 0 and x == 1
+    // without needing an input-side approximation of `-100` (see the doc comment on
+    // `binary_cross_entropy` for why the earlier composed floor could only reach `~-87.3`).
+    // Backward is PyTorch's own explicit formula, `(x - y) / max((1 - x) * x, eps)` with
+    // `eps = 1e-12`, not a derivative of the floored forward expression.
+    fn bce(x: f32, y: f32) -> f64 {
+        let log_x = f64::from(x).ln().max(-100.0);
+        let log_1mx = f64::from(1.0 - x).ln().max(-100.0);
+        -(f64::from(y) * log_x + f64::from(1.0 - y) * log_1mx)
     }
-    fn bce_grad(x: f32, y: f32, floor: f32) -> f64 {
-        // Composition trace: term1 = y * ln(max(x, floor)), term2 = (1-y) * ln(max(1-x,
-        // floor)); the input-side clamp's own boundary rule zeroes a term's local derivative
-        // wherever its *own* value fell below the floor, independent of the other term's
-        // weight.
-        let d_term1 = if x >= floor {
-            f64::from(y) / f64::from(x)
-        } else {
-            0.0
-        };
-        let complement = 1.0 - x;
-        let d_term2 = if complement >= floor {
-            -f64::from(1.0 - y) / f64::from(complement)
-        } else {
-            0.0
-        };
-        -(d_term1 + d_term2)
+    fn bce_grad(x: f32, y: f32) -> f64 {
+        let denominator = (f64::from(1.0 - x) * f64::from(x)).max(1e-12);
+        (f64::from(x) - f64::from(y)) / denominator
     }
 
     let device = Device::cuda(0)?;
@@ -8765,12 +8749,12 @@ fn binary_cross_entropy_matches_hand_computed_oracle_with_pytorch_log_clamp() ->
     let expected_loss: Vec<f64> = x_values
         .iter()
         .zip(y_values)
-        .map(|(&x, y)| bce(x, y, floor))
+        .map(|(&x, y)| bce(x, y))
         .collect();
     let expected_grad: Vec<f64> = x_values
         .iter()
         .zip(y_values)
-        .map(|(&x, y)| bce_grad(x, y, floor) / n)
+        .map(|(&x, y)| bce_grad(x, y) / n)
         .collect();
 
     let x = Tensor::from_slice(&x_values, [batch.of(2), feature.of(3)], &device)?
@@ -8781,13 +8765,13 @@ fn binary_cross_entropy_matches_hand_computed_oracle_with_pytorch_log_clamp() ->
 
     let loss = x.binary_cross_entropy(&y)?;
     close(
-        "BCELoss forward under reordered, asymmetric storage",
+        "BCELoss forward with PyTorch's exact -100 log floor",
         &loss.to_vec()?,
         &expected_loss,
     );
     loss.mean([batch, feature])?.backward()?;
     close(
-        "BCELoss gradient (exact zero at the floor boundary)",
+        "BCELoss gradient (PyTorch's explicit clamped-denominator form, finite at 0 and 1)",
         &x.grad().unwrap().to_vec()?,
         &expected_grad,
     );
@@ -10887,10 +10871,10 @@ fn pooling_family_rejects_invalid_configuration_before_launch() {
     assert!(error.contains("distinct"), "{error}");
 
     // LPPool rejects a non-positive `p` before any shape is even consulted.
-    assert!(LPPool1d::new(channel, height, 0, 2).is_err());
-    assert!(LPPool2d::new(channel, [height, width], 0, [2, 2]).is_err());
-    assert!(LPPool3d::new(channel, [height, width, channel.role("d")], 0, [2, 2, 2]).is_err());
-    let pool = LPPool2d::new(channel, [height, width], 2, [2, 2]).unwrap();
+    assert!(LPPool1d::new(channel, height, 0.0, 2).is_err());
+    assert!(LPPool2d::new(channel, [height, width], 0.0, [2, 2]).is_err());
+    assert!(LPPool3d::new(channel, [height, width, channel.role("d")], 0.0, [2, 2, 2]).is_err());
+    let pool = LPPool2d::new(channel, [height, width], 2.0, [2, 2]).unwrap();
     assert_eq!(
         pool.output_shape(&shape).unwrap(),
         Shape::new([height.of(2), width.of(2), channel.of(2)]).unwrap()
@@ -11165,7 +11149,7 @@ fn lp_pool1d_matches_sum_pooling_at_p_one() -> Result<()> {
     let inputs: [f32; 4] = [3.0, -5.0, 2.0, -1.0];
     let input = Tensor::from_slice(&inputs, [channel.of(1), length.of(4)], &device)?.with_grad();
 
-    let mut pool = LPPool1d::new(channel, length, 1, 2)?;
+    let mut pool = LPPool1d::new(channel, length, 1.0, 2)?;
     let output_shape = pool.build(input.shape(), &device, 0)?;
     assert_eq!(output_shape, Shape::new([length.of(2), channel.of(1)])?);
     let actual = pool.forward(&input)?;
@@ -11196,7 +11180,7 @@ fn lp_pool2d_matches_hand_computed_l2_forward_and_gradient_under_reordered_stora
         .with_layout([width, height, channel])?
         .with_grad();
 
-    let mut pool = LPPool2d::new(channel, [height, width], 2, [2, 2])?;
+    let mut pool = LPPool2d::new(channel, [height, width], 2.0, [2, 2])?;
     let output_shape = pool.build(input.shape(), &device, 0)?;
     assert_eq!(
         output_shape,
@@ -11238,7 +11222,7 @@ fn lp_pool3d_matches_hand_computed_forward_and_gradient_with_negative_sum() -> R
     )?
     .with_grad();
 
-    let mut pool = LPPool3d::new(channel, [depth, height, width], 3, [1, 1, 3])?;
+    let mut pool = LPPool3d::new(channel, [depth, height, width], 3.0, [1, 1, 3])?;
     let output_shape = pool.build(input.shape(), &device, 0)?;
     assert_eq!(
         output_shape,
@@ -12209,5 +12193,2033 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
         .unwrap_err()
         .to_string();
     assert!(error.contains("does not match"), "{error}");
+    Ok(())
+}
+
+// -- nn-climb-norms: PairwiseDistance/TripletMarginLoss general p-norm and eps placement,
+// MultiMarginLoss p=2 and per-class weight, CosineSimilarity's joint squared-norm clamp fix,
+// and ELU/CELU signed alpha. See `docs/design/library.md`'s "Norm orders and signed alpha". --
+
+#[test]
+#[ignore = "requires CUDA"]
+fn pairwise_distance_supports_general_p_and_infinity_norm_matching_hand_computed_oracle()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("pdist_p_batch"), Axis::new("pdist_p_feature"));
+    // Chosen so no diff-component lands near a norm's non-smooth point: p=1's |.| kink at 0,
+    // and p=inf's max() tie when two components share a magnitude, both make central-difference
+    // gradient checks spurious near those exact points, so every |diff| here is both bounded
+    // away from zero and pairwise distinct within its row.
+    let x1_values = [0.0_f64, 0.0, 0.0, 1.0, 2.0, 3.0];
+    let x2_values = [3.0_f64, 4.0, 2.0, 0.0, 0.0, 0.0];
+    let eps = 1e-6_f64;
+
+    fn lp_row(a: &[f64], b: &[f64], eps: f64, p: f64) -> f64 {
+        if p.is_infinite() {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y + eps).abs())
+                .fold(0.0_f64, f64::max)
+        } else {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y + eps).abs().powf(p))
+                .sum::<f64>()
+                .powf(1.0 / p)
+        }
+    }
+    fn lp_scalar_loss(a: &[f64], b: &[f64], eps: f64, p: f64) -> f64 {
+        (lp_row(&a[0..3], &b[0..3], eps, p) + lp_row(&a[3..6], &b[3..6], eps, p)) / 2.0
+    }
+
+    // p=1, p=3 (a non-special general exponent), and p -> the infinity-norm sentinel.
+    for &p in &[1.0_f64, 3.0, f64::INFINITY] {
+        let x1 = Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?
+            .with_grad();
+        let x2 = Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?
+            .with_grad();
+        let p32 = if p.is_infinite() {
+            f32::INFINITY
+        } else {
+            p as f32
+        };
+        let distance = x1.pairwise_distance(&x2, feature, p32, eps as f32)?;
+        let expected: Vec<f64> = (0..2)
+            .map(|row| {
+                lp_row(
+                    &x1_values[row * 3..row * 3 + 3],
+                    &x2_values[row * 3..row * 3 + 3],
+                    eps,
+                    p,
+                )
+            })
+            .collect();
+        close(
+            &format!("pairwise distance forward (p={p})"),
+            &distance.to_vec()?,
+            &expected,
+        );
+
+        distance.mean(batch)?.backward()?;
+        close(
+            &format!("pairwise distance gradient wrt x1 (p={p})"),
+            &x1.grad().unwrap().to_vec()?,
+            &central_difference(&x1_values, 1e-4, |candidate| {
+                lp_scalar_loss(candidate, &x2_values, eps, p)
+            }),
+        );
+        close(
+            &format!("pairwise distance gradient wrt x2 (p={p})"),
+            &x2.grad().unwrap().to_vec()?,
+            &central_difference(&x2_values, 1e-4, |candidate| {
+                lp_scalar_loss(&x1_values, candidate, eps, p)
+            }),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn pairwise_distance_p_must_be_a_positive_real_or_infinite() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("pdist_p_err_batch"),
+        Axis::new("pdist_p_err_feature"),
+    );
+    let x1 = Tensor::from_slice(&[1.0_f32, 2.0], [batch.of(1), feature.of(2)], &device)?;
+    let x2 = Tensor::from_slice(&[0.0_f32, 0.0], [batch.of(1), feature.of(2)], &device)?;
+    assert!(x1.pairwise_distance(&x2, feature, 0.0, 1e-6).is_err());
+    assert!(x1.pairwise_distance(&x2, feature, -1.0, 1e-6).is_err());
+    assert!(x1.pairwise_distance(&x2, feature, f32::NAN, 1e-6).is_err());
+    assert!(
+        x1.pairwise_distance(&x2, feature, f32::NEG_INFINITY, 1e-6)
+            .is_err()
+    );
+    assert!(x1.pairwise_distance(&x2, feature, 1.0, 1e-6).is_ok());
+    assert!(
+        x1.pairwise_distance(&x2, feature, f32::INFINITY, 1e-6)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn triplet_margin_loss_p_generalizes_the_underlying_pairwise_distance() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("triplet_p_batch"), Axis::new("triplet_p_feature"));
+    let anchor_values = [0.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let positive_values = [0.0_f64, 0.0, 1.0, 1.0, 1.0, 2.0];
+    let negative_values = [0.0_f64, 0.0, 2.5, -1.0, -1.0, -1.0];
+    let margin = 1.0_f32;
+    let eps = 1e-6_f64;
+    let p = 1.0_f64;
+
+    fn l1_row(a: &[f64], b: &[f64], eps: f64) -> f64 {
+        a.iter().zip(b).map(|(x, y)| (x - y + eps).abs()).sum()
+    }
+    fn triplet_scalar_loss_p1(
+        anchor: &[f64],
+        positive: &[f64],
+        negative: &[f64],
+        margin: f64,
+        eps: f64,
+    ) -> f64 {
+        (0..2)
+            .map(|row| {
+                let a = &anchor[row * 3..row * 3 + 3];
+                let p = &positive[row * 3..row * 3 + 3];
+                let n = &negative[row * 3..row * 3 + 3];
+                (margin + l1_row(a, p, eps) - l1_row(a, n, eps)).max(0.0)
+            })
+            .sum::<f64>()
+            / 2.0
+    }
+
+    let anchor = Tensor::from_slice(
+        &to_f32(&anchor_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let positive = Tensor::from_slice(
+        &to_f32(&positive_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let negative = Tensor::from_slice(
+        &to_f32(&negative_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let loss = anchor.triplet_margin_loss(
+        &positive, &negative, feature, margin, p as f32, eps as f32, false,
+    )?;
+    let expected: Vec<f64> = (0..2)
+        .map(|row| {
+            let a = &anchor_values[row * 3..row * 3 + 3];
+            let pos = &positive_values[row * 3..row * 3 + 3];
+            let neg = &negative_values[row * 3..row * 3 + 3];
+            (f64::from(margin) + l1_row(a, pos, eps) - l1_row(a, neg, eps)).max(0.0)
+        })
+        .collect();
+    close(
+        "triplet margin loss forward (p=1)",
+        &loss.to_vec()?,
+        &expected,
+    );
+
+    loss.mean(batch)?.backward()?;
+    close(
+        "triplet margin loss gradient wrt anchor (p=1)",
+        &anchor.grad().unwrap().to_vec()?,
+        &central_difference(&anchor_values, 1e-4, |candidate| {
+            triplet_scalar_loss_p1(
+                candidate,
+                &positive_values,
+                &negative_values,
+                f64::from(margin),
+                eps,
+            )
+        }),
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multi_margin_loss_supports_p2_and_per_class_weight_matching_hand_computed_oracle() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("mml_w_batch"), Axis::new("mml_w_class"));
+    let x_values = [2.0_f64, 1.5, -1.0, 0.0, 2.5, 3.0];
+    let target_values = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0];
+    let weight_values = [2.0_f32, 1.0, 0.5];
+    let margin = 1.0_f32;
+    let p = 2.0_f32;
+    let x =
+        Tensor::from_slice(&to_f32(&x_values), [batch.of(2), class.of(3)], &device)?.with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?;
+    let weight = Tensor::from_slice(&weight_values, [class.of(3)], &device)?;
+
+    let loss = x.multi_margin_loss(&target, class, p, margin, Some(&weight))?;
+    close(
+        "multi margin loss forward (p=2, weighted)",
+        &loss.to_vec()?,
+        &[1.0 / 6.0, 1.0 / 24.0],
+    );
+
+    fn weighted_multi_margin_scalar_loss(
+        x: &[f64],
+        t: &[f32],
+        w: &[f64],
+        margin: f64,
+        p: f64,
+    ) -> f64 {
+        (0..2)
+            .map(|row| {
+                let xs = &x[row * 3..row * 3 + 3];
+                let ts = &t[row * 3..row * 3 + 3];
+                let y = ts.iter().position(|&v| v == 1.0).unwrap();
+                let xy = xs[y];
+                let total: f64 = (0..3)
+                    .filter(|&i| i != y)
+                    .map(|i| (margin - xy + xs[i]).max(0.0).powf(p))
+                    .sum();
+                w[y] * total / 3.0
+            })
+            .sum::<f64>()
+            / 2.0
+    }
+    let weight_f64: Vec<f64> = weight_values.iter().map(|&v| f64::from(v)).collect();
+
+    loss.mean(batch)?.backward()?;
+    close(
+        "multi margin loss gradient (p=2, weighted)",
+        &x.grad().unwrap().to_vec()?,
+        &central_difference(&x_values, 1e-4, |candidate| {
+            weighted_multi_margin_scalar_loss(
+                candidate,
+                &target_values,
+                &weight_f64,
+                f64::from(margin),
+                f64::from(p),
+            )
+        }),
+    );
+
+    assert!(
+        x.detach()
+            .multi_margin_loss(&target, class, 1.5, margin, None)
+            .is_err()
+    );
+    let wrong_extent = Tensor::from_slice(&[1.0_f32, 1.0], [class.of(2)], &device)?;
+    assert!(
+        x.detach()
+            .multi_margin_loss(&target, class, p, margin, Some(&wrong_extent))
+            .is_err()
+    );
+    let wrong_axes = Tensor::from_slice(&[1.0_f32, 1.0, 1.0], [batch.of(3)], &device)?;
+    assert!(
+        x.detach()
+            .multi_margin_loss(&target, class, p, margin, Some(&wrong_axes))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cosine_similarity_joint_clamp_matches_pytorch_and_diverges_from_the_old_per_vector_clamp()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("cos_sim_joint_batch"),
+        Axis::new("cos_sim_joint_feature"),
+    );
+    // eps deliberately large (1e-3) to make the divergence visible with ordinary-magnitude
+    // inputs. Row 0: x1's true norm (1e-5) sits far below eps while x2's (5.0) sits far above
+    // it -- exactly the regime where the old per-vector clamp and the new joint-product clamp
+    // disagree. Row 1: both norms sit comfortably above eps, where the two formulas already
+    // agreed (recorded here so the fix is shown NOT to move that case).
+    let eps = 1e-3_f32;
+    let x1_values = [1e-5_f64, 0.0, 0.0, 3.0, 4.0, 0.0];
+    let x2_values = [3.0_f64, 4.0, 0.0, 0.0, 3.0, 4.0];
+    let x1 =
+        Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let x2 =
+        Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+
+    let similarity = x1.cosine_similarity(&x2, feature, eps)?;
+    // Hand-computed (not from the op under test): row 0's joint-clamp value is 0.03, five
+    // times the OLD per-vector-clamp formula's 0.006 -- the semantic change this PR makes.
+    close(
+        "cosine similarity forward (joint clamp)",
+        &similarity.to_vec()?,
+        &[0.03, 0.48],
+    );
+
+    fn cos_scalar_loss_joint_clamp(a: &[f64], b: &[f64], eps: f64) -> f64 {
+        let row = |a: &[f64], b: &[f64]| {
+            let dot: f64 = a.iter().zip(b).map(|(p, q)| p * q).sum();
+            let na2: f64 = a.iter().map(|p| p * p).sum();
+            let nb2: f64 = b.iter().map(|q| q * q).sum();
+            let denom = (na2 * nb2).max(eps * eps).sqrt();
+            dot / denom
+        };
+        (row(&a[0..3], &b[0..3]) + row(&a[3..6], &b[3..6])) / 2.0
+    }
+
+    similarity.mean(batch)?.backward()?;
+    close(
+        "cosine similarity gradient wrt x1 (joint clamp)",
+        &x1.grad().unwrap().to_vec()?,
+        &central_difference(&x1_values, 1e-5, |candidate| {
+            cos_scalar_loss_joint_clamp(candidate, &x2_values, f64::from(eps))
+        }),
+    );
+    close(
+        "cosine similarity gradient wrt x2 (joint clamp)",
+        &x2.grad().unwrap().to_vec()?,
+        &central_difference(&x2_values, 1e-5, |candidate| {
+            cos_scalar_loss_joint_clamp(&x1_values, candidate, f64::from(eps))
+        }),
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn elu_and_celu_support_negative_alpha_matching_hand_computed_oracle_under_reordered_storage()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("elu_neg_row"), Axis::new("elu_neg_col"));
+    // 5 rows, 2 cols: asymmetric extents, feature-major physical storage forces a genuinely
+    // permuted, non-contiguous read.
+    let values = [-2.0_f64, 1.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0, 2.0];
+    let alpha = -0.5_f64;
+    let n = values.len() as f64;
+
+    fn elu(x: f64, alpha: f64) -> f64 {
+        if x > 0.0 { x } else { alpha * (x.exp() - 1.0) }
+    }
+    fn elu_grad(x: f64, alpha: f64) -> f64 {
+        if x > 0.0 { 1.0 } else { alpha * x.exp() }
+    }
+    fn celu(x: f64, alpha: f64) -> f64 {
+        if x > 0.0 {
+            x
+        } else {
+            alpha * ((x / alpha).exp() - 1.0)
+        }
+    }
+    fn celu_grad(x: f64, alpha: f64) -> f64 {
+        if x > 0.0 { 1.0 } else { (x / alpha).exp() }
+    }
+
+    let elu_leaf = Tensor::from_slice(&to_f32(&values), [row.of(5), col.of(2)], &device)?
+        .with_layout([col, row])?
+        .with_grad();
+    let elu_output = elu_leaf.elu(alpha as f32)?;
+    let expected_elu: Vec<f64> = values.iter().map(|&x| elu(x, alpha)).collect();
+    close(
+        "elu forward (negative alpha, reordered storage)",
+        &elu_output.to_vec()?,
+        &expected_elu,
+    );
+    elu_output.mean([row, col])?.backward()?;
+    let expected_elu_gradient: Vec<f64> = values.iter().map(|&x| elu_grad(x, alpha) / n).collect();
+    close(
+        "elu gradient (negative alpha, reordered storage)",
+        &elu_leaf.grad().unwrap().to_vec()?,
+        &expected_elu_gradient,
+    );
+
+    let celu_leaf = Tensor::from_slice(&to_f32(&values), [row.of(5), col.of(2)], &device)?
+        .with_layout([col, row])?
+        .with_grad();
+    let celu_output = celu_leaf.celu(alpha as f32)?;
+    let expected_celu: Vec<f64> = values.iter().map(|&x| celu(x, alpha)).collect();
+    close(
+        "celu forward (negative alpha, reordered storage)",
+        &celu_output.to_vec()?,
+        &expected_celu,
+    );
+    celu_output.mean([row, col])?.backward()?;
+    let expected_celu_gradient: Vec<f64> =
+        values.iter().map(|&x| celu_grad(x, alpha) / n).collect();
+    close(
+        "celu gradient (negative alpha, reordered storage)",
+        &celu_leaf.grad().unwrap().to_vec()?,
+        &expected_celu_gradient,
+    );
+
+    assert!(elu_leaf.detach().elu(0.0).is_err());
+    assert!(celu_leaf.detach().celu(0.0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn nll_loss_weighted_matches_hand_computed_oracle_with_weight_and_ignore_index() -> Result<()> {
+    // `nll_loss_weighted` generalizes `nll_loss` with a per-class `weight` (multiplying each
+    // class's term before the class axis is summed) and an `ignore_index` (zeroing a row in
+    // proportion to its target mass on that class). Row 0 is one-hot at the ignored class and
+    // is fully zeroed; row 1 has no mass there and is unaffected by `ignore_index`, only by
+    // `weight`.
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("batch"), Axis::new("class"));
+    let probabilities = [[0.7f64, 0.2, 0.1], [0.2, 0.3, 0.5]];
+    let log_prob_values: Vec<f32> = probabilities
+        .iter()
+        .flat_map(|row| row.iter().map(|p| p.ln() as f32))
+        .collect();
+    let target_rows = [[1.0f64, 0.0, 0.0], [0.0, 0.5, 0.5]];
+    let target_values: Vec<f32> = target_rows
+        .iter()
+        .flat_map(|row| row.iter().map(|&t| t as f32))
+        .collect();
+    let weight_values = [2.0f32, 0.5, 1.0];
+    let ignore_index = 0usize;
+
+    let expected_loss: Vec<f64> = probabilities
+        .iter()
+        .zip(target_rows)
+        .map(|(probs, targets)| {
+            let keep = 1.0 - targets[ignore_index];
+            let raw: f64 = -probs
+                .iter()
+                .zip(targets)
+                .zip(weight_values)
+                .map(|((&p, t), w)| f64::from(w) * t * p.ln())
+                .sum::<f64>();
+            keep * raw
+        })
+        .collect();
+    let n_rows = probabilities.len() as f64;
+    let expected_grad: Vec<f64> = target_rows
+        .iter()
+        .flat_map(|row| {
+            let keep = 1.0 - row[ignore_index];
+            row.iter()
+                .zip(weight_values)
+                .map(move |(&t, w)| -keep * f64::from(w) * t / n_rows)
+        })
+        .collect();
+
+    // value(b, c) written in canonical (batch, class) order; asymmetric extents (2, 3).
+    let log_prob = Tensor::from_slice(&log_prob_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let targets = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+    let weight = Tensor::from_slice(&weight_values, [class.of(3)], &device)?;
+
+    let loss = log_prob.nll_loss_weighted(&targets, class, &weight, Some(ignore_index))?;
+    assert_eq!(loss.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "NLLLoss(weight, ignore_index) forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean(batch)?.backward()?;
+    close(
+        "NLLLoss(weight, ignore_index) gradient",
+        &log_prob.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        log_prob
+            .detach()
+            .nll_loss_weighted(&targets.with_grad(), class, &weight, None)
+            .is_err()
+    );
+    assert!(
+        log_prob
+            .detach()
+            .nll_loss_weighted(&targets, class, &weight.with_grad(), None)
+            .is_err()
+    );
+    let error = log_prob
+        .detach()
+        .nll_loss_weighted(&targets, class, &weight, Some(3))
+        .err()
+        .expect("out of range ignore_index")
+        .to_string();
+    assert!(error.contains("out of range"), "{error}");
+    let other = Axis::new("other");
+    let wrong_weight = Tensor::from_slice(&[1.0f32], [other.of(1)], &device)?;
+    assert!(
+        log_prob
+            .detach()
+            .nll_loss_weighted(&targets, class, &wrong_weight, None)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn kl_div_loss_log_target_matches_hand_computed_oracle() -> Result<()> {
+    // `kl_div_loss_log_target` is `kl_div_loss` at PyTorch's `log_target = true`: `targets`
+    // also holds log-probabilities, and the pointwise loss is `exp(target) * (target - self)`.
+    // Unlike `log_target = false`, no `xlogy` zero-target substitution is needed, so this
+    // oracle needs no zero-probability row.
+    fn kl_term(log_q: f64, log_p: f64) -> f64 {
+        log_p.exp() * (log_p - log_q)
+    }
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("batch"), Axis::new("class"));
+    // value(b, c) written in canonical (batch, class) order; asymmetric extents (2, 3).
+    let log_q_values = [-0.5f32, -1.0, -2.0, -0.3, -0.9, -1.6];
+    let p_values = [0.5f64, 0.3, 0.2, 0.1, 0.4, 0.5];
+    let log_p_values: Vec<f32> = p_values.iter().map(|p| p.ln() as f32).collect();
+    let n = log_q_values.len() as f64;
+    let expected_loss: Vec<f64> = log_q_values
+        .iter()
+        .zip(log_p_values.iter())
+        .map(|(&lq, &lp)| kl_term(f64::from(lq), f64::from(lp)))
+        .collect();
+    let expected_grad: Vec<f64> = log_p_values
+        .iter()
+        .map(|&lp| -f64::from(lp).exp() / n)
+        .collect();
+
+    let log_q = Tensor::from_slice(&log_q_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let log_p = Tensor::from_slice(&log_p_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+
+    let loss = log_q.kl_div_loss_log_target(&log_p)?;
+    close(
+        "KLDivLoss(log_target=true) forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, class])?.backward()?;
+    close(
+        "KLDivLoss(log_target=true) gradient (exactly -exp(target))",
+        &log_q.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        log_q
+            .detach()
+            .kl_div_loss_log_target(&log_p.with_grad())
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn poisson_nll_loss_full_matches_hand_computed_oracle_at_log_input_false_and_full_true()
+-> Result<()> {
+    // `poisson_nll_loss_full` generalizes `poisson_nll_loss` with PyTorch's remaining
+    // `PoissonNLLLoss` options. This oracle exercises `log_input = false` (`self` holds the
+    // rate itself, base loss `self - target*log(self+eps)`) together with `full = true` (adds
+    // the Stirling term `target*log(target) - target + 0.5*log(2*pi*target)` where
+    // `target > 1`, else `0`); target `1.0` sits exactly at the `> 1` boundary (excluded) to
+    // exercise the mask's strictness.
+    let eps = 1e-3f64;
+    fn base(rate: f64, target: f64, eps: f64) -> f64 {
+        rate - target * (rate + eps).ln()
+    }
+    fn base_grad(rate: f64, target: f64, eps: f64) -> f64 {
+        1.0 - target / (rate + eps)
+    }
+    fn stirling(target: f64) -> f64 {
+        if target > 1.0 {
+            target * target.ln() - target + 0.5 * (2.0 * std::f64::consts::PI * target).ln()
+        } else {
+            0.0
+        }
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (2, 3).
+    let rate_values = [0.5f32, 2.0, 1.0, 3.0, 0.1, 5.0];
+    let target_values = [1.0f32, 3.0, 0.5, 8.0, 0.2, 1.5];
+    let n = rate_values.len() as f64;
+    let expected_loss: Vec<f64> = rate_values
+        .iter()
+        .zip(target_values)
+        .map(|(&r, t)| base(f64::from(r), f64::from(t), eps) + stirling(f64::from(t)))
+        .collect();
+    let expected_grad: Vec<f64> = rate_values
+        .iter()
+        .zip(target_values)
+        .map(|(&r, t)| base_grad(f64::from(r), f64::from(t), eps) / n)
+        .collect();
+
+    let rate = Tensor::from_slice(&rate_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+
+    let loss = rate.poisson_nll_loss_full(&target, false, true, eps as f32)?;
+    close(
+        "PoissonNLLLoss(log_input=false, full=true) forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "PoissonNLLLoss(log_input=false, full=true) gradient (Stirling term contributes none)",
+        &rate.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    // `poisson_nll_loss` delegates to `poisson_nll_loss_full` with `full = false`; confirm the
+    // two remain bit-exact for the default `log_input = true` case.
+    let log_rate = Tensor::from_slice(&rate_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let default_loss = log_rate.poisson_nll_loss(&target)?;
+    let explicit_loss = log_rate.poisson_nll_loss_full(&target, true, false, 0.0)?;
+    let explicit_loss_f64: Vec<f64> = explicit_loss
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    close(
+        "poisson_nll_loss / poisson_nll_loss_full(true, false) bit-exact delegation",
+        &default_loss.to_vec()?,
+        &explicit_loss_f64,
+    );
+
+    assert!(
+        rate.detach()
+            .poisson_nll_loss_full(&target.with_grad(), false, true, eps as f32)
+            .is_err()
+    );
+    assert!(
+        rate.detach()
+            .poisson_nll_loss_full(&target, false, true, 0.0)
+            .is_err()
+    );
+    assert!(
+        rate.detach()
+            .poisson_nll_loss_full(&target, false, true, f32::NAN)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gaussian_nll_loss_full_matches_hand_computed_oracle_with_full_true_constant() -> Result<()> {
+    // `gaussian_nll_loss_full` adds PyTorch's `full = true` constant term `0.5*log(2*pi)` to
+    // `gaussian_nll_loss`'s own `full = false` value; that constant depends on none of `self`,
+    // `targets`, or `var`, so no operand's gradient changes.
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    let eps = 1e-3f32;
+    let mean_values = [0.0f32, 2.0, -1.0, 0.5, 1.0, -2.0];
+    let target_values = [1.0f32, 2.0, 0.0, 0.5, 1.5, -2.0];
+    let var_values = [0.5f32, 1e-8, 2.0, 1.0, 3.0, 0.25];
+    let half_ln_two_pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+
+    let mean = Tensor::from_slice(&mean_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let var = Tensor::from_slice(&var_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+
+    let base = mean.gaussian_nll_loss(&target, &var, eps)?;
+    let expected_loss: Vec<f64> = base
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v) + half_ln_two_pi)
+        .collect();
+
+    let mean_full = mean.gaussian_nll_loss_full(&target, &var, eps, true)?;
+    close(
+        "GaussianNLLLoss(full=true) forward adds 0.5*ln(2*pi) to the full=false value",
+        &mean_full.to_vec()?,
+        &expected_loss,
+    );
+    mean_full.mean([batch, feature])?.backward()?;
+    let mean_grad = mean.grad().unwrap().to_vec()?;
+    let var_grad = var.grad().unwrap().to_vec()?;
+
+    // Independent second graph at full=false, to compare gradients against (the constant term
+    // contributes none).
+    let mean2 = Tensor::from_slice(&mean_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let var2 = Tensor::from_slice(&var_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    mean2
+        .gaussian_nll_loss(&target, &var2, eps)?
+        .mean([batch, feature])?
+        .backward()?;
+    let mean2_grad_f64: Vec<f64> = mean2
+        .grad()
+        .unwrap()
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    let var2_grad_f64: Vec<f64> = var2
+        .grad()
+        .unwrap()
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    close(
+        "GaussianNLLLoss(full=true) mean gradient matches full=false (constant term, no gradient)",
+        &mean_grad,
+        &mean2_grad_f64,
+    );
+    close(
+        "GaussianNLLLoss(full=true) var gradient matches full=false (constant term, no gradient)",
+        &var_grad,
+        &var2_grad_f64,
+    );
+
+    // `gaussian_nll_loss_full(..., false)` is bit-exact with `gaussian_nll_loss`.
+    let mean3 = Tensor::from_slice(&mean_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let var3 = Tensor::from_slice(&var_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let delegated = mean3.gaussian_nll_loss_full(&target, &var3, eps, false)?;
+    let delegated_f64: Vec<f64> = delegated.to_vec()?.iter().map(|&v| f64::from(v)).collect();
+    close(
+        "gaussian_nll_loss / gaussian_nll_loss_full(eps, false) bit-exact delegation",
+        &base.to_vec()?,
+        &delegated_f64,
+    );
+    Ok(())
+}
+
+#[test]
+fn pooling_options_and_unpooling_reject_invalid_configurations_before_launch() {
+    let (channel, length, height, width) = (
+        Axis::new("channel"),
+        Axis::new("length"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let line = Shape::new([channel.of(1), length.of(5)]).unwrap();
+
+    // ceil_mode drops a last window that would start in the right padding: L=5, k=2, s=2,
+    // p=1 rounds (5 + 2 - 2) / 2 up to 3, +1 = 4 windows, but window 3 would start at
+    // padded 6 >= L + p = 6, so PyTorch keeps 3.
+    let pool = AvgPool1d::new(channel, length, 2)
+        .padding(1)
+        .ceil_mode(true);
+    assert_eq!(
+        pool.output_shape(&line).unwrap(),
+        Shape::new([length.of(3), channel.of(1)]).unwrap()
+    );
+    // ceil_mode keeps an overhanging window that still starts inside the input: L=5, k=2,
+    // s=2, no padding gives 3 windows (floor mode gives 2).
+    let pool = AvgPool1d::new(channel, length, 2).ceil_mode(true);
+    assert_eq!(
+        pool.output_shape(&line).unwrap(),
+        Shape::new([length.of(3), channel.of(1)]).unwrap()
+    );
+    // ceil_mode admits a kernel wider than the input when the stride rounds it in, as
+    // PyTorch does (L=1, k=2, s=2 -> 1 window).
+    let unit = Shape::new([channel.of(1), length.of(1)]).unwrap();
+    assert_eq!(
+        LPPool1d::new(channel, length, 2.0, 2)
+            .unwrap()
+            .ceil_mode(true)
+            .output_shape(&unit)
+            .unwrap(),
+        Shape::new([length.of(1), channel.of(1)]).unwrap()
+    );
+    assert!(
+        LPPool1d::new(channel, length, 2.0, 2)
+            .unwrap()
+            .output_shape(&unit)
+            .is_err()
+    );
+
+    let error = AvgPool2d::new(channel, [height, width], [2, 2])
+        .divisor_override(0)
+        .output_shape(&Shape::new([channel.of(1), height.of(4), width.of(4)]).unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("divisor_override must be positive"),
+        "{error}"
+    );
+
+    // Any finite positive real `p` is accepted; zero, negative and non-finite are not.
+    assert!(LPPool1d::new(channel, length, 1.5, 2).is_ok());
+    for p in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert!(LPPool1d::new(channel, length, p, 2).is_err(), "{p}");
+    }
+
+    // MaxUnpool: default size `(in - 1) * s - 2p + k`, explicit sizes strictly within one
+    // stride of it, distinct axes.
+    let pooled = Shape::new([height.of(2), width.of(3), channel.of(1)]).unwrap();
+    let unpool = MaxUnpool2d::new([height, width], [2, 2]);
+    assert_eq!(
+        unpool.output_shape(&pooled).unwrap(),
+        Shape::new([height.of(4), width.of(6), channel.of(1)]).unwrap()
+    );
+    let unpool = MaxUnpool2d::new([height, width], [3, 3])
+        .stride([2, 2])
+        .padding([1, 1]);
+    assert_eq!(
+        unpool.output_shape(&pooled).unwrap(),
+        Shape::new([height.of(3), width.of(5), channel.of(1)]).unwrap()
+    );
+    let error = MaxUnpool2d::new([height, height], [2, 2])
+        .output_shape(&pooled)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("distinct"), "{error}");
+    let error = MaxUnpool1d::new(length, 0)
+        .output_shape(&line)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("positive"), "{error}");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool1d_ceil_mode_count_include_pad_and_divisor_override_match_hand_computed() -> Result<()> {
+    // L=6, k=3, s=2, p=1, ceil_mode: 4 windows over padded [pad, 1..6, pad] plus one
+    // overhang slot; padded starts 0, 2, 4, 6. Window 3 holds x5, the right padding and the
+    // overhang: PyTorch divides it by 2 (clipped to the padded input) with
+    // count_include_pad=True, by 1 (real elements) without it, by 4 under divisor_override=4.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let inputs: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, AvgPool1d, [f64; 4], [f64; 6]); 3] = [
+        (
+            "count_include_pad=True",
+            AvgPool1d::new(channel, length, 3)
+                .stride(2)
+                .padding(1)
+                .ceil_mode(true),
+            [1.0, 3.0, 5.0, 3.0],
+            [
+                1.0 / 3.0,
+                2.0 / 3.0,
+                1.0 / 3.0,
+                2.0 / 3.0,
+                1.0 / 3.0,
+                5.0 / 6.0,
+            ],
+        ),
+        (
+            "count_include_pad=False",
+            AvgPool1d::new(channel, length, 3)
+                .stride(2)
+                .padding(1)
+                .ceil_mode(true)
+                .count_include_pad(false),
+            [1.5, 3.0, 5.0, 6.0],
+            [0.5, 5.0 / 6.0, 1.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0, 4.0 / 3.0],
+        ),
+        (
+            "divisor_override=4",
+            AvgPool1d::new(channel, length, 3)
+                .stride(2)
+                .padding(1)
+                .ceil_mode(true)
+                .divisor_override(4),
+            [0.75, 2.25, 3.75, 1.5],
+            [0.25, 0.5, 0.25, 0.5, 0.25, 0.5],
+        ),
+    ];
+    for (name, mut pool, forward, gradient) in cases {
+        let input =
+            Tensor::from_slice(&inputs, [channel.of(1), length.of(6)], &device)?.with_grad();
+        assert_eq!(
+            pool.build(input.shape(), &device, 0)?,
+            Shape::new([length.of(4), channel.of(1)])?
+        );
+        let actual = pool.forward(&input)?;
+        close(
+            &format!("AvgPool1d ceil_mode {name} forward"),
+            &actual.to_vec()?,
+            &forward,
+        );
+        actual.sum([channel, length])?.backward()?;
+        close(
+            &format!("AvgPool1d ceil_mode {name} gradient"),
+            &input.grad().unwrap().to_vec()?,
+            &gradient,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool2d_ceil_mode_matches_hand_computed_under_reordered_storage() -> Result<()> {
+    // 2x3 input, 2x2 kernel, stride 2, ceil_mode: height keeps 1 window, width rounds up to
+    // 2, the second clipped to column 2 alone. Divisors: 4 and 2 (no padding, so both
+    // count_include_pad settings agree).
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let inputs: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    for include in [true, false] {
+        let input =
+            Tensor::from_slice(&inputs, [channel.of(1), height.of(2), width.of(3)], &device)?
+                .with_layout([width, height, channel])?
+                .with_grad();
+        let mut pool = AvgPool2d::new(channel, [height, width], [2, 2])
+            .ceil_mode(true)
+            .count_include_pad(include);
+        assert_eq!(
+            pool.build(input.shape(), &device, 0)?,
+            Shape::new([height.of(1), width.of(2), channel.of(1)])?
+        );
+        let actual = pool.forward(&input)?;
+        close(
+            "reordered-storage ceil_mode AvgPool2d forward",
+            &actual.to_vec()?,
+            &[3.0, 4.5],
+        );
+        actual.sum([channel, height, width])?.backward()?;
+        close(
+            "reordered-storage ceil_mode AvgPool2d gradient",
+            &input.grad().unwrap().to_vec()?,
+            &[0.25, 0.25, 0.5, 0.25, 0.25, 0.5],
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool3d_count_exclude_pad_matches_hand_computed() -> Result<()> {
+    // Width [2, 4], kernel 2, stride 2, padding 1: windows [pad, 2] and [4, pad]. Without
+    // count_include_pad each divides by its one real element.
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[2.0, 4.0],
+        [channel.of(1), depth.of(1), height.of(1), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let mut pool = AvgPool3d::new(channel, [depth, height, width], [1, 1, 2])
+        .padding([0, 0, 1])
+        .count_include_pad(false);
+    pool.build(input.shape(), &device, 0)?;
+    let actual = pool.forward(&input)?;
+    close(
+        "AvgPool3d count_include_pad=False forward",
+        &actual.to_vec()?,
+        &[2.0, 4.0],
+    );
+    actual.sum([channel, depth, height, width])?.backward()?;
+    close(
+        "AvgPool3d count_include_pad=False gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[1.0, 1.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn lp_pool_real_p_matches_hand_computed_forward_and_gradient() -> Result<()> {
+    // p = 1.5 over [1, 4] and [0, 9]: sums 1 + 8 = 9 and 0 + 27 = 27, roots 9^(2/3) and 9.
+    // Gradient x_i^(p-1) * S^(1/p-1): sqrt(x_i) * S^(-1/3); zero input has zero gradient.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let input = Tensor::from_slice(
+        &[1.0, 4.0, 0.0, 9.0],
+        [channel.of(1), length.of(4)],
+        &device,
+    )?
+    .with_grad();
+    let mut pool = LPPool1d::new(channel, length, 1.5, 2)?;
+    pool.build(input.shape(), &device, 0)?;
+    let actual = pool.forward(&input)?;
+    close(
+        "LPPool1d(p=1.5) forward",
+        &actual.to_vec()?,
+        &[4.3267487109222245, 9.0],
+    );
+    actual.sum([channel, length])?.backward()?;
+    close(
+        "LPPool1d(p=1.5) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.4807498567691362, 0.9614997135382723, 0.0, 1.0],
+    );
+
+    // p = 0.5 over [4, 9]: (2 + 3)^2 = 25; gradient S / sqrt(x_i) = 2.5, 5/3.
+    let (depth, height, width) = (Axis::new("depth"), Axis::new("height"), Axis::new("width"));
+    let input = Tensor::from_slice(
+        &[4.0, 9.0],
+        [channel.of(1), depth.of(1), height.of(1), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let mut pool = LPPool3d::new(channel, [depth, height, width], 0.5, [1, 1, 2])?;
+    pool.build(input.shape(), &device, 0)?;
+    let actual = pool.forward(&input)?;
+    close("LPPool3d(p=0.5) forward", &actual.to_vec()?, &[25.0]);
+    actual.sum([channel, depth, height, width])?.backward()?;
+    close(
+        "LPPool3d(p=0.5) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[2.5, 5.0 / 3.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn lp_pool2d_real_p_ceil_mode_matches_hand_computed_under_reordered_storage() -> Result<()> {
+    // p = 2.5, kernel [1, 2], stride [1, 2], ceil_mode over rows [1, 2, 4] and [3, 1, 1]: the
+    // second window of each row is clipped to one element, which PyTorch's
+    // `avg_pool(x^p) * k` composition scales by k / 1 = 2: `(2 x^p)^(1/p) = 2^0.4 x`.
+    // Full windows: `(a^p + b^p)^(1/p)`, gradient `x_i^(p-1) S^(1/p-1)`.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 2.0, 4.0, 3.0, 1.0, 1.0],
+        [channel.of(1), height.of(2), width.of(3)],
+        &device,
+    )?
+    .with_layout([width, channel, height])?
+    .with_grad();
+    let mut pool = LPPool2d::new(channel, [height, width], 2.5, [1, 2])?.ceil_mode(true);
+    assert_eq!(
+        pool.build(input.shape(), &device, 0)?,
+        Shape::new([height.of(2), width.of(2), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "reordered-storage ceil_mode LPPool2d(p=2.5) forward",
+        &actual.to_vec()?,
+        &[
+            2.1345563259430547,
+            5.278031643091578,
+            3.0755472204062158,
+            1.3195079107728942,
+        ],
+    );
+    actual.sum([channel, height, width])?.backward()?;
+    close(
+        "reordered-storage ceil_mode LPPool2d(p=2.5) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            0.3206554095886695,
+            0.9069504581771924,
+            1.3195079107728942,
+            0.9633814574894259,
+            0.18540284793793801,
+            1.3195079107728942,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_max_pool_cross_axis_ties_route_to_pytorch_scan_order() -> Result<()> {
+    // PyTorch's adaptive max kernel scans a window with the last spatial axis innermost and
+    // keeps the first strict maximum. [[1, 5], [5, 2]] ties at (0, 1) and (1, 0): PyTorch
+    // keeps (0, 1), flat index 1. (Reducing height first, then width, would pick (1, 0).)
+    let device = Device::cuda(0)?;
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    let input = Tensor::from_slice(&[1.0, 5.0, 5.0, 2.0], [height.of(2), width.of(2)], &device)?
+        .with_layout([width, height])?
+        .with_grad();
+    let actual = AdaptiveMaxPool2d::new([height, width], [1, 1]).forward(&input)?;
+    close(
+        "AdaptiveMaxPool2d cross-axis tie forward",
+        &actual.to_vec()?,
+        &[5.0],
+    );
+    actual.sum([height, width])?.backward()?;
+    close(
+        "reordered-storage AdaptiveMaxPool2d cross-axis tie gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 1.0, 0.0, 0.0],
+    );
+
+    // Depth x width tie in 3D: depth 0 = [1, 7], depth 1 = [7, 0]. Scan order (d, h, w)
+    // reaches (0, 0, 1) first.
+    let depth = Axis::new("depth");
+    let input = Tensor::from_slice(
+        &[1.0, 7.0, 7.0, 0.0],
+        [depth.of(2), height.of(1), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let actual = AdaptiveMaxPool3d::new([depth, height, width], [1, 1, 1]).forward(&input)?;
+    close(
+        "AdaptiveMaxPool3d cross-axis tie forward",
+        &actual.to_vec()?,
+        &[7.0],
+    );
+    actual.sum([depth, height, width])?.backward()?;
+    close(
+        "AdaptiveMaxPool3d cross-axis tie gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 1.0, 0.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool2d_indices_and_max_unpool2d_match_hand_computed() -> Result<()> {
+    // [[1, 6, 3, 2], [5, 4, 8, 8]], 2x2 windows: maxima 6 at flat 1 and 8 at flat 6 (the
+    // first of the tied pair in row-major scan). Unpooling puts them back in a zero 2x4
+    // plane; with weights w = 1..8 on the unpooled output, each pooled value's gradient is
+    // w[index] (2 and 7), which max pooling routes to its winner.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 6.0, 3.0, 2.0, 5.0, 4.0, 8.0, 8.0],
+        [channel.of(1), height.of(2), width.of(4)],
+        &device,
+    )?
+    .with_grad();
+    let pool = MaxPool2d::new(channel, [height, width], [2, 2]);
+    let (pooled, indices) = pool.forward_with_indices(&input)?;
+    assert_eq!(indices, vec![1, 6]);
+    close(
+        "MaxPool2d return_indices forward",
+        &pooled.to_vec()?,
+        &[6.0, 8.0],
+    );
+    let unpool = MaxUnpool2d::new([height, width], [2, 2]);
+    let unpooled = unpool.forward(&pooled, &indices)?;
+    assert_eq!(
+        unpooled.shape(),
+        &Shape::new([height.of(2), width.of(4), channel.of(1)])?
+    );
+    close(
+        "MaxUnpool2d forward",
+        &unpooled.to_vec()?,
+        &[0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0],
+    );
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [height.of(2), width.of(4), channel.of(1)],
+        &device,
+    )?;
+    unpooled
+        .mul(&weights)?
+        .sum([height, width, channel])?
+        .backward()?;
+    close(
+        "MaxUnpool2d then MaxPool2d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_unpool1d_duplicates_output_size_and_bounds_match_pytorch() -> Result<()> {
+    // Overlapping MaxPool1d(k=3, s=1) over [1, 5, 2, 0] picks index 1 twice.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let input = Tensor::from_slice(
+        &[1.0, 5.0, 2.0, 0.0],
+        [channel.of(1), length.of(4)],
+        &device,
+    )?;
+    let (pooled, indices) = MaxPool1d::new(channel, length, 3)
+        .stride(1)
+        .forward_with_indices(&input)?;
+    assert_eq!(indices, vec![1, 1]);
+    close(
+        "overlapping MaxPool1d forward",
+        &pooled.to_vec()?,
+        &[5.0, 5.0],
+    );
+
+    // Unpool distinct values at the duplicate index: the last write (20) wins, as in
+    // PyTorch's CPU kernel, and both inputs receive the upstream gradient at index 1 (2.0).
+    let values =
+        Tensor::from_slice(&[10.0, 20.0], [length.of(2), channel.of(1)], &device)?.with_grad();
+    let unpool = MaxUnpool1d::new(length, 3).stride(1);
+    let unpooled = unpool.forward(&values, &indices)?;
+    close(
+        "MaxUnpool1d duplicate index forward (last write wins)",
+        &unpooled.to_vec()?,
+        &[0.0, 20.0, 0.0, 0.0],
+    );
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0],
+        [length.of(4), channel.of(1)],
+        &device,
+    )?;
+    unpooled.mul(&weights)?.sum([length, channel])?.backward()?;
+    close(
+        "MaxUnpool1d duplicate index gradient (gather by index)",
+        &values.grad().unwrap().to_vec()?,
+        &[2.0, 2.0],
+    );
+
+    // MaxPool1d(k=2) over odd length 5 drops the tail; output_size=5 restores it, within
+    // PyTorch's (default - stride, default + stride) = (2, 6) window.
+    let input = Tensor::from_slice(
+        &[3.0, 1.0, 4.0, 1.0, 5.0],
+        [channel.of(1), length.of(5)],
+        &device,
+    )?;
+    let (pooled, indices) = MaxPool1d::new(channel, length, 2).forward_with_indices(&input)?;
+    assert_eq!(indices, vec![0, 2]);
+    let unpool = MaxUnpool1d::new(length, 2);
+    close(
+        "MaxUnpool1d output_size forward",
+        &unpool.forward_sized(&pooled, &indices, 5)?.to_vec()?,
+        &[3.0, 0.0, 4.0, 0.0, 0.0],
+    );
+    let error = unpool
+        .forward_sized(&pooled, &indices, 6)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("outside"), "{error}");
+    let error = pooled
+        .max_unpool1d(length, &[0, 4], 4)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("outside the output volume"), "{error}");
+    let error = pooled
+        .max_unpool1d(length, &[0], 4)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("indices"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool3d_indices_and_max_unpool3d_match_hand_computed_under_reordered_storage() -> Result<()> {
+    // Two channels, kernel [1, 2, 1] over height: channel 0 [3, 7] -> 7 at flat 1, channel 1
+    // [9, -1] -> 9 at flat 0. Indices follow the pooled output's logical order (channel
+    // last). Weighted unpooled gradients: w(h1, c0) = 3, w(h0, c1) = 2.
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[3.0, 7.0, 9.0, -1.0],
+        [channel.of(2), depth.of(1), height.of(2), width.of(1)],
+        &device,
+    )?
+    .with_layout([height, width, channel, depth])?
+    .with_grad();
+    let (pooled, indices) =
+        MaxPool3d::new(channel, [depth, height, width], [1, 2, 1]).forward_with_indices(&input)?;
+    assert_eq!(indices, vec![1, 0]);
+    close(
+        "MaxPool3d return_indices forward",
+        &pooled.to_vec()?,
+        &[7.0, 9.0],
+    );
+    let unpooled =
+        MaxUnpool3d::new([depth, height, width], [1, 2, 1]).forward(&pooled, &indices)?;
+    assert_eq!(
+        unpooled.shape(),
+        &Shape::new([depth.of(1), height.of(2), width.of(1), channel.of(2)])?
+    );
+    close(
+        "MaxUnpool3d forward",
+        &unpooled.to_vec()?,
+        &[0.0, 9.0, 7.0, 0.0],
+    );
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0],
+        [depth.of(1), height.of(2), width.of(1), channel.of(2)],
+        &device,
+    )?;
+    unpooled
+        .mul(&weights)?
+        .sum([depth, height, width, channel])?
+        .backward()?;
+    close(
+        "reordered-storage MaxUnpool3d then MaxPool3d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 3.0, 2.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+fn multihead_attention_rejects_invalid_configuration_before_allocation() {
+    let (feature, time) = (Axis::new("feature"), Axis::new("time"));
+    assert!(MultiheadAttention::new(feature, feature, 4, 2, 0.0).is_err());
+    assert!(MultiheadAttention::new(feature, time, 4, 2, 0.1).is_err());
+    assert!(MultiheadAttention::new(feature, time, 0, 2, 0.0).is_err());
+    assert!(MultiheadAttention::new(feature, time, 4, 0, 0.0).is_err());
+    assert!(MultiheadAttention::new(feature, time, 5, 2, 0.0).is_err());
+
+    let mha = MultiheadAttention::new(feature, time, 4, 2, 0.0).unwrap();
+    let q = Shape::new([time.of(2), feature.of(4)]).unwrap();
+    let k = Shape::new([time.of(3), feature.of(4)]).unwrap();
+    let v_mismatched = Shape::new([time.of(4), feature.of(4)]).unwrap();
+    assert!(mha.output_shape(&q, &k, &k).is_ok());
+    assert!(mha.output_shape(&q, &k, &v_mismatched).is_err());
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multihead_attention_two_head_self_attention_matches_hand_computed_oracle_with_key_padding_mask()
+-> Result<()> {
+    // Independent f64 oracle (finite differences of a from-scratch numpy forward, Richardson
+    // checked at eps in {1e-4, 5e-5} to under 1e-10 before being frozen as literals here) for
+    // embed_dim=4, num_heads=2 (head_feature=2), 3 self-attended time steps, and a key padding
+    // mask that excludes the last key from every query. `bk`'s gradient is exactly zero: adding
+    // a bias to every key shifts every score for a fixed (head, query) by the SAME amount
+    // (independent of the key position being scored), and softmax is invariant to a constant
+    // shift along its own reduced axis -- a property of the mechanism, not a coincidence of
+    // these particular weights.
+    let device = Device::cuda(0)?;
+    let (time, feature) = (Axis::new("time"), Axis::new("feature"));
+    let x_values: [f32; 12] = [
+        0.6, -0.3, 0.9, 0.15, -1.2, 0.45, -0.6, 0.3, 0.15, 0.75, -1.05, 0.6,
+    ];
+    let x = Tensor::from_slice(&x_values, [time.of(3), feature.of(4)], &device)?.with_grad();
+
+    let mut mha = MultiheadAttention::new(feature, time, 4, 2, 0.0)?;
+    let expected_shape = Shape::new([time.of(3), feature.of(4)])?;
+    assert_eq!(
+        mha.build(x.shape(), x.shape(), x.shape(), &device, 0)?,
+        expected_shape
+    );
+
+    let set = |mha: &MultiheadAttention, name: &str, values: &[f32]| -> Result<()> {
+        mha.named_parameters()
+            .iter()
+            .find(|(n, _)| n == name)
+            .ok_or("missing parameter")?
+            .1
+            .set_values(values)
+    };
+    set(
+        &mha,
+        "query.weight",
+        &[
+            0.4, 0.8, -0.4, 0.2, 0.2, -0.8, 1.2, 0.4, -0.6, 0.4, 0.8, -0.2, 0.8, 0.2, -0.4, 0.6,
+        ],
+    )?;
+    set(&mha, "query.bias", &[0.05, -0.1, 0.15, 0.0])?;
+    set(
+        &mha,
+        "key.weight",
+        &[
+            0.8, -0.4, 0.2, 0.4, -0.2, 0.6, 0.8, -0.4, 0.4, 0.2, -0.8, 0.6, -0.4, 0.8, 0.4, -0.2,
+        ],
+    )?;
+    set(&mha, "key.bias", &[-0.05, 0.1, 0.0, 0.05])?;
+    set(
+        &mha,
+        "value.weight",
+        &[
+            0.2, 0.4, -0.6, 0.8, 0.8, -0.2, 0.4, -0.4, -0.4, 0.6, 0.2, 0.4, 0.4, -0.4, 0.8, 0.2,
+        ],
+    )?;
+    set(&mha, "value.bias", &[0.0, 0.05, -0.05, 0.1])?;
+    set(
+        &mha,
+        "output.weight",
+        &[
+            0.6, -0.4, 0.2, 0.4, 0.4, 0.8, -0.4, -0.2, -0.2, 0.4, 0.6, 0.8, 0.8, -0.6, 0.4, 0.2,
+        ],
+    )?;
+    set(&mha, "output.bias", &[0.1, 0.0, -0.1, 0.05])?;
+
+    // PyTorch's own key_padding_mask convention: 1.0 = ignore that key for every query. The last
+    // key (index 2) is padding.
+    let key_padding = Tensor::from_slice(&[0.0, 0.0, 1.0], [mha.key_time().of(3)], &device)?;
+
+    let (output, weights) = mha.forward_with_weights(&x, &x, &x, None, Some(&key_padding), true)?;
+    close(
+        "MultiheadAttention forward",
+        &output.to_vec()?,
+        &[
+            -0.2659694341,
+            -0.1575912433,
+            0.3308803281,
+            0.5738299373,
+            -0.1220312472,
+            0.8221968242,
+            -0.1720345522,
+            0.1616877521,
+            0.6524414440,
+            0.3693247401,
+            -0.2079593236,
+            -0.1045806274,
+        ],
+    );
+    close(
+        "MultiheadAttention head-averaged weights (masked key gets zero weight)",
+        &weights.unwrap().to_vec()?,
+        &[
+            0.3406310228,
+            0.6593689772,
+            0.0,
+            0.6272801610,
+            0.3727198390,
+            0.0,
+            0.8671724567,
+            0.1328275433,
+            0.0,
+        ],
+    );
+
+    // Reordered physical storage for the input must not change the forward value.
+    let x_reordered = Tensor::from_slice(&x_values, [time.of(3), feature.of(4)], &device)?
+        .with_layout([feature, time])?;
+    close(
+        "MultiheadAttention forward is unaffected by reordered input storage",
+        &mha.forward(
+            &x_reordered,
+            &x_reordered,
+            &x_reordered,
+            None,
+            Some(&key_padding),
+        )?
+        .to_vec()?,
+        &[
+            -0.2659694341,
+            -0.1575912433,
+            0.3308803281,
+            0.5738299373,
+            -0.1220312472,
+            0.8221968242,
+            -0.1720345522,
+            0.1616877521,
+            0.6524414440,
+            0.3693247401,
+            -0.2079593236,
+            -0.1045806274,
+        ],
+    );
+
+    output.mean([time, feature])?.backward()?;
+    let grad = |name: &str| -> Vec<f32> {
+        mha.named_parameters()
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap()
+            .1
+            .grad()
+            .unwrap()
+            .to_vec()
+            .unwrap()
+    };
+    close(
+        "MultiheadAttention x gradient",
+        &x.grad().unwrap().to_vec()?,
+        &[
+            0.0251251226,
+            0.1364713234,
+            0.0885826173,
+            0.2129792737,
+            -0.0063528112,
+            0.0850940605,
+            0.0714196287,
+            0.1755497389,
+            -0.0005616756,
+            0.0022137745,
+            -0.0009979275,
+            0.0006980926,
+        ],
+    );
+    close(
+        "MultiheadAttention query.weight gradient",
+        &grad("query.weight"),
+        &[
+            -0.0024837483,
+            0.0010928493,
+            -0.0007901254,
+            0.0010271630,
+            0.0023874106,
+            -0.0010504607,
+            0.0010260336,
+            -0.0013338437,
+            0.0015863129,
+            -0.0006979777,
+            -0.0006484385,
+            0.0008429700,
+            0.0052972790,
+            -0.0023308027,
+            0.0013293262,
+            -0.0017281241,
+        ],
+    );
+    close(
+        "MultiheadAttention query.bias gradient",
+        &grad("query.bias"),
+        &[0.0198445104, -0.0087315846, 0.0041543950, -0.0054007134],
+    );
+    close(
+        "MultiheadAttention key.weight gradient",
+        &grad("key.weight"),
+        &[
+            0.0030097950,
+            -0.0033499178,
+            -0.0013439622,
+            -0.0014156062,
+            -0.0012540812,
+            0.0013957991,
+            0.0005599843,
+            0.0005898359,
+            0.0025081625,
+            -0.0027915982,
+            -0.0011199685,
+            -0.0011796718,
+            -0.0002508162,
+            0.0002791598,
+            0.0001119969,
+            0.0001179672,
+        ],
+    );
+    close(
+        "MultiheadAttention key.bias gradient is exactly zero (uniform shift along the softmax's own reduced axis)",
+        &grad("key.bias"),
+        &[0.0, 0.0, 0.0, 0.0],
+    );
+    close(
+        "MultiheadAttention value.weight gradient",
+        &grad("value.weight"),
+        &[
+            0.0038524380,
+            0.0028893285,
+            -0.0868647285,
+            -0.0434323642,
+            -0.0116051825,
+            -0.0087038869,
+            0.0161936369,
+            0.0080968184,
+            0.0832103650,
+            0.0624077737,
+            0.0876127263,
+            0.0438063631,
+            0.0396789635,
+            0.0297592226,
+            0.0872387274,
+            0.0436193637,
+        ],
+    );
+    close(
+        "MultiheadAttention value.bias gradient",
+        &grad("value.bias"),
+        &[0.2, 0.15, 0.4, 0.2],
+    );
+    close(
+        "MultiheadAttention output.weight gradient",
+        &grad("output.weight"),
+        &[
+            -0.0324077737,
+            -0.0324077737,
+            -0.0324077737,
+            -0.0324077737,
+            0.0598958066,
+            0.0598958066,
+            0.0598958066,
+            0.0598958066,
+            0.0786936369,
+            0.0786936369,
+            0.0786936369,
+            0.0786936369,
+            0.0103272490,
+            0.0103272490,
+            0.0103272490,
+            0.0103272490,
+        ],
+    );
+    close(
+        "MultiheadAttention output.bias gradient",
+        &grad("output.bias"),
+        &[0.25, 0.25, 0.25, 0.25],
+    );
+
+    Ok(())
+}
+
+// --- nn-climb-misc: Upsample bicubic/scale_factor, LinearCrossEntropyLoss,
+// AdaptiveLogSoftmaxWithLoss, CTCLoss -------------------------------------
+
+#[test]
+#[ignore = "requires CUDA"]
+fn resample_bicubic_matches_independent_oracle_forward_and_gradient() -> Result<()> {
+    // Independent oracle: a from-scratch Python reimplementation of PyTorch's
+    // documented `a = -0.75` separable bicubic kernel and
+    // `align_corners=False` half-pixel source formula (never calling this
+    // crate), forward-mode for the values and central differences for the
+    // gradient. Storage is reordered (`with_layout([length, batch])`, an
+    // unrelated `batch` axis preserved through the resample) for the CUDA
+    // non-trivial-layout coverage the base order requires.
+    let device = Device::cuda(0)?;
+    let (batch, length) = (Axis::new("batch"), Axis::new("length"));
+    let x = Tensor::from_slice(
+        &[0.0, 1.0, 2.0, 3.0, 10.0, 7.0, 3.0, -2.0],
+        [batch.of(2), length.of(4)],
+        &device,
+    )?
+    .with_layout([length, batch])?
+    .with_grad();
+
+    let out = x.resample_bicubic(length, 7)?;
+    assert_eq!(out.shape(), &Shape::new([batch.of(2), length.of(7)])?);
+    close(
+        "bicubic upsample values",
+        &out.to_vec()?,
+        &[
+            -0.099216, 0.279246, 0.896593, 1.5, 2.103407, 2.720754, 3.099216, 10.29765, 9.223761,
+            7.356414, 5.1875, 2.529155, -0.542274, -2.496082,
+        ],
+    );
+    let weight: Vec<f32> = (1..=14).map(|v| v as f32).collect();
+    let weight = Tensor::from_slice(&weight, [batch.of(2), length.of(7)], &device)?;
+    out.mul(&weight)?.mean([batch, length])?.backward()?;
+    close(
+        "bicubic upsample gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            0.15817, 0.389089, 0.626946, 0.825795, 1.019139, 1.27812, 1.515976, 1.686765,
+        ],
+    );
+
+    assert!(x.resample_bicubic(length, 0).is_err());
+    assert!(
+        Tensor::from_slice(&[0.0_f32], [length.of(1)], &device)?
+            .resample_bicubic(length, 2)
+            .is_err()
+    );
+    println!("bicubic upsample values, gradient, and rejections PASS");
+    Ok(())
+}
+
+#[test]
+fn upsample_module_rejects_invalid_configurations_before_launch() -> Result<()> {
+    let (height, width, depth) = (Axis::new("height"), Axis::new("width"), Axis::new("depth"));
+    assert!(Upsample::size(vec![height], UpsampleMode::Bilinear, vec![8]).is_err());
+    assert!(Upsample::size(vec![height, width], UpsampleMode::Trilinear, vec![8, 8]).is_err());
+    assert!(Upsample::size(vec![height, height], UpsampleMode::Bicubic, vec![8, 8]).is_err());
+    assert!(Upsample::size(vec![height], UpsampleMode::Nearest, vec![]).is_err());
+    assert!(Upsample::scale_factor(vec![height], UpsampleMode::Nearest, vec![-1.0]).is_err());
+
+    let shape = Shape::new([height.of(3), width.of(3)])?;
+    let odd_ratio = Upsample::size(vec![height, width], UpsampleMode::Bilinear, vec![7, 5])?
+        .output_shape(&shape);
+    assert!(odd_ratio.is_ok()); // bilinear tolerates a non-integer ratio
+    let odd_nearest = Upsample::size(vec![height, width], UpsampleMode::Nearest, vec![7, 6])?
+        .output_shape(&shape);
+    assert!(
+        odd_nearest.is_err(),
+        "nearest must reject a non-integer output ratio before forward runs a kernel"
+    );
+
+    let _ = depth; // exercised in the CUDA trilinear/bicubic module tests below
+    println!("Upsample rejects bad configurations before launch PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn upsample_module_nearest_scale_factor_and_bilinear_size_match_the_composed_primitives()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, height, width) = (Axis::new("batch"), Axis::new("height"), Axis::new("width"));
+    let values: Vec<f32> = (0..2 * 3 * 4).map(|v| v as f32).collect();
+    let x = Tensor::from_slice(&values, [batch.of(2), height.of(3), width.of(4)], &device)?;
+
+    let nearest =
+        Upsample::scale_factor(vec![height, width], UpsampleMode::Nearest, vec![2.0, 2.0])?;
+    let via_module = nearest.forward(&x)?;
+    let via_primitive = x.upsample_nearest(height, 2)?.upsample_nearest(width, 2)?;
+    assert_eq!(
+        via_module.shape(),
+        &Shape::new([batch.of(2), height.of(6), width.of(8)])?
+    );
+    close(
+        "Upsample nearest module matches composed upsample_nearest",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    let bilinear = Upsample::size(vec![height, width], UpsampleMode::Bilinear, vec![5, 6])?;
+    let via_module = bilinear.forward(&x)?;
+    let via_primitive = x
+        .resample_bilinear(height, 5)?
+        .resample_bilinear(width, 6)?;
+    assert_eq!(
+        via_module.shape(),
+        &Shape::new([batch.of(2), height.of(5), width.of(6)])?
+    );
+    close(
+        "Upsample bilinear module matches composed resample_bilinear",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+    println!("Upsample nearest and bilinear module composition PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn upsample_module_bicubic_and_trilinear_match_the_composed_primitives() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, height, width, depth) = (
+        Axis::new("batch"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+    let values: Vec<f32> = (0..2 * 4 * 5).map(|v| v as f32 / 3.0).collect();
+    let x = Tensor::from_slice(&values, [batch.of(2), height.of(4), width.of(5)], &device)?;
+    let bicubic =
+        Upsample::scale_factor(vec![height, width], UpsampleMode::Bicubic, vec![1.75, 1.4])?;
+    let via_module = bicubic.forward(&x)?;
+    let via_primitive = x.resample_bicubic(height, 7)?.resample_bicubic(width, 7)?;
+    assert_eq!(via_module.shape(), via_primitive.shape());
+    close(
+        "Upsample bicubic module matches composed resample_bicubic",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    let cube_values: Vec<f32> = (0..2 * 2 * 3).map(|v| v as f32).collect();
+    let cube = Tensor::from_slice(
+        &cube_values,
+        [depth.of(2), height.of(2), width.of(3)],
+        &device,
+    )?;
+    let trilinear = Upsample::size(
+        vec![depth, height, width],
+        UpsampleMode::Trilinear,
+        vec![4, 3, 5],
+    )?;
+    let via_module = trilinear.forward(&cube)?;
+    let via_primitive = cube
+        .resample_bilinear(depth, 4)?
+        .resample_bilinear(height, 3)?
+        .resample_bilinear(width, 5)?;
+    assert_eq!(
+        via_module.shape(),
+        &Shape::new([depth.of(4), height.of(3), width.of(5)])?
+    );
+    close(
+        "Upsample trilinear module matches composed resample_bilinear",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+    println!("Upsample bicubic and trilinear module composition PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn linear_cross_entropy_with_logits_matches_independent_oracle_and_label_smoothing() -> Result<()> {
+    // Independent oracle: a from-scratch Python reimplementation (linear
+    // projection + log-softmax + one-hot NLL, never calling this crate),
+    // forward-mode for the values, central differences for the gradient.
+    let device = Device::cuda(0)?;
+    let (batch, feature, class) = (Axis::new("batch"), Axis::new("feature"), Axis::new("class"));
+    let x = Tensor::from_slice(
+        &[1.0, -1.0, 0.5, 2.0],
+        [batch.of(2), feature.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let weight = Tensor::from_slice(
+        &[0.3, -0.2, 0.1, 0.5, 0.4, -0.3],
+        [feature.of(2), class.of(3)],
+        &device,
+    )?;
+    let bias = Tensor::from_slice(&[0.1, -0.1, 0.05], [class.of(3)], &device)?;
+    let targets = Tensor::from_slice(
+        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [batch.of(2), class.of(3)],
+        &device,
+    )?;
+
+    let loss = x.linear_cross_entropy_with_logits(
+        &weight,
+        Some(&bias),
+        feature,
+        &targets,
+        class,
+        LinearCrossEntropyOptions::default(),
+    )?;
+    assert_eq!(loss.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "linear_cross_entropy forward",
+        &loss.to_vec()?,
+        &[1.188473, 2.278166],
+    );
+    loss.sum(batch)?.backward()?;
+    close(
+        "linear_cross_entropy gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[-0.1892274, -0.4392002, 0.02558424, 0.6872382],
+    );
+
+    let smoothed = x.linear_cross_entropy_with_logits(
+        &weight,
+        Some(&bias),
+        feature,
+        &targets,
+        class,
+        LinearCrossEntropyOptions {
+            label_smoothing: 0.1,
+        },
+    )?;
+    close(
+        "linear_cross_entropy label_smoothing=0.1 forward",
+        &smoothed.to_vec()?,
+        &[1.190139, 2.183166],
+    );
+
+    let bad_options = x.linear_cross_entropy_with_logits(
+        &weight,
+        Some(&bias),
+        feature,
+        &targets,
+        class,
+        LinearCrossEntropyOptions {
+            label_smoothing: 1.0,
+        },
+    );
+    assert!(bad_options.is_err());
+    println!("linear_cross_entropy forward, gradient, smoothing, and rejection PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_log_softmax_with_loss_matches_independent_oracle_and_gradient() -> Result<()> {
+    // Independent oracle: a from-scratch Python reimplementation of the
+    // documented head/tail-cluster algorithm (Grave et al., never calling
+    // this crate), forward-mode for the loss, central differences on the
+    // input for the gradient.
+    let device = Device::cuda(0)?;
+    let (batch, feature, head, hidden, tail) = (
+        Axis::new("batch"),
+        Axis::new("feature"),
+        Axis::new("head"),
+        Axis::new("hidden"),
+        Axis::new("tail"),
+    );
+    let x = Tensor::from_slice(
+        &[1.0, -1.0, 0.5, 2.0],
+        [batch.of(2), feature.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let head_weight = Tensor::from_slice(
+        &[0.3, -0.2, 0.1, 0.5, 0.4, -0.3],
+        [feature.of(2), head.of(3)],
+        &device,
+    )?;
+    let down = Tensor::from_slice(&[0.7, -0.6], [feature.of(2), hidden.of(1)], &device)?;
+    let up = Tensor::from_slice(&[0.2, -0.4], [hidden.of(1), tail.of(2)], &device)?;
+
+    let loss = x.adaptive_log_softmax_with_loss(
+        feature,
+        &[0, 3],
+        &head_weight,
+        None,
+        &[(down, up)],
+        &[2],
+        4,
+        4.0,
+    )?;
+    assert_eq!(loss.shape(), &Shape::new([])?);
+    close(
+        "adaptive_log_softmax_with_loss forward",
+        &loss.to_vec()?,
+        &[2.009961],
+    );
+    loss.backward()?;
+    close(
+        "adaptive_log_softmax_with_loss gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[-0.1001569, -0.2182897, 0.08118351, 0.2748076],
+    );
+
+    let bad_cutoffs =
+        x.adaptive_log_softmax_with_loss(feature, &[0, 3], &head_weight, None, &[], &[2], 4, 4.0);
+    assert!(bad_cutoffs.is_err());
+    let bad_target = x.adaptive_log_softmax_with_loss(
+        feature,
+        &[0, 9],
+        &head_weight,
+        None,
+        &[(
+            Tensor::from_slice(&[0.7, -0.6], [feature.of(2), hidden.of(1)], &device)?,
+            Tensor::from_slice(&[0.2, -0.4], [hidden.of(1), tail.of(2)], &device)?,
+        )],
+        &[2],
+        4,
+        4.0,
+    );
+    assert!(bad_target.is_err());
+    println!("adaptive_log_softmax_with_loss forward, gradient, and rejections PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn ctc_loss_matches_a_brute_force_alignment_enumeration_oracle_and_gradient() -> Result<()> {
+    // Independent oracle: a from-scratch Python brute-force enumeration of
+    // every length-5 alignment over {blank, 1, 2} for each row, summing the
+    // probability of every alignment that collapses (remove repeats, then
+    // blanks) to that row's target, never calling this crate's recursion;
+    // central differences on `log_probs` for the gradient.
+    let device = Device::cuda(0)?;
+    let (time, batch, class) = (Axis::new("time"), Axis::new("batch"), Axis::new("class"));
+    let values: Vec<f32> = vec![
+        -1.356791, -0.479507, -2.092115, -0.488288, -1.761924, -1.538934, -0.6963312, -1.533338,
+        -1.252549, -2.085385, -0.6334775, -1.064217, -1.493144, -0.5757505, -1.546218, -0.888717,
+        -1.527629, -0.9894868, -1.631313, -1.513596, -0.5374938, -1.881604, -1.47204, -0.4809473,
+        -0.7197948, -1.193529, -1.560655, -1.75642, -1.988898, -0.3703511,
+    ];
+    let log_probs =
+        Tensor::from_slice(&values, [time.of(5), batch.of(2), class.of(3)], &device)?.with_grad();
+    let loss = Tensor::ctc_loss(&log_probs, time, class, &[vec![1, 2], vec![2, 1]], 0)?;
+    assert_eq!(loss.shape(), &Shape::new([])?);
+    close("ctc_loss forward", &loss.to_vec()?, &[1.140298]);
+    loss.backward()?;
+    close(
+        "ctc_loss gradient",
+        &log_probs.grad().expect("log_probs gradient").to_vec()?,
+        &[
+            -0.07417303,
+            -0.175827,
+            0.0,
+            -0.1755447,
+            0.0,
+            -0.07445528,
+            -0.117174,
+            -0.1064924,
+            -0.02633362,
+            -0.04761355,
+            -0.01877553,
+            -0.1836109,
+            -0.06401731,
+            -0.1022976,
+            -0.08368509,
+            -0.08095412,
+            -0.0464776,
+            -0.1225683,
+            -0.03408435,
+            -0.01110847,
+            -0.2048072,
+            -0.04722227,
+            -0.1303284,
+            -0.07244934,
+            -0.1633451,
+            0.0,
+            -0.08665488,
+            -0.09162478,
+            -0.1583752,
+            0.0,
+        ],
+    );
+
+    let mismatched_lengths = Tensor::ctc_loss(&log_probs, time, class, &[vec![1, 2], vec![2]], 0);
+    assert!(mismatched_lengths.is_err());
+    let blank_in_target = Tensor::ctc_loss(&log_probs, time, class, &[vec![0, 1], vec![1, 2]], 0);
+    assert!(blank_in_target.is_err());
+    println!("ctc_loss forward, gradient, and rejections PASS");
     Ok(())
 }

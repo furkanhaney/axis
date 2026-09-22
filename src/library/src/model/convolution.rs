@@ -1060,21 +1060,33 @@ impl Module for Fold {
     }
 }
 
-/// Which reduction a [`Pooling`] window applies. Shared geometry (kernel/stride/padding
+/// Which reduction a [`Pooling`] window applies. Shared geometry (kernel/stride/padding/ceil
 /// validation and the windowed patch extraction) is identical across the family; only the
 /// per-window reduction differs, so one generic struct serves `MaxPool*d`, `AvgPool*d`, and
 /// `LPPool*d` instead of three near-duplicate ones.
 #[derive(Clone, Copy)]
 enum PoolReduce {
     Max,
-    /// `count_include_pad=True` (PyTorch's default): divides by the full kernel volume, never
-    /// by the count of real (non-padding) positions.
-    Avg,
-    /// Power-average pooling, `(sum(x^p))^(1/p)`. `p` must be a positive integer: Axis's own
-    /// restriction, narrower than PyTorch's `norm_type: float`, chosen because every practical
-    /// use is an integer and a genuinely fractional `1/p` root of a negative partial sum has no
-    /// well-defined real value anyway.
-    Lp(u32),
+    /// `sum(window) / divisor`, PyTorch's `avg_pool` divisor rule: `divisor_override` when
+    /// set; otherwise, with `count_include_pad`, the window clipped to the padded input (the
+    /// full kernel volume except for a `ceil_mode` window overhanging the right padding);
+    /// without it, the count of real (non-padding) positions.
+    Avg {
+        count_include_pad: bool,
+        divisor_override: Option<usize>,
+    },
+    /// Power-average pooling, `(sum(x^p))^(1/p)`, for any finite positive real `p`.
+    Lp(f32),
+}
+
+/// Host-side geometry of one [`Pooling`] call, computed before any device work.
+struct PoolGeometry<const N: usize> {
+    shape: Shape,
+    channels: usize,
+    input: [usize; N],
+    output: [usize; N],
+    /// Zero positions appended past the right padding so every `ceil_mode` window exists.
+    overhang: [usize; N],
 }
 
 struct Pooling<const N: usize> {
@@ -1083,6 +1095,7 @@ struct Pooling<const N: usize> {
     kernel: [usize; N],
     stride: [usize; N],
     padding: [usize; N],
+    ceil_mode: bool,
     patch: Axis,
     reduce: PoolReduce,
     name: &'static str,
@@ -1104,14 +1117,14 @@ impl<const N: usize> Pooling<N> {
             // extent.
             stride: kernel,
             padding: [0; N],
+            ceil_mode: false,
             patch: channels.role("pool_patch"),
             reduce,
             name,
         }
     }
 
-    /// Output shape and the input's channel extent (needed again by `forward`).
-    fn geometry(&self, input: &Shape) -> Result<(Shape, usize)> {
+    fn geometry(&self, input: &Shape) -> Result<PoolGeometry<N>> {
         let name = self.name;
         if !(N == 2 || N == 3) {
             return Err("Axis pooling supports exactly two or three spatial axes".into());
@@ -1127,16 +1140,26 @@ impl<const N: usize> Pooling<N> {
         if self.stride.contains(&0) {
             return Err(format!("{name} stride extents must be positive").into());
         }
-        let channel_extent = input.extent(self.channels)?;
-        let mut output_spatial = [0; N];
-        // Four parallel small arrays share one index; a `.zip()` chain would read worse than
-        // the loop it replaces.
+        if let PoolReduce::Avg {
+            divisor_override: Some(0),
+            ..
+        } = self.reduce
+        {
+            return Err(format!("{name} divisor_override must be positive").into());
+        }
+        let channels = input.extent(self.channels)?;
+        let mut sizes = [0; N];
+        let mut output = [0; N];
+        let mut overhang = [0; N];
+        // Several parallel small arrays share one index; a `.zip()` chain would read worse
+        // than the loop it replaces.
         #[allow(clippy::needless_range_loop)]
         for index in 0..N {
+            let (kernel, stride) = (self.kernel[index], self.stride[index]);
             let doubled_padding = self.padding[index]
                 .checked_mul(2)
                 .ok_or_else(|| format!("{name} padding overflow"))?;
-            if doubled_padding > self.kernel[index] {
+            if doubled_padding > kernel {
                 // PyTorch's own MaxPool/AvgPool constraint. It also guarantees every window
                 // keeps at least one real, unpadded element, so a fully-padding window is
                 // unreachable.
@@ -1144,14 +1167,28 @@ impl<const N: usize> Pooling<N> {
                     format!("{name} padding must be at most half the kernel extent").into(),
                 );
             }
-            let input_extent = input.extent(self.spatial[index])?;
-            let padded = input_extent
+            let extent = input.extent(self.spatial[index])?;
+            let padded = extent
                 .checked_add(doubled_padding)
                 .ok_or_else(|| format!("{name} padded spatial extent overflow"))?;
-            if self.kernel[index] > padded {
+            // PyTorch's `pooling_output_shape`: `ceil_mode` rounds the window count up, then
+            // drops a last window that would start past the input and its left padding (in
+            // the right padding or beyond), so every window keeps a real element.
+            let span = if self.ceil_mode {
+                padded + (stride - 1)
+            } else {
+                padded
+            };
+            if kernel > span {
                 return Err(format!("{name} kernel must fit the padded spatial axes").into());
             }
-            output_spatial[index] = (padded - self.kernel[index]) / self.stride[index] + 1;
+            let mut count = (span - kernel) / stride + 1;
+            if self.ceil_mode && (count - 1) * stride >= extent + self.padding[index] {
+                count -= 1;
+            }
+            sizes[index] = extent;
+            output[index] = count;
+            overhang[index] = ((count - 1) * stride + kernel).saturating_sub(padded);
         }
         // Matches `unfold_grouped`'s own layout: unrelated axes (spatial axes replaced in
         // place, other axes untouched) come first, then the channel axis is appended, exactly
@@ -1164,35 +1201,99 @@ impl<const N: usize> Pooling<N> {
                 self.spatial
                     .iter()
                     .position(|&axis| axis == dim.axis)
-                    .map_or(*dim, |index| dim.axis.of(output_spatial[index]))
+                    .map_or(*dim, |index| dim.axis.of(output[index]))
             })
             .collect();
-        dims.push(self.channels.of(channel_extent));
-        Ok((Shape::new(dims)?, channel_extent))
+        dims.push(self.channels.of(channels));
+        Ok(PoolGeometry {
+            shape: Shape::new(dims)?,
+            channels,
+            input: sizes,
+            output,
+            overhang,
+        })
     }
 
     fn output_shape(&self, input: &Shape) -> Result<Shape> {
-        Ok(self.geometry(input)?.0)
+        Ok(self.geometry(input)?.shape)
+    }
+
+    /// Per-output-window element counts over the spatial axes (supplied order, last axis
+    /// fastest): each window clipped to the padded input when `include_padding`, else to the
+    /// real input. `None` when every window counts the full kernel volume, so callers keep
+    /// the plain uniform reduction (and its exact bits).
+    fn window_counts(
+        &self,
+        geometry: &PoolGeometry<N>,
+        include_padding: bool,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        let volume: usize = self.kernel.iter().product();
+        let windows: usize = geometry.output.iter().product();
+        let mut counts = Vec::with_capacity(windows);
+        for window in 0..windows {
+            let mut remainder = window;
+            let mut count = 1;
+            for index in (0..N).rev() {
+                let position = remainder % geometry.output[index];
+                remainder /= geometry.output[index];
+                let (extent, padding) = (geometry.input[index], self.padding[index]);
+                // Window bounds in padded coordinates.
+                let start = position * self.stride[index];
+                let end = (start + self.kernel[index]).min(extent + 2 * padding);
+                count *= if include_padding {
+                    end - start
+                } else {
+                    end.min(extent + padding) - start.max(padding)
+                };
+            }
+            counts.push(count);
+        }
+        if counts.iter().all(|&count| count == volume) {
+            return Ok(None);
+        }
+        let counts: Vec<f32> = counts.into_iter().map(|count| count as f32).collect();
+        Ok(Some(Tensor::from_slice(
+            &counts,
+            self.spatial_dims(geometry),
+            device,
+        )?))
+    }
+
+    /// The pooled spatial axes alone, in supplied order: the shape of a per-window divisor.
+    fn spatial_dims(&self, geometry: &PoolGeometry<N>) -> Vec<Dim> {
+        (0..N)
+            .map(|index| self.spatial[index].of(geometry.output[index]))
+            .collect()
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let (_, channel_extent) = self.geometry(input.shape())?;
+        let geometry = self.geometry(input.shape())?;
         let kernel_volume = self.kernel.iter().product();
         // Max pads with negative infinity so a padded position can never win; average and
-        // power-average pad with zero (an average- or sum-neutral value) exactly as `Conv2d`
-        // does, since `count_include_pad=True`/the LP sum both count every kernel position.
+        // power-average pad with zero (a sum-neutral value) exactly as `Conv2d` does, and
+        // count padding through their explicit divisors instead.
         let fill = match self.reduce {
             PoolReduce::Max => f32::NEG_INFINITY,
-            PoolReduce::Avg | PoolReduce::Lp(_) => 0.0,
+            PoolReduce::Avg { .. } | PoolReduce::Lp(_) => 0.0,
         };
+        // A `ceil_mode` window overhanging the right padding reads zeros appended past the
+        // real input: only average and LP pooling expose `ceil_mode`, and for their sums an
+        // appended zero is indistinguishable from padding.
+        let mut source = input.clone();
+        for index in 0..N {
+            if geometry.overhang[index] > 0 {
+                source = source.pad_zeros(self.spatial[index], 0, geometry.overhang[index])?;
+            }
+        }
         // Materialize the windowed patches (as `Conv2d`/`Conv3d` do); `unfold_grouped`'s
         // backward (col2im) already sums overlapping window contributions exactly, so no new
         // backend kernel is needed for either padding or a stride smaller than the kernel, for
         // any of the three reductions below.
-        let patches = input.unfold_grouped(
+        let patches = source.unfold_grouped(
             self.channels,
             self.spatial,
-            self.channels.of(channel_extent),
+            self.channels.of(geometry.channels),
             self.patch.of(kernel_volume),
             self.kernel,
             self.stride,
@@ -1203,23 +1304,130 @@ impl<const N: usize> Pooling<N> {
             // `-min(-patch)`: `Tensor::min` already ignores non-finite candidates and breaks
             // ties toward the first logical coordinate.
             PoolReduce::Max => patches.scale(-1.0)?.min(self.patch)?.scale(-1.0),
-            PoolReduce::Avg => patches.mean(self.patch),
-            PoolReduce::Lp(p) => {
-                let mut power = patches.clone();
-                for _ in 1..p {
-                    power = power.mul(&patches)?;
+            PoolReduce::Avg {
+                count_include_pad,
+                divisor_override,
+            } => {
+                if let Some(divisor) = divisor_override {
+                    let windows = geometry.output.iter().product();
+                    let divisor = Tensor::from_slice(
+                        &vec![divisor as f32; windows],
+                        self.spatial_dims(&geometry),
+                        input.device(),
+                    )?;
+                    return patches.sum(self.patch)?.div(&divisor);
                 }
-                let sum = power.sum(self.patch)?;
+                match self.window_counts(&geometry, count_include_pad, input.device())? {
+                    None => patches.mean(self.patch),
+                    Some(counts) => patches.sum(self.patch)?.div(&counts),
+                }
+            }
+            PoolReduce::Lp(p) => {
+                let power = if p.fract() == 0.0 {
+                    // Integer `p`: repeated products, the exact path every integer `p` has
+                    // always taken (its bits must not move).
+                    let mut power = patches.clone();
+                    for _ in 1..p as u64 {
+                        power = power.mul(&patches)?;
+                    }
+                    power
+                } else {
+                    // Real `p`: `exp(p * ln x)`. A zero reads as one inside the logarithm and
+                    // is masked back to zero afterwards, so `0^p = 0` with a zero (not NaN)
+                    // gradient; a negative `x` stays NaN, as `x.pow(p)` is in PyTorch.
+                    let zero = patches.eq(0.0)?;
+                    patches
+                        .add(&zero)?
+                        .ln()?
+                        .scale(p)?
+                        .exp()?
+                        .mul(&zero.logical_not()?)?
+                };
+                let mut sum = power.sum(self.patch)?;
+                // PyTorch composes LP pooling as `avg_pool(x^p, ceil_mode) * kernel_volume`: a
+                // `ceil_mode` window clipped at the input edge is its sum rescaled by
+                // `kernel_volume / clipped_count`, not its plain sum.
+                if let Some(counts) = self.window_counts(&geometry, true, input.device())? {
+                    sum = sum.div(&counts)?.scale(kernel_volume as f32)?;
+                }
                 // sign(sum) as a constant (no gradient of its own, matching `torch.sign`):
-                // +1/-1/0. PyTorch's own `lp_pool` composition guards the final root with
-                // exactly this sign, since an odd `p` can leave `sum` negative and a literal
-                // real `1/p` power of a negative base is otherwise undefined for non-integer
-                // `1/p`.
+                // +1/-1/0. An odd integer `p` can leave `sum` negative; the signed root keeps
+                // it real where a literal `1/p` power would be NaN.
                 let sign = sum.gt(0.0)?.sub(&sum.lt(0.0)?)?;
-                let root = sum.abs()?.ln()?.scale(1.0 / p as f32)?.exp()?;
+                let root = sum.abs()?.ln()?.scale(1.0 / p)?.exp()?;
                 sign.mul(&root)
             }
         }
+    }
+
+    /// [`Self::forward`] for max pooling, plus PyTorch's `return_indices=True` indices: per
+    /// output element in its logical order, the row-major offset (supplied spatial order,
+    /// last axis fastest) of the winning input position within its spatial volume. The
+    /// winner is the first position in window scan order (last spatial axis innermost)
+    /// holding the output value, exactly the element the gradient routes to.
+    fn forward_with_indices(&self, input: &Tensor) -> Result<(Tensor, Vec<usize>)> {
+        let geometry = self.geometry(input.shape())?;
+        let output = self.forward(input)?;
+        let maxima = output.to_vec()?;
+        let values = input.to_vec()?;
+        let input_shape = input.shape();
+        let output_shape = output.shape();
+        let mut input_positions = Vec::with_capacity(input_shape.rank());
+        for dim in input_shape.dims() {
+            input_positions.push(output_shape.index(dim.axis)?);
+        }
+        let mut spatial_positions = [0usize; N];
+        for (slot, &axis) in spatial_positions.iter_mut().zip(&self.spatial) {
+            *slot = input_shape.index(axis)?;
+        }
+        let volume: usize = self.kernel.iter().product();
+        let mut indices = Vec::with_capacity(maxima.len());
+        for (element, &maximum) in maxima.iter().enumerate() {
+            let output_coords = output_shape.coords(element);
+            let mut coords: Vec<usize> = input_positions
+                .iter()
+                .map(|&position| output_coords[position])
+                .collect();
+            let window_start = coords.clone();
+            let mut winner = None;
+            'scan: for offset in 0..volume {
+                let mut remainder = offset;
+                let mut flat = 0;
+                let mut stride = 1;
+                for index in (0..N).rev() {
+                    let kernel_offset = remainder % self.kernel[index];
+                    remainder /= self.kernel[index];
+                    let padded =
+                        window_start[spatial_positions[index]] * self.stride[index] + kernel_offset;
+                    let Some(position) = padded
+                        .checked_sub(self.padding[index])
+                        .filter(|&position| position < geometry.input[index])
+                    else {
+                        continue 'scan;
+                    };
+                    coords[spatial_positions[index]] = position;
+                    flat += position * stride;
+                    stride *= geometry.input[index];
+                }
+                let logical = input_shape
+                    .dims()
+                    .iter()
+                    .zip(&coords)
+                    .fold(0, |index, (dim, &coord)| index * dim.extent + coord);
+                let value = values[logical];
+                if value.is_finite() && value == maximum {
+                    winner = Some(flat);
+                    break;
+                }
+            }
+            indices.push(winner.ok_or_else(|| {
+                format!(
+                    "{} found no finite maximum at output element {element}",
+                    self.name
+                )
+            })?);
+        }
+        Ok((output, indices))
     }
 }
 
@@ -1257,6 +1465,17 @@ impl MaxPool2d {
     pub fn padding(mut self, padding: [usize; 2]) -> Self {
         self.0.padding = padding;
         self
+    }
+
+    /// [`Module::forward`] plus PyTorch's `return_indices=True` indices, the input to
+    /// [`MaxUnpool2d`]: one host-side index per output element, in the output's logical
+    /// ([`Tensor::to_vec`]) order, each the row-major offset of the winning input position
+    /// within its spatial volume (supplied spatial order, last axis fastest), per slice of
+    /// every other axis. The winner is the first maximum in window scan order (last spatial
+    /// axis innermost), the same element the gradient routes to. A window with no finite
+    /// candidate is an error: there is no position a NaN result could name.
+    pub fn forward_with_indices(&self, input: &Tensor) -> Result<(Tensor, Vec<usize>)> {
+        self.0.forward_with_indices(input)
     }
 }
 
@@ -1298,6 +1517,17 @@ impl MaxPool3d {
     pub fn padding(mut self, padding: [usize; 3]) -> Self {
         self.0.padding = padding;
         self
+    }
+
+    /// [`Module::forward`] plus PyTorch's `return_indices=True` indices, the input to
+    /// [`MaxUnpool3d`]: one host-side index per output element, in the output's logical
+    /// ([`Tensor::to_vec`]) order, each the row-major offset of the winning input position
+    /// within its spatial volume (supplied spatial order, last axis fastest), per slice of
+    /// every other axis. The winner is the first maximum in window scan order (last spatial
+    /// axis innermost), the same element the gradient routes to. A window with no finite
+    /// candidate is an error: there is no position a NaN result could name.
+    pub fn forward_with_indices(&self, input: &Tensor) -> Result<(Tensor, Vec<usize>)> {
+        self.0.forward_with_indices(input)
     }
 }
 
@@ -1361,6 +1591,14 @@ impl Pooling1d {
         let lifted = input.broadcast_to(&self.lift(input.shape())?)?;
         self.inner.forward(&lifted)?.select(self.unit, 0)
     }
+
+    /// The lifted unit axis is last and has extent one, so the inner flat index is already
+    /// the real axis's own coordinate.
+    fn forward_with_indices(&self, input: &Tensor) -> Result<(Tensor, Vec<usize>)> {
+        let lifted = input.broadcast_to(&self.lift(input.shape())?)?;
+        let (output, indices) = self.inner.forward_with_indices(&lifted)?;
+        Ok((output.select(self.unit, 0)?, indices))
+    }
 }
 
 /// Named-channel 1D max pooling; see [`MaxPool2d`] for the shared contract, applied along one
@@ -1389,6 +1627,13 @@ impl MaxPool1d {
         self.0.inner.padding[0] = padding;
         self
     }
+
+    /// [`Module::forward`] plus PyTorch's `return_indices=True` indices; see
+    /// [`MaxPool2d::forward_with_indices`]. Each index is the winning coordinate along the
+    /// spatial axis, the input to [`MaxUnpool1d`].
+    pub fn forward_with_indices(&self, input: &Tensor) -> Result<(Tensor, Vec<usize>)> {
+        self.0.forward_with_indices(input)
+    }
 }
 
 impl Module for MaxPool1d {
@@ -1403,11 +1648,15 @@ impl Module for MaxPool1d {
     }
 }
 
-/// Named-channel 1D average pooling: reduce each kernel window to its mean, independently per
-/// channel, matching PyTorch's `nn.AvgPool1d` with its default `count_include_pad=True` (every
-/// window divides by the full kernel extent, not by the count of real, non-padding positions)
-/// and `divisor_override=None`. `ceil_mode=True` is not implemented: every output position comes
-/// from PyTorch's default `ceil_mode=False` floor formula. Stride defaults to the kernel extent
+/// Named-channel 1D average pooling: `sum(window) / divisor`, independently per channel,
+/// matching PyTorch's `nn.AvgPool1d` and all of its options. The divisor is
+/// `divisor_override` when set; otherwise, with `count_include_pad=True` (the default), the
+/// window's extent clipped to the padded input -- the full kernel extent except for a
+/// `ceil_mode` window overhanging the right padding; with `count_include_pad=False`, the count
+/// of real (non-padding) positions. The window count is
+/// `floor((L + 2p - k) / s) + 1`, or with `ceil_mode=True` `ceil((L + 2p - k) / s) + 1` minus
+/// one when that last window would start at or past `L + p` (PyTorch's own rule: every
+/// window starts inside the input or its left padding). Stride defaults to the kernel extent
 /// and padding to `0`; padding must be at most half the kernel extent, the same constraint
 /// [`MaxPool1d`] enforces.
 pub struct AvgPool1d(Pooling1d);
@@ -1418,7 +1667,10 @@ impl AvgPool1d {
             channels,
             spatial,
             kernel,
-            PoolReduce::Avg,
+            PoolReduce::Avg {
+                count_include_pad: true,
+                divisor_override: None,
+            },
             "AvgPool1d",
         ))
     }
@@ -1432,6 +1684,36 @@ impl AvgPool1d {
     /// Set symmetric padding. Defaults to `0`.
     pub fn padding(mut self, padding: usize) -> Self {
         self.0.inner.padding[0] = padding;
+        self
+    }
+
+    /// Round the window count up (PyTorch's `ceil_mode=True`); a last window that would
+    /// start in the right padding is still dropped. Defaults to `false`.
+    pub fn ceil_mode(mut self, ceil_mode: bool) -> Self {
+        self.0.inner.ceil_mode = ceil_mode;
+        self
+    }
+
+    /// Whether padding positions count toward the divisor. Defaults to `true`.
+    pub fn count_include_pad(mut self, include: bool) -> Self {
+        if let PoolReduce::Avg {
+            count_include_pad, ..
+        } = &mut self.0.inner.reduce
+        {
+            *count_include_pad = include;
+        }
+        self
+    }
+
+    /// Divide every window's sum by this constant instead. Must be positive (checked before
+    /// launch). Unset by default.
+    pub fn divisor_override(mut self, divisor: usize) -> Self {
+        if let PoolReduce::Avg {
+            divisor_override, ..
+        } = &mut self.0.inner.reduce
+        {
+            *divisor_override = Some(divisor);
+        }
         self
     }
 }
@@ -1448,8 +1730,9 @@ impl Module for AvgPool1d {
     }
 }
 
-/// Named-channel 2D average pooling; see [`AvgPool1d`] for the shared `count_include_pad=True`,
-/// `ceil_mode=False`-only contract, applied over two spatial axes as [`MaxPool2d`] is.
+/// Named-channel 2D average pooling; see [`AvgPool1d`] for the shared `ceil_mode`,
+/// `count_include_pad` and `divisor_override` contract, applied per axis over two spatial axes
+/// as [`MaxPool2d`] is; a window's divisor is the product of its per-axis counts.
 pub struct AvgPool2d(Pooling<2>);
 
 impl AvgPool2d {
@@ -1458,7 +1741,10 @@ impl AvgPool2d {
             channels,
             spatial,
             kernel,
-            PoolReduce::Avg,
+            PoolReduce::Avg {
+                count_include_pad: true,
+                divisor_override: None,
+            },
             "AvgPool2d",
         ))
     }
@@ -1472,6 +1758,36 @@ impl AvgPool2d {
     /// Set symmetric padding in the order of the supplied spatial axes. Defaults to `[0, 0]`.
     pub fn padding(mut self, padding: [usize; 2]) -> Self {
         self.0.padding = padding;
+        self
+    }
+
+    /// Round the window count up (PyTorch's `ceil_mode=True`); a last window that would
+    /// start in the right padding is still dropped. Defaults to `false`.
+    pub fn ceil_mode(mut self, ceil_mode: bool) -> Self {
+        self.0.ceil_mode = ceil_mode;
+        self
+    }
+
+    /// Whether padding positions count toward the divisor. Defaults to `true`.
+    pub fn count_include_pad(mut self, include: bool) -> Self {
+        if let PoolReduce::Avg {
+            count_include_pad, ..
+        } = &mut self.0.reduce
+        {
+            *count_include_pad = include;
+        }
+        self
+    }
+
+    /// Divide every window's sum by this constant instead. Must be positive (checked before
+    /// launch). Unset by default.
+    pub fn divisor_override(mut self, divisor: usize) -> Self {
+        if let PoolReduce::Avg {
+            divisor_override, ..
+        } = &mut self.0.reduce
+        {
+            *divisor_override = Some(divisor);
+        }
         self
     }
 }
@@ -1498,7 +1814,10 @@ impl AvgPool3d {
             channels,
             spatial,
             kernel,
-            PoolReduce::Avg,
+            PoolReduce::Avg {
+                count_include_pad: true,
+                divisor_override: None,
+            },
             "AvgPool3d",
         ))
     }
@@ -1512,6 +1831,36 @@ impl AvgPool3d {
     /// Set symmetric padding in the order of the supplied spatial axes. Defaults to `[0, 0, 0]`.
     pub fn padding(mut self, padding: [usize; 3]) -> Self {
         self.0.padding = padding;
+        self
+    }
+
+    /// Round the window count up (PyTorch's `ceil_mode=True`); a last window that would
+    /// start in the right padding is still dropped. Defaults to `false`.
+    pub fn ceil_mode(mut self, ceil_mode: bool) -> Self {
+        self.0.ceil_mode = ceil_mode;
+        self
+    }
+
+    /// Whether padding positions count toward the divisor. Defaults to `true`.
+    pub fn count_include_pad(mut self, include: bool) -> Self {
+        if let PoolReduce::Avg {
+            count_include_pad, ..
+        } = &mut self.0.reduce
+        {
+            *count_include_pad = include;
+        }
+        self
+    }
+
+    /// Divide every window's sum by this constant instead. Must be positive (checked before
+    /// launch). Unset by default.
+    pub fn divisor_override(mut self, divisor: usize) -> Self {
+        if let PoolReduce::Avg {
+            divisor_override, ..
+        } = &mut self.0.reduce
+        {
+            *divisor_override = Some(divisor);
+        }
         self
     }
 }
@@ -1530,18 +1879,22 @@ impl Module for AvgPool3d {
 
 /// Named-channel 1D power-average pooling: `(sum(x^p))^(1/p)` over each kernel window,
 /// independently per channel, matching PyTorch's `nn.LPPool1d`
-/// (`f(X) = (sum_{x in X} x^p)^(1/p)`; at `p = 1` this is exactly sum pooling). `p` must be a
-/// positive integer (Axis's own restriction, narrower than PyTorch's `norm_type: float`, chosen
-/// because every practical use is an integer and a real, non-integer `1/p` root of a negative
-/// partial sum has no well-defined value). PyTorch's `LPPool` has no `padding` parameter, so
-/// none is exposed here either. `ceil_mode=True` is not implemented, matching [`AvgPool1d`].
-/// Stride defaults to the kernel extent, matching every other pooling family in this file.
+/// (`f(X) = (sum_{x in X} x^p)^(1/p)`; at `p = 1` this is exactly sum pooling, and there is no
+/// division by the window size). `p` (PyTorch's `norm_type`) is any finite positive real. An
+/// integer `p` uses repeated products; a real `p` uses `exp(p ln x)` with `0^p = 0`, so a
+/// negative input under a non-integer `p` is NaN, as `x.pow(p)` is in PyTorch. One deliberate
+/// difference remains: an odd integer `p` whose window sum is negative returns the real
+/// signed root `sign(s) |s|^(1/p)`, where PyTorch's `pow(1/p)` returns NaN. With
+/// `ceil_mode=True`, windows are counted as in [`AvgPool1d`] and a window clipped at the input
+/// edge is `(sum * k / clipped)^(1/p)`, exactly PyTorch's `avg_pool(x^p) * k` composition.
+/// PyTorch's `LPPool` has no `padding` parameter, so none is exposed here either. Stride
+/// defaults to the kernel extent, matching every other pooling family in this file.
 pub struct LPPool1d(Pooling1d);
 
 impl LPPool1d {
-    pub fn new(channels: Axis, spatial: Axis, p: u32, kernel: usize) -> Result<Self> {
-        if p == 0 {
-            return Err("LPPool1d p must be a positive integer".into());
+    pub fn new(channels: Axis, spatial: Axis, p: f32, kernel: usize) -> Result<Self> {
+        if !(p.is_finite() && p > 0.0) {
+            return Err("LPPool1d p must be finite and positive".into());
         }
         Ok(Self(Pooling1d::new(
             channels,
@@ -1555,6 +1908,13 @@ impl LPPool1d {
     /// Set stride. Defaults to the kernel extent.
     pub fn stride(mut self, stride: usize) -> Self {
         self.0.inner.stride[0] = stride;
+        self
+    }
+
+    /// Round the window count up (PyTorch's `ceil_mode=True`); see [`LPPool1d`]. Defaults to
+    /// `false`.
+    pub fn ceil_mode(mut self, ceil_mode: bool) -> Self {
+        self.0.inner.ceil_mode = ceil_mode;
         self
     }
 }
@@ -1576,9 +1936,9 @@ impl Module for LPPool1d {
 pub struct LPPool2d(Pooling<2>);
 
 impl LPPool2d {
-    pub fn new(channels: Axis, spatial: [Axis; 2], p: u32, kernel: [usize; 2]) -> Result<Self> {
-        if p == 0 {
-            return Err("LPPool2d p must be a positive integer".into());
+    pub fn new(channels: Axis, spatial: [Axis; 2], p: f32, kernel: [usize; 2]) -> Result<Self> {
+        if !(p.is_finite() && p > 0.0) {
+            return Err("LPPool2d p must be finite and positive".into());
         }
         Ok(Self(Pooling::new(
             channels,
@@ -1592,6 +1952,13 @@ impl LPPool2d {
     /// Set stride in the order of the supplied spatial axes. Defaults to the kernel extent.
     pub fn stride(mut self, stride: [usize; 2]) -> Self {
         self.0.stride = stride;
+        self
+    }
+
+    /// Round the window count up (PyTorch's `ceil_mode=True`); see [`LPPool1d`]. Defaults to
+    /// `false`.
+    pub fn ceil_mode(mut self, ceil_mode: bool) -> Self {
+        self.0.ceil_mode = ceil_mode;
         self
     }
 }
@@ -1613,9 +1980,9 @@ impl Module for LPPool2d {
 pub struct LPPool3d(Pooling<3>);
 
 impl LPPool3d {
-    pub fn new(channels: Axis, spatial: [Axis; 3], p: u32, kernel: [usize; 3]) -> Result<Self> {
-        if p == 0 {
-            return Err("LPPool3d p must be a positive integer".into());
+    pub fn new(channels: Axis, spatial: [Axis; 3], p: f32, kernel: [usize; 3]) -> Result<Self> {
+        if !(p.is_finite() && p > 0.0) {
+            return Err("LPPool3d p must be finite and positive".into());
         }
         Ok(Self(Pooling::new(
             channels,
@@ -1629,6 +1996,13 @@ impl LPPool3d {
     /// Set stride in the order of the supplied spatial axes. Defaults to the kernel extent.
     pub fn stride(mut self, stride: [usize; 3]) -> Self {
         self.0.stride = stride;
+        self
+    }
+
+    /// Round the window count up (PyTorch's `ceil_mode=True`); see [`LPPool1d`]. Defaults to
+    /// `false`.
+    pub fn ceil_mode(mut self, ceil_mode: bool) -> Self {
+        self.0.ceil_mode = ceil_mode;
         self
     }
 }
@@ -1851,5 +2225,216 @@ impl Module for AdaptiveMaxPool3d {
     }
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         self.0.forward(input)
+    }
+}
+
+/// Shared geometry for the max-unpooling family: PyTorch's `MaxUnpoolNd` default output size
+/// `(in - 1) * stride - 2 * padding + kernel` per axis, an explicit size validated against
+/// PyTorch's own `default - stride < size < default + stride` window, and dispatch to
+/// [`Tensor::max_unpool`].
+struct Unpooling<const N: usize> {
+    spatial: [Axis; N],
+    kernel: [usize; N],
+    stride: [usize; N],
+    padding: [usize; N],
+    name: &'static str,
+}
+
+impl<const N: usize> Unpooling<N> {
+    fn new(spatial: [Axis; N], kernel: [usize; N], name: &'static str) -> Self {
+        Self {
+            spatial,
+            kernel,
+            stride: kernel,
+            padding: [0; N],
+            name,
+        }
+    }
+
+    fn sizes(&self, input: &Shape, output_size: Option<[usize; N]>) -> Result<[usize; N]> {
+        let name = self.name;
+        for (index, &axis) in self.spatial.iter().enumerate() {
+            if self.spatial[..index].contains(&axis) {
+                return Err(format!("{name} requires distinct spatial axes").into());
+            }
+        }
+        if self.kernel.contains(&0) || self.stride.contains(&0) {
+            return Err(format!("{name} kernel and stride extents must be positive").into());
+        }
+        let mut sizes = [0; N];
+        for index in 0..N {
+            let extent = input.extent(self.spatial[index])?;
+            let default = extent
+                .checked_sub(1)
+                .and_then(|steps| steps.checked_mul(self.stride[index]))
+                .and_then(|span| span.checked_add(self.kernel[index]))
+                .and_then(|span| span.checked_sub(2 * self.padding[index]))
+                .filter(|&size| size > 0)
+                .ok_or_else(|| format!("{name} default output size is not positive"))?;
+            sizes[index] = match output_size {
+                None => default,
+                Some(requested) => {
+                    let size = requested[index];
+                    if size + self.stride[index] <= default || size >= default + self.stride[index]
+                    {
+                        return Err(format!(
+                            "{name} output size {size} is outside ({}, {}) for axis {index}",
+                            default as isize - self.stride[index] as isize,
+                            default + self.stride[index]
+                        )
+                        .into());
+                    }
+                    size
+                }
+            };
+        }
+        Ok(sizes)
+    }
+
+    fn output_shape(&self, input: &Shape, output_size: Option<[usize; N]>) -> Result<Shape> {
+        let sizes = self.sizes(input, output_size)?;
+        Shape::new(input.dims().iter().map(|dim| {
+            self.spatial
+                .iter()
+                .position(|&axis| axis == dim.axis)
+                .map_or(*dim, |index| dim.axis.of(sizes[index]))
+        }))
+    }
+
+    fn forward(
+        &self,
+        input: &Tensor,
+        indices: &[usize],
+        output_size: Option<[usize; N]>,
+    ) -> Result<Tensor> {
+        let sizes = self.sizes(input.shape(), output_size)?;
+        input.max_unpool(self.spatial, indices, sizes)
+    }
+}
+
+/// Named-axis 1D max unpooling, PyTorch's `nn.MaxUnpool1d`: the partial inverse of
+/// [`MaxPool1d`], scattering each input value to the position its index names in a zero
+/// output and leaving every other position zero. `indices` are
+/// [`MaxPool1d::forward_with_indices`]'s, one per input element in its logical order; see
+/// [`Tensor::max_unpool3d`] for duplicates and the gradient (a gather of the upstream gradient
+/// by the same indices). Stride defaults to the kernel extent and padding to `0`; the output
+/// extent defaults to `(in - 1) * stride - 2 * padding + kernel`, and an explicit one (to undo
+/// a pool whose floor division dropped a remainder) must lie strictly within `stride` of that
+/// default, as PyTorch requires. Not a [`Module`]: like PyTorch's, its forward takes the
+/// indices as a second input.
+pub struct MaxUnpool1d(Unpooling<1>);
+
+impl MaxUnpool1d {
+    pub fn new(spatial: Axis, kernel: usize) -> Self {
+        Self(Unpooling::new([spatial], [kernel], "MaxUnpool1d"))
+    }
+
+    /// Set stride. Defaults to the kernel extent.
+    pub fn stride(mut self, stride: usize) -> Self {
+        self.0.stride = [stride];
+        self
+    }
+
+    /// Set padding. Defaults to `0`.
+    pub fn padding(mut self, padding: usize) -> Self {
+        self.0.padding = [padding];
+        self
+    }
+
+    /// The output shape at the default output extent.
+    pub fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        self.0.output_shape(input, None)
+    }
+
+    pub fn forward(&self, input: &Tensor, indices: &[usize]) -> Result<Tensor> {
+        self.0.forward(input, indices, None)
+    }
+
+    /// [`Self::forward`] at an explicit output extent (PyTorch's `output_size`).
+    pub fn forward_sized(&self, input: &Tensor, indices: &[usize], size: usize) -> Result<Tensor> {
+        self.0.forward(input, indices, Some([size]))
+    }
+}
+
+/// Named-axis 2D max unpooling, PyTorch's `nn.MaxUnpool2d`; see [`MaxUnpool1d`] for the
+/// shared contract. Its indices are [`MaxPool2d::forward_with_indices`]'s, row-major offsets
+/// into the output's spatial plane in the supplied spatial order.
+pub struct MaxUnpool2d(Unpooling<2>);
+
+impl MaxUnpool2d {
+    pub fn new(spatial: [Axis; 2], kernel: [usize; 2]) -> Self {
+        Self(Unpooling::new(spatial, kernel, "MaxUnpool2d"))
+    }
+
+    /// Set stride in the order of the supplied spatial axes. Defaults to the kernel extent.
+    pub fn stride(mut self, stride: [usize; 2]) -> Self {
+        self.0.stride = stride;
+        self
+    }
+
+    /// Set padding in the order of the supplied spatial axes. Defaults to `[0, 0]`.
+    pub fn padding(mut self, padding: [usize; 2]) -> Self {
+        self.0.padding = padding;
+        self
+    }
+
+    /// The output shape at the default output extents.
+    pub fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        self.0.output_shape(input, None)
+    }
+
+    pub fn forward(&self, input: &Tensor, indices: &[usize]) -> Result<Tensor> {
+        self.0.forward(input, indices, None)
+    }
+
+    /// [`Self::forward`] at explicit output extents (PyTorch's `output_size`).
+    pub fn forward_sized(
+        &self,
+        input: &Tensor,
+        indices: &[usize],
+        size: [usize; 2],
+    ) -> Result<Tensor> {
+        self.0.forward(input, indices, Some(size))
+    }
+}
+
+/// Named-axis 3D max unpooling, PyTorch's `nn.MaxUnpool3d`; see [`MaxUnpool1d`] for the
+/// shared contract. Its indices are [`MaxPool3d::forward_with_indices`]'s.
+pub struct MaxUnpool3d(Unpooling<3>);
+
+impl MaxUnpool3d {
+    pub fn new(spatial: [Axis; 3], kernel: [usize; 3]) -> Self {
+        Self(Unpooling::new(spatial, kernel, "MaxUnpool3d"))
+    }
+
+    /// Set stride in the order of the supplied spatial axes. Defaults to the kernel extent.
+    pub fn stride(mut self, stride: [usize; 3]) -> Self {
+        self.0.stride = stride;
+        self
+    }
+
+    /// Set padding in the order of the supplied spatial axes. Defaults to `[0, 0, 0]`.
+    pub fn padding(mut self, padding: [usize; 3]) -> Self {
+        self.0.padding = padding;
+        self
+    }
+
+    /// The output shape at the default output extents.
+    pub fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        self.0.output_shape(input, None)
+    }
+
+    pub fn forward(&self, input: &Tensor, indices: &[usize]) -> Result<Tensor> {
+        self.0.forward(input, indices, None)
+    }
+
+    /// [`Self::forward`] at explicit output extents (PyTorch's `output_size`).
+    pub fn forward_sized(
+        &self,
+        input: &Tensor,
+        indices: &[usize],
+        size: [usize; 3],
+    ) -> Result<Tensor> {
+        self.0.forward(input, indices, Some(size))
     }
 }

@@ -1,6 +1,6 @@
 # The torch.nn catalog, row by row
 
-`classes 161 · yes 87 · partial 33 · refused 0 · no 41`
+`classes 161 · yes 111 · partial 16 · refused 0 · no 34`
 
 The denominator is every class in the layer sections of PyTorch 2.14's
 [`torch.nn` page](https://docs.pytorch.org/docs/2.14/nn.html) on 2026-09-22:
@@ -38,20 +38,20 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Pooling layers | `MaxPool1d` | yes | #130: unit-axis lift over MaxPool2d path, oracle |
 | Pooling layers | `MaxPool2d` | yes | #130: audit: asymmetric-kernel CUDA test added |
 | Pooling layers | `MaxPool3d` | yes | #130: audit: reordered-storage CUDA test added |
-| Pooling layers | `MaxUnpool1d` | no | absent |
-| Pooling layers | `MaxUnpool2d` | no | absent |
-| Pooling layers | `MaxUnpool3d` | no | absent |
-| Pooling layers | `AvgPool1d` | partial | #130: count_include_pad=True only; no ceil_mode/divisor_override |
-| Pooling layers | `AvgPool2d` | partial | #130: same |
-| Pooling layers | `AvgPool3d` | partial | #130: same |
+| Pooling layers | `MaxUnpool1d` | partial | #134: scatter by MaxPool forward_with_indices, duplicates last-write like PyTorch CPU; not a Module (two inputs), same rule as Bilinear |
+| Pooling layers | `MaxUnpool2d` | partial | #134: same |
+| Pooling layers | `MaxUnpool3d` | partial | #134: same, reordered storage |
+| Pooling layers | `AvgPool1d` | yes | #134: ceil_mode, count_include_pad, divisor_override per PyTorch; defaults bit-exact |
+| Pooling layers | `AvgPool2d` | yes | #134: same, reordered storage |
+| Pooling layers | `AvgPool3d` | yes | #134: count_include_pad=False case |
 | Pooling layers | `FractionalMaxPool2d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Pooling layers | `FractionalMaxPool3d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Pooling layers | `LPPool1d` | partial | #130: integer p only |
 | Pooling layers | `LPPool2d` | partial | #130: integer p only |
 | Pooling layers | `LPPool3d` | partial | #130: integer p only |
-| Pooling layers | `AdaptiveMaxPool1d` | partial | #130: separable gather+max; cross-axis tie order may differ from PyTorch |
-| Pooling layers | `AdaptiveMaxPool2d` | partial | #130: same |
-| Pooling layers | `AdaptiveMaxPool3d` | partial | #130: same |
+| Pooling layers | `AdaptiveMaxPool1d` | yes | #134: PyTorch scan order, first maximum |
+| Pooling layers | `AdaptiveMaxPool2d` | yes | #134: cross-axis ties route in PyTorch's scan order |
+| Pooling layers | `AdaptiveMaxPool3d` | yes | #134: same, reordered storage |
 | Pooling layers | `AdaptiveAvgPool1d` | yes | #130: PyTorch bin formula, oracle |
 | Pooling layers | `AdaptiveAvgPool2d` | yes | #130: same |
 | Pooling layers | `AdaptiveAvgPool3d` | yes | #130: module over generalized adaptive_avg_pool |
@@ -70,7 +70,7 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Padding Layers | `CircularPad1d` | yes | #128: generic named-axis CircularPad module; oracle across 1d/2d/3d from PyTorch 2.14 runs |
 | Padding Layers | `CircularPad2d` | yes | #128: generic named-axis CircularPad module; oracle across 1d/2d/3d from PyTorch 2.14 runs |
 | Padding Layers | `CircularPad3d` | yes | #128: generic named-axis CircularPad module; oracle across 1d/2d/3d from PyTorch 2.14 runs |
-| Non-linear Activations (weighted sum, nonlinearity) | `ELU` | partial | #123: CUDA oracle fwd+grad; alpha restricted to finite positive (PyTorch allows any nonzero) |
+| Non-linear Activations (weighted sum, nonlinearity) | `ELU` | yes | #133: any nonzero finite alpha, positive alpha bit-exact |
 | Non-linear Activations (weighted sum, nonlinearity) | `Hardshrink` | yes | #124: CUDA oracle fwd+grad incl. PyTorch ATen kink conventions |
 | Non-linear Activations (weighted sum, nonlinearity) | `Hardsigmoid` | yes | #124: CUDA oracle fwd+grad incl. PyTorch ATen kink conventions |
 | Non-linear Activations (weighted sum, nonlinearity) | `Hardtanh` | yes | #124: CUDA oracle fwd+grad incl. PyTorch ATen kink conventions |
@@ -83,7 +83,7 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Non-linear Activations (weighted sum, nonlinearity) | `ReLU6` | yes | #124: CUDA oracle fwd+grad incl. PyTorch ATen kink conventions |
 | Non-linear Activations (weighted sum, nonlinearity) | `RReLU` | no | absent |
 | Non-linear Activations (weighted sum, nonlinearity) | `SELU` | yes | #123: CUDA oracle fwd+grad, reordered storage |
-| Non-linear Activations (weighted sum, nonlinearity) | `CELU` | partial | #123: CUDA oracle fwd+grad; alpha restricted to finite positive |
+| Non-linear Activations (weighted sum, nonlinearity) | `CELU` | yes | #133: any nonzero finite alpha |
 | Non-linear Activations (weighted sum, nonlinearity) | `GELU` | yes | `GELU` (tanh form) and `ExactGELU` (`model/nn.rs`); open issue asks the docs to say which is PyTorch's default |
 | Non-linear Activations (weighted sum, nonlinearity) | `Sigmoid` | yes | `Tensor::sigmoid`; the BCE-with-logits witness exercises it |
 | Non-linear Activations (weighted sum, nonlinearity) | `SiLU` | yes | `SiLU` (`model/nn.rs`) |
@@ -99,7 +99,7 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Non-linear Activations (other) | `Softmax` | yes | `Tensor::softmax` over a named axis; causal softmax has a hand-checked CUDA witness |
 | Non-linear Activations (other) | `Softmax2d` | yes | #123: softmax over named channel axis, oracle |
 | Non-linear Activations (other) | `LogSoftmax` | yes | #123: x - logsumexp, oracle |
-| Non-linear Activations (other) | `AdaptiveLogSoftmaxWithLoss` | no | absent |
+| Non-linear Activations (other) | `AdaptiveLogSoftmaxWithLoss` | partial | #136: loss only; no per-row output, log_prob(), predict() |
 | Normalization Layers | `BatchNorm1d` | no | #open: trained BatchNorm with persistent running statistics |
 | Normalization Layers | `BatchNorm2d` | no | same open issue |
 | Normalization Layers | `BatchNorm3d` | no | same open issue |
@@ -118,12 +118,12 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Normalization Layers | `LocalResponseNorm` | yes | #129: composed, oracle, PyTorch defaults |
 | Normalization Layers | `RMSNorm` | yes | `RmsNorm` (`model/normalization.rs`) |
 | Recurrent Layers | `RNNBase` | no | absent |
-| Recurrent Layers | `RNN` | partial | #122: rnn_matches_independent_f64_forward_and_all_central_differences, rnn_relu_executes_asymmetric_geometry_with_reordered_layout; missing num_layers, bidirectional, bias toggle, fused scan |
-| Recurrent Layers | `LSTM` | partial | `Lstm` (`model/recurrent.rs`): eager IFGO correctness; fused recurrence, direction and layer stacking remain (backlog) |
-| Recurrent Layers | `GRU` | partial | #122: gru_matches_independent_f64_forward_and_all_central_differences, gru_executes_asymmetric_geometry_with_reordered_layout; missing num_layers, bidirectional, bias toggle, fused scan |
-| Recurrent Layers | `RNNCell` | partial | #122: via rnn oracle; missing standalone CUDA geometry test (same gap as LSTMCell), bias toggle |
-| Recurrent Layers | `LSTMCell` | partial | `LstmCell` with forward and gradient oracles in `recurrent_tests.rs`; not yet under the six-point definition's CUDA geometry coverage |
-| Recurrent Layers | `GRUCell` | partial | #122: via gru oracle; missing standalone CUDA geometry test, bias toggle |
+| Recurrent Layers | `RNN` | yes | #137: num_layers, bidirectional, bias toggle; 2-layer bidirectional f64 oracle over all weights and states |
+| Recurrent Layers | `LSTM` | yes | #137: depth and direction closed; fused recurrence is a performance item, inter-layer dropout defaults to 0 |
+| Recurrent Layers | `GRU` | yes | #137: same as RNN |
+| Recurrent Layers | `RNNCell` | yes | #137: standalone reordered-storage asymmetric CUDA test |
+| Recurrent Layers | `LSTMCell` | yes | #137: standalone CUDA test |
+| Recurrent Layers | `GRUCell` | yes | #137: standalone CUDA test |
 | Transformer Layers | `Transformer` | no | absent |
 | Transformer Layers | `TransformerEncoder` | no | absent |
 | Transformer Layers | `TransformerDecoder` | no | absent |
@@ -141,19 +141,19 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Dropout Layers | `FeatureAlphaDropout` | no | absent |
 | Sparse Layers | `Embedding` | yes | one-hot `Embedding` (`model/nn.rs`); arbitrary-index `gather` for large tables |
 | Sparse Layers | `EmbeddingBag` | partial | #129: sum/mean/max via gather+scatter_add; not a Module; empty Max bag gives NaN where PyTorch gives 0 |
-| Distance Functions | `CosineSimilarity` | partial | #125: oracle+central-difference; eps clamps each norm, PyTorch 2.14 clamps the norm product (my brief's error) |
-| Distance Functions | `PairwiseDistance` | partial | #125: p=2 only |
+| Distance Functions | `CosineSimilarity` | yes | #133: joint clamp on the squared-norm product, as PyTorch; test shows divergence from old clamp |
+| Distance Functions | `PairwiseDistance` | yes | #133: any p>0 and inf-norm, eps on the difference, p=2 bit-exact; general-p oracle |
 | Loss Functions | `L1Loss` | yes | #126: absolute_error + new reordered-storage CUDA evidence |
 | Loss Functions | `MSELoss` | yes | #126: squared_error + new reordered-storage CUDA evidence |
 | Loss Functions | `CrossEntropyLoss` | yes | `categorical_cross_entropy_with_logits` |
-| Loss Functions | `LinearCrossEntropyLoss` | no | absent |
-| Loss Functions | `LinearCrossEntropyOptions` | no | absent |
-| Loss Functions | `CTCLoss` | no | absent |
-| Loss Functions | `NLLLoss` | partial | #126: no weight / ignore_index |
-| Loss Functions | `PoissonNLLLoss` | partial | #126: no log_input=False / full=True |
-| Loss Functions | `GaussianNLLLoss` | partial | #126: no full=True |
-| Loss Functions | `KLDivLoss` | partial | #126: no log_target=True |
-| Loss Functions | `BCELoss` | partial | #126: log floor ~-87.3 (f32::MIN_POSITIVE) instead of PyTorch's -100, to keep gradients finite at 0 and 1 |
+| Loss Functions | `LinearCrossEntropyLoss` | partial | #136: unfused Linear+CE composition stores full logits (PyTorch's point is not to); no reduction/weight/ignore_index |
+| Loss Functions | `LinearCrossEntropyOptions` | partial | #136: label_smoothing only |
+| Loss Functions | `CTCLoss` | partial | #136: exact gradient via autodiff through log-space recursion, brute-force alignment oracle; no per-row input/target lengths |
+| Loss Functions | `NLLLoss` | yes | #138: per-class weight and ignore_index; mean-reduction weighting rule documented |
+| Loss Functions | `PoissonNLLLoss` | yes | #138: log_input=False and full=True Stirling term; default bit-exact |
+| Loss Functions | `GaussianNLLLoss` | yes | #138: full=True constant; default bit-exact |
+| Loss Functions | `KLDivLoss` | yes | #138: log_target=True |
+| Loss Functions | `BCELoss` | yes | #138: exact -100 log floor with PyTorch's explicit clamped backward via a dedicated kernel |
 | Loss Functions | `BCEWithLogitsLoss` | yes | `binary_cross_entropy_with_logits` and the weighted form; hand-checked CUDA witness |
 | Loss Functions | `MarginRankingLoss` | yes | #125: oracle+central-difference |
 | Loss Functions | `HingeEmbeddingLoss` | yes | #125: oracle+central-difference |
@@ -163,12 +163,12 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Loss Functions | `SoftMarginLoss` | yes | #126: oracle fwd+grad |
 | Loss Functions | `MultiLabelSoftMarginLoss` | yes | #126: mean of BCE-with-logits, oracle |
 | Loss Functions | `CosineEmbeddingLoss` | yes | #125: oracle+central-difference |
-| Loss Functions | `MultiMarginLoss` | partial | #125: p=1 only |
-| Loss Functions | `TripletMarginLoss` | partial | #125: p=2 only |
+| Loss Functions | `MultiMarginLoss` | yes | #133: p in {1,2} and per-class weight (a constant, as in PyTorch) |
+| Loss Functions | `TripletMarginLoss` | yes | #133: p passed through to every distance incl. swap |
 | Loss Functions | `TripletMarginWithDistanceLoss` | yes | #125: closure distance, PairwiseDistance default |
 | Vision Layers | `PixelShuffle` | yes | #128: split+merge, PyTorch oracle |
 | Vision Layers | `PixelUnshuffle` | yes | #128: split+merge, PyTorch oracle |
-| Vision Layers | `Upsample` | partial | nearest and bilinear only; no trilinear or bicubic, no scale-factor form |
+| Vision Layers | `Upsample` | yes | #136: module with size= or scale_factor=, nearest/bilinear/trilinear/bicubic (A=-0.75); no align_corners=True |
 | Vision Layers | `UpsamplingNearest2d` | yes | `Tensor::upsample_nearest`, named-axis |
 | Vision Layers | `UpsamplingBilinear2d` | yes | `Tensor::resample_bilinear`, named-axis |
 | Shuffle Layers | `ChannelShuffle` | yes | #128: groups=3 PyTorch oracle |
@@ -177,4 +177,4 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Utilities (modules) | `Flatten` | yes | #129: merge of named axes, oracle |
 | Utilities (modules) | `Unflatten` | yes | #129: split of a named axis, oracle |
 
-Score: mean of strict (87/161) and half-credit ((87+33/2)/161) = 59.16% = 5916 bp.
+Score: mean of strict (111/161) and half-credit ((111+16/2)/161) = 71.43% = 7143 bp.

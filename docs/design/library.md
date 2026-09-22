@@ -1156,3 +1156,333 @@ existing device kernels with no new one. `Fold` rejects an input whose
 extents are inconsistent with its `output_size`/kernel/stride/padding before
 any device call, the same "before launch" contract every other row in this
 family holds.
+
+### Recurrent layers: depth, direction and bias
+
+`Rnn`, `Gru` and `Lstm` each stack `RecurrentConfig::num_layers` eager
+per-step transitions (`RnnCell`, `GruCell`, `LstmCell` respectively), and
+optionally run a second, reversed-time transition per layer
+(`RecurrentConfig::bidirectional`), matching PyTorch's `RNN`/`GRU`/`LSTM`
+depth and direction semantics over one named time axis:
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `num_layers` | how many transitions are stacked; layer `i`'s (possibly two-direction) hidden output feeds layer `i + 1` verbatim | `1` |
+| `bidirectional` | run a second transition per layer over the reversed time order and concatenate `[forward; backward]` on the hidden axis (PyTorch's order) | `false` |
+| `bias` | allocate each transition's combined bias parameter (`LstmCell`'s convention: one bias, not PyTorch's separate `bias_ih`/`bias_hh`) | `true` |
+
+`RecurrentConfig` is a plain struct, not a shared base type: PyTorch's
+`RNNBase` also owns shared weight storage and flattening behavior that these
+three families do not share (each keeps its own gate layout and init
+convention already), so Axis stops at the config fields the three
+constructors actually have in common, rather than inventing a class
+hierarchy to also claim the `RNNBase` row.
+
+Every layer after the first reads a hidden extent of `hidden * 2` when
+`bidirectional`, since it consumes the previous layer's concatenated output.
+`run`/`run_from` take and return `num_layers * num_directions` states,
+ordered `layer * directions + direction` (direction `0` = forward, `1` =
+backward), matching PyTorch's `(num_layers * num_directions, batch, hidden)`
+stacking order; each entry carries only that one layer/direction's own
+hidden (and, for `Lstm`, cell) state, never a doubled extent. The default
+configuration (one layer, unidirectional, `bias = true`) is bit-exact with
+this family before `num_layers`/`bidirectional`/`bias` existed, and keeps its
+original unprefixed parameter names (`input_weight`, `recurrent_weight`,
+`bias`); any other configuration prefixes every name with its layer and
+direction (`layer0_forward_input_weight`, ...), since it then owns more than
+one of each.
+
+`RnnCell`/`GruCell`/`LstmCell` themselves stay single-layer, single-direction
+primitives -- `bias(false)` toggles their own bias parameter, and `Rnn`,
+`Gru` and `Lstm` build one (or two, when bidirectional) per layer from
+`RecurrentConfig`'s `bias` field. `RnnCell`'s `nonlinearity` (`Tanh` default,
+`Relu` matching `nonlinearity="relu"`) applies identically to every layer and
+direction of the `Rnn` that owns it.
+
+### Norm orders and signed alpha
+
+Four gap-closes on wave 1's PR #125/#123 distance, margin-loss and signed-linear-unit rows;
+`docs/nn/catalog.md` records the row-level verdicts.
+
+- **`Tensor::pairwise_distance`/`Tensor::triplet_margin_loss` now take a `p`.** Both were
+  Euclidean-only (`p=2`, hardcoded). `p` is now any positive real or `f32::INFINITY`, matching
+  PyTorch's own `p`-norm domain. `p == 2.0` still runs the original
+  `((diff)^2).sum(axis).sqrt()` composition bit-exact (no other row's recorded output moves);
+  `p == 1.0` is `abs(diff).sum(axis)`; `p == f32::INFINITY` is `abs(diff).max(axis)` (PyTorch's
+  documented `p -> inf` limit); every other `p` is the general `(sum(abs(diff)^p))^(1/p)`,
+  composed from `ln`/`exp` (`x^p = exp(p * ln(x))`) since there is no dedicated elementwise
+  power op -- `ln(0) = -inf` and `exp(-inf) = 0` give the mathematically correct zero
+  contribution at an exactly-zero coordinate. `eps` (PyTorch default `1e-6`) is unchanged: added
+  to the raw difference BEFORE the norm, exactly where PyTorch's own `F.pairwise_distance` adds
+  it (`aten/src/ATen/native/Distance.cpp`), never as a denominator floor.
+- **`Tensor::multi_margin_loss` now takes a `p` and an optional `weight`.** `p` (PyTorch
+  default `1.0`) must be exactly `1.0` or `2.0`, PyTorch's own documented domain; `p == 2.0`
+  squares the per-class hinge term before summing. `weight` (PyTorch default `None`) is an
+  optional length-`class.extent()` tensor indexed by `class` alone: when given, the WHOLE
+  per-sample hinge sum is multiplied by `weight[target]` -- the true class's own weight,
+  gathered once per sample as `target.mul(weight).sum(class)` -- never a per-competing-class
+  lookup or an average over all classes, matching `aten/src/ATen/native/LossMulti.h`.
+- **`Tensor::cosine_similarity`'s clamp changed shape (semantic fix).** Wave 1 clamped
+  `||x1||` and `||x2||` to `eps` INDIVIDUALLY before multiplying them; PyTorch's own kernel
+  (`aten/src/ATen/native/Distance.cpp`) instead clamps the PRODUCT of the two squared norms to
+  `eps^2` before one shared square root: `x1.x2 / sqrt(clamp_min(||x1||^2 * ||x2||^2, eps^2))`.
+  The two formulas agree whenever both norms sit above `eps`; they diverge whenever exactly one
+  operand's real norm sits below `eps` (the joint form still lets that operand's real, sub-`eps`
+  norm shrink the denominator, since only the PRODUCT is floored -- the individually-clamped
+  form floors it at `eps` regardless of the OTHER operand's norm). Axis now matches the joint
+  form exactly, forward and gradient.
+- **`ELU`/`CELU` accept any finite, nonzero `alpha`**, PyTorch's own documented domain
+  (`torch.nn.CELU`'s docs read "valid for alpha != 0"; `torch.nn.ELU`'s give no sign
+  restriction at all). Both keep their existing two-branch composition (`x` where `x > 0`,
+  otherwise the exponential branch) unchanged -- for `CELU`, `alpha * (exp(x / alpha) - 1)`
+  already equals PyTorch's `max(0, x) + min(0, alpha * (exp(x / alpha) - 1))` for every nonzero
+  `alpha`, not only positive ones, because the sign of `alpha * (exp(x / alpha) - 1)` always
+  lands on the side the `max`/`min` wrapper would have selected anyway; the same argument, with
+  `celu`'s `exp(x / alpha)` collapsing to `exp(x)`, holds for `ELU`. The positive branch never
+  reads `alpha`, so every already-recorded `alpha > 0` output and gradient stays bit-exact; only
+  the validation guard widens from "positive" to "nonzero".
+
+### Likelihood losses: full options
+
+`NLLLoss`, `KLDivLoss`, `PoissonNLLLoss`, `GaussianNLLLoss`, and `BCELoss`
+(the "Regression and likelihood losses" section above) each had one stated
+gap against PyTorch. This wave closes all five, in place where the existing
+op's own output stays bit-exact, and as a new sibling method where PyTorch's
+option changes what the op returns for callers who ask for it.
+
+`Tensor::nll_loss_weighted(targets, class, weight, ignore_index)` is
+`nll_loss` plus PyTorch's per-class `weight` and `ignore_index`. `weight`
+follows the same per-class-weight convention
+`binary_cross_entropy_with_logits_weighted` already uses for `pos_weight`:
+one value per class, broadcasting like `mul`. Weighting multiplies each
+class's term before the class axis is summed,
+`-sum(class, weight * target * self)` — PyTorch's `weight[c] * log_prob[c]`
+at a one-hot target, generalized linearly to a soft one exactly the way
+`nll_loss` itself already generalizes one-hot to soft targets. PyTorch's
+`reduction='mean'` with a `weight` does **not** divide by the row count: it
+divides by the sum of the *selected* weights (`weight[target[n]]` for every
+kept row), not by `N`. This op stays unreduced like every other loss in this
+family, so a caller reproducing PyTorch's mean computes that weight sum
+itself (`targets.mul(weight)?.sum(class)` at a one-hot target) and divides
+by it rather than calling the ordinary axis `mean`. `ignore_index`, given as
+`Some(class_index)`, zeroes a row's contribution in proportion to its target
+mass on that class (`loss_row *= 1 - target[ignore_index]`) — PyTorch's
+exact all-or-nothing behavior at a one-hot target, and a linear
+generalization at a soft one, the same shape `nll_loss`'s own target
+convention already takes. `nll_loss` itself is unchanged and stays the
+`weight == None` case.
+
+`Tensor::kl_div_loss_log_target(targets)` is `kl_div_loss` at PyTorch's
+`log_target = true`: `targets` also holds log-probabilities (rather than
+probabilities), and the pointwise loss is `exp(target) * (target - self)`.
+Unlike `log_target = false`, no `xlogy` zero-target substitution is needed —
+`target` never appears inside a logarithm here — so this sibling needs no
+zero-probability special case. `kl_div_loss` itself is unchanged and stays
+the `log_target = false` case.
+
+`Tensor::poisson_nll_loss_full(targets, log_input, full, eps)` generalizes
+`poisson_nll_loss` over both of PyTorch's remaining options. At
+`log_input = false`, `self` holds the rate directly (not its log) and the
+base loss is `self - target * log(self + eps)`, PyTorch's own formula;
+`eps` (finite and positive, required only in this branch) keeps the
+logarithm finite at `self == 0`. At `full = true`, PyTorch's Stirling
+approximation term, `target*log(target) - target + 0.5*log(2*pi*target)`,
+is added where `target > 1` (strictly; PyTorch's own threshold) and `0`
+elsewhere — computed with the same `xlogy`-style safe-substitution
+`kl_div_loss` already uses, so no element's logarithm ever sees a
+non-positive input before the mask zeroes its contribution. The term
+depends only on the (non-differentiable) `target`, so it contributes no
+gradient. `poisson_nll_loss(targets)` now delegates to
+`poisson_nll_loss_full(targets, true, false, 0.0)`, bit-exact with its
+earlier, narrower implementation.
+
+`Tensor::gaussian_nll_loss_full(targets, var, eps, full)` adds PyTorch's
+`full = true` constant, `0.5 * log(2*pi)`, to `gaussian_nll_loss`'s own
+`full = false` value. The constant depends on none of `self`, `targets`, or
+`var`, so no operand's gradient changes. `gaussian_nll_loss(targets, var,
+eps)` now delegates to `gaussian_nll_loss_full(targets, var, eps, false)`,
+bit-exact with its earlier, narrower implementation.
+
+`Tensor::binary_cross_entropy(targets)` (`BCELoss`) changes what it computes
+(not just what it offers): the earlier composition floored the *input*
+probability at `f32::MIN_POSITIVE` before `ln`, the closest a
+differentiated-through-`ln` composition could reach toward PyTorch's stated
+`-100` log floor, because both direct transcriptions of that floor broke
+backward in `f32` (see the entry above for the full trace). A dedicated
+kernel pair, `bce_loss`/`bce_loss_backward`, replaces that composition: the
+forward floors the *output* of each logarithm at exactly PyTorch's literal
+`-100`, and the backward is PyTorch's own explicit formula, `(x - y) /
+max((1 - x) * x, eps)` with `eps = 1e-12`, computed directly rather than
+falling out of differentiating the floored `ln`. It matches PyTorch's
+interior gradient formula away from the `eps` floor and, unlike the earlier
+composition, stays finite (not `0`) at a saturated wrong-side prediction —
+matching PyTorch's own large-but-finite gradient there instead of Axis's
+previous zero. This is the one row in this wave whose existing output
+changes; every other row above is additive.
+
+### Pooling options and unpooling
+
+The fixed-kernel pooling family now carries PyTorch 2.14's remaining options,
+all validated before launch and all composed from the existing
+`unfold_grouped` patch path, so no kernel was added.
+
+| Module | Option | Default | Semantics |
+| --- | --- | --- | --- |
+| `AvgPool1d/2d/3d` | `ceil_mode` | `false` | window count `ceil((L + 2p - k) / s) + 1`, minus one if that last window would start at or past `L + p` |
+| `AvgPool1d/2d/3d` | `count_include_pad` | `true` | divisor = window clipped to the padded input (full `k` except a `ceil_mode` overhang); `false` counts real positions only |
+| `AvgPool1d/2d/3d` | `divisor_override` | unset | every window's sum divided by this positive constant |
+| `LPPool1d/2d/3d` | `p` | (required) | any finite positive real; `(sum x^p)^(1/p)`, no averaging |
+| `LPPool1d/2d/3d` | `ceil_mode` | `false` | as above; a clipped window is `(sum * k / clipped)^(1/p)`, PyTorch's `avg_pool(x^p) * k` |
+| `MaxPool1d/2d/3d` | `forward_with_indices` | | PyTorch's `return_indices=True` |
+| `MaxUnpool1d/2d/3d` | `stride`, `padding`, output size | `kernel`, `0`, `(in - 1) s - 2p + k` | explicit size must lie strictly within one stride of the default |
+
+A `ceil_mode` window that overhangs the right padding reads zeros appended
+past the input. For a sum those zeros behave exactly like padding, and the
+divisor comes from host-side window counts, never from the zeros. When every
+window counts the full kernel volume, average and LP pooling keep their
+earlier reduction, so the default configuration's bits do not change.
+Integer `p` keeps its repeated-product path. A real `p` computes
+`exp(p ln x)` with `0^p = 0` and a zero gradient. A negative input is NaN,
+as `x.pow(p)` is in PyTorch. One difference from PyTorch remains on purpose:
+with an odd integer `p` and a negative window sum, Axis returns the real
+signed root where PyTorch returns NaN.
+
+Max-pool indices are host-side `usize` values, one per output element, in
+the output's logical order. Each is the row-major offset of the winning
+input position within its spatial volume, taking the axes in the supplied
+spatial order with the last one fastest. This is PyTorch's flattened
+`(D*)H*W` index. The winner is the first maximum in window scan order, which
+is also the element the gradient reaches. `Tensor::max_unpool{1,2,3}d`
+merges the input onto one axis and scatter-adds it into a zero output, so
+the gradient is a gather of the upstream gradient by the same indices, and
+the indices take no gradient. When two elements name the same position, the
+last one written is kept, as PyTorch's CPU kernel keeps it. The overwritten
+element adds `x - detach(x)`: zero in the forward pass, but it still
+receives the gradient that PyTorch's gather gives it.
+
+`adaptive_max_pool` now merges its per-axis gathered windows into a single
+window axis before one `max`. That axis walks every bin in PyTorch's
+adaptive-max scan order (last spatial axis innermost, first strict maximum
+kept). A tie between two positions on different axes therefore routes the
+gradient to PyTorch's element. The earlier axis-by-axis reduction resolved
+such ties by the axis reduced last. That is the only output that changed,
+and only for exact ties that span more than one axis.
+
+### Multi-head attention
+
+`MultiheadAttention::new(feature, time, embed_dim, num_heads, dropout)`
+(`model/nn.rs`) is PyTorch's `nn.MultiheadAttention` at its own default
+`dropout=0.0`: `Attention(Q, K, V) = softmax(QK^T / sqrt(head_feature)) V`
+computed independently per head and concatenated before one output
+projection. `query`, `key`, and `value` are separate tensors sharing one
+`feature` embedding axis and one `time` sequence axis (self-attention passes
+the same tensor three times); `key` and `value` must share a `time` extent
+with each other, but `query` may differ for cross-attention. `feature` splits
+into `num_heads` heads of `embed_dim / num_heads` each, which must divide
+evenly. It does not implement `Module`, the same reason `Bilinear` does not:
+`forward` takes three tensors, not one. Four separate `Linear` layers do the
+in- and out-projections with a learned bias by default, `Linear`'s own
+Xavier-uniform initialization, and the same `.bias(false)` opt-out before
+`build`.
+
+`attn_mask` is an `AttentionMask::Additive` (added to pre-softmax scores) or
+`AttentionMask::Boolean` value, and `key_padding_mask` is always boolean;
+both booleans use PyTorch's own convention (`1.0` forbids/ignores a
+position, the opposite of `Tensor::masked_softmax`'s validity sense). Either
+or both may be absent. Present boolean masks compose by validity AND and
+broadcast onto the score tensor before one `masked_softmax` call over the key
+axis, so an excluded position gets exactly zero probability and gradient;
+with neither mask present, forward runs ordinary `softmax`. `query_time` and
+`key_time` are the private per-call roles the shared `time` axis is renamed
+to once split into heads, exposed as accessors so a caller can build a
+correctly-tagged mask tensor. `forward_with_weights`'s `need_weights` flag
+additionally returns the attention probabilities averaged over heads
+(PyTorch's own default `average_attn_weights=True`); `forward` skips that
+reduction. Nonzero `dropout` is rejected by `new`: it needs the seeded,
+per-step training-pass contract (`TrainingPass`, Axis issue #127), which has
+not landed.
+
+### Upsample and sequence and clustered losses
+
+`Tensor::resample_bicubic(axis, out_extent)` closes `Upsample`'s stated
+"no trilinear or bicubic, no scale-factor form" gap (`Tensor::resample_bilinear`
+had already proven trilinear for free by composition). Same construction as
+`resample_bilinear`: weights are fixed by the input/output extents alone, so
+it is one `contract` against a host-built `[axis, resampled]` weight matrix,
+not a dedicated kernel, and inherits `contract`'s exact transpose backward.
+Weights use PyTorch's separable bicubic kernel with `a = -0.75` (`W(x) =
+(a+2)|x|^3 - (a+3)|x|^2 + 1` for `|x| <= 1`, `W(x) = a|x|^3 - 5a|x|^2 + 8a|x|
+- 4a` for `1 < |x| < 2`, else `0`) and PyTorch's `align_corners=False`
+half-pixel source formula (`source = (j + 0.5) * in/out - 0.5`), with the
+four taps per output column clamped (border-replicated) into
+`[0, in_extent - 1]`. `align_corners=True` is not implemented, for any of
+`resample_bilinear`, `resample_bicubic`, or the `Upsample` module.
+
+`Upsample` (`torch.nn.Upsample`) is a thin `Module` over a fixed, ordered
+list of named spatial axes: build it with `Upsample::size` (a literal
+per-axis output extent, PyTorch's `size=`) or `Upsample::scale_factor` (a
+per-axis multiplier, PyTorch's `scale_factor=`, output extent
+`floor(in_extent * scale_factor)`), and a mode (`Nearest`, `Bilinear`,
+`Bicubic`, `Trilinear`). `Nearest` composes `Tensor::upsample_nearest` once
+per axis (so every axis's output/input ratio must be a positive integer,
+rejected in `output_shape`/`build` before `forward` runs any kernel);
+`Bilinear` (exactly 2 axes) and `Trilinear` (exactly 3 axes) compose
+`resample_bilinear` once per axis; `Bicubic` (any axis count) composes
+`resample_bicubic` once per axis. All four modes are `align_corners=False`.
+
+`Tensor::linear_cross_entropy_with_logits` composes a final linear
+projection (`self.contract(weight, input_axis)` plus an optional bias,
+exactly `Linear::forward`'s own body) with
+`Tensor::categorical_cross_entropy_with_logits`, with a `LinearCrossEntropyOptions{
+label_smoothing }` matching PyTorch's `torch.nn.functional.linear_cross_entropy`
+default (`0.0`; blends `targets` toward the uniform distribution:
+`(1 - a) * target + a / width`). It is graded PARTIAL rather than YES: real
+PyTorch `linear_cross_entropy` is a fused kernel whose whole point is to
+avoid ever materializing the `[*, C]` logits tensor, halving peak activation
+memory at a large vocabulary; this composition produces the exact forward
+value and gradient but always materializes the full logits tensor, so it
+does not carry the memory-saving contract that is the row's real reason to
+exist. `reduction`, per-class `weight`, and `ignore_index` are not exposed
+(left to the caller / not implemented, matching this file's other loss
+functions).
+
+`Tensor::adaptive_log_softmax_with_loss` composes `torch.nn.AdaptiveLogSoftmaxWithLoss`'s
+forward loss (Grave et al., "Efficient softmax approximation for GPUs") from
+`contract` (head and per-cluster two-stage tail projections, each exactly
+`Linear`'s own body), `Tensor::log_softmax`, and a host-built one-hot
+selection reduced with `mul` + `sum` -- the same masked-selection idiom
+`categorical_cross_entropy_with_logits` itself already uses, in place of
+`Tensor::gather`, because `gather` applies one host index list uniformly
+across every row while each row here targets a different class. `cutoffs`,
+`div_value` (default `4.0`, validated against each tail projection's hidden
+extent via PyTorch's own `floor(in_features / div_value^(cluster + 1))`
+formula) and `head_bias` (`Some`/`None` for PyTorch's `True`/`False`, default
+`None`) match PyTorch's constructor exactly; input is restricted to
+`[batch_axis, input_axis]` with one target index per row, matching
+PyTorch's own `(N, in_features)`/`(N,)` restriction. Graded PARTIAL: only
+the scalar `reduction='mean'` loss is implemented; the separate
+`log_prob`/`predict` full-distribution and argmax queries PyTorch's class
+also exposes are not attempted.
+
+`Tensor::ctc_loss` implements `torch.nn.CTCLoss(blank=0, reduction='mean',
+zero_infinity=False)`'s forward recursion (Graves 2006) directly as a
+composed tensor graph: a host loop over the time axis (`driven from the
+host per time step`) builds each step's `alpha` from the previous step's
+`alpha` shifted by one and by two positions along a length-`2L + 1`
+blank-interleaved extended target axis (`concat`/`narrow` for the shift,
+`stack` + `logsumexp` for the pairwise/triple log-sum, an additive
+`0`/`-1e30` mask for the "skip a blank" transition rule, and a host-built
+one-hot `contract` for the per-row emission lookup -- the same substitution
+for `gather` as `adaptive_log_softmax_with_loss`, since each row's target
+sequence differs). No hand-derived backward exists: the forward recursion
+alone is a complete, differentiable definition of `-log P(target | input)`,
+so ordinary reverse-mode autodiff through this graph supplies CTC's
+textbook `beta`-based gradient exactly, for free. A finite `-1e30` sentinel
+stands in for `-inf` throughout, because `Tensor::logsumexp` returns `NaN`
+(not `-inf`) for a group whose every member is nonfinite -- a documented
+existing behavior, not something this row changes, that the recursion hits
+at every early time step (`resample_bicubic`'s doc comment does not need
+this because `contract` never fully excludes a term). Graded PARTIAL: all
+rows in one call must share one target length and the time axis's full
+extent is every row's input length; PyTorch's own per-row
+`input_lengths`/`target_lengths` (mixed-length batches) are not implemented.

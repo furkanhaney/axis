@@ -515,6 +515,28 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn bce_loss(&self, x: &Buffer, y: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(x.shape()[0] as usize)?;
+        kernels::bce_loss((&mut out).partition([128]), x.as_ref(), y.as_ref())
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn bce_loss_backward(
+        &self,
+        gradient: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(x.shape()[0] as usize)?;
+        kernels::bce_loss_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            x.as_ref(),
+            y.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn categorical_cross_entropy(
         &self,
         logits: &Buffer,
@@ -2044,6 +2066,45 @@ mod kernels {
         let probability = select(gt_tile(z, zero), one / (one + e), e / (one + e));
         let log_weight = one + (p - one) * y;
         out.store(gradient.load_like(out) * (log_weight * probability - p * y));
+    }
+    // `BCELoss` for probability inputs, PyTorch's own `binary_cross_entropy` kernel shape:
+    // `-[y*log(x) + (1-y)*log(1-x)]` with each logarithm floored at exactly `-100` (PyTorch's
+    // own literal), rather than flooring the probability before the logarithm the way
+    // `Tensor::clamp`+`Tensor::ln` composition would. This kernel and its backward below are
+    // the dedicated, non-differentiated-through-`ln` pair `binary_cross_entropy` (the
+    // probability-input `BCELoss`) now calls, replacing that composition.
+    #[cutile::entry()]
+    fn bce_loss(
+        out: &mut Tensor<f32, { [128] }>,
+        x: &Tensor<f32, { [-1] }>,
+        y: &Tensor<f32, { [-1] }>,
+    ) {
+        let p = x.load_like(out);
+        let t = y.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let floor = constant(-100.0f32, shape![128]);
+        let log_p = max_tile(log(p), floor);
+        let log_1mp = max_tile(log(one - p), floor);
+        out.store(zero - (t * log_p + (one - t) * log_1mp));
+    }
+    // PyTorch's own `binary_cross_entropy_backward`: `grad * (x - y) / max((1 - x) * x, eps)`
+    // with `eps = 1e-12`, computed directly rather than falling out of the forward's own
+    // composition -- so it stays finite at `x == 0` and `x == 1`, where a floored-input `ln`
+    // composition's own backward would divide by exactly zero.
+    #[cutile::entry()]
+    fn bce_loss_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        x: &Tensor<f32, { [-1] }>,
+        y: &Tensor<f32, { [-1] }>,
+    ) {
+        let p = x.load_like(out);
+        let t = y.load_like(out);
+        let one = constant(1.0f32, shape![128]);
+        let eps = constant(1e-12f32, shape![128]);
+        let denominator = max_tile((one - p) * p, eps);
+        out.store(gradient.load_like(out) * (p - t) / denominator);
     }
     #[cutile::entry()]
     fn categorical_cross_entropy(

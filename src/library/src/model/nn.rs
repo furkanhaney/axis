@@ -371,6 +371,252 @@ impl Module for PositionEmbedding {
     }
 }
 
+/// An additive (`f32`, added to pre-softmax scores; `-infinity` or a large
+/// negative forbids a query/key pair) or boolean `attn_mask` for
+/// [`MultiheadAttention`]. The boolean variant uses PyTorch's own convention:
+/// a `1.0` entry forbids that query/key pair from attending, `0.0` allows it
+/// -- the opposite sense from `Tensor::masked_softmax`'s own validity mask,
+/// which `MultiheadAttention` inverts internally before calling it.
+pub enum AttentionMask {
+    Additive(Tensor),
+    Boolean(Tensor),
+}
+
+/// Scaled dot-product multi-head attention, `torch.nn.MultiheadAttention` at
+/// its own default `dropout=0.0`: `Attention(Q, K, V) = softmax(QK^T /
+/// sqrt(head_feature)) V`, computed independently per head and concatenated
+/// before one output projection (PyTorch's `forward`, `batch_first`-agnostic
+/// since Axis has no positional batch axis to begin with).
+///
+/// `query`, `key`, and `value` are separate tensors sharing one `feature`
+/// embedding axis (`embed_dim`) and one `time` sequence axis; passing the
+/// same tensor for all three is self-attention, and `key`/`value` may carry a
+/// different `time` extent than `query` for cross-attention as long as `key`
+/// and `value` agree with each other. `feature` splits into `num_heads`
+/// independent `head_feature`-wide heads (`embed_dim / num_heads`, which must
+/// divide evenly); any other axis present on the inputs (a batch or
+/// population axis) passes through unconsumed and broadcasts across
+/// attention the same way `AttentionAxes::attend` already does in
+/// `examples/training/attention`, whose self-attention composition this
+/// generalizes to separate Q/K/V and explicit masks.
+///
+/// In-projection and out-projection are four separate [`Linear`] layers with
+/// a learned bias by default (`bias=True`, PyTorch's own default); `.bias(false)`
+/// before `build` omits every projection's bias parameter, matching
+/// `Linear::bias(false)`. Weights use `Linear`'s own Xavier-uniform
+/// initialization, not PyTorch's `nn.MultiheadAttention` in-place
+/// `xavier_uniform_`/zero reset, the same documented departure `Linear`
+/// itself already takes from PyTorch's `reset_parameters`.
+///
+/// `attn_mask` (additive or boolean, either or neither present) and
+/// `key_padding_mask` (always boolean, `1.0` marks a key that must be
+/// ignored for every query in its batch/population entry -- PyTorch's own
+/// `key_padding_mask` convention) compose by validity AND before a single
+/// `Tensor::masked_softmax` call over the key axis, so a position excluded by
+/// either mask gets exactly zero probability and zero gradient; supplying
+/// neither runs ordinary `softmax`. Build a mask tensor against
+/// [`MultiheadAttention::query_time`] and [`MultiheadAttention::key_time`] --
+/// the private per-call roles the shared `time` axis is renamed to before the
+/// attention score matrix is formed, exposed so a caller can name them.
+///
+/// `forward` returns only the output; `forward_with_weights`'s `need_weights`
+/// additionally returns the attention probabilities averaged over heads
+/// (PyTorch's own default `average_attn_weights=True`), indexed by
+/// `query_time` and `key_time`.
+///
+/// Only `dropout == 0.0`, PyTorch's own default, is supported: nonzero
+/// dropout needs a seeded draw that is reproducible per training step, which
+/// is the not-yet-landed training-pass contract (`Module::forward_training`,
+/// `TrainingPass`, Axis issue #127); `new` rejects a nonzero value
+/// immediately rather than silently ignoring it.
+pub struct MultiheadAttention {
+    feature: Axis,
+    time: Axis,
+    head: Dim,
+    head_feature: Dim,
+    query_time: Axis,
+    key_time: Axis,
+    query_proj: Linear,
+    key_proj: Linear,
+    value_proj: Linear,
+    out_proj: Linear,
+}
+impl MultiheadAttention {
+    /// `feature` and `time` must be distinct axes. `embed_dim` must be a
+    /// nonzero multiple of a nonzero `num_heads`. `dropout` must be exactly
+    /// `0.0`; see the training-pass contract note above.
+    pub fn new(
+        feature: Axis,
+        time: Axis,
+        embed_dim: usize,
+        num_heads: usize,
+        dropout: f32,
+    ) -> Result<Self> {
+        if feature == time {
+            return Err("MultiheadAttention requires distinct feature and time axes".into());
+        }
+        if dropout != 0.0 {
+            return Err(
+                "MultiheadAttention only supports dropout=0.0 until the seeded, per-step \
+                 training-pass contract lands (Axis issue #127); nonzero dropout is rejected \
+                 rather than silently ignored"
+                    .into(),
+            );
+        }
+        if num_heads == 0 || embed_dim == 0 || !embed_dim.is_multiple_of(num_heads) {
+            return Err(
+                "MultiheadAttention requires a positive embed_dim divisible by a positive \
+                 num_heads"
+                    .into(),
+            );
+        }
+        let head = Axis::new("mha_head").of(num_heads);
+        let head_feature = Axis::new("mha_head_feature").of(embed_dim / num_heads);
+        let projection = || Linear::new(feature, feature.of(embed_dim));
+        Ok(Self {
+            feature,
+            time,
+            head,
+            head_feature,
+            query_time: time.role("mha_query_time"),
+            key_time: time.role("mha_key_time"),
+            query_proj: projection(),
+            key_proj: projection(),
+            value_proj: projection(),
+            out_proj: projection(),
+        })
+    }
+    /// Disable every projection's learned bias term. Has no effect once
+    /// `build` has already allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.query_proj = self.query_proj.bias(bias);
+        self.key_proj = self.key_proj.bias(bias);
+        self.value_proj = self.value_proj.bias(bias);
+        self.out_proj = self.out_proj.bias(bias);
+        self
+    }
+    /// The private role `time` is renamed to for `query` positions once
+    /// projected; build an `attn_mask` tensor against this axis.
+    pub fn query_time(&self) -> Axis {
+        self.query_time
+    }
+    /// The private role `time` is renamed to for `key`/`value` positions once
+    /// projected; build an `attn_mask` or `key_padding_mask` tensor against
+    /// this axis.
+    pub fn key_time(&self) -> Axis {
+        self.key_time
+    }
+    pub fn output_shape(&self, query: &Shape, key: &Shape, value: &Shape) -> Result<Shape> {
+        query.extent(self.time)?;
+        if key.extent(self.time)? != value.extent(self.time)? {
+            return Err("MultiheadAttention key and value must share the same time extent".into());
+        }
+        self.out_proj
+            .output_shape(&self.query_proj.output_shape(query)?)
+    }
+    pub fn build(
+        &mut self,
+        query: &Shape,
+        key: &Shape,
+        value: &Shape,
+        device: &Device,
+        seed: u64,
+    ) -> Result<Shape> {
+        let output = self.output_shape(query, key, value)?;
+        let projected = self.query_proj.build(query, device, seed)?;
+        self.key_proj.build(key, device, seed.wrapping_add(1))?;
+        self.value_proj.build(value, device, seed.wrapping_add(2))?;
+        self.out_proj
+            .build(&projected, device, seed.wrapping_add(3))?;
+        Ok(output)
+    }
+    fn split_heads(&self, x: &Tensor, role: Axis) -> Result<Tensor> {
+        x.split(self.feature, [self.head, self.head_feature])?
+            .rename(self.time, role)
+    }
+    pub fn forward(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attn_mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        Ok(self
+            .forward_with_weights(query, key, value, attn_mask, key_padding_mask, false)?
+            .0)
+    }
+    /// `need_weights` additionally computes and returns the head-averaged
+    /// attention probabilities; pass `false` to skip that reduction entirely
+    /// when only the output is needed.
+    pub fn forward_with_weights(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attn_mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+        need_weights: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        self.output_shape(query.shape(), key.shape(), value.shape())?;
+        let q = self.split_heads(&self.query_proj.forward(query)?, self.query_time)?;
+        let k = self.split_heads(&self.key_proj.forward(key)?, self.key_time)?;
+        let v = self.split_heads(&self.value_proj.forward(value)?, self.key_time)?;
+        let mut scores = q
+            .contract(&k, self.head_feature.axis)?
+            .scale(1.0 / (self.head_feature.extent as f32).sqrt())?;
+        if let Some(AttentionMask::Additive(mask)) = attn_mask {
+            scores = scores.add(mask)?;
+        }
+        let mut validity: Option<Tensor> = None;
+        if let Some(mask) = key_padding_mask {
+            validity = Some(mask.logical_not()?.broadcast_to(scores.shape())?);
+        }
+        if let Some(AttentionMask::Boolean(mask)) = attn_mask {
+            let allowed = mask.logical_not()?.broadcast_to(scores.shape())?;
+            validity = Some(match validity {
+                Some(v) => v.mul(&allowed)?,
+                None => allowed,
+            });
+        }
+        let probabilities = match &validity {
+            Some(v) => scores.masked_softmax(self.key_time, v)?,
+            None => scores.softmax(self.key_time)?,
+        };
+        let attended = probabilities
+            .contract(&v, self.key_time)?
+            .merge([self.head.axis, self.head_feature.axis], self.feature)?
+            .rename(self.query_time, self.time)?;
+        let output = self.out_proj.forward(&attended)?;
+        let weights = if need_weights {
+            Some(
+                probabilities
+                    .mean(self.head.axis)?
+                    .rename(self.query_time, self.time)?,
+            )
+        } else {
+            None
+        };
+        Ok((output, weights))
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        [
+            ("query", &self.query_proj),
+            ("key", &self.key_proj),
+            ("value", &self.value_proj),
+            ("output", &self.out_proj),
+        ]
+        .into_iter()
+        .flat_map(|(prefix, layer)| {
+            layer
+                .named_parameters()
+                .into_iter()
+                .map(move |(name, parameter)| (format!("{prefix}.{name}"), parameter))
+        })
+        .collect()
+    }
+}
+
 /// A family of independent linear maps sharing one explicit population axis.
 /// Inputs without the population axis are broadcast to every member; inputs
 /// already carrying it keep memberwise independence through later layers.
@@ -508,16 +754,17 @@ impl Module for GELU {
     }
 }
 
-/// Elementwise ELU with an explicit, finite, positive `alpha`. See
-/// [`Tensor::elu`] for the exact forward/backward split at `x == 0`.
+/// Elementwise ELU with an explicit, finite, nonzero `alpha` (PyTorch's own domain --
+/// negative `alpha` included). See [`Tensor::elu`] for the exact forward/backward split at
+/// `x == 0` and the sign-algebra argument for why negative `alpha` is safe here.
 #[derive(Clone, Copy)]
 pub struct ELU {
     alpha: f32,
 }
 impl ELU {
     pub fn new(alpha: f32) -> Result<Self> {
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Err("ELU alpha must be finite and positive".into());
+        if !alpha.is_finite() || alpha == 0.0 {
+            return Err("ELU alpha must be finite and nonzero".into());
         }
         Ok(Self { alpha })
     }
@@ -534,16 +781,18 @@ impl Module for ELU {
     }
 }
 
-/// Elementwise CELU with an explicit, finite, positive `alpha`. See
-/// [`Tensor::celu`] for the exact forward/backward split at `x == 0`.
+/// Elementwise CELU with an explicit, finite, nonzero `alpha` -- PyTorch's own documented
+/// domain, "valid for alpha != 0", negative `alpha` included. See [`Tensor::celu`] for the
+/// exact forward/backward split at `x == 0` and why the two-branch composition already matches
+/// PyTorch's `max(0, x) + min(0, ...)` definition for any nonzero `alpha`.
 #[derive(Clone, Copy)]
 pub struct CELU {
     alpha: f32,
 }
 impl CELU {
     pub fn new(alpha: f32) -> Result<Self> {
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Err("CELU alpha must be finite and positive".into());
+        if !alpha.is_finite() || alpha == 0.0 {
+            return Err("CELU alpha must be finite and nonzero".into());
         }
         Ok(Self { alpha })
     }
@@ -1700,6 +1949,172 @@ impl Module for ChannelShuffle {
         let new_channel = self.channel.role("channel_shuffle_merged");
         let merged = split.merge([within, group], new_channel)?;
         merged.rename(new_channel, self.channel)
+    }
+}
+
+/// `torch.nn.Upsample`'s interpolation mode (`mode=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpsampleMode {
+    Nearest,
+    Bilinear,
+    Bicubic,
+    Trilinear,
+}
+
+/// `torch.nn.Upsample(size=None, scale_factor=None, mode='nearest',
+/// align_corners=None)` over a fixed, ordered list of named spatial axes
+/// (PyTorch infers 1D/2D/3D from the input's trailing dims; here the axes
+/// are named explicitly instead, so any rank works). Build with
+/// [`Upsample::size`] (a literal per-axis output extent, PyTorch's `size=`)
+/// or [`Upsample::scale_factor`] (a per-axis multiplier, PyTorch's
+/// `scale_factor=`) -- exactly one form, matching PyTorch's own mutual
+/// exclusivity.
+///
+/// `Nearest` composes [`Tensor::upsample_nearest`] once per axis, so every
+/// axis's output/input ratio must be a positive integer (an exact ratio;
+/// caught in `output_shape`/`build`, before `forward` ever runs a kernel) --
+/// the same restriction `upsample_nearest` itself already carries. `Bilinear`
+/// (exactly 2 axes) and `Trilinear` (exactly 3 axes) both compose
+/// [`Tensor::resample_bilinear`] once per axis: exact because linear
+/// interpolation is separable (`world/fluid`'s U-Net calls the 2D form on
+/// `height` then `width`; `trilinear_upsample_matches_composed_bilinear_
+/// against_independent_oracle` in `tests.rs` proves the 3-axis composition
+/// against a real PyTorch `F.interpolate(mode="trilinear")` oracle).
+/// `Bicubic` (any axis count) composes the new
+/// [`Tensor::resample_bicubic`] once per axis, also separable. All four
+/// modes use PyTorch's `align_corners=False` default; `align_corners=True`
+/// is not implemented for any mode (out of scope for the gap this closes:
+/// `docs/nn/catalog.md` named bicubic, trilinear and `scale_factor=`, not
+/// `align_corners`).
+///
+/// `scale_factor` output extents use PyTorch's own `floor(in_extent *
+/// scale_factor)` (its documented behavior once `recompute_scale_factor`,
+/// deprecated since PyTorch 1.6 and removed by 2.14, no longer applies).
+pub struct Upsample {
+    axes: Vec<Axis>,
+    mode: UpsampleMode,
+    size: Option<Vec<usize>>,
+    scale_factor: Option<Vec<f64>>,
+}
+impl Upsample {
+    pub fn size(axes: Vec<Axis>, mode: UpsampleMode, size: Vec<usize>) -> Result<Self> {
+        if axes.len() != size.len() {
+            return Err("Upsample size must give exactly one output extent per axis".into());
+        }
+        Self::new(axes, mode, Some(size), None)
+    }
+    pub fn scale_factor(
+        axes: Vec<Axis>,
+        mode: UpsampleMode,
+        scale_factor: Vec<f64>,
+    ) -> Result<Self> {
+        if axes.len() != scale_factor.len() {
+            return Err("Upsample scale_factor must give exactly one factor per axis".into());
+        }
+        for &factor in &scale_factor {
+            if factor <= 0.0 || factor.is_nan() {
+                return Err("Upsample scale_factor values must be positive".into());
+            }
+        }
+        Self::new(axes, mode, None, Some(scale_factor))
+    }
+    fn new(
+        axes: Vec<Axis>,
+        mode: UpsampleMode,
+        size: Option<Vec<usize>>,
+        scale_factor: Option<Vec<f64>>,
+    ) -> Result<Self> {
+        if axes.is_empty() {
+            return Err("Upsample requires at least one spatial axis".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !axes.iter().all(|axis| seen.insert(*axis)) {
+            return Err("Upsample spatial axes must be distinct".into());
+        }
+        match mode {
+            UpsampleMode::Bilinear if axes.len() != 2 => {
+                return Err("Upsample bilinear requires exactly 2 spatial axes".into());
+            }
+            UpsampleMode::Trilinear if axes.len() != 3 => {
+                return Err("Upsample trilinear requires exactly 3 spatial axes".into());
+            }
+            _ => {}
+        }
+        Ok(Self {
+            axes,
+            mode,
+            size,
+            scale_factor,
+        })
+    }
+    fn output_extents(&self, input: &Shape) -> Result<Vec<usize>> {
+        if let Some(size) = &self.size {
+            for &extent in size {
+                if extent == 0 {
+                    return Err("Upsample size extents must be at least 1".into());
+                }
+            }
+            Ok(size.clone())
+        } else if let Some(factors) = &self.scale_factor {
+            self.axes
+                .iter()
+                .zip(factors)
+                .map(|(&axis, &factor)| {
+                    let extent = input.extent(axis)?;
+                    let out = ((extent as f64) * factor).floor() as usize;
+                    if out == 0 {
+                        return Err("Upsample scale_factor produced a zero output extent".into());
+                    }
+                    Ok(out)
+                })
+                .collect()
+        } else {
+            Err("Upsample requires either size or scale_factor".into())
+        }
+    }
+}
+impl Module for Upsample {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let extents = self.output_extents(input)?;
+        if self.mode == UpsampleMode::Nearest {
+            for (&axis, &out_extent) in self.axes.iter().zip(extents.iter()) {
+                let in_extent = input.extent(axis)?;
+                if out_extent % in_extent != 0 {
+                    return Err(format!(
+                        "Upsample nearest output extent {out_extent} is not an exact integer multiple of {axis:?}'s input extent {in_extent}"
+                    )
+                    .into());
+                }
+            }
+        }
+        let dims = input.dims().iter().copied().map(|dim| {
+            match self.axes.iter().position(|&axis| axis == dim.axis) {
+                Some(position) => dim.axis.of(extents[position]),
+                None => dim,
+            }
+        });
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        let extents = self.output_extents(input.shape())?;
+        let mut output = input.clone();
+        for (&axis, &out_extent) in self.axes.iter().zip(extents.iter()) {
+            output = match self.mode {
+                UpsampleMode::Nearest => {
+                    let in_extent = output.extent(axis)?;
+                    output.upsample_nearest(axis, out_extent / in_extent)?
+                }
+                UpsampleMode::Bilinear | UpsampleMode::Trilinear => {
+                    output.resample_bilinear(axis, out_extent)?
+                }
+                UpsampleMode::Bicubic => output.resample_bicubic(axis, out_extent)?,
+            };
+        }
+        Ok(output)
     }
 }
 
