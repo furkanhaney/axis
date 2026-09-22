@@ -38,12 +38,24 @@ option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
 `Sequential`, with tensor-level losses (including `abs`/`absolute_error`, PyTorch's
 unreduced `F.l1_loss`, zero gradient at exactly zero matching its `abs` backward
 convention), sine, elementwise `exp`/`ln`, a PyTorch-exact
-`Tensor::softplus(beta, threshold)`, differentiable central
-differences, softmax, causal masking, named-axis nearest and bilinear
+`Tensor::softplus(beta, threshold)`, a numerically stable named-axis
+`Tensor::logsumexp(axis)` (`m + ln(sum(exp(x - m)))` with the shift `m = max(axis)`
+detached, so the gradient is exactly `softmax`; an all-non-finite group inherits `max`'s
+`NaN` rather than PyTorch's `-infinity`), differentiable central
+differences, softmax, causal masking, `Tensor::masked_softmax(axis, mask)`
+(a variable-length validity mask rather than causal masking's fixed
+triangular shape; masked positions get exactly zero probability and
+gradient, and a group whose mask is entirely zero returns all zeros instead
+of the `NaN` a literal `masked_fill(-inf)` composition would produce),
+named-axis nearest and bilinear
 resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
 composition, named reductions, an arbitrary-index `gather` (a host-side integer
 index, not a one-hot contraction, so it scales to a large table where
-`Embedding` cannot), data regimes, metrics, trainers, and optimizers.
+`Embedding` cannot), `Tensor::argmin` (a host-side, non-differentiable index of
+`min`'s own winning coordinate), `Tensor::scatter_add` (`gather`'s exact
+transpose: sums values into host-index-named buckets, with an exact gradient)
+and its constant-ones case `Tensor::bincount`, data regimes, metrics,
+trainers, and optimizers.
 `gt`/`ge`/`lt`/`le`/`eq` compare a tensor against a scalar into a `{0.0, 1.0}`
 mask with no gradient of its own; `logical_and`/`logical_not` compose masks the
 same way PyTorch's `&`/`~` do on 0/1 tensors (`mul`, `1 - x`).

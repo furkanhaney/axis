@@ -5775,6 +5775,7 @@ fn named_axis_roll_matches_hand_computed_values_gradients_and_wrap_around() -> R
 }
 
 #[test]
+#[ignore = "requires CUDA"]
 fn broadcast_to_composes_an_outer_pairwise_squared_distance_matching_torch_cdist() -> Result<()> {
     // vision/image-encode's Stage A `soft_recon` computes `torch.cdist(P, sites) ** 2`, a
     // (pixel, site) squared-distance matrix from `P: (pixel, coord)` and `sites: (site,
@@ -5895,6 +5896,537 @@ fn broadcast_to_matches_hand_computed_pairwise_squared_distance_under_reordered_
     Ok(())
 }
 
+#[test]
+#[ignore = "requires CUDA"]
+fn argmin_matches_hand_computed_oracle_with_a_tie() -> Result<()> {
+    // image-encode's `stage_a.py` `hard_eval`: `torch.cdist(P, sites).argmin(1)` picks each
+    // pixel's nearest site. Eight pixels, three sites (`site` extent 3); pixel 3 is exactly
+    // equidistant from site 0 and site 1 (squared distances 25.0 and 25.0) and must resolve to
+    // site 0, the first logical coordinate, exactly matching `Tensor::min`'s own tie rule. Site
+    // 2 (a distant, never-nearest site) is never a winner, setting up the empty-bucket case the
+    // scatter-add/bincount tests below exercise.
+    let device = Device::cuda(0)?;
+    let (pixel, site) = (Axis::new("pixel"), Axis::new("site"));
+    #[rustfmt::skip]
+    let distances = Tensor::from_slice(
+        &[
+            0.0, 100.0, 10000.0,
+            1.0, 81.0, 10000.0,
+            81.0, 1.0, 10000.0,
+            25.0, 25.0, 10000.0, // tie: site 0 and site 1
+            4.0, 64.0, 10000.0,
+            64.0, 4.0, 10000.0,
+            9.0, 49.0, 10000.0,
+            49.0, 9.0, 10000.0,
+        ],
+        [pixel.of(8), site.of(3)],
+        &device,
+    )?;
+    assert_eq!(distances.argmin(site)?, vec![0, 0, 1, 0, 0, 1, 0, 1]);
+
+    // Reordered physical storage (site-major rather than pixel-major) must read the same
+    // logical values through the permuted strides, mirroring `gather`'s own reordered-storage
+    // coverage.
+    let reordered = distances.with_layout([site, pixel])?;
+    assert_eq!(reordered.argmin(site)?, vec![0, 0, 1, 0, 0, 1, 0, 1]);
+
+    let error = distances
+        .argmin(Axis::new("missing"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn argmin_errors_on_a_group_with_no_finite_candidate() -> Result<()> {
+    // usize cannot name "no winner", so unlike `min` (which returns NaN), a group with no
+    // finite candidate at all is an error rather than a silently meaningless index.
+    let device = Device::cuda(0)?;
+    let (row, candidate) = (Axis::new("row"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            3.0,
+            f32::NAN,
+            2.0,
+        ],
+        [row.of(2), candidate.of(3)],
+        &device,
+    )?;
+    let error = values.argmin(candidate).err().unwrap().to_string();
+    assert!(error.contains("no finite candidate"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn scatter_add_and_bincount_match_hand_computed_oracle_with_an_empty_bucket_and_gradient()
+-> Result<()> {
+    // image-encode's `stage_a.py` `hard_eval`: `torch.bincount(lab, minlength=k)` and
+    // `torch.zeros(k, 3).index_add_(0, lab, I)`, given the labels the argmin test above computed
+    // for the same eight pixels and three sites. Site 2 is picked by no pixel: its count and sum
+    // must come out exact zero, not an error.
+    let device = Device::cuda(0)?;
+    let (pixel, site, channel) = (Axis::new("pixel"), Axis::new("site"), Axis::new("channel"));
+    let labels = [0usize, 0, 1, 0, 0, 1, 0, 1];
+    #[rustfmt::skip]
+    let colours = Tensor::from_slice(
+        &[
+            1.0, 0.0, 0.0,
+            2.0, 0.0, 0.0,
+            0.0, 3.0, 0.0,
+            4.0, 0.0, 0.0,
+            5.0, 0.0, 0.0,
+            0.0, 6.0, 0.0,
+            7.0, 0.0, 0.0,
+            0.0, 8.0, 0.0,
+        ],
+        [pixel.of(8), channel.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let sums = colours.scatter_add(pixel, &labels, site, 3)?;
+    assert_eq!(sums.shape(), &Shape::new([site.of(3), channel.of(3)])?);
+    close(
+        "scatter-add per-site colour sums, including the empty site",
+        &sums.to_vec()?,
+        &[19.0, 0.0, 0.0, 0.0, 17.0, 0.0, 0.0, 0.0, 0.0],
+    );
+
+    let counts = Tensor::bincount(&labels, site, 3, &device)?;
+    assert_eq!(counts.shape(), &Shape::new([site.of(3)])?);
+    close(
+        "bincount, including the empty site",
+        &counts.to_vec()?,
+        &[5.0, 3.0, 0.0],
+    );
+    // "Mean colour per site" (`hard_eval`'s actual metric) is the caller's own division of
+    // `scatter_add`'s sum by `bincount`'s count, unclamped: site 2 divides 0.0 by 0.0, IEEE NaN,
+    // exactly as `x.div(y)` is documented to do with no built-in safe-denominator behaviour.
+    let sums_flat = sums.to_vec()?;
+    let counts_flat = counts.to_vec()?;
+    for (site_index, &count) in counts_flat.iter().enumerate() {
+        for channel_index in 0..3 {
+            let mean = sums_flat[site_index * 3 + channel_index] / count;
+            match site_index {
+                0 => {
+                    assert!((f64::from(mean) - [19.0 / 5.0, 0.0, 0.0][channel_index]).abs() < 1e-5)
+                }
+                1 => {
+                    assert!((f64::from(mean) - [0.0, 17.0 / 3.0, 0.0][channel_index]).abs() < 1e-5)
+                }
+                _ => assert!(
+                    mean.is_nan(),
+                    "empty site's unclamped mean is NaN, not zero"
+                ),
+            }
+        }
+    }
+
+    // A weighted reduction downstream makes the gradient test discriminate bucket routing: a
+    // transposed or misrouted backward would not reproduce this pattern the way a uniform
+    // upstream gradient could not catch.
+    #[rustfmt::skip]
+    let weights = Tensor::from_slice(
+        &[
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+            201.0, 211.0, 221.0,
+        ],
+        [site.of(3), channel.of(3)],
+        &device,
+    )?;
+    sums.mul(&weights)?.sum([site, channel])?.backward()?;
+    #[rustfmt::skip]
+    close(
+        "scatter-add gradient routes each pixel's own weighted bucket back to it",
+        &colours.grad().expect("colours gradient").to_vec()?,
+        &[
+            1.0, 11.0, 21.0,
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+            1.0, 11.0, 21.0,
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+        ],
+    );
+
+    // Rejected before any device work: a mismatched index length, an out-of-range bucket, a
+    // zero bucket count, and an axis this tensor does not have.
+    assert!(colours.scatter_add(pixel, &labels[..7], site, 3).is_err());
+    assert!(
+        colours
+            .scatter_add(pixel, &[0, 1, 2, 0, 0, 1, 0, 3], site, 3)
+            .is_err()
+    );
+    assert!(colours.scatter_add(pixel, &labels, site, 0).is_err());
+    assert!(
+        colours
+            .scatter_add(Axis::new("missing"), &labels, site, 3)
+            .is_err()
+    );
+    assert!(Tensor::bincount(&[], site, 3, &device).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn scatter_add_matches_hand_computed_oracle_under_reordered_pixel_storage() -> Result<()> {
+    // Same routing contract as the test above, this time with the source tensor's PHYSICAL
+    // storage transposed relative to its logical [pixel, channel] order (mirroring a value
+    // tensor copied through `with_layout`), so `scatter_add` must read through the permuted
+    // strides in `self.0.layout` rather than assume row-major storage -- exactly the case
+    // `gather_matches_hand_computed_oracle_under_reordered_table_storage` covers for `gather`.
+    let device = Device::cuda(0)?;
+    let (pixel, site, channel) = (Axis::new("pixel"), Axis::new("site"), Axis::new("channel"));
+    let values = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [pixel.of(4), channel.of(2)],
+        &device,
+    )?
+    .with_layout([channel, pixel])?
+    .with_grad();
+
+    let labels = [1usize, 0, 1, 0];
+    let sums = values.scatter_add(pixel, &labels, site, 2)?;
+    close(
+        "reordered scatter-add forward",
+        &sums.to_vec()?,
+        &[10.0, 12.0, 6.0, 8.0],
+    );
+
+    let weights = Tensor::from_slice(
+        &[1000.0, 2000.0, 3000.0, 4000.0],
+        [site.of(2), channel.of(2)],
+        &device,
+    )?;
+    sums.mul(&weights)?.sum([site, channel])?.backward()?;
+    close(
+        "reordered scatter-add gradient",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[
+            3000.0, 4000.0, 1000.0, 2000.0, 3000.0, 4000.0, 1000.0, 2000.0,
+        ],
+    );
+    Ok(())
+}
+
+/// Issue #80: `energy-output/fit_readout_sweep.py:46` computes `q = a + torch.logsumexp(z,
+/// dim=1)` as one of its four swept readouts. Hand-computed literals: row 0's inputs are
+/// `[ln(1), ln(2), ln(3)]`, whose exponentials sum to `6`, so `logsumexp = ln(6)`; row 1's
+/// are `[ln(4), ln(4), ln(8)]`, summing to `16`, so `logsumexp = ln(16)`. The gradient of
+/// `logsumexp` is exactly `softmax` along the reduced axis (`exp(x - m) / sum(exp(x - m))`,
+/// independent of the detached shift `m`), so `mean(batch)`'s backward should land precisely
+/// on each row's softmax scaled by `1 / batch_extent`.
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_matches_hand_computed_literals_and_gradient_equals_softmax() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            0.0_f32,
+            2.0_f32.ln(),
+            3.0_f32.ln(),
+            4.0_f32.ln(),
+            4.0_f32.ln(),
+            8.0_f32.ln(),
+        ],
+        [batch.of(2), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let reduced = values.logsumexp(candidate)?;
+    assert_eq!(reduced.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "logsumexp hand-computed forward",
+        &reduced.to_vec()?,
+        &[6.0_f64.ln(), 16.0_f64.ln()],
+    );
+
+    reduced.mean(batch)?.backward()?;
+    close(
+        "logsumexp gradient equals softmax/batch_extent",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[
+            0.5 / 6.0,
+            1.0 / 6.0,
+            1.5 / 6.0,
+            0.5 / 4.0,
+            0.5 / 4.0,
+            1.0 / 4.0,
+        ],
+    );
+
+    let error = values
+        .logsumexp(Axis::new("missing"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
+    println!("logsumexp hand-computed forward and gradient PASS");
+    Ok(())
+}
+
+/// Same evidence bar, at a magnitude where naively exponentiating `x` directly (without
+/// subtracting the per-row maximum first) would overflow `f32`. Row 0 has one dominant
+/// entry (`1000` against two `0`s, a large spread); row 1 is a near-tie shifted onto the
+/// same large magnitude (`1000 + ln(k)`, a small spread). Both rows stay exactly the shape
+/// of the small-magnitude case above -- `logsumexp` is shift-invariant, so row 1's softmax
+/// gradient reproduces row 0's from the previous test bit for bit.
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_large_magnitude_input_does_not_overflow() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            1000.0_f32,
+            0.0_f32,
+            0.0_f32,
+            1000.0_f32,
+            1000.0_f32 + 2.0_f32.ln(),
+            1000.0_f32 + 3.0_f32.ln(),
+        ],
+        [batch.of(2), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let reduced = values.logsumexp(candidate)?;
+    close(
+        "logsumexp large-magnitude forward",
+        &reduced.to_vec()?,
+        &[1000.0, 1000.0 + 6.0_f64.ln()],
+    );
+
+    reduced.mean(batch)?.backward()?;
+    close(
+        "logsumexp large-magnitude gradient equals softmax/batch_extent",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[0.5, 0.0, 0.0, 0.5 / 6.0, 1.0 / 6.0, 1.5 / 6.0],
+    );
+    println!("logsumexp large-magnitude forward and gradient PASS");
+    Ok(())
+}
+
+/// Documents the one place `logsumexp` diverges from `torch.logsumexp`: a group with no
+/// finite candidate at all. `Tensor::max`'s own convention (see its doc comment) ignores
+/// non-finite candidates and returns `NaN`, with zero derivative, for a group that has no
+/// finite one -- rather than PyTorch's `-infinity` for an all-`-infinity` `max`. `logsumexp`
+/// reuses `max` verbatim for its shift `m`, so an all-`-infinity` (or otherwise all
+/// non-finite) group produces `m = NaN` and therefore `logsumexp = NaN` too, where
+/// `torch.logsumexp` returns `-infinity`. Unlike `max`, `logsumexp` has no dedicated
+/// backward rule to zero that group's gradient: `NaN` propagates through the ordinary
+/// `sub`/`exp`/`sum`/`ln` composition, so the gradient is `NaN`, not zero.
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_all_nonfinite_group_returns_nan_unlike_pytorchs_negative_infinity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
+        [batch.of(1), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let reduced = values.logsumexp(candidate)?;
+    assert!(
+        reduced.to_vec()?[0].is_nan(),
+        "expected NaN, matching max's empty-group convention, not PyTorch's -infinity"
+    );
+
+    reduced.mean(batch)?.backward()?;
+    let gradient = values.grad().expect("values gradient").to_vec()?;
+    assert!(
+        gradient.iter().all(|g| g.is_nan()),
+        "logsumexp has no dedicated backward rule to zero an empty group's gradient the way max does: {gradient:?}"
+    );
+    println!("logsumexp all-nonfinite group PASS");
+    Ok(())
+}
+
+/// Reordered-storage CUDA case: physical storage is transposed relative to the declared
+/// `[batch, candidate]` logical order, so `logsumexp`'s internal `max`/`sub`/`sum` calls
+/// must all read through `self.0.layout`'s permuted strides rather than assume contiguous
+/// storage in axis order. Row 0's inputs are `[ln(1), ln(1), ln(2), ln(4)]` (exponentials
+/// sum to `8`); row 1's are `[ln(3), ln(5), ln(5), ln(3)]` (sum to `16`).
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_reordered_storage_matches_hand_computed_forward_and_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, group) = (Axis::new("row"), Axis::new("group"));
+    let values = Tensor::from_slice(
+        &[
+            0.0_f32,
+            0.0_f32,
+            2.0_f32.ln(),
+            4.0_f32.ln(),
+            3.0_f32.ln(),
+            5.0_f32.ln(),
+            5.0_f32.ln(),
+            3.0_f32.ln(),
+        ],
+        [row.of(2), group.of(4)],
+        &device,
+    )?
+    .with_layout([group, row])?
+    .with_grad();
+
+    let reduced = values.logsumexp(group)?;
+    assert_eq!(reduced.shape(), &Shape::new([row.of(2)])?);
+    close(
+        "logsumexp reordered-storage forward",
+        &reduced.to_vec()?,
+        &[8.0_f64.ln(), 16.0_f64.ln()],
+    );
+
+    reduced.mean(row)?.backward()?;
+    close(
+        "logsumexp reordered-storage gradient equals softmax/row_extent",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[
+            0.5 / 8.0,
+            0.5 / 8.0,
+            1.0 / 8.0,
+            2.0 / 8.0,
+            1.5 / 16.0,
+            2.5 / 16.0,
+            2.5 / 16.0,
+            1.5 / 16.0,
+        ],
+    );
+    println!("logsumexp reordered-storage forward and gradient PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn masked_softmax_zeroes_masked_positions_and_a_fully_masked_bag_returns_zero() -> Result<()> {
+    // gastric `InterfaceMIL`/`PhaseSeparableFusion` pattern: `scores.masked_fill(~valid,
+    // -inf).softmax(dim)` over a variable-length token bank, but with one bag whose validity
+    // mask is entirely zero -- PyTorch's composition leaves that whole row `NaN` and every
+    // consumer calls `nan_to_num(neginf=0.0)` on it by hand; `masked_softmax` folds that
+    // cleanup into the op itself.
+    let device = Device::cuda(0)?;
+    let (bag, token) = (Axis::new("bag"), Axis::new("token"));
+    // Bag 0: token 1 is masked out; its huge score (5.0) must never influence the result.
+    // Bag 1: every token is masked out.
+    let scores = Tensor::from_slice(
+        &[1.0, 5.0, 2.0, 3.0, -1.0, 0.5],
+        [bag.of(2), token.of(3)],
+        &device,
+    )?
+    .with_grad();
+    // Built in [token, bag] order -- the transpose of `scores`'s own axis order -- so the
+    // mask must be realigned before use, exactly like `masked_mean`'s own test.
+    let mask = Tensor::from_slice(
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        [token.of(3), bag.of(2)],
+        &device,
+    )?;
+
+    let probability = scores.masked_softmax(token, &mask)?;
+    close(
+        "masked softmax forward",
+        &probability.to_vec()?,
+        &[0.2689414213699951, 0.0, 0.7310585786300049, 0.0, 0.0, 0.0],
+    );
+
+    let weights = Tensor::from_slice(&[1.0, 2.0, 4.0], [token.of(3)], &device)?;
+    probability.mul(&weights)?.mean([bag, token])?.backward()?;
+    close(
+        "masked softmax gradient",
+        &scores.grad().unwrap().to_vec()?,
+        &[
+            -0.09830596662074094,
+            0.0,
+            0.09830596662074088,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    );
+
+    let grad_mask = Tensor::from_slice(&[1.0; 6], [bag.of(2), token.of(3)], &device)?.with_grad();
+    assert!(scores.detach().masked_softmax(token, &grad_mask).is_err());
+    let fractional = Tensor::from_slice(
+        &[1.0, 0.5, 1.0, 0.0, 1.0, 0.0],
+        [bag.of(2), token.of(3)],
+        &device,
+    )?;
+    assert!(scores.detach().masked_softmax(token, &fractional).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn masked_softmax_matches_hand_computed_oracle_under_reordered_storage() -> Result<()> {
+    // Same capability, asymmetric extents (2 bags x 4 tokens) with both `scores` and `mask`
+    // stored transposed relative to their logical [bag, token] axis order, so the composition
+    // must read through `with_layout`'s permuted strides rather than assume either operand is
+    // already contiguous in its declared axis order. Bag 0 keeps 3 of 4 tokens valid (an
+    // ordinary partial mask); bag 1 is fully masked.
+    let device = Device::cuda(0)?;
+    let (bag, token) = (Axis::new("bag"), Axis::new("token"));
+    let scores = Tensor::from_slice(
+        &[0.5, -0.5, 2.0, 7.0, 1.0, 1.0, 1.0, 1.0],
+        [bag.of(2), token.of(4)],
+        &device,
+    )?
+    .with_layout([token, bag])?
+    .with_grad();
+    let mask = Tensor::from_slice(
+        &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [bag.of(2), token.of(4)],
+        &device,
+    )?
+    .with_layout([token, bag])?;
+
+    let probability = scores.masked_softmax(token, &mask)?;
+    close(
+        "masked softmax forward under reordered storage",
+        &probability.to_vec()?,
+        &[
+            0.17095278019779028,
+            0.0628900132458675,
+            0.7661572065563422,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    );
+
+    let weights = Tensor::from_slice(&[2.0, 0.5, 1.0, 100.0], [token.of(4)], &device)?;
+    probability.mul(&weights)?.mean([bag, token])?.backward()?;
+    close(
+        "masked softmax gradient under reordered storage",
+        &scores.grad().unwrap().to_vec()?,
+        &[
+            0.018387942305745593,
+            -0.005027331543869745,
+            -0.013360610761875839,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    );
+    Ok(())
+}
 #[test]
 fn training_pass_seed_and_next_seed_match_the_documented_splitmix64_mix() {
     // Independent reimplementation of TrainingPass's doc-commented formula: `new` stores its
