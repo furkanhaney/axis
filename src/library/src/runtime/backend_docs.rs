@@ -171,6 +171,20 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn clamp(&self, _a: &Buffer, _min: f32, _max: f32) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn clamp_backward(
+        &self,
+        _gradient: &Buffer,
+        _a: &Buffer,
+        _min: f32,
+        _max: f32,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn binary_cross_entropy(
         &self,
         _logits: &Buffer,

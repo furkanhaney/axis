@@ -158,6 +158,11 @@ enum Rule {
         input: Buffer,
         epsilon: f32,
     },
+    Clamp {
+        input: Buffer,
+        min: f32,
+        max: f32,
+    },
     BinaryCrossEntropy {
         logits: Buffer,
         targets: Buffer,
@@ -1239,6 +1244,52 @@ impl Tensor {
                 Rule::InverseSqrt {
                     input: self.0.value.clone(),
                     epsilon,
+                },
+            )],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise clamp into `[min, max]`; either bound may be `None` to leave that side
+    /// unbounded, matching `torch.clamp`'s optional `min`/`max` keywords (`sites.clamp_(0,
+    /// 1)` in `vision/image-encode`'s Stage A and `counts.clamp(min=1)` in
+    /// `world/energy-output`'s reconstruction loss are the two consumers -- the second gives
+    /// only `min`). Rejects a `NaN` bound or `min > max` before any device launch. A `NaN`
+    /// element of `self` propagates unclamped: like [`Self::gt`] and its siblings, every
+    /// ordered comparison against `NaN` is `false`, so neither the low nor the high branch
+    /// ever fires for it.
+    ///
+    /// Gradient matches PyTorch's `clamp` convention, not "zero at the boundary too": the
+    /// upstream gradient passes through unchanged where `min <= x && x <= max` -- including
+    /// exactly at either bound -- and is zero everywhere `x` was actually moved by clamping.
+    /// A `NaN` input therefore also gets a zero gradient, since `x >= min` is itself `false`
+    /// for `NaN` under the same ordered-comparison rule.
+    pub fn clamp(&self, min: Option<f32>, max: Option<f32>) -> Result<Self> {
+        if min.is_some_and(f32::is_nan) {
+            return Err("clamp min must not be NaN".into());
+        }
+        if max.is_some_and(f32::is_nan) {
+            return Err("clamp max must not be NaN".into());
+        }
+        if let (Some(min), Some(max)) = (min, max)
+            && min > max
+        {
+            return Err(format!("clamp requires min <= max, got min={min} max={max}").into());
+        }
+        let lo = min.unwrap_or(f32::NEG_INFINITY);
+        let hi = max.unwrap_or(f32::INFINITY);
+        let value = self.device().clamp(&self.0.value, lo, hi)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Clamp {
+                    input: self.0.value.clone(),
+                    min: lo,
+                    max: hi,
                 },
             )],
             false,
@@ -2722,6 +2773,9 @@ impl Tensor {
                         Rule::InverseSqrt { input, epsilon } => self
                             .device()
                             .inverse_sqrt_backward(&gradient, input, *epsilon)?,
+                        Rule::Clamp { input, min, max } => {
+                            self.device().clamp_backward(&gradient, input, *min, *max)?
+                        }
                         Rule::BinaryCrossEntropy { logits, targets } => self
                             .device()
                             .binary_cross_entropy_backward(&gradient, logits, targets)?,
