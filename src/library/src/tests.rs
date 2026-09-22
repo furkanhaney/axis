@@ -3849,3 +3849,147 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     println!("concat values, gradients, and composed-path cross-check PASS");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn sum_matches_hand_computed_values_and_gradient_over_multiple_axes() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, time, feature) = (Axis::new("batch"), Axis::new("time"), Axis::new("feature"));
+    // Canonical (batch, time, feature) order, feature fastest.
+    let values: Vec<_> = (1..=12).map(|value| value as f32).collect();
+    let x =
+        Tensor::from_slice(&values, [batch.of(2), time.of(3), feature.of(2)], &device)?.with_grad();
+
+    let summed = x.sum([batch, time])?;
+    // feature 0: 1+3+5+7+9+11 = 36; feature 1: 2+4+6+8+10+12 = 42.
+    close(
+        "sum over two axes at once",
+        &summed.to_vec()?,
+        &[36.0, 42.0],
+    );
+
+    // Weight the two features differently before reducing to a scalar so the gradient
+    // check distinguishes them; sum's own local derivative is exactly 1 per contributing
+    // element, so d(scalar)/d(x[b, t, f]) = weight[f] / feature_count regardless of b, t.
+    let weights = Tensor::from_slice(&[1.0, 2.0], [feature.of(2)], &device)?;
+    summed.mul(&weights)?.mean(feature)?.backward()?;
+    close(
+        "sum gradient broadcasts unscaled across the reduced axes",
+        &x.grad().unwrap().to_vec()?,
+        &[0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0],
+    );
+
+    let missing = Axis::new("missing");
+    let error = x.sum(missing).err().unwrap().to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
+    assert!(x.sum([batch, batch]).is_err());
+    println!("sum forward, multi-axis gradient, and axis rejection PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn sum_over_reordered_asymmetric_storage_matches_hand_computed_values_and_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, time, feature) = (Axis::new("batch"), Axis::new("time"), Axis::new("feature"));
+    const BATCH: usize = 3;
+    const TIME: usize = 2;
+    const FEATURE: usize = 4;
+    // value(b, t, f) = b*100 + t*10 + f, written in canonical (batch, time, feature) order;
+    // `with_layout` below then forces a physically reordered, non-contiguous storage while
+    // `to_vec()` keeps following this canonical order (Shape.dims(), not physical strides).
+    let mut values = vec![0.0f32; BATCH * TIME * FEATURE];
+    for b in 0..BATCH {
+        for t in 0..TIME {
+            for f in 0..FEATURE {
+                values[(b * TIME + t) * FEATURE + f] = (b * 100 + t * 10 + f) as f32;
+            }
+        }
+    }
+    let x = Tensor::from_slice(
+        &values,
+        [batch.of(BATCH), time.of(TIME), feature.of(FEATURE)],
+        &device,
+    )?
+    .with_layout([feature, time, batch])?
+    .with_grad();
+
+    let summed = x.sum([batch, time])?;
+    // sum_f = sum_b sum_t (b*100 + t*10 + f) = (0+100+200)*TIME + (0+10)*BATCH + f*BATCH*TIME
+    //       = 300*2 + 10*3 + 6f = 630 + 6f
+    close(
+        "sum over reordered and asymmetric storage",
+        &summed.to_vec()?,
+        &[630.0, 636.0, 642.0, 648.0],
+    );
+
+    let weights = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], [feature.of(FEATURE)], &device)?;
+    summed.mul(&weights)?.mean(feature)?.backward()?;
+    let mut expected_gradient = vec![0.0f64; BATCH * TIME * FEATURE];
+    for b in 0..BATCH {
+        for t in 0..TIME {
+            for f in 0..FEATURE {
+                expected_gradient[(b * TIME + t) * FEATURE + f] = (f + 1) as f64 / FEATURE as f64;
+            }
+        }
+    }
+    close(
+        "sum gradient under reordered storage lands on the original logical positions",
+        &x.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn sum_composes_with_divide_for_masked_counts_including_a_zero_count() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, feature) = (Axis::new("row"), Axis::new("feature"));
+    // Per-feature masked squared error, already zeroed where the mask is zero, mirroring
+    // energy-output's fit_reconstruction.py loss_fn (`losses.sum(dim=0) /
+    // counts.clamp(min=1)`) and fluid's train.py batch_loss (`num = (... * mb).sum()`).
+    #[rustfmt::skip]
+    let masked_losses = Tensor::from_slice(
+        &[
+            2.0, 0.0, 0.0,
+            4.0, 0.0, 6.0,
+            0.0, 0.0, 3.0,
+            8.0, 0.0, 0.0,
+        ],
+        [row.of(4), feature.of(3)],
+        &device,
+    )?;
+    #[rustfmt::skip]
+    let mask = Tensor::from_slice(
+        &[
+            1.0, 0.0, 0.0,
+            1.0, 0.0, 1.0,
+            0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0,
+        ],
+        [row.of(4), feature.of(3)],
+        &device,
+    )?;
+
+    let counts = mask.sum(row)?;
+    close("mask.sum(row) counts", &counts.to_vec()?, &[3.0, 0.0, 2.0]);
+
+    let losses = masked_losses.sum(row)?.div(&counts)?;
+    let actual = losses.to_vec()?;
+    // feature 0: 14/3; feature 2: 9/2 -- ordinary division, matching PyTorch's
+    // `(...).sum(dim=0) / counts.clamp(min=1)` at those columns exactly, since the clamp
+    // is a no-op once the count is already positive.
+    assert!(
+        (f64::from(actual[0]) - 14.0 / 3.0).abs() < 1e-6,
+        "{actual:?}"
+    );
+    assert!((f64::from(actual[2]) - 4.5).abs() < 1e-6, "{actual:?}");
+    // feature 1 has zero mask everywhere, so both the summed numerator and the summed
+    // count are exactly zero. `div` applies no clamp (documented on `Tensor::div`), so
+    // this is IEEE `0.0 / 0.0 = NaN` -- exactly the case the consumer studies' own
+    // `counts.clamp(min=1)` exists to avoid; `sum` itself makes no such policy choice.
+    assert!(actual[1].is_nan(), "{actual:?}");
+    println!("sum composed with divide over masked counts, including a zero count, PASS");
+    Ok(())
+}
