@@ -2074,7 +2074,11 @@ mod kernels {
     // the dedicated, non-differentiated-through-`ln` pair `binary_cross_entropy` (the
     // probability-input `BCELoss`) now calls, replacing that composition.
     #[cutile::entry()]
-    fn bce_loss(out: &mut Tensor<f32, { [128] }>, x: &Tensor<f32, { [-1] }>, y: &Tensor<f32, { [-1] }>) {
+    fn bce_loss(
+        out: &mut Tensor<f32, { [128] }>,
+        x: &Tensor<f32, { [-1] }>,
+        y: &Tensor<f32, { [-1] }>,
+    ) {
         let p = x.load_like(out);
         let t = y.load_like(out);
         let zero = constant(0.0f32, shape![128]);

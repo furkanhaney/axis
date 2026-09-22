@@ -952,8 +952,7 @@ impl Tensor {
             .any(|&axis| !self.shape().contains(axis))
         {
             return Err(
-                "nll_loss_weighted weight axes must be a subset of the log-probability axes"
-                    .into(),
+                "nll_loss_weighted weight axes must be a subset of the log-probability axes".into(),
             );
         }
         self.compatible_device(targets)?;
@@ -1042,9 +1041,7 @@ impl Tensor {
         self.shared_extents(targets)?;
         let input = self.align(self.shape())?;
         let targets = targets.align(self.shape())?;
-        let value = self
-            .device()
-            .bce_loss(&input.0.value, &targets.0.value)?;
+        let value = self.device().bce_loss(&input.0.value, &targets.0.value)?;
         Ok(Self::node(
             self.shape().clone(),
             Layout::contiguous(self.shape()),
@@ -1163,7 +1160,7 @@ impl Tensor {
         {
             return Err("poisson_nll_loss_full requires identical axis sets".into());
         }
-        if !log_input && !(eps.is_finite() && eps > 0.0) {
+        if !(log_input || eps.is_finite() && eps > 0.0) {
             return Err("poisson_nll_loss_full eps must be finite and positive".into());
         }
         let base = if log_input {
@@ -4787,8 +4784,7 @@ impl Tensor {
                             .device()
                             .binary_cross_entropy_backward(&gradient, logits, targets)?,
                         Rule::BceLoss { input, targets } => {
-                            self.device()
-                                .bce_loss_backward(&gradient, input, targets)?
+                            self.device().bce_loss_backward(&gradient, input, targets)?
                         }
                         Rule::BinaryCrossEntropyWeighted {
                             logits,

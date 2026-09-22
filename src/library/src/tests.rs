@@ -12415,7 +12415,11 @@ fn poisson_nll_loss_full_matches_hand_computed_oracle_at_log_input_false_and_ful
         .with_layout([feature, batch])?;
     let default_loss = log_rate.poisson_nll_loss(&target)?;
     let explicit_loss = log_rate.poisson_nll_loss_full(&target, true, false, 0.0)?;
-    let explicit_loss_f64: Vec<f64> = explicit_loss.to_vec()?.iter().map(|&v| f64::from(v)).collect();
+    let explicit_loss_f64: Vec<f64> = explicit_loss
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
     close(
         "poisson_nll_loss / poisson_nll_loss_full(true, false) bit-exact delegation",
         &default_loss.to_vec()?,
