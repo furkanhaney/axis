@@ -2899,6 +2899,405 @@ impl Tensor {
         self.align(shape)
     }
 
+    // --- Distances and margin losses ----------------------------------------------------
+    //
+    // `docs/nn/catalog.md`'s Distance Functions and margin-family Loss Functions rows. Every
+    // method below is a plain tensor-level function, not a `Module`, exactly like
+    // `categorical_cross_entropy_with_logits` and `binary_cross_entropy_with_logits`: a
+    // PyTorch default that is itself a parameter (`margin`, `eps`, `swap`, ...) is an explicit
+    // argument, its PyTorch default cited in the doc comment, never a Rust `Default`. A
+    // `target`/label argument is always a constant (rejected if it requires gradients),
+    // matching how cross-entropy already treats its targets. Every function below reduces only
+    // the one named axis its own definition consumes (the compared feature axis, or the class
+    // axis) and leaves every other axis unreduced for the caller's own `.mean(axes)` /
+    // `.sum(axes)`, exactly as `binary_cross_entropy_with_logits` leaves batch reduction to its
+    // caller.
+
+    /// Same axis-agreement contract [`Self::squared_error`] already checks inline: identical
+    /// axis sets (equal rank, every axis of `self` present in `rhs`), rejected before any
+    /// device work.
+    fn require_identical_axes(&self, rhs: &Self, context: &str) -> Result<()> {
+        if self.shape().rank() != rhs.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&a| !rhs.shape().contains(a))
+        {
+            return Err(format!("{context} requires identical axis sets").into());
+        }
+        Ok(())
+    }
+
+    /// Elementwise `x * (x + epsilon)^-1/2`: an ordinary `sqrt(x)` for any `x` far above
+    /// `epsilon`, whose gradient stays finite as `x -> 0` (a literal `pow(0.5)` composition
+    /// divides by zero there). This is exactly the norm Muon's `normalized_l2` already computes
+    /// this way; `epsilon` here is a numerical floor rather than a public contract, so every
+    /// caller below passes `f32::MIN_POSITIVE`, matching `normalized_l2`'s own choice.
+    fn stable_sqrt(&self, epsilon: f32) -> Result<Self> {
+        let inverse_root = self.inverse_sqrt(epsilon)?;
+        self.mul(&inverse_root)
+    }
+
+    /// Cosine similarity along one named feature axis: [PyTorch's `CosineSimilarity`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.CosineSimilarity.html),
+    /// `cos = (x1 . x2) / (max(||x1||_2, eps) * max(||x2||_2, eps))`. Each L2 norm is clamped to
+    /// `eps` INDIVIDUALLY before the product -- PyTorch's own C++ kernel instead clamps the
+    /// product of the squared norms to `eps^2` before one shared square root; the two formulas
+    /// agree whenever either input has a norm above `eps`, and diverge only in the degenerate
+    /// near-zero-vector regime neither treats as a meaningful similarity. `eps` matches
+    /// PyTorch's default `1e-8` and must be finite and positive. `self`/`rhs` require identical
+    /// axis sets including `axis`; every other axis is preserved unreduced.
+    pub fn cosine_similarity(&self, rhs: &Self, axis: Axis, eps: f32) -> Result<Self> {
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err("cosine_similarity eps must be finite and positive".into());
+        }
+        self.require_identical_axes(rhs, "cosine_similarity")?;
+        self.extent(axis)?;
+        let dot = self.mul(rhs)?.sum(axis)?;
+        let norm_self = self
+            .mul(self)?
+            .sum(axis)?
+            .stable_sqrt(f32::MIN_POSITIVE)?
+            .clamp(Some(eps), None)?;
+        let norm_rhs = rhs
+            .mul(rhs)?
+            .sum(axis)?
+            .stable_sqrt(f32::MIN_POSITIVE)?
+            .clamp(Some(eps), None)?;
+        dot.div(&norm_self.mul(&norm_rhs)?)
+    }
+
+    /// Euclidean pairwise distance along one named feature axis: [PyTorch's `PairwiseDistance`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.PairwiseDistance.html) at its
+    /// default `p=2`, `((self - rhs + eps)^2).sum(axis).sqrt()`. `eps` (PyTorch's default
+    /// `1e-6`) is added to the raw difference before squaring -- exactly where PyTorch's own
+    /// `F.pairwise_distance` adds it, not as a denominator floor. `keepdim=False` is automatic:
+    /// `axis` is removed like every other Axis reduction. Only `p=2` is implemented; PyTorch's
+    /// general `p`-norm is not, since every consumer below uses the Euclidean default.
+    /// `self`/`rhs` require identical axis sets including `axis`.
+    pub fn pairwise_distance(&self, rhs: &Self, axis: Axis, eps: f32) -> Result<Self> {
+        if !eps.is_finite() {
+            return Err("pairwise_distance eps must be finite".into());
+        }
+        self.require_identical_axes(rhs, "pairwise_distance")?;
+        self.extent(axis)?;
+        let eps_tensor = Self::from_slice(&[eps], [], self.device())?;
+        let diff = self.sub(rhs)?.add(&eps_tensor)?;
+        diff.mul(&diff)?.sum(axis)?.stable_sqrt(f32::MIN_POSITIVE)
+    }
+
+    /// [PyTorch's `MarginRankingLoss`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.MarginRankingLoss.html):
+    /// `max(0, -target * (self - rhs) + margin)`, elementwise and unreduced. `target` is a
+    /// constant `1.0`/`-1.0` per element (checked before launch) and carries no gradient,
+    /// matching `categorical_cross_entropy_with_logits`'s constant targets. `margin` (PyTorch
+    /// default `0.0`) must be finite. `self`, `rhs`, and `target` require identical axis sets.
+    pub fn margin_ranking_loss(&self, rhs: &Self, target: &Self, margin: f32) -> Result<Self> {
+        if !margin.is_finite() {
+            return Err("margin_ranking_loss margin must be finite".into());
+        }
+        if target.requires_grad() {
+            return Err("margin_ranking_loss target cannot require gradients".into());
+        }
+        self.require_identical_axes(rhs, "margin_ranking_loss")?;
+        self.require_identical_axes(target, "margin_ranking_loss")?;
+        if target
+            .to_vec()?
+            .iter()
+            .any(|&value| !value.is_finite() || (value != 1.0 && value != -1.0))
+        {
+            return Err("margin_ranking_loss target must be exactly 1.0 or -1.0".into());
+        }
+        let margin_tensor = Self::from_slice(&[margin], [], self.device())?;
+        let scaled = self.sub(rhs)?.mul(target)?;
+        margin_tensor.sub(&scaled)?.relu()
+    }
+
+    /// [PyTorch's `HingeEmbeddingLoss`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.HingeEmbeddingLoss.html): per
+    /// element, `self` where `target == 1`, else `max(0, margin - self)` where `target == -1`.
+    /// `target` is a constant `1.0`/`-1.0` per element (checked before launch, no gradient).
+    /// `margin` (PyTorch default `1.0`) must be finite. `self` and `target` require identical
+    /// axis sets. Unreduced.
+    pub fn hinge_embedding_loss(&self, target: &Self, margin: f32) -> Result<Self> {
+        if !margin.is_finite() {
+            return Err("hinge_embedding_loss margin must be finite".into());
+        }
+        if target.requires_grad() {
+            return Err("hinge_embedding_loss target cannot require gradients".into());
+        }
+        self.require_identical_axes(target, "hinge_embedding_loss")?;
+        if target
+            .to_vec()?
+            .iter()
+            .any(|&value| !value.is_finite() || (value != 1.0 && value != -1.0))
+        {
+            return Err("hinge_embedding_loss target must be exactly 1.0 or -1.0".into());
+        }
+        let margin_tensor = Self::from_slice(&[margin], [], self.device())?;
+        let positive_mask = target.gt(0.0)?;
+        let negative_mask = positive_mask.logical_not()?;
+        let relu_term = margin_tensor.sub(self)?.relu()?;
+        positive_mask
+            .mul(self)?
+            .add(&negative_mask.mul(&relu_term)?)
+    }
+
+    /// [PyTorch's `CosineEmbeddingLoss`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.CosineEmbeddingLoss.html):
+    /// `1 - cos(self, rhs)` where `target == 1`, else `max(0, cos(self, rhs) - margin)` where
+    /// `target == -1`, reducing the named `feature` axis via [`Self::cosine_similarity`] at its
+    /// own default `eps = 1e-8`. PyTorch's public documented formula names no `eps` at all; its
+    /// C++ kernel instead adds a fixed, undocumented `1e-12` inside the sum of squares. Reusing
+    /// `CosineSimilarity`'s own public default keeps one canonical epsilon across the family
+    /// rather than inventing a second undocumented constant. `margin` (PyTorch default `0.0`)
+    /// must be finite. `target` is a constant `1.0`/`-1.0` (checked before launch): it must not
+    /// contain `feature`, and its remaining axes must be a subset of `self`'s. Unreduced over
+    /// every axis but `feature`.
+    pub fn cosine_embedding_loss(
+        &self,
+        rhs: &Self,
+        target: &Self,
+        feature: Axis,
+        margin: f32,
+    ) -> Result<Self> {
+        if !margin.is_finite() {
+            return Err("cosine_embedding_loss margin must be finite".into());
+        }
+        if target.requires_grad() {
+            return Err("cosine_embedding_loss target cannot require gradients".into());
+        }
+        if target.shape().contains(feature) {
+            return Err(
+                "cosine_embedding_loss target must not contain the reduced feature axis".into(),
+            );
+        }
+        if target
+            .shape()
+            .axes()
+            .iter()
+            .any(|&a| !self.shape().contains(a))
+        {
+            return Err(
+                "cosine_embedding_loss target axes must be a subset of the input axes".into(),
+            );
+        }
+        if target
+            .to_vec()?
+            .iter()
+            .any(|&value| !value.is_finite() || (value != 1.0 && value != -1.0))
+        {
+            return Err("cosine_embedding_loss target must be exactly 1.0 or -1.0".into());
+        }
+        let cosine = self.cosine_similarity(rhs, feature, 1e-8)?;
+        let margin_tensor = Self::from_slice(&[margin], [], self.device())?;
+        let one = Self::from_slice(&[1.0], [], self.device())?;
+        let positive_mask = target.gt(0.0)?;
+        let negative_mask = positive_mask.logical_not()?;
+        let positive_term = one.sub(&cosine)?;
+        let negative_term = cosine.sub(&margin_tensor)?.relu()?;
+        positive_mask
+            .mul(&positive_term)?
+            .add(&negative_mask.mul(&negative_term)?)
+    }
+
+    /// [PyTorch's `TripletMarginLoss`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.TripletMarginLoss.html) at its
+    /// default `p=2`: `max(0, margin + d(self, positive) - d(self, negative))`, where `d` is
+    /// [`Self::pairwise_distance`] along `axis` with the given `eps`. When `swap` is true
+    /// (PyTorch default `false`), `d(self, negative)` is instead the smaller of itself and
+    /// `d(positive, negative)` (Balntas et al.'s swap term, penalizing a positive that sits
+    /// closer to the negative than the anchor does), computed by stacking the two distances on
+    /// a fresh axis and reducing with [`Self::min`]. `margin` (PyTorch default `1.0`) must be
+    /// finite. Unreduced over every axis but `axis`.
+    pub fn triplet_margin_loss(
+        &self,
+        positive: &Self,
+        negative: &Self,
+        axis: Axis,
+        margin: f32,
+        eps: f32,
+        swap: bool,
+    ) -> Result<Self> {
+        if !margin.is_finite() {
+            return Err("triplet_margin_loss margin must be finite".into());
+        }
+        let distance_positive = self.pairwise_distance(positive, axis, eps)?;
+        let mut distance_negative = self.pairwise_distance(negative, axis, eps)?;
+        if swap {
+            let distance_swap = positive.pairwise_distance(negative, axis, eps)?;
+            let pair = axis.role("triplet_margin_loss_swap_pair");
+            distance_negative =
+                Tensor::stack(&[distance_negative, distance_swap], pair, 0)?.min(pair)?;
+        }
+        let margin_tensor = Self::from_slice(&[margin], [], self.device())?;
+        margin_tensor
+            .add(&distance_positive)?
+            .sub(&distance_negative)?
+            .relu()
+    }
+
+    /// [PyTorch's `TripletMarginWithDistanceLoss`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.TripletMarginWithDistanceLoss.html):
+    /// exactly [`Self::triplet_margin_loss`]'s `max(0, margin + d(self, positive) - d(self,
+    /// negative))` and `swap` rule, with `d` an arbitrary caller-supplied Rust closure over two
+    /// tensors in place of a fixed `p`-norm. PyTorch defaults `distance_function` to `None`,
+    /// meaning `PairwiseDistance()`; Rust has no `Option`-shaped default that keeps a plain,
+    /// statically dispatched closure parameter, so the default is spelled explicitly by the
+    /// caller, e.g. `anchor.triplet_margin_with_distance_loss(&pos, &neg, margin, swap, |a, b|
+    /// a.pairwise_distance(b, axis, eps))?`. `margin` (PyTorch default `1.0`) must be finite.
+    pub fn triplet_margin_with_distance_loss(
+        &self,
+        positive: &Self,
+        negative: &Self,
+        margin: f32,
+        swap: bool,
+        distance: impl Fn(&Self, &Self) -> Result<Self>,
+    ) -> Result<Self> {
+        if !margin.is_finite() {
+            return Err("triplet_margin_with_distance_loss margin must be finite".into());
+        }
+        let distance_positive = distance(self, positive)?;
+        let mut distance_negative = distance(self, negative)?;
+        if swap {
+            let distance_swap = distance(positive, negative)?;
+            let pair = Axis::new("triplet_margin_with_distance_loss_swap_pair");
+            distance_negative =
+                Tensor::stack(&[distance_negative, distance_swap], pair, 0)?.min(pair)?;
+        }
+        let margin_tensor = Self::from_slice(&[margin], [], self.device())?;
+        margin_tensor
+            .add(&distance_positive)?
+            .sub(&distance_negative)?
+            .relu()
+    }
+
+    /// [PyTorch's `MultiMarginLoss`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.MultiMarginLoss.html) at its
+    /// default `p=1`: for each class `i`, `max(0, margin - self[target] + self[i])`, summed over
+    /// `i != target` and scaled by `1 / class.extent()`. `target` is a constant one-hot
+    /// indicator over `class` (checked before launch: every value `0.0`/`1.0`, summing to
+    /// exactly `1.0`), matching how `categorical_cross_entropy_with_logits` already spells a
+    /// class label as a tensor rather than a host index. `margin` (PyTorch default `1.0`) must
+    /// be finite; `class` must have at least two classes. PyTorch's optional per-class `weight`
+    /// and its general `p` are not implemented -- every consumer below uses the defaults.
+    /// Unreduced over every axis but `class`.
+    pub fn multi_margin_loss(&self, target: &Self, class: Axis, margin: f32) -> Result<Self> {
+        if !margin.is_finite() {
+            return Err("multi_margin_loss margin must be finite".into());
+        }
+        if target.requires_grad() {
+            return Err("multi_margin_loss target cannot require gradients".into());
+        }
+        if !target.shape().contains(class)
+            || target
+                .shape()
+                .axes()
+                .iter()
+                .any(|&a| !self.shape().contains(a))
+        {
+            return Err("multi_margin_loss target must contain the class axis and may omit only broadcast axes".into());
+        }
+        self.compatible_device(target)?;
+        self.shared_extents(target)?;
+        let width = self.extent(class)?;
+        if width < 2 {
+            return Err("multi_margin_loss requires at least two classes".into());
+        }
+        let mut ordered_dims: Vec<_> = self
+            .shape()
+            .dims()
+            .iter()
+            .copied()
+            .filter(|dim| dim.axis != class)
+            .collect();
+        ordered_dims.push(class.of(width));
+        let ordered = Shape::new(ordered_dims)?;
+        let target_ordered = target.align(&ordered)?;
+        for distribution in target_ordered.to_vec()?.chunks_exact(width) {
+            if distribution
+                .iter()
+                .any(|&v| !v.is_finite() || (v != 0.0 && v != 1.0))
+            {
+                return Err("multi_margin_loss target must be one-hot (values 0.0 or 1.0)".into());
+            }
+            let sum: f32 = distribution.iter().sum();
+            if (sum - 1.0).abs() > 1e-5 {
+                return Err(
+                    format!("multi_margin_loss target row must sum to 1; observed {sum}").into(),
+                );
+            }
+        }
+        let target_score = self.mul(target)?.sum(class)?.broadcast_to(self.shape())?;
+        let margin_tensor = Self::from_slice(&[margin], [], self.device())?;
+        let hinge = margin_tensor.sub(&target_score)?.add(self)?.relu()?;
+        let not_target = target.logical_not()?;
+        hinge
+            .mul(&not_target)?
+            .sum(class)?
+            .scale(1.0 / width as f32)
+    }
+
+    /// [PyTorch's `MultiLabelMarginLoss`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.MultiLabelMarginLoss.html):
+    /// `(1 / class.extent()) * sum_{i,j} max(0, 1 - (self[j] - self[i]))`, summed over class
+    /// positions `i` that are NOT a positive label and `j` that ARE. PyTorch spells the
+    /// positive-label set as a fixed-width index array terminated by `-1`; Axis instead takes
+    /// `target` as a constant multi-hot `{0.0, 1.0}` indicator over `class` (`1.0` at every
+    /// positive label) -- the same floating-point-tensor spelling
+    /// `categorical_cross_entropy_with_logits` already uses for a single label, generalized to a
+    /// set. The two encodings name the same label sets; `target` is checked before launch
+    /// (every value exactly `0.0` or `1.0`) and carries no gradient. `class` must have at least
+    /// two classes. Neither `margin` (PyTorch fixes it at `1.0`; it is not a parameter of this
+    /// class) nor `weight`/`reduction` exist to configure. Unreduced over every axis but
+    /// `class`.
+    pub fn multi_label_margin_loss(&self, target: &Self, class: Axis) -> Result<Self> {
+        if target.requires_grad() {
+            return Err("multi_label_margin_loss target cannot require gradients".into());
+        }
+        if !target.shape().contains(class)
+            || target
+                .shape()
+                .axes()
+                .iter()
+                .any(|&a| !self.shape().contains(a))
+        {
+            return Err("multi_label_margin_loss target must contain the class axis and may omit only broadcast axes".into());
+        }
+        self.compatible_device(target)?;
+        self.shared_extents(target)?;
+        let width = self.extent(class)?;
+        if width < 2 {
+            return Err("multi_label_margin_loss requires at least two classes".into());
+        }
+        if target
+            .to_vec()?
+            .iter()
+            .any(|&value| !value.is_finite() || (value != 0.0 && value != 1.0))
+        {
+            return Err("multi_label_margin_loss target must be 0.0 or 1.0".into());
+        }
+        let pair = class.role("multi_label_margin_loss_pair");
+        let mut combined_dims: Vec<_> = self.shape().dims().to_vec();
+        combined_dims.push(pair.of(width));
+        let combined = Shape::new(combined_dims)?;
+
+        let score_i = self.broadcast_to(&combined)?;
+        let score_j = self.rename(class, pair)?.broadcast_to(&combined)?;
+        let target_i = target.broadcast_to(&combined)?;
+        let target_j = target.rename(class, pair)?.broadcast_to(&combined)?;
+
+        let one = Self::from_slice(&[1.0], [], self.device())?;
+        let hinge = one.sub(&score_j.sub(&score_i)?)?.relu()?;
+        let not_target_i = one.sub(&target_i)?;
+        let mask = target_j.mul(&not_target_i)?;
+        hinge
+            .mul(&mask)?
+            .sum([class, pair])?
+            .scale(1.0 / width as f32)
+    }
+
     /// Stack equal named shapes, inserting a new logical axis at `position`.
     /// Physical storage is stack-major so each source remains one contiguous copy.
     pub fn stack(values: &[Self], axis: Axis, position: usize) -> Result<Self> {
