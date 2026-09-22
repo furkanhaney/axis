@@ -35,6 +35,9 @@ resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
 composition, named reductions, an arbitrary-index `gather` (a host-side integer
 index, not a one-hot contraction, so it scales to a large table where
 `Embedding` cannot), data regimes, metrics, trainers, and optimizers.
+`gt`/`ge`/`lt`/`le`/`eq` compare a tensor against a scalar into a `{0.0, 1.0}`
+mask with no gradient of its own; `logical_and`/`logical_not` compose masks the
+same way PyTorch's `&`/`~` do on 0/1 tensors (`mul`, `1 - x`).
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
 `one_cycle_lr` schedule functions (`optim.rs`), and a global-norm

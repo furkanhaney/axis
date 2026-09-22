@@ -4515,3 +4515,136 @@ fn gather_matches_hand_computed_oracle_under_reordered_table_storage() -> Result
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn comparison_scalar_ops_match_hand_computed_edge_cases_including_nan() -> Result<()> {
+    // energy-output/fit_reconstruction.py:108,127-130 and fluid/scripts/train.py:133
+    // both compare a tensor against a plain scalar (`counts > 0`, `rand < MASK_RATE`,
+    // `xb.abs() > 0`), never against another tensor, so only the scalar form is
+    // implemented. Edge cases: exact equality at a representable value (0.0, and a
+    // non-zero 1.5), and NaN -- Axis tensors are dense f32 (no separate NaN-free
+    // invariant), so a real caller can hand one to a comparison, and every ordered
+    // IEEE comparison against NaN must come back false (0.0), never true or NaN.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let values = [-2.0f32, -0.5, 0.0, 0.5, 1.5, 2.0, f32::NAN];
+    let x = Tensor::from_slice(&values, [sample.of(values.len())], &device)?;
+
+    close(
+        "gt(0.0)",
+        &x.gt(0.0)?.to_vec()?,
+        &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0],
+    );
+    close(
+        "ge(0.0)",
+        &x.ge(0.0)?.to_vec()?,
+        &[0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0],
+    );
+    close(
+        "lt(0.0)",
+        &x.lt(0.0)?.to_vec()?,
+        &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    close(
+        "le(0.0)",
+        &x.le(0.0)?.to_vec()?,
+        &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    close(
+        "eq(0.0)",
+        &x.eq(0.0)?.to_vec()?,
+        &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    // Exact equality at a representable non-zero value: only index 4 (1.5) matches.
+    close(
+        "eq(1.5)",
+        &x.eq(1.5)?.to_vec()?,
+        &[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    );
+
+    // Comparisons carry no autograd edge at all, matching PyTorch (`>` etc. are
+    // non-differentiable): even when the input requires grad, the mask does not.
+    assert!(
+        !x.with_grad().gt(0.0)?.requires_grad(),
+        "a comparison output must not require grad even when its input does"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn comparison_masks_gate_multiplication_and_compose_with_logical_and_not() -> Result<()> {
+    // fluid/scripts/train.py:133: `xb + noise * (xb.abs() > 0).float()` uses a
+    // comparison-derived mask as a multiplicative gate. The mask must contribute
+    // its VALUE to the forward pass but none of its own gradient: `d(x*mask)/dx`
+    // is `mask` treated as a constant, never `mask`'s own (nonexistent) derivative.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let x_values = [-3.0f32, 0.0, 2.0, -1.0, 4.0];
+    let x = Tensor::from_slice(&x_values, [sample.of(5)], &device)?.with_grad();
+
+    let gate = x.gt(0.0)?;
+    assert!(
+        !gate.requires_grad(),
+        "the gate must carry no autograd edge of its own"
+    );
+    let gated = x.mul(&gate)?;
+    close(
+        "multiplicative gate forward",
+        &gated.to_vec()?,
+        &[0.0, 0.0, 2.0, 0.0, 4.0],
+    );
+    gated.mean(sample)?.backward()?;
+    // d(mean(x*mask))/dx_i = mask_i / n, treating mask as a constant.
+    close(
+        "gate gradient treats the mask as a constant",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[0.0, 0.0, 0.2, 0.0, 0.2],
+    );
+
+    // energy-output/fit_reconstruction.py:127-129:
+    //   hidden = (torch.rand(...) < MASK_RATE) & observed
+    //   visible = observed & ~hidden
+    let feature = Axis::new("feature");
+    let observed = Tensor::from_slice(&[1.0f32, 1.0, 0.0, 1.0], [feature.of(4)], &device)?;
+    let draws = Tensor::from_slice(&[0.1f32, 0.9, 0.2, 0.4], [feature.of(4)], &device)?;
+    let hidden = draws.lt(0.5)?.logical_and(&observed)?;
+    close(
+        "hidden mask (rand < rate) & observed",
+        &hidden.to_vec()?,
+        &[1.0, 0.0, 0.0, 1.0],
+    );
+    let visible = observed.logical_and(&hidden.logical_not()?)?;
+    close(
+        "visible mask observed & ~hidden",
+        &visible.to_vec()?,
+        &[0.0, 1.0, 0.0, 0.0],
+    );
+    assert!(!hidden.requires_grad());
+    assert!(!visible.requires_grad());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn comparison_matches_logical_order_under_reordered_cuda_storage() -> Result<()> {
+    // Elementwise ops read the raw physical buffer and keep the tensor's existing
+    // Layout unchanged (`with_layout` only ever changes physical strides), so a
+    // comparison on a reordered-storage tensor must still read out in the
+    // tensor's own logical Shape order via `to_vec()`, exactly like `sign` or
+    // `sin` on a permuted tensor.
+    let device = Device::cuda(0)?;
+    let (batch, time) = (Axis::new("batch"), Axis::new("time"));
+    let values: Vec<f32> = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+    let x = Tensor::from_slice(&values, [batch.of(2), time.of(3)], &device)?
+        .with_layout([time, batch])?;
+    let mask = x.gt(0.5)?;
+    assert_eq!(mask.shape(), x.shape());
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&v| f64::from(u8::from(v > 0.5)))
+        .collect();
+    close("reordered-storage comparison", &mask.to_vec()?, &expected);
+    Ok(())
+}
