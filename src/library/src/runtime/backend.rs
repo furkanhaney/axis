@@ -705,6 +705,7 @@ impl Device {
                         spec.input_special_strides[0],
                         spec.input_special_strides[1],
                         spec.input_special_strides[2],
+                        spec.fill,
                     )
                 }
                 .enqueue_on(&self.0.stream)?;
@@ -734,6 +735,7 @@ impl Device {
                         spec.input_special_strides[1],
                         spec.input_special_strides[2],
                         spec.input_special_strides[3],
+                        spec.fill,
                     )
                 }
                 .enqueue_on(&self.0.stream)?;
@@ -991,7 +993,7 @@ impl Device {
     }
 }
 
-/// Compact convolution patch geometry. Per-element source indices are computed
+/// Compact convolution/pooling patch geometry. Per-element source indices are computed
 /// by the kernels, so storage grows with tensor rank rather than patch count.
 #[derive(Clone)]
 pub(crate) struct UnfoldSpec {
@@ -1003,6 +1005,10 @@ pub(crate) struct UnfoldSpec {
     pub forward_metadata: Vec<i32>,
     pub backward_metadata: Vec<i32>,
     pub channels_per_group: i32,
+    /// Value written for a patch position outside the input (padding). Convolution and the
+    /// public `unfold2d` use `0.0`, which is correct for a linear contraction; max pooling uses
+    /// `f32::NEG_INFINITY` so a padded position can never win the windowed maximum.
+    pub fill: f32,
     pub kernel: [i32; 3],
     pub stride: [i32; 3],
     pub padding: [i32; 3],
@@ -1131,6 +1137,7 @@ mod kernels {
         input_channel_stride: i32,
         input_height_stride: i32,
         input_width_stride: i32,
+        fill: f32,
     ) {
         let output_index: Tile<i32, { [128] }> =
             iota(shape![128]) + broadcast_scalar(get_tile_block_id().0 * 128i32, shape![128]);
@@ -1191,7 +1198,7 @@ mod kernels {
                 ordering::Relaxed,
                 Some(scope::Device),
                 Some(valid),
-                Some(0.0f32),
+                Some(fill),
                 None,
                 Latency::<0>,
             )
@@ -1223,6 +1230,7 @@ mod kernels {
         input_depth_stride: i32,
         input_height_stride: i32,
         input_width_stride: i32,
+        fill: f32,
     ) {
         let output_index: Tile<i32, { [128] }> =
             iota(shape![128]) + broadcast_scalar(get_tile_block_id().0 * 128i32, shape![128]);
@@ -1293,7 +1301,7 @@ mod kernels {
                 ordering::Relaxed,
                 Some(scope::Device),
                 Some(valid),
-                Some(0.0f32),
+                Some(fill),
                 None,
                 Latency::<0>,
             )

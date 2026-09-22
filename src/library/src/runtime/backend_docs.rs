@@ -371,6 +371,7 @@ pub(crate) struct UnfoldSpec {
     pub forward_metadata: Vec<i32>,
     pub backward_metadata: Vec<i32>,
     pub channels_per_group: i32,
+    pub fill: f32,
     pub kernel: [i32; 3],
     pub stride: [i32; 3],
     pub padding: [i32; 3],

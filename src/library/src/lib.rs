@@ -46,7 +46,7 @@ mod train;
 
 pub use axis::{Axis, Dim, IntoAxes, Shape};
 pub use backend::Device;
-pub use convolution::{Conv2d, Conv3d};
+pub use convolution::{Conv2d, Conv3d, MaxPool2d, MaxPool3d};
 pub use data::{
     AdditionDataset, AdditionSample, Batch, DataLoader, DataRegimeReceipt, DataSource,
     FinitePassesLoader, InMemoryDataset, Sample,
@@ -114,11 +114,11 @@ pub mod prelude {
         Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
         LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
         LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
-        MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
-        PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot, ResidualClaim,
-        ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential,
-        Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh, Tensor, TrainStep,
-        Trainer, cosine_annealing_lr, one_cycle_lr,
+        MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
+        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear,
+        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot,
+        ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD,
+        Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh,
+        Tensor, TrainStep, Trainer, cosine_annealing_lr, one_cycle_lr,
     };
 }

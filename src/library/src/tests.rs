@@ -1375,6 +1375,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
         [3, 3],
         [1, 1],
         [1, 1],
+        0.0,
     )?;
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 1);
     let height_time = input.unfold_grouped(
@@ -1385,6 +1386,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
         [3, 3],
         [1, 1],
         [1, 1],
+        0.0,
     )?;
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
 
@@ -1402,6 +1404,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
         [3, 3],
         [1, 1],
         [1, 1],
+        0.0,
     )?;
     assert_eq!(repeated.to_vec()?, height_width.to_vec()?);
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
@@ -1426,6 +1429,7 @@ fn unfold2d_plan_cache_distinguishes_equal_extent_spatial_axes() -> Result<()> {
             [1, 1],
             [100, 100],
             [10, 10],
+            0.0,
         )?;
         assert_eq!(all_padding.to_vec()?, vec![0.0; 4]);
         assert_eq!(all_padding.layout_strides(), &[1, 1, 1, 2, 1]);
@@ -1929,6 +1933,7 @@ fn unfold3d_cache_distinguishes_equal_extent_spatial_axis_order() -> Result<()> 
         [3, 3, 3],
         [1, 1, 1],
         [1, 1, 1],
+        0.0,
     )?;
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 1);
     let depth_height_time = input.unfold_grouped(
@@ -1939,6 +1944,7 @@ fn unfold3d_cache_distinguishes_equal_extent_spatial_axis_order() -> Result<()> 
         [3, 3, 3],
         [1, 1, 1],
         [1, 1, 1],
+        0.0,
     )?;
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
 
@@ -1960,6 +1966,7 @@ fn unfold3d_cache_distinguishes_equal_extent_spatial_axis_order() -> Result<()> 
         [3, 3, 3],
         [1, 1, 1],
         [1, 1, 1],
+        0.0,
     )?;
     assert_eq!(repeated.to_vec()?, depth_height_width.to_vec()?);
     assert_eq!(Tensor::unfold_plan_build_count(), builds + 2);
@@ -3847,5 +3854,256 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
         Tensor::from_slice(&[0.0, 1.0, 2.0], [batch.of(1), feature.of(3)], &device)?;
     assert!(Tensor::concat(&[a.clone(), b.clone(), mismatched_batch], feature).is_err());
     println!("concat values, gradients, and composed-path cross-check PASS");
+    Ok(())
+}
+
+#[test]
+fn max_pool_rejects_invalid_configuration_before_launch() {
+    let (channel, height, width, depth) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+    let shape = Shape::new([channel.of(2), height.of(4), width.of(4)]).unwrap();
+
+    // Padding more than half the kernel extent: PyTorch's own `MaxPool2d` constraint, which
+    // also guarantees every window keeps at least one real, unpadded element.
+    let error = MaxPool2d::new(channel, [height, width], [2, 2])
+        .padding([2, 0])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("padding must be at most half"), "{error}");
+
+    // The channel axis cannot also be a spatial axis.
+    let error = MaxPool2d::new(channel, [channel, width], [2, 2])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("distinct"), "{error}");
+
+    // Kernel and stride extents must be positive.
+    let error = MaxPool2d::new(channel, [height, width], [0, 2])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("positive"), "{error}");
+    let error = MaxPool2d::new(channel, [height, width], [2, 2])
+        .stride([0, 1])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("positive"), "{error}");
+
+    // A kernel that does not fit even the padded extent is rejected.
+    let error = MaxPool2d::new(channel, [height, width], [9, 9])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("fit"), "{error}");
+
+    // The 3D entry point follows the same contract with its own three spatial axes.
+    let volume = Shape::new([channel.of(2), depth.of(3), height.of(4), width.of(4)]).unwrap();
+    let error = MaxPool3d::new(channel, [depth, height, width], [3, 3, 3])
+        .padding([0, 2, 0])
+        .output_shape(&volume)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("padding must be at most half"), "{error}");
+
+    // A well-formed configuration reports the expected output shape, purely from shape math
+    // (no device is needed: pooling has no parameters to build). Spatial axes are preserved in
+    // place at their pooled extent; the channel axis is appended, exactly as `Conv2d` appends
+    // its output-channel axis.
+    let pool = MaxPool2d::new(channel, [height, width], [2, 2]);
+    assert_eq!(
+        pool.output_shape(&shape).unwrap(),
+        Shape::new([height.of(2), width.of(2), channel.of(2)]).unwrap()
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool2d_matches_hand_computed_forward_and_gradient_with_remainder_and_ties() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    // Height 3 with kernel 2 / stride 2 leaves row 2 as an uncovered remainder (PyTorch's own
+    // default `ceil_mode=False` behavior). Channel 0's first window ties at 5.0; channel 1 has
+    // no ties, to check ordinary gradient routing too.
+    #[rustfmt::skip]
+    let inputs: [f32; 24] = [
+        1.0, 5.0, 2.0, 6.0,
+        5.0, 3.0, 6.0, 0.5,
+        9.0, 9.0, 9.0, 9.0,
+
+        -1.0, -2.0, -3.0, -4.0,
+        -5.0, -0.5, -6.0, -7.0,
+        0.0, 0.0, 0.0, 0.0,
+    ];
+    let input = Tensor::from_slice(&inputs, [channel.of(2), height.of(3), width.of(4)], &device)?
+        .with_grad();
+
+    let mut pool = MaxPool2d::new(channel, [height, width], [2, 2]);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    // Spatial axes are preserved in place at their pooled extent; the channel axis is appended,
+    // exactly as `Conv2d` appends its output-channel axis.
+    assert_eq!(
+        output_shape,
+        Shape::new([height.of(1), width.of(2), channel.of(2)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "MaxPool2d forward",
+        &actual.to_vec()?,
+        &[5.0, -0.5, 6.0, -3.0],
+    );
+
+    actual.mean([channel, height, width])?.backward()?;
+    #[rustfmt::skip]
+    let expected_gradient: [f64; 24] = [
+        0.0, 0.25, 0.0, 0.25,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+
+        0.0, 0.0, 0.25, 0.0,
+        0.0, 0.25, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+    ];
+    close(
+        "MaxPool2d gradient (ties route to the first logical coordinate, the remainder row gets none)",
+        &input.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool2d_with_padding_matches_hand_computed_forward_and_sums_overlapping_gradients()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    // Kernel 3 / stride 1 / padding 1 ("same" padding), the exact convention `morpheus`'s
+    // peak-NMS decode and `gastric`'s morphological dilation both use. Every value is negative,
+    // so a stray zero-fill at a padded position (instead of negative infinity) would win the
+    // corner windows incorrectly and this oracle would fail.
+    #[rustfmt::skip]
+    let inputs: [f32; 9] = [
+        -1.0, -9.0, -2.0,
+        -8.0, -7.0, -9.0,
+        -3.0, -9.0, -4.0,
+    ];
+    let input = Tensor::from_slice(&inputs, [channel.of(1), height.of(3), width.of(3)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+
+    let mut pool = MaxPool2d::new(channel, [height, width], [3, 3])
+        .stride([1, 1])
+        .padding([1, 1]);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([height.of(3), width.of(3), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    #[rustfmt::skip]
+    let expected: [f64; 9] = [
+        -1.0, -1.0, -2.0,
+        -1.0, -1.0, -2.0,
+        -3.0, -3.0, -4.0,
+    ];
+    close("padded MaxPool2d forward", &actual.to_vec()?, &expected);
+
+    actual.mean([channel, height, width])?.backward()?;
+    // Source (0, 0) wins four overlapping windows, (0, 2) and (2, 0) each win two, and (2, 2)
+    // wins one; `unfold`'s col2im backward must sum every overlapping contribution exactly.
+    #[rustfmt::skip]
+    let expected_gradient: [f64; 9] = [
+        4.0 / 9.0, 0.0, 2.0 / 9.0,
+        0.0, 0.0, 0.0,
+        2.0 / 9.0, 0.0, 1.0 / 9.0,
+    ];
+    close(
+        "padded MaxPool2d gradient (overlapping windows sum onto their shared source)",
+        &input.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool3d_matches_gastric_kernel_and_sums_overlapping_gradients_per_channel() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    // `gastric`'s `interface_region_masks_3d` dilation: kernel (1, 3, 3), stride 1,
+    // padding (0, 1, 1) -- depth is a pure pass-through (no depth reduction, no depth padding),
+    // and each channel pools independently. Channel 1 repeats channel 0's grid shifted by -100
+    // so it shares the same argmax pattern under a different absolute scale.
+    #[rustfmt::skip]
+    let inputs: [f32; 18] = [
+        -1.0, -9.0, -2.0,
+        -8.0, -7.0, -9.0,
+        -3.0, -9.0, -4.0,
+
+        -101.0, -109.0, -102.0,
+        -108.0, -107.0, -109.0,
+        -103.0, -109.0, -104.0,
+    ];
+    let input = Tensor::from_slice(
+        &inputs,
+        [channel.of(2), depth.of(1), height.of(3), width.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let mut pool = MaxPool3d::new(channel, [depth, height, width], [1, 3, 3])
+        .stride([1, 1, 1])
+        .padding([0, 1, 1]);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    // Spatial axes stay in place at their pooled extent; the channel axis is appended.
+    assert_eq!(
+        output_shape,
+        Shape::new([depth.of(1), height.of(3), width.of(3), channel.of(2)])?
+    );
+    let actual = pool.forward(&input)?;
+    #[rustfmt::skip]
+    let expected: [f64; 18] = [
+        -1.0, -101.0,   -1.0, -101.0,   -2.0, -102.0,
+        -1.0, -101.0,   -1.0, -101.0,   -2.0, -102.0,
+        -3.0, -103.0,   -3.0, -103.0,   -4.0, -104.0,
+    ];
+    close("MaxPool3d forward", &actual.to_vec()?, &expected);
+
+    actual.mean([channel, depth, height, width])?.backward()?;
+    #[rustfmt::skip]
+    let expected_gradient: [f64; 18] = [
+        4.0 / 18.0, 0.0, 2.0 / 18.0,
+        0.0, 0.0, 0.0,
+        2.0 / 18.0, 0.0, 1.0 / 18.0,
+
+        4.0 / 18.0, 0.0, 2.0 / 18.0,
+        0.0, 0.0, 0.0,
+        2.0 / 18.0, 0.0, 1.0 / 18.0,
+    ];
+    close(
+        "MaxPool3d gradient (each channel pools independently)",
+        &input.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
     Ok(())
 }

@@ -48,6 +48,7 @@ struct UnfoldPlanKey {
     stride: [usize; 3],
     padding: [usize; 3],
     group: Option<Dim>,
+    fill_bits: u32,
 }
 
 thread_local! {
@@ -1326,12 +1327,15 @@ impl Tensor {
         patch: Dim,
         kernel: [usize; 2],
     ) -> Result<Self> {
-        self.unfold_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0])
+        self.unfold_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0], 0.0)
     }
 
-    /// Lower a configured 2D or 3D convolution to grouped patches. The group
+    /// Lower a configured 2D or 3D convolution or pooling op to grouped patches. The group
     /// and patch axes are appended so merging grouped output channels restores
     /// convolution's public rule that output channels are the final logical axis.
+    /// `fill` is written at every patch position outside the input (padding); convolution
+    /// passes `0.0`, and windowed max pooling passes `f32::NEG_INFINITY` so a padded position
+    /// can never win the reduction.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn unfold_grouped<const N: usize>(
         &self,
@@ -1342,6 +1346,7 @@ impl Tensor {
         kernel: [usize; N],
         stride: [usize; N],
         padding: [usize; N],
+        fill: f32,
     ) -> Result<Self> {
         self.unfold_configured(
             channels,
@@ -1351,6 +1356,7 @@ impl Tensor {
             kernel,
             stride,
             padding,
+            fill,
         )
     }
 
@@ -1364,8 +1370,12 @@ impl Tensor {
         kernel: [usize; N],
         stride: [usize; N],
         padding: [usize; N],
+        fill: f32,
     ) -> Result<Self> {
         let name = format!("unfold{N}d");
+        if !fill.is_finite() && fill != f32::NEG_INFINITY {
+            return Err(format!("{name} fill must be finite or negative infinity").into());
+        }
         if !(N == 2 || N == 3) {
             return Err("Axis unfold supports exactly two or three spatial axes".into());
         }
@@ -1463,6 +1473,7 @@ impl Tensor {
             stride: stride_key,
             padding: padding_key,
             group,
+            fill_bits: fill.to_bits(),
         };
         let mut output_order = vec![];
         if let Some(group) = group {
@@ -1580,6 +1591,7 @@ impl Tensor {
             forward_metadata,
             backward_metadata,
             channels_per_group: to_i32(channels_per_group)?,
+            fill,
             kernel: kernel_spec,
             stride: stride_spec,
             padding: padding_spec,
