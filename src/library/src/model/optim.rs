@@ -159,6 +159,22 @@ impl Adam {
     pub fn completed_steps(&self) -> i32 {
         self.step
     }
+
+    /// Overwrite the base learning rate used by the next [`Adam::step`]. Call
+    /// it once per step from a schedule value such as [`cosine_annealing_lr`]
+    /// or [`one_cycle_lr`] before stepping, mirroring PyTorch's
+    /// `optimizer.param_groups[...]['lr'] = value` scheduler pattern.
+    ///
+    /// Has no effect on a parameter whose rate instead comes from
+    /// [`Adam::with_axis_learning_rates`]: that per-axis buffer replaces the
+    /// scalar rate entirely for the elements it covers rather than scaling it.
+    pub fn set_learning_rate(&mut self, learning_rate: f32) -> Result<()> {
+        if !learning_rate.is_finite() || learning_rate <= 0.0 {
+            return Err("Adam learning rate must be finite and positive".into());
+        }
+        self.learning_rate = learning_rate;
+        Ok(())
+    }
 }
 
 /// Adam with decoupled weight decay; moments and updates remain device-resident.
@@ -187,6 +203,12 @@ impl AdamW {
 
     pub fn completed_steps(&self) -> i32 {
         self.0.completed_steps()
+    }
+
+    /// Overwrite the base learning rate used by the next [`AdamW::step`]. See
+    /// [`Adam::set_learning_rate`].
+    pub fn set_learning_rate(&mut self, learning_rate: f32) -> Result<()> {
+        self.0.set_learning_rate(learning_rate)
     }
 }
 
@@ -220,6 +242,122 @@ impl SGD {
         }
         Ok(())
     }
+
+    /// Overwrite the learning rate used by the next [`SGD::step`]. Call it
+    /// once per step from a schedule value such as [`cosine_annealing_lr`] or
+    /// [`one_cycle_lr`] before stepping.
+    pub fn set_learning_rate(&mut self, learning_rate: f32) -> Result<()> {
+        if !learning_rate.is_finite() || learning_rate <= 0.0 {
+            return Err("learning rate must be finite and positive".into());
+        }
+        self.learning_rate = learning_rate;
+        Ok(())
+    }
+}
+
+/// Cosine-annealed learning rate at `step` (0-indexed), matching PyTorch's
+/// `CosineAnnealingLR` closed form
+/// (<https://docs.pytorch.org/docs/2.14/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html>):
+///
+/// ```text
+/// eta_t = eta_min + (eta_max - eta_min) * (1 + cos(pi * step / t_max)) / 2
+/// ```
+///
+/// `eta_max` is the rate at `step == 0`; `eta_t == eta_min` at `step ==
+/// t_max`. Axis exposes the bare value function rather than PyTorch's
+/// stateful scheduler object: a caller drives an optimizer with it by
+/// calling [`SGD::set_learning_rate`], [`Adam::set_learning_rate`], or
+/// [`AdamW::set_learning_rate`] once per step, before that step's update.
+/// The formula is periodic in `step` with period `2 * t_max` exactly as
+/// PyTorch's own closed form is: stepping past `t_max` continues the same
+/// cosine arc back up toward `eta_max` rather than holding `eta_min`. Pass
+/// `step < t_max` for a single anneal, matching the three cited consumers'
+/// `CosineAnnealingLR(optimizer, total_steps, eta_min=...)` usage, which
+/// never schedules past its own `total_steps`.
+pub fn cosine_annealing_lr(eta_max: f32, eta_min: f32, t_max: u32, step: u32) -> Result<f32> {
+    if !eta_max.is_finite() || eta_max <= 0.0 {
+        return Err("cosine annealing eta_max must be finite and positive".into());
+    }
+    if !eta_min.is_finite() || eta_min < 0.0 {
+        return Err("cosine annealing eta_min must be finite and nonnegative".into());
+    }
+    if eta_min > eta_max {
+        return Err("cosine annealing eta_min must not exceed eta_max".into());
+    }
+    if t_max == 0 {
+        return Err("cosine annealing t_max must be positive".into());
+    }
+    let progress = f64::from(step) / f64::from(t_max);
+    let cosine = (std::f64::consts::PI * progress).cos();
+    let value = f64::from(eta_min) + f64::from(eta_max - eta_min) * (1.0 + cosine) / 2.0;
+    Ok(value as f32)
+}
+
+/// PyTorch's own defaults for [`one_cycle_lr`]: `pct_start=0.3`,
+/// `div_factor=25`, `final_div_factor=1e4`, `anneal_strategy="cos"`,
+/// `three_phase=False`. None of the three sampled consumer call sites
+/// (`render`, `gastric`, `morpheus`) override any of them; Axis exposes only
+/// what they exercise rather than the full `OneCycleLR` knob surface.
+const ONE_CYCLE_PCT_START: f64 = 0.3;
+const ONE_CYCLE_DIV_FACTOR: f64 = 25.0;
+const ONE_CYCLE_FINAL_DIV_FACTOR: f64 = 1e4;
+
+/// One-cycle learning rate at `step` (0-indexed of `total_steps`), matching
+/// PyTorch's `OneCycleLR` at its own defaults
+/// (<https://docs.pytorch.org/docs/2.14/generated/torch.optim.lr_scheduler.OneCycleLR.html>):
+/// a cosine warmup from `max_lr / div_factor` up to `max_lr` over the first
+/// `pct_start` fraction of `total_steps`, then a cosine anneal down to
+/// `max_lr / div_factor / final_div_factor`. PyTorch's own closed form
+/// (`torch/optim/lr_scheduler.py`, `_annealing_cos` and `OneCycleLR.get_lr`):
+///
+/// ```text
+/// annealing_cos(start, end, pct) = end + (start - end) / 2 * (cos(pi * pct) + 1)
+/// step_size_up   = pct_start * total_steps - 1
+/// step_size_down = (total_steps - 1) - step_size_up
+/// lr(step) = annealing_cos(initial_lr, max_lr, step / step_size_up)                if step <= step_size_up
+///          = annealing_cos(max_lr, min_lr, (step - step_size_up) / step_size_down) otherwise
+/// ```
+///
+/// Call [`SGD::set_learning_rate`], [`Adam::set_learning_rate`], or
+/// [`AdamW::set_learning_rate`] with the result once per step, before that
+/// step's update. `step` must be strictly less than `total_steps`, matching
+/// PyTorch's own "Tried to step ... but the specified number of total steps
+/// ..." guard against scheduling past the cycle.
+pub fn one_cycle_lr(max_lr: f32, total_steps: u32, step: u32) -> Result<f32> {
+    if !max_lr.is_finite() || max_lr <= 0.0 {
+        return Err("one-cycle max_lr must be finite and positive".into());
+    }
+    if total_steps < 2 {
+        return Err("one-cycle total_steps must be at least 2".into());
+    }
+    if step >= total_steps {
+        return Err(
+            format!("one-cycle step {step} is out of range for {total_steps} total steps").into(),
+        );
+    }
+    let max_lr = f64::from(max_lr);
+    let total_steps = f64::from(total_steps);
+    let step = f64::from(step);
+    let initial_lr = max_lr / ONE_CYCLE_DIV_FACTOR;
+    let min_lr = initial_lr / ONE_CYCLE_FINAL_DIV_FACTOR;
+    let step_size_up = ONE_CYCLE_PCT_START * total_steps - 1.0;
+    let step_size_down = (total_steps - 1.0) - step_size_up;
+    if step_size_up <= 0.0 || step_size_down <= 0.0 {
+        return Err(
+            "one-cycle total_steps is too small for the default 0.3 warmup fraction".into(),
+        );
+    }
+    let value = if step <= step_size_up {
+        annealing_cos(initial_lr, max_lr, step / step_size_up)
+    } else {
+        annealing_cos(max_lr, min_lr, (step - step_size_up) / step_size_down)
+    };
+    Ok(value as f32)
+}
+
+fn annealing_cos(start: f64, end: f64, pct: f64) -> f64 {
+    let cos_out = (std::f64::consts::PI * pct).cos() + 1.0;
+    end + (start - end) / 2.0 * cos_out
 }
 
 const NEWTON_SCHULZ_A: f32 = 3.4445;
@@ -600,6 +738,46 @@ mod tests {
         assert!(AdamW::new(f32::NAN, 0.0).is_err());
         assert!(AdamW::new(0.001, f32::INFINITY).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn set_learning_rate_rejects_invalid_values_on_every_optimizer() -> Result<()> {
+        assert!(SGD::new(0.1)?.set_learning_rate(0.0).is_err());
+        assert!(SGD::new(0.1)?.set_learning_rate(f32::NAN).is_err());
+        assert!(SGD::new(0.1)?.set_learning_rate(-1.0).is_err());
+        assert!(SGD::new(0.1)?.set_learning_rate(0.5).is_ok());
+        assert!(Adam::new(0.1)?.set_learning_rate(0.0).is_err());
+        assert!(Adam::new(0.1)?.set_learning_rate(f32::INFINITY).is_err());
+        assert!(Adam::new(0.1)?.set_learning_rate(0.5).is_ok());
+        assert!(AdamW::new(0.1, 0.0)?.set_learning_rate(0.0).is_err());
+        assert!(AdamW::new(0.1, 0.0)?.set_learning_rate(f32::NAN).is_err());
+        assert!(AdamW::new(0.1, 0.0)?.set_learning_rate(0.5).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn cosine_annealing_lr_rejects_invalid_configurations() {
+        assert!(cosine_annealing_lr(0.0, 0.0, 4, 0).is_err());
+        assert!(cosine_annealing_lr(f32::NAN, 0.0, 4, 0).is_err());
+        assert!(cosine_annealing_lr(0.1, f32::NAN, 4, 0).is_err());
+        assert!(cosine_annealing_lr(0.1, -0.01, 4, 0).is_err());
+        assert!(cosine_annealing_lr(0.1, 0.2, 4, 0).is_err());
+        assert!(cosine_annealing_lr(0.1, 0.0, 0, 0).is_err());
+        assert!(cosine_annealing_lr(0.1, 0.0, 4, 0).is_ok());
+        assert!(cosine_annealing_lr(0.1, 0.1, 4, 0).is_ok());
+    }
+
+    #[test]
+    fn one_cycle_lr_rejects_invalid_configurations() {
+        assert!(one_cycle_lr(0.0, 10, 0).is_err());
+        assert!(one_cycle_lr(f32::NAN, 10, 0).is_err());
+        assert!(one_cycle_lr(1.0, 1, 0).is_err());
+        assert!(one_cycle_lr(1.0, 10, 10).is_err());
+        assert!(one_cycle_lr(1.0, 10, 11).is_err());
+        // step_size_up = 0.3 * total_steps - 1 must stay positive.
+        assert!(one_cycle_lr(1.0, 3, 0).is_err());
+        assert!(one_cycle_lr(1.0, 10, 0).is_ok());
+        assert!(one_cycle_lr(1.0, 10, 9).is_ok());
     }
 
     fn close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {

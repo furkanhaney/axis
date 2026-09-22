@@ -3291,3 +3291,109 @@ fn binary_alignment_of_permuted_layouts_matches_values_and_gradients() -> Result
     );
     Ok(())
 }
+
+#[test]
+fn cosine_annealing_lr_matches_pytorch_closed_form_at_exact_angles() -> Result<()> {
+    // torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=4, eta_min=0.0) from a base
+    // learning rate of 0.1: eta_t = eta_min + (eta_max - eta_min) * (1 + cos(pi * t / T_max)) / 2.
+    // Steps 0..=4 land exactly on cos(0), cos(pi/4), cos(pi/2), cos(3pi/4), cos(pi)
+    // = 1, sqrt(2)/2, 0, -sqrt(2)/2, -1 — well-known values, not approximated by the op
+    // under test.
+    let actual: Vec<f32> = (0u32..=4)
+        .map(|step| cosine_annealing_lr(0.1, 0.0, 4, step))
+        .collect::<Result<_>>()?;
+    close(
+        "cosine annealing at exact trig angles",
+        &actual,
+        &[0.1, 0.08535533905932738, 0.05, 0.014644660940672627, 0.0],
+    );
+    assert!(cosine_annealing_lr(0.1, 0.2, 4, 0).is_err());
+    assert!(cosine_annealing_lr(0.1, 0.0, 0, 0).is_err());
+    Ok(())
+}
+
+#[test]
+fn one_cycle_lr_matches_pytorch_default_schedule() -> Result<()> {
+    // torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1.0, total_steps=10) at PyTorch's
+    // own defaults (pct_start=0.3, div_factor=25, final_div_factor=1e4, anneal_strategy="cos"):
+    // step_size_up = 0.3*10 - 1 = 2, step_size_down = (10-1) - 2 = 7; initial_lr = 1/25 = 0.04,
+    // min_lr = 0.04/1e4 = 0.000004. Ten values, one per call to get_last_lr() after each
+    // .step(), computed independently from the same public closed form (not the op under
+    // test): warmup crosses exactly through max_lr at step 2 (the phase boundary), and the
+    // final value at step 9 is the exact rational 1/25/10000.
+    let actual: Vec<f32> = (0u32..10)
+        .map(|step| one_cycle_lr(1.0, 10, step))
+        .collect::<Result<_>>()?;
+    close(
+        "one-cycle default schedule",
+        &actual,
+        &[
+            0.040000000000000036,
+            0.52,
+            1.0,
+            0.9504846320134737,
+            0.8117456539497631,
+            0.6112620219362893,
+            0.38874197806371075,
+            0.18825834605023697,
+            0.049519367986526286,
+            0.000004,
+        ],
+    );
+    assert!(one_cycle_lr(1.0, 10, 10).is_err());
+    assert!(one_cycle_lr(1.0, 1, 0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn trainer_driven_sgd_consumes_a_cosine_annealing_schedule_each_step() -> Result<()> {
+    // The consumer's own training loop shape: call the pure schedule function, hand the
+    // result to the optimizer's setter, then let Trainer::step order zero_grad/loss/
+    // backward/optimizer.step as usual. This is the end-to-end witness that Trainer and SGD
+    // actually consume the scheduled rate, not just that the schedule function is correct in
+    // isolation (that is covered independently above).
+    struct ConstantGradientParameter(Parameter);
+    impl Module for ConstantGradientParameter {
+        fn output_shape(&self, input: &Shape) -> Result<Shape> {
+            Ok(input.clone())
+        }
+        fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+            Ok(input.clone())
+        }
+        fn forward(&self, _input: &Tensor) -> Result<Tensor> {
+            Ok(self.0.tensor())
+        }
+        fn named_parameters(&self) -> Vec<(String, Parameter)> {
+            vec![("weight".into(), self.0.clone())]
+        }
+    }
+
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let parameter = Parameter::new(Tensor::from_slice(&[1.0, 2.0], [feature.of(2)], &device)?);
+    let dummy = Tensor::from_slice(&[0.0, 0.0], [feature.of(2)], &device)?;
+    let mut model = ConstantGradientParameter(parameter.clone());
+    let mut trainer = Trainer::new(SGD::new(1.0)?);
+
+    // eta_max=0.5, eta_min=0.1, t_max=2: step 0 -> 0.5 (cos(0)=1), step 1 -> 0.3 (cos(pi/2)=0).
+    let mut expected = [1.0_f64, 2.0_f64];
+    for step in 0..2u32 {
+        let rate = cosine_annealing_lr(0.5, 0.1, 2, step)?;
+        trainer.optimizer_mut().set_learning_rate(rate)?;
+        trainer.step(&mut model, |model| model.forward(&dummy)?.mean(feature))?;
+        // The identity forward's mean over 2 elements has a constant gradient of 1/2 per
+        // element regardless of the parameter's value, so the expected update is exact
+        // arithmetic independent of both the schedule and SGD implementations.
+        for value in &mut expected {
+            *value -= f64::from(rate) * 0.5;
+        }
+        close(
+            &format!("trainer-driven SGD step {step} at scheduled rate {rate}"),
+            &parameter.tensor().to_vec()?,
+            &expected,
+        );
+    }
+    assert_eq!(trainer.completed_steps(), 2);
+    Ok(())
+}
