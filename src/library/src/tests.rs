@@ -4854,3 +4854,105 @@ fn seeded_uniform_and_normal_tensors_build_named_axis_tensors_with_no_gradient_e
     println!("seeded uniform/normal tensor construction PASS");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adamw_with_hyperparameters_matches_hand_computed_two_step_update() -> Result<()> {
+    // Independent scalar oracle for issue #82 (AdamW's public constructor could not express a
+    // non-default beta2, blocking upscale_eval's SwinIR trainer, which uses betas=(0.9, 0.99)).
+    // lr=0.1, weight_decay=0.1, beta1=0.8, beta2=0.9, epsilon=1e-8, theta0=1.0, constant
+    // gradient g=0.4 every step. epsilon's ~1e-8 contribution to each denominator is far below
+    // this test's tolerance and is omitted from the arithmetic below.
+    //
+    // step 1:
+    //   m1 = (1 - beta1) * g              = 0.2 * 0.4   = 0.08
+    //   v1 = (1 - beta2) * g^2            = 0.1 * 0.16  = 0.016
+    //   mhat1 = m1 / (1 - beta1^1)        = 0.08 / 0.2  = 0.4
+    //   vhat1 = v1 / (1 - beta2^1)        = 0.016 / 0.1 = 0.16
+    //   decayed0 = theta0 * (1 - lr*wd)   = 1.0 * 0.99  = 0.99
+    //   theta1 = decayed0 - lr*mhat1/sqrt(vhat1) = 0.99 - 0.1*(0.4/0.4) = 0.89
+    // step 2 (g=0.4 again):
+    //   m2 = beta1*m1 + (1-beta1)*g       = 0.8*0.08 + 0.2*0.4   = 0.144
+    //   v2 = beta2*v1 + (1-beta2)*g^2     = 0.9*0.016 + 0.1*0.16 = 0.0304
+    //   mhat2 = m2 / (1 - beta1^2)        = 0.144 / 0.36 = 0.4
+    //   vhat2 = v2 / (1 - beta2^2)        = 0.0304 / 0.19 = 0.16
+    //   decayed1 = theta1 * (1 - lr*wd)   = 0.89 * 0.99  = 0.8811
+    //   theta2 = decayed1 - lr*mhat2/sqrt(vhat2) = 0.8811 - 0.1*(0.4/0.4) = 0.7811
+    let device = Device::cuda(0)?;
+    let unit = Axis::new("unit");
+    let parameter = Parameter::new(Tensor::from_slice(&[1.0], [unit.of(1)], &device)?);
+    let coefficient = Tensor::from_slice(&[0.4], [unit.of(1)], &device)?;
+    let mut adamw = AdamW::with_hyperparameters(0.1, 0.1, 0.8, 0.9, 1e-8)?;
+    for expected in [0.89_f64, 0.7811_f64] {
+        parameter
+            .tensor()
+            .mul(&coefficient)?
+            .mean(unit)?
+            .backward()?;
+        adamw.step_parameters([parameter.clone()])?;
+        close(
+            "AdamW hand-computed non-default-beta update",
+            &parameter.tensor().to_vec()?,
+            &[expected],
+        );
+        parameter.zero_grad();
+    }
+    assert_eq!(adamw.completed_steps(), 2);
+
+    // Validation mirrors Adam::with_hyperparameters exactly (same finite/range checks, in the
+    // same argument order), plus AdamW's own weight-decay check.
+    assert!(AdamW::with_hyperparameters(0.0, 0.0, 0.9, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(f32::NAN, 0.0, 0.9, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 1.0, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 0.9, 1.0, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 0.9, 0.999, 0.0).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, -0.1, 0.9, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 0.9, 0.99, 1e-8).is_ok());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adamw_new_matches_with_hyperparameters_at_defaults_bit_exactly() -> Result<()> {
+    // AdamW::new(lr, weight_decay) must stay byte-identical to before #82: it now forwards to
+    // with_hyperparameters at Adam's own defaults (beta1=0.9, beta2=0.999, epsilon=1e-8), so the
+    // two must drive an identical parameter to the same bits, not merely within tolerance.
+    let device = Device::cuda(0)?;
+    let unit = Axis::new("unit");
+    let make_parameter = |value: f32| -> Result<Parameter> {
+        Ok(Parameter::new(Tensor::from_slice(
+            &[value],
+            [unit.of(1)],
+            &device,
+        )?))
+    };
+    let coefficient = Tensor::from_slice(&[0.3], [unit.of(1)], &device)?;
+    let default_parameter = make_parameter(1.0)?;
+    let explicit_parameter = make_parameter(1.0)?;
+    let mut default_adamw = AdamW::new(0.05, 0.02)?;
+    let mut explicit_adamw = AdamW::with_hyperparameters(0.05, 0.02, 0.9, 0.999, 1e-8)?;
+
+    for _ in 0..3 {
+        for parameter in [&default_parameter, &explicit_parameter] {
+            parameter
+                .tensor()
+                .mul(&coefficient)?
+                .mean(unit)?
+                .backward()?;
+        }
+        default_adamw.step_parameters([default_parameter.clone()])?;
+        explicit_adamw.step_parameters([explicit_parameter.clone()])?;
+        assert_eq!(
+            default_parameter.tensor().to_vec()?,
+            explicit_parameter.tensor().to_vec()?,
+            "AdamW::new must stay bit-exact with AdamW::with_hyperparameters at its own defaults"
+        );
+        default_parameter.zero_grad();
+        explicit_parameter.zero_grad();
+    }
+    assert_eq!(
+        default_adamw.completed_steps(),
+        explicit_adamw.completed_steps()
+    );
+    Ok(())
+}
