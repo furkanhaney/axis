@@ -3974,7 +3974,9 @@ fn named_axis_bilinear_upsample_matches_hand_computed_values_and_mass_conserving
     )?
     .with_grad();
 
-    let resized = x.resample_bilinear(height, 4)?.resample_bilinear(width, 6)?;
+    let resized = x
+        .resample_bilinear(height, 4)?
+        .resample_bilinear(width, 6)?;
     assert_eq!(resized.shape(), &Shape::new([height.of(4), width.of(6)])?);
     close(
         "bilinear upsample values",
@@ -4009,8 +4011,7 @@ fn named_axis_bilinear_upsample_matches_hand_computed_values_and_mass_conserving
 
 #[test]
 #[ignore = "requires CUDA"]
-fn named_axis_bilinear_upsample_matches_a_reordered_storage_weighted_gradient_case() -> Result<()>
-{
+fn named_axis_bilinear_upsample_matches_a_reordered_storage_weighted_gradient_case() -> Result<()> {
     // A second, independently-derived gradient check (the raw per-element
     // transpose-weight sum, unlike the mass-conservation shortcut above) on
     // a tensor whose physical storage is permuted relative to its declared
