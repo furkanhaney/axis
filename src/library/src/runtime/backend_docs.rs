@@ -154,6 +154,10 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn sign(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn binary_cross_entropy(
         &self,
         _logits: &Buffer,

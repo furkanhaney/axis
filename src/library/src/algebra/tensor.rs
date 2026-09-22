@@ -929,6 +929,28 @@ impl Tensor {
             None,
         ))
     }
+    /// Elementwise sign quantization to `{-1, +1}` with a straight-through backward.
+    ///
+    /// Forward: `+1` where `x > 0`, otherwise `-1`, so `x == 0` maps to `-1`. This
+    /// reproduces bae's `bitae.quantize` two-level branch,
+    /// `torch.where(z > 0, 1.0, -1.0)`, rather than `torch.sign`, which would give
+    /// exactly `0` at `x == 0`. Backward passes the upstream gradient through
+    /// unchanged (the straight-through estimator, `Rule::Identity`), matching
+    /// `z + (hard - z).detach()` in the same reference: the hard threshold has no
+    /// gradient of its own, so the whole local Jacobian is the identity. Output
+    /// has the same [`Shape`] as the input.
+    pub fn sign_straight_through(&self) -> Result<Self> {
+        let value = self.device().sign(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Identity)],
+            false,
+            None,
+        ))
+    }
     /// Elementwise `(x + epsilon)^-1/2`; inputs plus epsilon must be positive.
     pub fn inverse_sqrt(&self, epsilon: f32) -> Result<Self> {
         if !epsilon.is_finite() || epsilon <= 0.0 {

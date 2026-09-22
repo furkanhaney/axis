@@ -554,6 +554,23 @@ impl Module for Tanh {
     }
 }
 
+/// Parameter-free sign quantization to `{-1, +1}` with a straight-through
+/// backward. See [`Tensor::sign_straight_through`] for the exact forward and
+/// backward semantics this reproduces from bae's `bitae.quantize`.
+#[derive(Clone, Copy)]
+pub struct SignStraightThrough;
+impl Module for SignStraightThrough {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.sign_straight_through()
+    }
+}
+
 pub trait IntoLayers {
     fn into_layers(self) -> Vec<Box<dyn Module>>;
 }
