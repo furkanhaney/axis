@@ -101,6 +101,11 @@ enum Rule {
     Multiply(Buffer),
     Relu(Buffer),
     Sigmoid(Buffer),
+    Silu(Buffer),
+    LeakyRelu {
+        input: Buffer,
+        negative_slope: f32,
+    },
     Tanh(Buffer),
     Sin(Buffer),
     Gelu(Buffer),
@@ -884,22 +889,41 @@ impl Tensor {
         ))
     }
     /// Elementwise sigmoid linear unit, `x * sigmoid(x)`.
-    ///
-    /// This is composed from the same verified elementwise primitives used by
-    /// the rest of the graph, so reverse mode preserves named axes and layout.
     pub fn silu(&self) -> Result<Self> {
-        self.mul(&self.sigmoid()?)
+        let value = self.device().silu(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Silu(self.0.value.clone()))],
+            false,
+            None,
+        ))
     }
 
     /// Elementwise leaky ReLU with an explicit finite, non-negative slope.
-    /// Its derivative at exactly zero is zero, matching Axis's compositional
-    /// ReLU convention.
+    /// Its derivative at exactly zero is the negative slope, matching PyTorch.
     pub fn leaky_relu(&self, negative_slope: f32) -> Result<Self> {
         if !negative_slope.is_finite() || negative_slope < 0.0 {
             return Err("leaky_relu negative slope must be finite and non-negative".into());
         }
-        self.relu()?
-            .add(&self.scale(-1.0)?.relu()?.scale(-negative_slope)?)
+        let value = self.device().leaky_relu(&self.0.value, negative_slope)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::LeakyRelu {
+                    input: self.0.value.clone(),
+                    negative_slope,
+                },
+            )],
+            false,
+            None,
+        ))
     }
     /// Elementwise hyperbolic tangent.
     pub fn tanh(&self) -> Result<Self> {
@@ -2182,6 +2206,14 @@ impl Tensor {
                         Rule::Relu(x) => self.device().relu_backward(&gradient, x)?,
                         Rule::Sigmoid(probability) => {
                             self.device().sigmoid_backward(&gradient, probability)?
+                        }
+                        Rule::Silu(input) => self.device().silu_backward(&gradient, input)?,
+                        Rule::LeakyRelu {
+                            input,
+                            negative_slope,
+                        } => {
+                            self.device()
+                                .leaky_relu_backward(&gradient, input, *negative_slope)?
                         }
                         Rule::Tanh(output) => self.device().tanh_backward(&gradient, output)?,
                         Rule::Sin(input) => self.device().sin_backward(&gradient, input)?,

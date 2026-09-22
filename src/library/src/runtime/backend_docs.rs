@@ -88,6 +88,27 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn silu(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn silu_backward(&self, _gradient: &Buffer, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn leaky_relu(&self, _a: &Buffer, _negative_slope: f32) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn leaky_relu_backward(
+        &self,
+        _gradient: &Buffer,
+        _a: &Buffer,
+        _negative_slope: f32,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn tanh(&self, _a: &Buffer) -> Result<Buffer> {
         unavailable()
     }
