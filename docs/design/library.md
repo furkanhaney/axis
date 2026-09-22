@@ -198,6 +198,31 @@ whole local Jacobian is the straight-through pass-through, `Rule::Identity`.
 Axis leaves any squashing (bae applies `tanh` first) to the caller rather than
 folding it into this op, matching bae's own composition of the two steps.
 
+`Tensor::uniform(dims, seed, low, high, device)` and `Tensor::normal(dims,
+seed, mean, std, device)` are the public, seeded random tensor constructors:
+`world/energy-output` needs a fresh reproducible Bernoulli mask drawn every
+epoch from one seed, and `world/fluid` needs seeded Gaussian noise added to
+training inputs. Both draw from the same shared xorshift64 stream that
+`Linear`/`Embedding`/`PositionEmbedding` initialization already uses
+(`model/nn.rs`'s `uniform_values`, itself now a thin wrapper over the shared
+`crate::tensor::xorshift_unit_stream`), so a seed reproduces bit-exact values
+everywhere it is used, on any run or machine. `uniform` rescales each raw
+`[0, 1)` sample to `[low, high)`; `normal` consumes successive raw pairs
+`(u1, u2)` through the Box-Muller transform, `z0 = sqrt(-2 * ln(1 - u1)) *
+cos(2*pi*u2)`, `z1 = sqrt(-2 * ln(1 - u1)) * sin(2*pi*u2)`, each scaled to
+`mean + std * z`; an odd element count drops the unused second value of the
+final pair. Using `1 - u1` rather than `u1` keeps the logarithm defined on
+the shared stream's documented first-sample-exactly-zero seeds, at the cost
+of collapsing that pair's first two normal draws to exactly `mean`. Both
+constructors generate their values host-side, then upload them exactly like
+`Tensor::from_slice` — the simplest honest implementation, and adequate for
+the small per-epoch draws both consumers need. A random draw has no upstream
+input, so neither constructor produces a gradient edge; it is a constant a
+program can then compose with `mul`/`add` like any other tensor, not a
+trainable parameter. Neither is dropout (a train/eval-mode masking module,
+tracked separately) or an `RNG`-state object: each call is deterministic in
+its seed alone, with no mutable generator to advance or restore.
+
 `DataLoader` batches any `DataSource` and checks its regime before releasing a
 batch. Finite `InMemoryDataset` sources report corpus size; generated sources
 such as `AdditionDataset` do not invent one. Each guarded batch carries a
@@ -379,6 +404,7 @@ provenance contract; reading a file is not itself a research guarantee.
 | `x.min(axis)` | Remove one named axis and preserve unrelated axes. Ignore NaN and infinities, choose the first logical coordinate on finite ties, and route backward only to that winner. A group with no finite value returns NaN with zero derivative even under a non-finite upstream derivative. Forward and backward remain device-resident. |
 | `x.max(axis)` | Exact mirror of `x.min(axis)`: same axis-removal contract, the same first-logical-coordinate tie rule, and the same NaN/zero-derivative empty-group behavior, over the maximum instead of the minimum. No `argmax`. |
 | Elementwise add/multiply/divide | Align shared identities with equal extents. Permit scalar or subset-axis broadcasting, such as a `[hidden]` bias on `[batch, hidden]`. `x.div(y)` applies no epsilon or clamping; division by zero yields IEEE `inf`/`nan`, as in PyTorch, and callers that need a safe denominator (such as a masked-mean count) must clamp it themselves before dividing. |
+| `x.gt(scalar)` / `.ge(scalar)` / `.lt(scalar)` / `.le(scalar)` / `.eq(scalar)` | Elementwise comparison against a scalar into a `{0.0, 1.0}` mask, IEEE-ordered so any comparison against `NaN` is `false`. Axis is floating point only, so this is the boolean dtype: no separate bool tensor exists. The mask carries no autograd edge at all -- not even a zero one -- matching PyTorch, where comparisons are non-differentiable; a downstream `x.mul(&mask)` still differentiates correctly with respect to `x`, treating the mask as a constant. Only the scalar form exists: every migrated consumer compares against a scalar, never against another tensor. `x.logical_and(&mask)` (`mul`) and `x.logical_not()` (`1 - x`) compose masks the way PyTorch's `&`/`~` do; logical OR has no named method since nothing calls it, but on 0/1 masks it is an elementwise maximum. |
 | Incomparable axis sets | Require explicit expansion. `[batch, time] + [batch, hidden]` must not silently create `[batch, time, hidden]`. |
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
