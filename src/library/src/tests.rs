@@ -5155,3 +5155,226 @@ fn seeded_uniform_and_normal_tensors_build_named_axis_tensors_with_no_gradient_e
     println!("seeded uniform/normal tensor construction PASS");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn argmin_matches_hand_computed_oracle_with_a_tie() -> Result<()> {
+    // image-encode's `stage_a.py` `hard_eval`: `torch.cdist(P, sites).argmin(1)` picks each
+    // pixel's nearest site. Eight pixels, three sites (`site` extent 3); pixel 3 is exactly
+    // equidistant from site 0 and site 1 (squared distances 25.0 and 25.0) and must resolve to
+    // site 0, the first logical coordinate, exactly matching `Tensor::min`'s own tie rule. Site
+    // 2 (a distant, never-nearest site) is never a winner, setting up the empty-bucket case the
+    // scatter-add/bincount tests below exercise.
+    let device = Device::cuda(0)?;
+    let (pixel, site) = (Axis::new("pixel"), Axis::new("site"));
+    #[rustfmt::skip]
+    let distances = Tensor::from_slice(
+        &[
+            0.0, 100.0, 10000.0,
+            1.0, 81.0, 10000.0,
+            81.0, 1.0, 10000.0,
+            25.0, 25.0, 10000.0, // tie: site 0 and site 1
+            4.0, 64.0, 10000.0,
+            64.0, 4.0, 10000.0,
+            9.0, 49.0, 10000.0,
+            49.0, 9.0, 10000.0,
+        ],
+        [pixel.of(8), site.of(3)],
+        &device,
+    )?;
+    assert_eq!(distances.argmin(site)?, vec![0, 0, 1, 0, 0, 1, 0, 1]);
+
+    // Reordered physical storage (site-major rather than pixel-major) must read the same
+    // logical values through the permuted strides, mirroring `gather`'s own reordered-storage
+    // coverage.
+    let reordered = distances.with_layout([site, pixel])?;
+    assert_eq!(reordered.argmin(site)?, vec![0, 0, 1, 0, 0, 1, 0, 1]);
+
+    let error = distances
+        .argmin(Axis::new("missing"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn argmin_errors_on_a_group_with_no_finite_candidate() -> Result<()> {
+    // usize cannot name "no winner", so unlike `min` (which returns NaN), a group with no
+    // finite candidate at all is an error rather than a silently meaningless index.
+    let device = Device::cuda(0)?;
+    let (row, candidate) = (Axis::new("row"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            3.0,
+            f32::NAN,
+            2.0,
+        ],
+        [row.of(2), candidate.of(3)],
+        &device,
+    )?;
+    let error = values.argmin(candidate).err().unwrap().to_string();
+    assert!(error.contains("no finite candidate"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn scatter_add_and_bincount_match_hand_computed_oracle_with_an_empty_bucket_and_gradient()
+-> Result<()> {
+    // image-encode's `stage_a.py` `hard_eval`: `torch.bincount(lab, minlength=k)` and
+    // `torch.zeros(k, 3).index_add_(0, lab, I)`, given the labels the argmin test above computed
+    // for the same eight pixels and three sites. Site 2 is picked by no pixel: its count and sum
+    // must come out exact zero, not an error.
+    let device = Device::cuda(0)?;
+    let (pixel, site, channel) = (Axis::new("pixel"), Axis::new("site"), Axis::new("channel"));
+    let labels = [0usize, 0, 1, 0, 0, 1, 0, 1];
+    #[rustfmt::skip]
+    let colours = Tensor::from_slice(
+        &[
+            1.0, 0.0, 0.0,
+            2.0, 0.0, 0.0,
+            0.0, 3.0, 0.0,
+            4.0, 0.0, 0.0,
+            5.0, 0.0, 0.0,
+            0.0, 6.0, 0.0,
+            7.0, 0.0, 0.0,
+            0.0, 8.0, 0.0,
+        ],
+        [pixel.of(8), channel.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let sums = colours.scatter_add(pixel, &labels, site, 3)?;
+    assert_eq!(sums.shape(), &Shape::new([site.of(3), channel.of(3)])?);
+    close(
+        "scatter-add per-site colour sums, including the empty site",
+        &sums.to_vec()?,
+        &[19.0, 0.0, 0.0, 0.0, 17.0, 0.0, 0.0, 0.0, 0.0],
+    );
+
+    let counts = Tensor::bincount(&labels, site, 3, &device)?;
+    assert_eq!(counts.shape(), &Shape::new([site.of(3)])?);
+    close(
+        "bincount, including the empty site",
+        &counts.to_vec()?,
+        &[5.0, 3.0, 0.0],
+    );
+    // "Mean colour per site" (`hard_eval`'s actual metric) is the caller's own division of
+    // `scatter_add`'s sum by `bincount`'s count, unclamped: site 2 divides 0.0 by 0.0, IEEE NaN,
+    // exactly as `x.div(y)` is documented to do with no built-in safe-denominator behaviour.
+    let sums_flat = sums.to_vec()?;
+    let counts_flat = counts.to_vec()?;
+    for (site_index, &count) in counts_flat.iter().enumerate() {
+        for channel_index in 0..3 {
+            let mean = sums_flat[site_index * 3 + channel_index] / count;
+            match site_index {
+                0 => {
+                    assert!((f64::from(mean) - [19.0 / 5.0, 0.0, 0.0][channel_index]).abs() < 1e-5)
+                }
+                1 => {
+                    assert!((f64::from(mean) - [0.0, 17.0 / 3.0, 0.0][channel_index]).abs() < 1e-5)
+                }
+                _ => assert!(
+                    mean.is_nan(),
+                    "empty site's unclamped mean is NaN, not zero"
+                ),
+            }
+        }
+    }
+
+    // A weighted reduction downstream makes the gradient test discriminate bucket routing: a
+    // transposed or misrouted backward would not reproduce this pattern the way a uniform
+    // upstream gradient could not catch.
+    #[rustfmt::skip]
+    let weights = Tensor::from_slice(
+        &[
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+            201.0, 211.0, 221.0,
+        ],
+        [site.of(3), channel.of(3)],
+        &device,
+    )?;
+    sums.mul(&weights)?.sum([site, channel])?.backward()?;
+    #[rustfmt::skip]
+    close(
+        "scatter-add gradient routes each pixel's own weighted bucket back to it",
+        &colours.grad().expect("colours gradient").to_vec()?,
+        &[
+            1.0, 11.0, 21.0,
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+            1.0, 11.0, 21.0,
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+            1.0, 11.0, 21.0,
+            101.0, 111.0, 121.0,
+        ],
+    );
+
+    // Rejected before any device work: a mismatched index length, an out-of-range bucket, a
+    // zero bucket count, and an axis this tensor does not have.
+    assert!(colours.scatter_add(pixel, &labels[..7], site, 3).is_err());
+    assert!(
+        colours
+            .scatter_add(pixel, &[0, 1, 2, 0, 0, 1, 0, 3], site, 3)
+            .is_err()
+    );
+    assert!(colours.scatter_add(pixel, &labels, site, 0).is_err());
+    assert!(
+        colours
+            .scatter_add(Axis::new("missing"), &labels, site, 3)
+            .is_err()
+    );
+    assert!(Tensor::bincount(&[], site, 3, &device).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn scatter_add_matches_hand_computed_oracle_under_reordered_pixel_storage() -> Result<()> {
+    // Same routing contract as the test above, this time with the source tensor's PHYSICAL
+    // storage transposed relative to its logical [pixel, channel] order (mirroring a value
+    // tensor copied through `with_layout`), so `scatter_add` must read through the permuted
+    // strides in `self.0.layout` rather than assume row-major storage -- exactly the case
+    // `gather_matches_hand_computed_oracle_under_reordered_table_storage` covers for `gather`.
+    let device = Device::cuda(0)?;
+    let (pixel, site, channel) = (Axis::new("pixel"), Axis::new("site"), Axis::new("channel"));
+    let values = Tensor::from_slice(
+        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [pixel.of(4), channel.of(2)],
+        &device,
+    )?
+    .with_layout([channel, pixel])?
+    .with_grad();
+
+    let labels = [1usize, 0, 1, 0];
+    let sums = values.scatter_add(pixel, &labels, site, 2)?;
+    close(
+        "reordered scatter-add forward",
+        &sums.to_vec()?,
+        &[10.0, 12.0, 6.0, 8.0],
+    );
+
+    let weights = Tensor::from_slice(
+        &[1000.0, 2000.0, 3000.0, 4000.0],
+        [site.of(2), channel.of(2)],
+        &device,
+    )?;
+    sums.mul(&weights)?.sum([site, channel])?.backward()?;
+    close(
+        "reordered scatter-add gradient",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[
+            3000.0, 4000.0, 1000.0, 2000.0, 3000.0, 4000.0, 1000.0, 2000.0,
+        ],
+    );
+    Ok(())
+}
