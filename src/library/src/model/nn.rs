@@ -492,6 +492,8 @@ impl Module for ReLU {
     }
 }
 
+/// Parameter-free tanh-form GELU. PyTorch's default `nn.GELU()` is the erf form,
+/// [`ExactGELU`]; a faithful port of an un-annotated PyTorch model uses that one.
 #[derive(Clone, Copy)]
 pub struct GELU;
 impl Module for GELU {
@@ -506,7 +508,8 @@ impl Module for GELU {
     }
 }
 
-/// Parameter-free erf-form GELU for checkpoints trained with exact GELU.
+/// Parameter-free erf-form GELU for checkpoints trained with exact GELU, which is
+/// PyTorch's default `nn.GELU()`.
 #[derive(Clone, Copy)]
 pub struct ExactGELU;
 impl Module for ExactGELU {
