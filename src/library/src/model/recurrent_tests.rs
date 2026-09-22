@@ -785,3 +785,672 @@ fn lstm_causality_streaming_layout_and_state_contracts() -> Result<()> {
     );
     Ok(())
 }
+
+/// Forward sequence and terminal hidden state shared by the RNN and GRU
+/// independent oracles below (neither family carries LSTM's separate cell
+/// state).
+struct SequenceReference {
+    sequence: Vec<f64>,
+    hidden: Vec<f64>,
+}
+
+// ---------------------------------------------------------------------
+// RNN (Elman)
+// ---------------------------------------------------------------------
+
+#[derive(Clone)]
+struct RnnCase {
+    input: Vec<f64>,
+    initial_hidden: Vec<f64>,
+    input_weight: Vec<f64>,
+    recurrent_weight: Vec<f64>,
+    bias: Vec<f64>,
+}
+
+fn rnn_case() -> RnnCase {
+    RnnCase {
+        input: vec![
+            0.2, -0.4, 0.7, 0.1, -0.3, 0.8, -0.6, 0.5, 0.9, -0.2, 0.4, 0.3,
+        ],
+        initial_hidden: vec![0.1, -0.2, 0.3, 0.05],
+        input_weight: vec![0.15, -0.2, 0.3, 0.1],
+        recurrent_weight: vec![-0.2, 0.1, 0.25, -0.35],
+        bias: vec![0.05, -0.1],
+    }
+}
+
+fn rnn_reference_step(
+    case: &RnnCase,
+    input: &[f64],
+    hidden: &mut [f64],
+    nonlinearity: fn(f64) -> f64,
+) {
+    let mut total = case.bias.clone();
+    for (input_feature, &input_value) in input.iter().enumerate() {
+        for (feature, value) in total.iter_mut().enumerate() {
+            *value += input_value * case.input_weight[input_feature * H + feature];
+        }
+    }
+    let previous = hidden.to_vec();
+    for (previous_feature, &previous_value) in previous.iter().enumerate() {
+        for (feature, value) in total.iter_mut().enumerate() {
+            *value += previous_value * case.recurrent_weight[previous_feature * H + feature];
+        }
+    }
+    for feature in 0..H {
+        hidden[feature] = nonlinearity(total[feature]);
+    }
+}
+
+fn rnn_reference(case: &RnnCase, nonlinearity: fn(f64) -> f64) -> SequenceReference {
+    let mut hidden = case.initial_hidden.clone();
+    let mut sequence = vec![0.0; B * T * H];
+    for batch in 0..B {
+        let mut h = hidden[batch * H..(batch + 1) * H].to_vec();
+        for step in 0..T {
+            let offset = (batch * T + step) * I;
+            rnn_reference_step(case, &case.input[offset..offset + I], &mut h, nonlinearity);
+            for feature in 0..H {
+                sequence[(batch * T + step) * H + feature] = h[feature];
+            }
+        }
+        hidden[batch * H..(batch + 1) * H].copy_from_slice(&h);
+    }
+    SequenceReference { sequence, hidden }
+}
+
+fn rnn_objective(case: &RnnCase, nonlinearity: fn(f64) -> f64) -> f64 {
+    let result = rnn_reference(case, nonlinearity);
+    let sequence_coefficients = [
+        0.2, -0.3, 0.5, 0.1, -0.4, 0.7, -0.6, 0.8, 0.25, -0.15, 0.45, -0.35,
+    ];
+    let hidden_coefficients = [0.3, -0.2, 0.6, 0.1];
+    result
+        .sequence
+        .iter()
+        .zip(sequence_coefficients)
+        .map(|(value, coefficient)| value * coefficient)
+        .sum::<f64>()
+        + result
+            .hidden
+            .iter()
+            .zip(hidden_coefficients)
+            .map(|(value, coefficient)| value * coefficient)
+            .sum::<f64>()
+}
+
+fn rnn_finite_difference(
+    case: &RnnCase,
+    nonlinearity: fn(f64) -> f64,
+    field: fn(&mut RnnCase) -> &mut Vec<f64>,
+) -> Vec<f64> {
+    let epsilon = 1e-5;
+    (0..field(&mut case.clone()).len())
+        .map(|index| {
+            let mut high = case.clone();
+            field(&mut high)[index] += epsilon;
+            let mut low = case.clone();
+            field(&mut low)[index] -= epsilon;
+            (rnn_objective(&high, nonlinearity) - rnn_objective(&low, nonlinearity))
+                / (2.0 * epsilon)
+        })
+        .collect()
+}
+
+fn install_rnn(model: &Rnn, case: &RnnCase) -> Result<()> {
+    model
+        .parameter("input_weight")?
+        .set_values(&f32s(&case.input_weight))?;
+    model
+        .parameter("recurrent_weight")?
+        .set_values(&f32s(&case.recurrent_weight))?;
+    model.parameter("bias")?.set_values(&f32s(&case.bias))?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rnn_matches_independent_f64_forward_and_all_central_differences() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, time, input, hidden) = (
+        Axis::new("batch"),
+        Axis::new("time"),
+        Axis::new("input"),
+        Axis::new("hidden"),
+    );
+    let case = rnn_case();
+    let expected = rnn_reference(&case, f64::tanh);
+    let mut model = Rnn::new(input, hidden.of(H), time)?;
+    model.build(
+        &Shape::new([batch.of(B), time.of(T), input.of(I)])?,
+        &device,
+        17,
+    )?;
+    install_rnn(&model, &case)?;
+
+    let x = Tensor::from_slice(
+        &f32s(&case.input),
+        [batch.of(B), time.of(T), input.of(I)],
+        &device,
+    )?
+    .with_layout([input, time, batch])?
+    .with_grad();
+    let initial = Tensor::from_slice(
+        &f32s(&case.initial_hidden),
+        [batch.of(B), hidden.of(H)],
+        &device,
+    )?
+    .with_layout([hidden, batch])?
+    .with_grad();
+    let run = model.run_from(&x, &initial)?;
+    assert_eq!(
+        run.sequence.shape(),
+        &Shape::new([batch.of(B), time.of(T), hidden.of(H)])?
+    );
+    close(
+        "RNN sequence",
+        &run.sequence.to_vec()?,
+        &expected.sequence,
+        4e-5,
+    );
+    close(
+        "RNN final hidden",
+        &run.state.to_vec()?,
+        &expected.hidden,
+        4e-5,
+    );
+    close(
+        "RNN final hidden equals last sequence coordinate",
+        &run.sequence.select(time, T - 1)?.to_vec()?,
+        &expected.hidden,
+        4e-5,
+    );
+
+    let sequence_coefficients = [
+        0.2, -0.3, 0.5, 0.1, -0.4, 0.7, -0.6, 0.8, 0.25, -0.15, 0.45, -0.35,
+    ];
+    let hidden_coefficients = [0.3, -0.2, 0.6, 0.1];
+    let loss = weighted_sum(
+        &run.sequence,
+        &sequence_coefficients,
+        &[batch, time, hidden],
+    )?
+    .add(&weighted_sum(
+        &run.state,
+        &hidden_coefficients,
+        &[batch, hidden],
+    )?)?;
+    loss.backward()?;
+
+    let gradients = [
+        (
+            "RNN input gradient",
+            x.grad().unwrap().to_vec()?,
+            rnn_finite_difference(&case, f64::tanh, |case| &mut case.input),
+        ),
+        (
+            "RNN initial hidden gradient",
+            initial.grad().unwrap().to_vec()?,
+            rnn_finite_difference(&case, f64::tanh, |case| &mut case.initial_hidden),
+        ),
+        (
+            "RNN input-weight gradient",
+            model.parameter("input_weight")?.grad().unwrap().to_vec()?,
+            rnn_finite_difference(&case, f64::tanh, |case| &mut case.input_weight),
+        ),
+        (
+            "RNN recurrent-weight gradient",
+            model
+                .parameter("recurrent_weight")?
+                .grad()
+                .unwrap()
+                .to_vec()?,
+            rnn_finite_difference(&case, f64::tanh, |case| &mut case.recurrent_weight),
+        ),
+        (
+            "RNN bias gradient",
+            model.parameter("bias")?.grad().unwrap().to_vec()?,
+            rnn_finite_difference(&case, f64::tanh, |case| &mut case.bias),
+        ),
+    ];
+    for (name, actual, expected) in gradients {
+        close(name, &actual, &expected, 3e-3);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rnn_relu_executes_asymmetric_geometry_with_reordered_layout() -> Result<()> {
+    const REPLICAS: usize = 2;
+    const PATIENTS: usize = 3;
+
+    let device = Device::cuda(0)?;
+    let (replica, time, patient, input, hidden) = (
+        Axis::new("replica"),
+        Axis::new("time"),
+        Axis::new("patient"),
+        Axis::new("input"),
+        Axis::new("hidden"),
+    );
+    assert!(Rnn::new(time, hidden.of(H), time).is_err());
+    assert!(Rnn::new(input, time.of(H), time).is_err());
+
+    let case = rnn_case();
+    let input_values: Vec<_> = (0..REPLICAS * T * PATIENTS * I)
+        .map(|index| ((index * 7 % 29) as f64 - 14.0) / 10.0)
+        .collect();
+    let input_shape = Shape::new([
+        replica.of(REPLICAS),
+        time.of(T),
+        patient.of(PATIENTS),
+        input.of(I),
+    ])?;
+    let mut model = Rnn::new(input, hidden.of(H), time)?.nonlinearity(RnnNonlinearity::Relu);
+    model.build(&input_shape, &device, 41)?;
+    install_rnn(&model, &case)?;
+    assert_eq!(
+        model
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["input_weight", "recurrent_weight", "bias"]
+    );
+    let tensor = Tensor::from_slice(
+        &f32s(&input_values),
+        input_shape.dims().iter().copied(),
+        &device,
+    )?
+    .with_layout([patient, input, replica, time])?;
+    let run = model.run(&tensor)?;
+
+    assert_eq!(
+        run.sequence.shape(),
+        &Shape::new([
+            replica.of(REPLICAS),
+            time.of(T),
+            patient.of(PATIENTS),
+            hidden.of(H),
+        ])?
+    );
+    let state_shape = Shape::new([replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(H)])?;
+    assert_eq!(run.state.shape(), &state_shape);
+
+    let relu = |value: f64| value.max(0.0);
+    let mut expected_sequence = vec![0.0; REPLICAS * T * PATIENTS * H];
+    let mut expected_hidden = vec![0.0; REPLICAS * PATIENTS * H];
+    for replica_index in 0..REPLICAS {
+        for patient_index in 0..PATIENTS {
+            let mut stream_hidden = vec![0.0; H];
+            for step in 0..T {
+                let input_offset = ((replica_index * T + step) * PATIENTS + patient_index) * I;
+                rnn_reference_step(
+                    &case,
+                    &input_values[input_offset..input_offset + I],
+                    &mut stream_hidden,
+                    relu,
+                );
+                let output_offset = ((replica_index * T + step) * PATIENTS + patient_index) * H;
+                expected_sequence[output_offset..output_offset + H].copy_from_slice(&stream_hidden);
+            }
+            let state_offset = (replica_index * PATIENTS + patient_index) * H;
+            expected_hidden[state_offset..state_offset + H].copy_from_slice(&stream_hidden);
+        }
+    }
+    close(
+        "asymmetric RNN sequence",
+        &run.sequence.to_vec()?,
+        &expected_sequence,
+        4e-5,
+    );
+    close(
+        "asymmetric RNN hidden state",
+        &run.state.to_vec()?,
+        &expected_hidden,
+        4e-5,
+    );
+
+    let wrong = Tensor::zeros(
+        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(H + 1)],
+        &device,
+    )?;
+    assert!(model.run_from(&tensor, &wrong).is_err());
+    let other_device = Device::cuda(0)?;
+    let wrong_device = Tensor::zeros(
+        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(H)],
+        &other_device,
+    )?;
+    assert!(model.run_from(&tensor, &wrong_device).is_err());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// GRU
+// ---------------------------------------------------------------------
+
+#[derive(Clone)]
+struct GruCase {
+    input: Vec<f64>,
+    initial_hidden: Vec<f64>,
+    input_weight: Vec<f64>,
+    recurrent_weight: Vec<f64>,
+    bias: Vec<f64>,
+}
+
+fn gru_case() -> GruCase {
+    GruCase {
+        input: vec![
+            0.2, -0.4, 0.7, 0.1, -0.3, 0.8, -0.6, 0.5, 0.9, -0.2, 0.4, 0.3,
+        ],
+        initial_hidden: vec![0.1, -0.2, 0.3, 0.05],
+        input_weight: vec![
+            0.15, -0.2, 0.3, 0.1, -0.25, 0.4, 0.05, -0.3, -0.1, 0.35, -0.2, 0.25,
+        ],
+        recurrent_weight: vec![
+            -0.2, 0.1, 0.25, -0.35, 0.3, 0.15, -0.1, 0.2, 0.4, -0.25, 0.05, 0.3,
+        ],
+        bias: vec![0.05, -0.1, 0.2, 0.15, -0.05, 0.08],
+    }
+}
+
+/// Independent host reference for PyTorch's GRU gate order (`r, z, n`) with
+/// the reset gate multiplying the hidden-side candidate contribution after
+/// its own matrix product, matching `GruCell`'s doc comment exactly.
+fn gru_reference_step(case: &GruCase, input: &[f64], hidden: &mut [f64]) {
+    let mut input_gates = case.bias.clone();
+    for (input_feature, &input_value) in input.iter().enumerate() {
+        for (gate, value) in input_gates.iter_mut().enumerate() {
+            *value += input_value * case.input_weight[input_feature * 3 * H + gate];
+        }
+    }
+    let mut hidden_gates = [0.0; 3 * H];
+    for (previous_feature, &previous_value) in hidden.iter().enumerate() {
+        for (gate, value) in hidden_gates.iter_mut().enumerate() {
+            *value += previous_value * case.recurrent_weight[previous_feature * 3 * H + gate];
+        }
+    }
+    for feature in 0..H {
+        let reset = sigmoid(input_gates[feature] + hidden_gates[feature]);
+        let update = sigmoid(input_gates[H + feature] + hidden_gates[H + feature]);
+        let candidate =
+            (input_gates[2 * H + feature] + reset * hidden_gates[2 * H + feature]).tanh();
+        hidden[feature] = (1.0 - update) * candidate + update * hidden[feature];
+    }
+}
+
+fn gru_reference(case: &GruCase) -> SequenceReference {
+    let mut hidden = case.initial_hidden.clone();
+    let mut sequence = vec![0.0; B * T * H];
+    for batch in 0..B {
+        let mut h = hidden[batch * H..(batch + 1) * H].to_vec();
+        for step in 0..T {
+            let offset = (batch * T + step) * I;
+            gru_reference_step(case, &case.input[offset..offset + I], &mut h);
+            for feature in 0..H {
+                sequence[(batch * T + step) * H + feature] = h[feature];
+            }
+        }
+        hidden[batch * H..(batch + 1) * H].copy_from_slice(&h);
+    }
+    SequenceReference { sequence, hidden }
+}
+
+fn gru_objective(case: &GruCase) -> f64 {
+    let result = gru_reference(case);
+    let sequence_coefficients = [
+        0.2, -0.3, 0.5, 0.1, -0.4, 0.7, -0.6, 0.8, 0.25, -0.15, 0.45, -0.35,
+    ];
+    let hidden_coefficients = [0.3, -0.2, 0.6, 0.1];
+    result
+        .sequence
+        .iter()
+        .zip(sequence_coefficients)
+        .map(|(value, coefficient)| value * coefficient)
+        .sum::<f64>()
+        + result
+            .hidden
+            .iter()
+            .zip(hidden_coefficients)
+            .map(|(value, coefficient)| value * coefficient)
+            .sum::<f64>()
+}
+
+fn gru_finite_difference(case: &GruCase, field: fn(&mut GruCase) -> &mut Vec<f64>) -> Vec<f64> {
+    let epsilon = 1e-5;
+    (0..field(&mut case.clone()).len())
+        .map(|index| {
+            let mut high = case.clone();
+            field(&mut high)[index] += epsilon;
+            let mut low = case.clone();
+            field(&mut low)[index] -= epsilon;
+            (gru_objective(&high) - gru_objective(&low)) / (2.0 * epsilon)
+        })
+        .collect()
+}
+
+fn install_gru(model: &Gru, case: &GruCase) -> Result<()> {
+    model
+        .parameter("input_weight")?
+        .set_values(&f32s(&case.input_weight))?;
+    model
+        .parameter("recurrent_weight")?
+        .set_values(&f32s(&case.recurrent_weight))?;
+    model.parameter("bias")?.set_values(&f32s(&case.bias))?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gru_matches_independent_f64_forward_and_all_central_differences() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, time, input, hidden) = (
+        Axis::new("batch"),
+        Axis::new("time"),
+        Axis::new("input"),
+        Axis::new("hidden"),
+    );
+    let case = gru_case();
+    let expected = gru_reference(&case);
+    let mut model = Gru::new(input, hidden.of(H), time)?;
+    model.build(
+        &Shape::new([batch.of(B), time.of(T), input.of(I)])?,
+        &device,
+        17,
+    )?;
+    install_gru(&model, &case)?;
+
+    let x = Tensor::from_slice(
+        &f32s(&case.input),
+        [batch.of(B), time.of(T), input.of(I)],
+        &device,
+    )?
+    .with_layout([input, time, batch])?
+    .with_grad();
+    let initial = Tensor::from_slice(
+        &f32s(&case.initial_hidden),
+        [batch.of(B), hidden.of(H)],
+        &device,
+    )?
+    .with_layout([hidden, batch])?
+    .with_grad();
+    let run = model.run_from(&x, &initial)?;
+    assert_eq!(
+        run.sequence.shape(),
+        &Shape::new([batch.of(B), time.of(T), hidden.of(H)])?
+    );
+    close(
+        "GRU sequence",
+        &run.sequence.to_vec()?,
+        &expected.sequence,
+        4e-5,
+    );
+    close(
+        "GRU final hidden",
+        &run.state.to_vec()?,
+        &expected.hidden,
+        4e-5,
+    );
+    close(
+        "GRU final hidden equals last sequence coordinate",
+        &run.sequence.select(time, T - 1)?.to_vec()?,
+        &expected.hidden,
+        4e-5,
+    );
+
+    let sequence_coefficients = [
+        0.2, -0.3, 0.5, 0.1, -0.4, 0.7, -0.6, 0.8, 0.25, -0.15, 0.45, -0.35,
+    ];
+    let hidden_coefficients = [0.3, -0.2, 0.6, 0.1];
+    let loss = weighted_sum(
+        &run.sequence,
+        &sequence_coefficients,
+        &[batch, time, hidden],
+    )?
+    .add(&weighted_sum(
+        &run.state,
+        &hidden_coefficients,
+        &[batch, hidden],
+    )?)?;
+    loss.backward()?;
+
+    let gradients = [
+        (
+            "GRU input gradient",
+            x.grad().unwrap().to_vec()?,
+            gru_finite_difference(&case, |case| &mut case.input),
+        ),
+        (
+            "GRU initial hidden gradient",
+            initial.grad().unwrap().to_vec()?,
+            gru_finite_difference(&case, |case| &mut case.initial_hidden),
+        ),
+        (
+            "GRU input-weight gradient",
+            model.parameter("input_weight")?.grad().unwrap().to_vec()?,
+            gru_finite_difference(&case, |case| &mut case.input_weight),
+        ),
+        (
+            "GRU recurrent-weight gradient",
+            model
+                .parameter("recurrent_weight")?
+                .grad()
+                .unwrap()
+                .to_vec()?,
+            gru_finite_difference(&case, |case| &mut case.recurrent_weight),
+        ),
+        (
+            "GRU bias gradient",
+            model.parameter("bias")?.grad().unwrap().to_vec()?,
+            gru_finite_difference(&case, |case| &mut case.bias),
+        ),
+    ];
+    for (name, actual, expected) in gradients {
+        close(name, &actual, &expected, 3e-3);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gru_executes_asymmetric_geometry_with_reordered_layout() -> Result<()> {
+    const REPLICAS: usize = 2;
+    const PATIENTS: usize = 3;
+
+    let device = Device::cuda(0)?;
+    let (replica, time, patient, input, hidden) = (
+        Axis::new("replica"),
+        Axis::new("time"),
+        Axis::new("patient"),
+        Axis::new("input"),
+        Axis::new("hidden"),
+    );
+    assert!(Gru::new(time, hidden.of(H), time).is_err());
+    assert!(Gru::new(input, time.of(H), time).is_err());
+
+    let case = gru_case();
+    let input_values: Vec<_> = (0..REPLICAS * T * PATIENTS * I)
+        .map(|index| ((index * 7 % 29) as f64 - 14.0) / 10.0)
+        .collect();
+    let input_shape = Shape::new([
+        replica.of(REPLICAS),
+        time.of(T),
+        patient.of(PATIENTS),
+        input.of(I),
+    ])?;
+    let mut model = Gru::new(input, hidden.of(H), time)?;
+    model.build(&input_shape, &device, 41)?;
+    install_gru(&model, &case)?;
+    assert_eq!(
+        model
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["input_weight", "recurrent_weight", "bias"]
+    );
+    let tensor = Tensor::from_slice(
+        &f32s(&input_values),
+        input_shape.dims().iter().copied(),
+        &device,
+    )?
+    .with_layout([patient, input, replica, time])?;
+    let run = model.run(&tensor)?;
+
+    assert_eq!(
+        run.sequence.shape(),
+        &Shape::new([
+            replica.of(REPLICAS),
+            time.of(T),
+            patient.of(PATIENTS),
+            hidden.of(H),
+        ])?
+    );
+    let state_shape = Shape::new([replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(H)])?;
+    assert_eq!(run.state.shape(), &state_shape);
+
+    let mut expected_sequence = vec![0.0; REPLICAS * T * PATIENTS * H];
+    let mut expected_hidden = vec![0.0; REPLICAS * PATIENTS * H];
+    for replica_index in 0..REPLICAS {
+        for patient_index in 0..PATIENTS {
+            let mut stream_hidden = vec![0.0; H];
+            for step in 0..T {
+                let input_offset = ((replica_index * T + step) * PATIENTS + patient_index) * I;
+                gru_reference_step(
+                    &case,
+                    &input_values[input_offset..input_offset + I],
+                    &mut stream_hidden,
+                );
+                let output_offset = ((replica_index * T + step) * PATIENTS + patient_index) * H;
+                expected_sequence[output_offset..output_offset + H].copy_from_slice(&stream_hidden);
+            }
+            let state_offset = (replica_index * PATIENTS + patient_index) * H;
+            expected_hidden[state_offset..state_offset + H].copy_from_slice(&stream_hidden);
+        }
+    }
+    close(
+        "asymmetric GRU sequence",
+        &run.sequence.to_vec()?,
+        &expected_sequence,
+        4e-5,
+    );
+    close(
+        "asymmetric GRU hidden state",
+        &run.state.to_vec()?,
+        &expected_hidden,
+        4e-5,
+    );
+
+    let wrong = Tensor::zeros(
+        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(H + 1)],
+        &device,
+    )?;
+    assert!(model.run_from(&tensor, &wrong).is_err());
+    let other_device = Device::cuda(0)?;
+    let wrong_device = Tensor::zeros(
+        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(H)],
+        &other_device,
+    )?;
+    assert!(model.run_from(&tensor, &wrong_device).is_err());
+    Ok(())
+}

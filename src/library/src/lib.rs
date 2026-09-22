@@ -46,7 +46,12 @@ mod train;
 
 pub use axis::{Axis, Dim, IntoAxes, Shape};
 pub use backend::Device;
-pub use convolution::{Conv2d, Conv3d, MaxPool2d, MaxPool3d};
+pub use convolution::{
+    AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveAvgPool3d, AdaptiveMaxPool1d, AdaptiveMaxPool2d,
+    AdaptiveMaxPool3d, AvgPool1d, AvgPool2d, AvgPool3d, Conv1d, Conv2d, Conv3d, ConvTranspose1d,
+    ConvTranspose2d, ConvTranspose3d, Fold, LPPool1d, LPPool2d, LPPool3d, MaxPool1d, MaxPool2d,
+    MaxPool3d, Unfold,
+};
 pub use data::{
     AdditionDataset, AdditionSample, Batch, DataLoader, DataRegimeReceipt, DataSource,
     FinitePassesLoader, InMemoryDataset, Sample,
@@ -65,16 +70,23 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    Embedding, ExactGELU, GELU, IntoLayers, LeakyReLU, Linear, Module, ParamId, Parameter,
-    PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU, SignStraightThrough, Tanh,
+    Bilinear, CELU, ChannelShuffle, CircularPad, ConstantPad, ELU, Embedding, EmbeddingBag,
+    EmbeddingBagMode, ExactGELU, Flatten, GELU, GLU, Hardshrink, Hardsigmoid, Hardswish, Hardtanh,
+    Identity, IntoLayers, LeakyReLU, Linear, LogSigmoid, LogSoftmax, Mish, Module, ModuleDict,
+    ModuleList, PReLU, ParamId, Parameter, ParameterDict, ParameterList, PixelShuffle,
+    PixelUnshuffle, PopulationLinear, PositionEmbedding, ReLU, ReLU6, ReflectionPad,
+    ReplicationPad, SELU, Sequential, SiLU, SignStraightThrough, Softmax2d, Softmin, Softplus,
+    Softshrink, Softsign, Tanh, Tanhshrink, Threshold, Unflatten, ZeroPad,
 };
-pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
+pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, LocalResponseNorm, RmsNorm};
 pub use optim::{
     Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD, clip_grad_norm,
     cosine_annealing_lr, one_cycle_lr,
 };
 pub use preprocess::Standardizer;
-pub use recurrent::{Lstm, LstmCell, LstmRun, LstmState};
+pub use recurrent::{
+    Gru, GruCell, GruRun, Lstm, LstmCell, LstmRun, LstmState, Rnn, RnnCell, RnnNonlinearity, RnnRun,
+};
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
 };
@@ -106,19 +118,28 @@ mod window_tests;
 
 pub mod prelude {
     pub use crate::{
-        Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
-        CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
-        Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
-        EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
-        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
-        Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
-        LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
-        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
-        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear,
-        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot,
-        ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD,
-        Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh,
-        Tensor, TrainStep, Trainer, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        Adam, AdamW, AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveAvgPool3d, AdaptiveMaxPool1d,
+        AdaptiveMaxPool2d, AdaptiveMaxPool3d, AdditionDataset, AdditionSample, AvgPool1d,
+        AvgPool2d, AvgPool3d, Axis, Batch, Bilinear, CELU, CategoricalAccuracy, CentralDifference,
+        ChannelShuffle, CircularPad, ConstantPad, Conv1d, Conv2d, Conv3d, ConvTranspose1d,
+        ConvTranspose2d, ConvTranspose3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
+        Disjointness, DisjointnessEvidence, DisjointnessReceipt, ELU, Embedding, EmbeddingBag,
+        EmbeddingBagMode, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, EmpiricalResidual,
+        EmpiricalResidualReceipt, ExactGELU, FinitePasses, FinitePassesLoader, FinitePassesReceipt,
+        Flatten, Fold, GELU, GLU, GroupNorm, Gru, GruCell, GruRun, Hardshrink, Hardsigmoid,
+        Hardswish, Hardtanh, Identity, IdentityScheme, Idr, IdrLimits, IdrReceipt, InMemoryDataset,
+        InstanceNorm, LPPool1d, LPPool2d, LPPool3d, LawIdentity, LayerNorm, LeakyReLU,
+        LearningDirection, LearningEvidence, LearningLimits, LearningObservation, LearningProgress,
+        LearningProgressReceipt, Linear, LocalResponseNorm, LogSigmoid, LogSoftmax, Lstm, LstmCell,
+        LstmRun, LstmState, MaxPool1d, MaxPool2d, MaxPool3d, Mish, Module, ModuleDict, ModuleList,
+        MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        MuonWithAuxAdamW, Optimizer, PReLU, ParamId, Parameter, ParameterDict, ParameterList,
+        PixelShuffle, PixelUnshuffle, PopulationLinear, PopulationMode, PopulationReceipt,
+        PopulationSpec, PositionEmbedding, ReLU, ReLU6, ReflectionPad, RegimeSnapshot,
+        ReplicationPad, ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result,
+        RmsNorm, Rnn, RnnCell, RnnNonlinearity, RnnRun, SELU, SGD, Sample, Sequential, Shape, SiLU,
+        SignStraightThrough, SinglePass, Softmax2d, Softmin, Softplus, Softshrink, Softsign,
+        Standardizer, Tanh, Tanhshrink, Tensor, Threshold, TrainStep, Trainer, Unflatten, Unfold,
+        ZeroPad, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
     };
 }
