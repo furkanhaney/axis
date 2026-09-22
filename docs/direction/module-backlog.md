@@ -38,6 +38,11 @@ index, not a one-hot contraction, so it scales to a large table where
 `gt`/`ge`/`lt`/`le`/`eq` compare a tensor against a scalar into a `{0.0, 1.0}`
 mask with no gradient of its own; `logical_and`/`logical_not` compose masks the
 same way PyTorch's `&`/`~` do on 0/1 tensors (`mul`, `1 - x`).
+`clamp(min, max)` bounds a tensor elementwise into `[min, max]` with either
+side an optional `f32` (`None` leaves it unbounded), propagating `NaN` inputs
+unclamped and passing the gradient through at either bound as well as
+strictly inside it, matching PyTorch's `clamp`, not a "zero at the boundary
+too" convention.
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
 `one_cycle_lr` schedule functions (`optim.rs`), and a global-norm
