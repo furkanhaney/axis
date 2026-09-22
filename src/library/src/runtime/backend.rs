@@ -156,6 +156,23 @@ impl Device {
             .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    /// `-gradient * numerator / denominator^2`: the divisor's gradient in `a / b`.
+    pub(crate) fn divide_backward_denominator(
+        &self,
+        gradient: &Buffer,
+        numerator: &Buffer,
+        denominator: &Buffer,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(denominator.shape()[0] as usize)?;
+        kernels::divide_backward_denominator(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            numerator.as_ref(),
+            denominator.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn mask_gradient(&self, gradient: &Buffer, winners: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(gradient.shape()[0] as usize)?;
         kernels::mask_gradient(
@@ -1969,8 +1986,10 @@ mod kernels {
             out.store(x + y);
         } else if OP == 1 {
             out.store(x - y);
-        } else {
+        } else if OP == 2 {
             out.store(x * y);
+        } else {
+            out.store(x / y);
         }
     }
     #[cutile::entry()]
@@ -2269,5 +2288,20 @@ mod kernels {
         let one = constant(1.0f32, shape![1]);
         let zero = constant(0.0f32, shape![1]);
         out.store(select(eq_tile(winner, input), one, zero));
+    }
+
+    /// `-gradient * numerator / denominator^2`, the divisor's gradient in `a / b`.
+    #[cutile::entry()]
+    fn divide_backward_denominator(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        numerator: &Tensor<f32, { [-1] }>,
+        denominator: &Tensor<f32, { [-1] }>,
+    ) {
+        let g = gradient.load_like(out);
+        let a = numerator.load_like(out);
+        let b = denominator.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        out.store((zero - g) * a / (b * b));
     }
 }
