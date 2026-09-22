@@ -1401,3 +1401,88 @@ additionally returns the attention probabilities averaged over heads
 reduction. Nonzero `dropout` is rejected by `new`: it needs the seeded,
 per-step training-pass contract (`TrainingPass`, Axis issue #127), which has
 not landed.
+
+### Upsample and sequence and clustered losses
+
+`Tensor::resample_bicubic(axis, out_extent)` closes `Upsample`'s stated
+"no trilinear or bicubic, no scale-factor form" gap (`Tensor::resample_bilinear`
+had already proven trilinear for free by composition). Same construction as
+`resample_bilinear`: weights are fixed by the input/output extents alone, so
+it is one `contract` against a host-built `[axis, resampled]` weight matrix,
+not a dedicated kernel, and inherits `contract`'s exact transpose backward.
+Weights use PyTorch's separable bicubic kernel with `a = -0.75` (`W(x) =
+(a+2)|x|^3 - (a+3)|x|^2 + 1` for `|x| <= 1`, `W(x) = a|x|^3 - 5a|x|^2 + 8a|x|
+- 4a` for `1 < |x| < 2`, else `0`) and PyTorch's `align_corners=False`
+half-pixel source formula (`source = (j + 0.5) * in/out - 0.5`), with the
+four taps per output column clamped (border-replicated) into
+`[0, in_extent - 1]`. `align_corners=True` is not implemented, for any of
+`resample_bilinear`, `resample_bicubic`, or the `Upsample` module.
+
+`Upsample` (`torch.nn.Upsample`) is a thin `Module` over a fixed, ordered
+list of named spatial axes: build it with `Upsample::size` (a literal
+per-axis output extent, PyTorch's `size=`) or `Upsample::scale_factor` (a
+per-axis multiplier, PyTorch's `scale_factor=`, output extent
+`floor(in_extent * scale_factor)`), and a mode (`Nearest`, `Bilinear`,
+`Bicubic`, `Trilinear`). `Nearest` composes `Tensor::upsample_nearest` once
+per axis (so every axis's output/input ratio must be a positive integer,
+rejected in `output_shape`/`build` before `forward` runs any kernel);
+`Bilinear` (exactly 2 axes) and `Trilinear` (exactly 3 axes) compose
+`resample_bilinear` once per axis; `Bicubic` (any axis count) composes
+`resample_bicubic` once per axis. All four modes are `align_corners=False`.
+
+`Tensor::linear_cross_entropy_with_logits` composes a final linear
+projection (`self.contract(weight, input_axis)` plus an optional bias,
+exactly `Linear::forward`'s own body) with
+`Tensor::categorical_cross_entropy_with_logits`, with a `LinearCrossEntropyOptions{
+label_smoothing }` matching PyTorch's `torch.nn.functional.linear_cross_entropy`
+default (`0.0`; blends `targets` toward the uniform distribution:
+`(1 - a) * target + a / width`). It is graded PARTIAL rather than YES: real
+PyTorch `linear_cross_entropy` is a fused kernel whose whole point is to
+avoid ever materializing the `[*, C]` logits tensor, halving peak activation
+memory at a large vocabulary; this composition produces the exact forward
+value and gradient but always materializes the full logits tensor, so it
+does not carry the memory-saving contract that is the row's real reason to
+exist. `reduction`, per-class `weight`, and `ignore_index` are not exposed
+(left to the caller / not implemented, matching this file's other loss
+functions).
+
+`Tensor::adaptive_log_softmax_with_loss` composes `torch.nn.AdaptiveLogSoftmaxWithLoss`'s
+forward loss (Grave et al., "Efficient softmax approximation for GPUs") from
+`contract` (head and per-cluster two-stage tail projections, each exactly
+`Linear`'s own body), `Tensor::log_softmax`, and a host-built one-hot
+selection reduced with `mul` + `sum` -- the same masked-selection idiom
+`categorical_cross_entropy_with_logits` itself already uses, in place of
+`Tensor::gather`, because `gather` applies one host index list uniformly
+across every row while each row here targets a different class. `cutoffs`,
+`div_value` (default `4.0`, validated against each tail projection's hidden
+extent via PyTorch's own `floor(in_features / div_value^(cluster + 1))`
+formula) and `head_bias` (`Some`/`None` for PyTorch's `True`/`False`, default
+`None`) match PyTorch's constructor exactly; input is restricted to
+`[batch_axis, input_axis]` with one target index per row, matching
+PyTorch's own `(N, in_features)`/`(N,)` restriction. Graded PARTIAL: only
+the scalar `reduction='mean'` loss is implemented; the separate
+`log_prob`/`predict` full-distribution and argmax queries PyTorch's class
+also exposes are not attempted.
+
+`Tensor::ctc_loss` implements `torch.nn.CTCLoss(blank=0, reduction='mean',
+zero_infinity=False)`'s forward recursion (Graves 2006) directly as a
+composed tensor graph: a host loop over the time axis (`driven from the
+host per time step`) builds each step's `alpha` from the previous step's
+`alpha` shifted by one and by two positions along a length-`2L + 1`
+blank-interleaved extended target axis (`concat`/`narrow` for the shift,
+`stack` + `logsumexp` for the pairwise/triple log-sum, an additive
+`0`/`-1e30` mask for the "skip a blank" transition rule, and a host-built
+one-hot `contract` for the per-row emission lookup -- the same substitution
+for `gather` as `adaptive_log_softmax_with_loss`, since each row's target
+sequence differs). No hand-derived backward exists: the forward recursion
+alone is a complete, differentiable definition of `-log P(target | input)`,
+so ordinary reverse-mode autodiff through this graph supplies CTC's
+textbook `beta`-based gradient exactly, for free. A finite `-1e30` sentinel
+stands in for `-inf` throughout, because `Tensor::logsumexp` returns `NaN`
+(not `-inf`) for a group whose every member is nonfinite -- a documented
+existing behavior, not something this row changes, that the recursion hits
+at every early time step (`resample_bicubic`'s doc comment does not need
+this because `contract` never fully excludes a term). Graded PARTIAL: all
+rows in one call must share one target length and the time axis's full
+extent is every row's input length; PyTorch's own per-row
+`input_lengths`/`target_lengths` (mixed-length batches) are not implemented.
