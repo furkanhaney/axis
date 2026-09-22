@@ -88,6 +88,11 @@ enum Rule {
     Zero(usize),
     Scale(f32),
     Multiply(Buffer),
+    Divide(Buffer),
+    DivideDenominator {
+        numerator: Buffer,
+        denominator: Buffer,
+    },
     Relu(Buffer),
     Sigmoid(Buffer),
     Silu(Buffer),
@@ -570,9 +575,16 @@ impl Tensor {
         let rules = match op {
             0 => (Rule::Identity, Rule::Identity),
             1 => (Rule::Identity, Rule::Scale(-1.0)),
-            _ => (
+            2 => (
                 Rule::Multiply(b.0.value.clone()),
                 Rule::Multiply(a.0.value.clone()),
+            ),
+            _ => (
+                Rule::Divide(b.0.value.clone()),
+                Rule::DivideDenominator {
+                    numerator: a.0.value.clone(),
+                    denominator: b.0.value.clone(),
+                },
             ),
         };
         Ok(Self::node(
@@ -593,6 +605,13 @@ impl Tensor {
     }
     pub fn mul(&self, rhs: &Self) -> Result<Self> {
         self.binary(rhs, 2)
+    }
+    /// Elementwise `self / rhs`. Same shape-agreement contract as [`Tensor::mul`]:
+    /// identical axis sets, no implicit alignment. Division by zero follows IEEE
+    /// float semantics (produces `inf`/`nan`, as in PyTorch); callers that need a
+    /// safe denominator must clamp it themselves before dividing.
+    pub fn div(&self, rhs: &Self) -> Result<Self> {
+        self.binary(rhs, 3)
     }
     pub fn squared_error(&self, rhs: &Self) -> Result<Self> {
         if self.shape().rank() != rhs.shape().rank()
@@ -2106,6 +2125,15 @@ impl Tensor {
                         Rule::Zero(len) => self.device().zeros_buffer(*len)?,
                         Rule::Scale(f) => self.device().scale(&gradient, *f)?,
                         Rule::Multiply(rhs) => self.device().binary(&gradient, rhs, 2)?,
+                        Rule::Divide(rhs) => self.device().binary(&gradient, rhs, 3)?,
+                        Rule::DivideDenominator {
+                            numerator,
+                            denominator,
+                        } => self.device().divide_backward_denominator(
+                            &gradient,
+                            numerator,
+                            denominator,
+                        )?,
                         Rule::Relu(x) => self.device().relu_backward(&gradient, x)?,
                         Rule::Sigmoid(probability) => {
                             self.device().sigmoid_backward(&gradient, probability)?

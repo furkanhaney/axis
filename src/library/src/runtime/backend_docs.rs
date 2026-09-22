@@ -56,6 +56,15 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn divide_backward_denominator(
+        &self,
+        _gradient: &Buffer,
+        _numerator: &Buffer,
+        _denominator: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn mask_gradient(&self, _gradient: &Buffer, _winners: &Buffer) -> Result<Buffer> {
         unavailable()
     }
