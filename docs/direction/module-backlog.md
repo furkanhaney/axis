@@ -31,7 +31,9 @@ option), `Conv2d`, `Conv3d`, named-axis
 `GELU`, `ExactGELU`, `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
 `Sequential`, with tensor-level losses, sine, differentiable central
 differences, softmax, causal masking, attention
-composition, named reductions, data regimes, metrics, trainers, and optimizers.
+composition, named reductions, an arbitrary-index `gather` (a host-side integer
+index, not a one-hot contraction, so it scales to a large table where
+`Embedding` cannot), data regimes, metrics, trainers, and optimizers.
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
 `one_cycle_lr` schedule functions (`optim.rs`); there is still no gradient
