@@ -607,3 +607,52 @@ an accidental public restriction.
 Success is the existing training behavior expressed through short programs
 with these contracts enforced. The four golden programs remain acceptance
 targets, and each capability gains its status from a running witness.
+
+### Smooth and normalized activations
+
+`ELU::new(alpha)?`/`CELU::new(alpha)?` and their `Tensor::elu`/`Tensor::celu`
+require a finite, positive `alpha` (PyTorch's own default is `1.0` for both).
+Forward is `x` where `x > 0`, otherwise `alpha * (exp(x) - 1)` for `ELU` and
+`alpha * (exp(x / alpha) - 1)` for `CELU`; PyTorch's own definition allows a
+negative `CELU` alpha, but Axis narrows the accepted range to the saturating
+case every consumer wants. Both compose entirely from `gt`/`logical_not`,
+`clamp`, `exp`, and `scale`, with `x == 0` grouped into the negative branch
+(matching PyTorch's own `x > 0` split), so `clamp`'s pass-through gradient at
+its own upper bound keeps that boundary case exact. `SELU` (parameter-free)
+is `scale * elu(x, alpha)` at PyTorch's fixed literals
+`alpha = 1.6732632423543772`, `scale = 1.0507009873554805`.
+
+`Softplus::new()` wraps the existing `Tensor::softplus` with PyTorch's own
+defaults, `beta = 1`, `threshold = 20`; `.beta(value)?`/`.threshold(value)?`
+override them with the same validation `Tensor::softplus` itself applies.
+`Tensor::log_sigmoid` (and the parameter-free `LogSigmoid` module) is
+`ln(sigmoid(x))`, computed as `-softplus(-x)` for the same numerical
+stability `Tensor::softplus` already gives: it asymptotes to `x` for very
+negative inputs rather than underflowing through a literal `sigmoid`/`ln`
+composition. `Tensor::mish`/`Mish` is `x * tanh(softplus(x))` at Softplus's
+same default `beta`/`threshold`.
+
+`Tensor::glu(axis)`/`GLU::new(axis)` (Gated Linear Unit) requires an even
+extent on `axis`, narrows it into two equal halves that keep `axis`'s own
+identity, and gates the first half by the sigmoid of the second,
+`a * sigmoid(b)`, composed from `narrow` and `sigmoid`/`mul`.
+
+`Tensor::prelu(weight)` is `x` where `x > 0`, otherwise `weight * x`, with the
+same `x > 0` boundary convention as `ELU`/`CELU`. The `PReLU` module supplies
+the learnable `weight`, either `PReLU::shared()` (one weight for every
+element, PyTorch's `num_parameters=1` default) or `PReLU::channel(axis)` (one
+weight per entry of an explicit named axis, PyTorch's `num_parameters=C`);
+both start at PyTorch's default init, `0.25`. `weight` follows `mul`'s
+existing subset-axis broadcasting, so its own gradient (a per-channel or
+scalar sum over every position it was broadcast into) falls out of the
+existing broadcast-sum backward with no dedicated rule.
+
+`Tensor::log_softmax(axis)`/`LogSoftmax::new(axis)` is the numerically stable
+`x - logsumexp(x, axis)`, composed entirely from the existing `logsumexp`
+(itself `max`-shifted) and `sub`'s broadcast over the axis `logsumexp`
+removes. `Tensor::softmin(axis)`/`Softmin::new(axis)` is `softmax(-x, axis)`.
+`Softmax2d::new(channel, height, width)` requires exactly those three named
+axes (PyTorch's `Softmax2d` requires exactly a 3D `[C, H, W]` input) and
+delegates to the existing named-axis `Tensor::softmax(channel)`, which
+already treats every other axis independently; `height`/`width` exist to
+state and check the contract rather than to change the computation.
