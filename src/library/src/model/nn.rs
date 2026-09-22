@@ -662,3 +662,627 @@ impl Module for Sequential {
             .collect()
     }
 }
+
+/// Ordered collection of modules with no forward of its own, PyTorch's
+/// `nn.ModuleList`: PyTorch's own `nn.Module.forward` on it raises
+/// `NotImplementedError`, since only a subclass that actually threads data
+/// through its children -- such as [`Sequential`] -- has one, so
+/// `output_shape`/`build`/`forward` below each return an explicit error
+/// instead of guessing an order. Build and run a held module directly
+/// through [`ModuleList::get`]/[`ModuleList::get_mut`]/[`ModuleList::iter`].
+/// `named_parameters` still aggregates every held module's own parameters
+/// under [`Sequential`]'s own slot-path convention, `"{index}.{name}"` (e.g.
+/// `"0.weight"`), so they stay addressable through `model.parameter(path)`
+/// even though nothing here threads a single input through them in order.
+/// [`ModuleDict`], [`ParameterList`], and [`ParameterDict`] share this exact
+/// contract, keyed or indexed differently.
+pub struct ModuleList {
+    modules: Vec<Box<dyn Module>>,
+}
+impl ModuleList {
+    pub fn new(modules: Vec<Box<dyn Module>>) -> Self {
+        Self { modules }
+    }
+    pub fn push(&mut self, module: Box<dyn Module>) {
+        self.modules.push(module);
+    }
+    pub fn len(&self) -> usize {
+        self.modules.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+    pub fn get(&self, index: usize) -> Option<&dyn Module> {
+        self.modules.get(index).map(|module| module.as_ref())
+    }
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut (dyn Module + '_)> {
+        let module = self.modules.get_mut(index)?;
+        Some(module.as_mut())
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &dyn Module> {
+        self.modules.iter().map(|module| module.as_ref())
+    }
+}
+impl Module for ModuleList {
+    fn output_shape(&self, _input: &Shape) -> Result<Shape> {
+        Err("ModuleList has no forward of its own; call output_shape on a held module directly"
+            .into())
+    }
+    fn build(&mut self, _input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        Err("ModuleList has no forward of its own; build each held module directly".into())
+    }
+    fn forward(&self, _input: &Tensor) -> Result<Tensor> {
+        Err("ModuleList has no forward of its own, matching PyTorch's nn.ModuleList".into())
+    }
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.modules
+            .iter()
+            .enumerate()
+            .flat_map(|(i, module)| {
+                module
+                    .named_parameters()
+                    .into_iter()
+                    .map(move |(name, parameter)| (format!("{i}.{name}"), parameter))
+            })
+            .collect()
+    }
+}
+
+/// Named collection of modules with no forward of its own, insertion-ordered
+/// like PyTorch's `OrderedDict`-backed `nn.ModuleDict`. See [`ModuleList`]'s
+/// own doc for the shared no-forward/aggregation contract; slots here are
+/// addressable as `"{key}.{name}"`. Duplicate keys are rejected before any
+/// module is built.
+pub struct ModuleDict {
+    entries: Vec<(String, Box<dyn Module>)>,
+}
+impl ModuleDict {
+    pub fn new(entries: Vec<(String, Box<dyn Module>)>) -> Result<Self> {
+        for (index, (name, _)) in entries.iter().enumerate() {
+            if entries[..index].iter().any(|(other, _)| other == name) {
+                return Err(format!("ModuleDict contains duplicate key {name:?}").into());
+            }
+        }
+        Ok(Self { entries })
+    }
+    pub fn insert(&mut self, name: impl Into<String>, module: Box<dyn Module>) -> Result<()> {
+        let name = name.into();
+        if self.entries.iter().any(|(other, _)| *other == name) {
+            return Err(format!("ModuleDict contains duplicate key {name:?}").into());
+        }
+        self.entries.push((name, module));
+        Ok(())
+    }
+    pub fn get(&self, name: &str) -> Option<&dyn Module> {
+        self.entries
+            .iter()
+            .find(|(other, _)| other == name)
+            .map(|(_, module)| module.as_ref())
+    }
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut (dyn Module + '_)> {
+        let (_, module) = self.entries.iter_mut().find(|(other, _)| other == name)?;
+        Some(module.as_mut())
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+impl Module for ModuleDict {
+    fn output_shape(&self, _input: &Shape) -> Result<Shape> {
+        Err("ModuleDict has no forward of its own; call output_shape on a held module directly"
+            .into())
+    }
+    fn build(&mut self, _input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        Err("ModuleDict has no forward of its own; build each held module directly".into())
+    }
+    fn forward(&self, _input: &Tensor) -> Result<Tensor> {
+        Err("ModuleDict has no forward of its own, matching PyTorch's nn.ModuleDict".into())
+    }
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.entries
+            .iter()
+            .flat_map(|(name, module)| {
+                module
+                    .named_parameters()
+                    .into_iter()
+                    .map(move |(sub, parameter)| (format!("{name}.{sub}"), parameter))
+            })
+            .collect()
+    }
+}
+
+/// Ordered collection of standalone parameters, not owned by any module:
+/// PyTorch's `nn.ParameterList`. See [`ModuleList`]'s own doc for the shared
+/// no-forward/aggregation contract; slots here are addressable by index,
+/// `"{index}"`.
+#[derive(Clone)]
+pub struct ParameterList {
+    parameters: Vec<Parameter>,
+}
+impl ParameterList {
+    pub fn new(parameters: Vec<Parameter>) -> Self {
+        Self { parameters }
+    }
+    pub fn push(&mut self, parameter: Parameter) {
+        self.parameters.push(parameter);
+    }
+    pub fn get(&self, index: usize) -> Option<&Parameter> {
+        self.parameters.get(index)
+    }
+    pub fn len(&self) -> usize {
+        self.parameters.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.parameters.is_empty()
+    }
+}
+impl Module for ParameterList {
+    fn output_shape(&self, _input: &Shape) -> Result<Shape> {
+        Err("ParameterList has no forward of its own".into())
+    }
+    fn build(&mut self, _input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        Err("ParameterList has no forward of its own".into())
+    }
+    fn forward(&self, _input: &Tensor) -> Result<Tensor> {
+        Err("ParameterList has no forward of its own, matching PyTorch's nn.ParameterList".into())
+    }
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.parameters
+            .iter()
+            .enumerate()
+            .map(|(i, parameter)| (i.to_string(), parameter.clone()))
+            .collect()
+    }
+}
+
+/// Named collection of standalone parameters, not owned by any module:
+/// PyTorch's `nn.ParameterDict`. See [`ModuleList`]'s own doc for the shared
+/// no-forward/aggregation contract; slots here are addressable by key.
+/// Duplicate keys are rejected immediately.
+#[derive(Clone)]
+pub struct ParameterDict {
+    entries: Vec<(String, Parameter)>,
+}
+impl ParameterDict {
+    pub fn new(entries: Vec<(String, Parameter)>) -> Result<Self> {
+        for (index, (name, _)) in entries.iter().enumerate() {
+            if entries[..index].iter().any(|(other, _)| other == name) {
+                return Err(format!("ParameterDict contains duplicate key {name:?}").into());
+            }
+        }
+        Ok(Self { entries })
+    }
+    pub fn insert(&mut self, name: impl Into<String>, parameter: Parameter) -> Result<()> {
+        let name = name.into();
+        if self.entries.iter().any(|(other, _)| *other == name) {
+            return Err(format!("ParameterDict contains duplicate key {name:?}").into());
+        }
+        self.entries.push((name, parameter));
+        Ok(())
+    }
+    pub fn get(&self, name: &str) -> Option<&Parameter> {
+        self.entries
+            .iter()
+            .find(|(other, _)| other == name)
+            .map(|(_, parameter)| parameter)
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+impl Module for ParameterDict {
+    fn output_shape(&self, _input: &Shape) -> Result<Shape> {
+        Err("ParameterDict has no forward of its own".into())
+    }
+    fn build(&mut self, _input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        Err("ParameterDict has no forward of its own".into())
+    }
+    fn forward(&self, _input: &Tensor) -> Result<Tensor> {
+        Err("ParameterDict has no forward of its own, matching PyTorch's nn.ParameterDict".into())
+    }
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.entries.clone()
+    }
+}
+
+/// Merge a run of named axes into one, PyTorch's `nn.Flatten` expressed over
+/// identities instead of a positional `start_dim`/`end_dim` range: the
+/// caller names the exact axes to fold, in the physical order they should
+/// flatten in, and the single `output` axis that replaces them. A thin
+/// `Module` wrapper over [`Tensor::merge`]; see its own doc for the exact
+/// selected-axis-order and physical-layout contract this reuses verbatim,
+/// including which position the merged axis is inserted at.
+#[derive(Clone)]
+pub struct Flatten {
+    axes: Vec<Axis>,
+    output: Axis,
+}
+impl Flatten {
+    pub fn new(axes: impl IntoIterator<Item = Axis>, output: Axis) -> Self {
+        Self {
+            axes: axes.into_iter().collect(),
+            output,
+        }
+    }
+}
+impl Module for Flatten {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let axes = input.select_axes(self.axes.clone())?;
+        if axes.is_empty() {
+            return Err("Flatten requires at least one axis to merge".into());
+        }
+        let mut total = 1usize;
+        for &axis in &axes {
+            total = total
+                .checked_mul(input.extent(axis)?)
+                .ok_or("Flatten merged extent overflow")?;
+        }
+        let mut dims = Vec::with_capacity(input.rank());
+        let mut inserted = false;
+        for &dim in input.dims() {
+            if axes.contains(&dim.axis) {
+                if !inserted {
+                    dims.push(self.output.of(total));
+                    inserted = true;
+                }
+            } else {
+                dims.push(dim);
+            }
+        }
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.merge(self.axes.clone(), self.output)
+    }
+}
+
+/// Split one named axis into an ordered list of named axes whose extents
+/// multiply back to it, PyTorch's `nn.Unflatten` over identities instead of
+/// a positional dim and an unnamed size tuple. A thin `Module` wrapper over
+/// [`Tensor::split`]; see its own doc for the exact validation and physical
+/// layout it reuses verbatim.
+#[derive(Clone)]
+pub struct Unflatten {
+    axis: Axis,
+    dims: Vec<Dim>,
+}
+impl Unflatten {
+    pub fn new(axis: Axis, dims: impl IntoIterator<Item = Dim>) -> Self {
+        Self {
+            axis,
+            dims: dims.into_iter().collect(),
+        }
+    }
+}
+impl Module for Unflatten {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let index = input.index(self.axis)?;
+        let parts = Shape::new(self.dims.clone())?;
+        if parts.rank() == 0 || parts.len() != input.extent(self.axis)? {
+            return Err("Unflatten output extents must multiply to the source extent".into());
+        }
+        let mut dims = input.dims().to_vec();
+        dims.splice(index..=index, parts.dims().iter().copied());
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.split(self.axis, self.dims.clone())
+    }
+}
+
+/// Parameter-free passthrough, PyTorch's `nn.Identity`: returns its input
+/// unchanged.
+#[derive(Clone, Copy)]
+pub struct Identity;
+impl Module for Identity {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        Ok(input.clone())
+    }
+}
+
+/// Learned bilinear form over two named axes, `y = x1^T A x2 + b`, PyTorch's
+/// `nn.Bilinear`. Composed from two [`Tensor::contract`] calls -- `x1`
+/// contracted against `weight` over `in1`, then that intermediate contracted
+/// against `x2` over `in2` -- the same contraction [`Linear`] already uses,
+/// applied twice, so it needs no dedicated kernel. Any axis `x1` and `x2`
+/// share beyond `in1`/`in2` (such as a common batch axis) aligns
+/// automatically through that shared contraction, exactly like `Linear`'s
+/// own unrelated axes; an axis unique to either input passes through
+/// untouched.
+///
+/// Does not implement [`Module`], which only threads a single input tensor
+/// through `forward`: call [`Bilinear::build`] then [`Bilinear::forward`]
+/// directly with both operands.
+///
+/// Weight has logical shape `[in1, in2, output]` and starts uniform in
+/// `[-scale, scale)` with `scale = sqrt(6 / (in1_extent + in2_extent +
+/// output_extent))`, the same Xavier-style rule `Linear` uses generalized
+/// over both inputs (Axis does not reproduce PyTorch's own default
+/// `reset_parameters`, matching `Linear`'s own departure from it). Carries a
+/// learned `[output]` bias, zero-initialized like `Linear`'s; call
+/// `.bias(false)` before `build` to omit it entirely.
+#[derive(Clone)]
+pub struct Bilinear {
+    in1: Axis,
+    in2: Axis,
+    output: Dim,
+    in1_role: Axis,
+    in2_role: Axis,
+    output_role: Axis,
+    bias: bool,
+    bound: Option<(usize, usize, Parameter, Option<Parameter>)>,
+}
+impl Bilinear {
+    pub fn new(in1: Axis, in2: Axis, output: Dim) -> Self {
+        Self {
+            in1,
+            in2,
+            output,
+            in1_role: in1.role("bilinear_in1"),
+            in2_role: in2.role("bilinear_in2"),
+            output_role: output.axis.role("bilinear_output"),
+            bias: true,
+            bound: None,
+        }
+    }
+    /// Disable the learned bias term. Has no effect once `build` has already
+    /// allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.bias = bias;
+        self
+    }
+    pub fn output_shape(&self, x1: &Shape, x2: &Shape) -> Result<Shape> {
+        let extent1 = x1.extent(self.in1)?;
+        let extent2 = x2.extent(self.in2)?;
+        for dim in x1.dims() {
+            if dim.axis != self.in1 && x2.contains(dim.axis) && x2.extent(dim.axis)? != dim.extent
+            {
+                return Err(format!("Bilinear shared axis {:?} extent mismatch", dim.axis).into());
+            }
+        }
+        if let Some((bound1, bound2, _, _)) = &self.bound
+            && (*bound1, *bound2) != (extent1, extent2)
+        {
+            return Err("Bilinear input extents differ from its built extents".into());
+        }
+        let mut dims: Vec<_> = x1
+            .dims()
+            .iter()
+            .copied()
+            .filter(|d| d.axis != self.in1)
+            .collect();
+        for &dim in x2.dims() {
+            if dim.axis != self.in2 && !dims.iter().any(|d| d.axis == dim.axis) {
+                dims.push(dim);
+            }
+        }
+        dims.push(self.output);
+        Shape::new(dims)
+    }
+    pub fn build(&mut self, x1: &Shape, x2: &Shape, device: &Device, seed: u64) -> Result<Shape> {
+        let shape = self.output_shape(x1, x2)?;
+        if let Some((_, _, weight, _)) = &self.bound {
+            if !weight.tensor().device().same(device) {
+                return Err("Bilinear is already built on a different Device".into());
+            }
+            return Ok(shape);
+        }
+        let extent1 = x1.extent(self.in1)?;
+        let extent2 = x2.extent(self.in2)?;
+        let weight_shape = Shape::new([
+            self.in1_role.of(extent1),
+            self.in2_role.of(extent2),
+            self.output_role.of(self.output.extent),
+        ])?;
+        let scale = (6.0 / (extent1 + extent2 + self.output.extent) as f32).sqrt();
+        let weight = Parameter::new(Tensor::from_slice(
+            &uniform_values(seed, weight_shape.len(), scale),
+            weight_shape.dims().iter().copied(),
+            device,
+        )?);
+        let bias = if self.bias {
+            Some(Parameter::new(Tensor::from_slice(
+                &vec![0.0; self.output.extent],
+                [self.output_role.of(self.output.extent)],
+                device,
+            )?))
+        } else {
+            None
+        };
+        self.bound = Some((extent1, extent2, weight, bias));
+        Ok(shape)
+    }
+    pub fn forward(&self, x1: &Tensor, x2: &Tensor) -> Result<Tensor> {
+        self.output_shape(x1.shape(), x2.shape())?;
+        let (_, _, weight, bias) = self
+            .bound
+            .as_ref()
+            .ok_or("Bilinear must be built before forward")?;
+        let projected = x1
+            .rename(self.in1, self.in1_role)?
+            .contract(&weight.tensor(), self.in1_role)?
+            .contract(&x2.rename(self.in2, self.in2_role)?, self.in2_role)?;
+        let projected = match bias {
+            Some(bias) => projected.add(&bias.tensor())?,
+            None => projected,
+        };
+        projected.rename(self.output_role, self.output.axis)
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.bound
+            .as_ref()
+            .map(|(_, _, weight, bias)| {
+                let mut params = vec![("weight".into(), weight.clone())];
+                if let Some(bias) = bias {
+                    params.push(("bias".into(), bias.clone()));
+                }
+                params
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Pooling mode for [`EmbeddingBag`], matching PyTorch's `mode` argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbeddingBagMode {
+    Sum,
+    Mean,
+    Max,
+}
+
+/// Expand PyTorch's CSR-style `offsets` (bag `b` starts at `offsets[b]`) into
+/// one bag id per position of a length-`total` index, exactly the shape
+/// [`Tensor::scatter_add`]'s own `index` parameter wants.
+fn embedding_bag_assignment(offsets: &[usize], total: usize) -> Result<Vec<usize>> {
+    if offsets.is_empty() {
+        return Err("EmbeddingBag requires at least one bag".into());
+    }
+    if offsets[0] != 0 {
+        return Err("EmbeddingBag offsets must start at zero".into());
+    }
+    if offsets.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err("EmbeddingBag offsets must be non-decreasing".into());
+    }
+    if *offsets.last().expect("checked nonempty above") > total {
+        return Err("EmbeddingBag offsets exceed the index length".into());
+    }
+    let mut bag = vec![0usize; total];
+    for (b, &start) in offsets.iter().enumerate() {
+        let end = offsets.get(b + 1).copied().unwrap_or(total);
+        bag[start..end].fill(b);
+    }
+    Ok(bag)
+}
+
+/// One learned feature vector per vocabulary entry, pooled per bag: PyTorch's
+/// `nn.EmbeddingBag`. Unlike [`Embedding`]'s dense one-hot contraction, the
+/// input is a host-side flat row-index array together with `offsets` (bag
+/// `b` covers positions `offsets[b]..offsets[b + 1]`, or `..index.len()` for
+/// the last bag -- exactly `torch.nn.EmbeddingBag.forward`'s own `input`/
+/// `offsets` pair), so it scales to a large table the same way
+/// [`Tensor::gather`] itself does. Does not implement [`Module`], which only
+/// threads a single *tensor* input: the index and offsets are host-side
+/// integer arrays, not tensors, exactly as [`Tensor::gather`]'s own `index`
+/// and [`Tensor::scatter_add`]'s own `index`/`bucket` already are.
+///
+/// `forward` gathers one table row per position ([`Tensor::gather`]), then
+/// pools rows sharing a bag: `Sum` and `Mean` reuse [`Tensor::scatter_add`]
+/// directly (`Mean` additionally divides by each bag's own item count from
+/// [`Tensor::bincount`], clamped to at least one so an empty bag reads back
+/// as an exact zero row rather than `0 / 0`); `Max` instead broadcasts the
+/// gathered rows onto an explicit `[bag, position, feature]` cube, adds a
+/// host-built additive offset that is exactly `f32::NEG_INFINITY` at every
+/// `(bag, position)` pair whose position is not in that bag, and reduces
+/// with [`Tensor::max`], which already ignores non-finite candidates and
+/// documents the "no finite candidate" case as `NaN` with zero gradient --
+/// so an empty bag's max row is honestly `NaN`, a deliberate divergence from
+/// PyTorch's zero-filled empty bag for that one mode. No new kernel is
+/// needed for any mode. Entries start uniform in `[-0.02, 0.02)`, matching
+/// [`Embedding`].
+#[derive(Clone)]
+pub struct EmbeddingBag {
+    vocabulary: Dim,
+    feature: Dim,
+    position_role: Axis,
+    mode: EmbeddingBagMode,
+    table: Option<Parameter>,
+}
+impl EmbeddingBag {
+    pub fn new(vocabulary: Dim, feature: Dim, mode: EmbeddingBagMode) -> Self {
+        Self {
+            vocabulary,
+            feature,
+            position_role: vocabulary.axis.role("embedding_bag_position"),
+            mode,
+            table: None,
+        }
+    }
+    pub fn build(&mut self, device: &Device, seed: u64) -> Result<()> {
+        if let Some(table) = &self.table {
+            if !table.tensor().device().same(device) {
+                return Err("EmbeddingBag is already built on a different Device".into());
+            }
+            return Ok(());
+        }
+        let table_shape = Shape::new([self.vocabulary, self.feature])?;
+        let table = Parameter::new(Tensor::from_slice(
+            &uniform_values(seed, table_shape.len(), 0.02),
+            table_shape.dims().iter().copied(),
+            device,
+        )?);
+        self.table = Some(table);
+        Ok(())
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.table
+            .as_ref()
+            .map(|table| vec![("table".into(), table.clone())])
+            .unwrap_or_default()
+    }
+    /// `index[i]` names the vocabulary row position `i` reads; `offsets`
+    /// splits `index` into bags as documented on [`EmbeddingBag`] itself.
+    /// `output` is the bag axis of the `[output, feature]` result.
+    pub fn forward(&self, index: &[usize], offsets: &[usize], output: Axis) -> Result<Tensor> {
+        let table = self
+            .table
+            .as_ref()
+            .ok_or("EmbeddingBag must be built before forward")?;
+        if index.is_empty() {
+            return Err("EmbeddingBag requires a nonempty index".into());
+        }
+        let bag = embedding_bag_assignment(offsets, index.len())?;
+        let bag_count = offsets.len();
+        let device = table.tensor().device().clone();
+        let rows = table
+            .tensor()
+            .gather(self.vocabulary.axis, index, self.position_role)?;
+        match self.mode {
+            EmbeddingBagMode::Sum => {
+                rows.scatter_add(self.position_role, &bag, output, bag_count)
+            }
+            EmbeddingBagMode::Mean => {
+                let summed = rows.scatter_add(self.position_role, &bag, output, bag_count)?;
+                let counts = Tensor::bincount(&bag, output, bag_count, &device)?
+                    .clamp(Some(1.0), None)?;
+                summed.div(&counts)
+            }
+            EmbeddingBagMode::Max => {
+                let mut offset_values = vec![f32::NEG_INFINITY; bag_count * index.len()];
+                for (position, &b) in bag.iter().enumerate() {
+                    offset_values[b * index.len() + position] = 0.0;
+                }
+                let offset = Tensor::from_slice(
+                    &offset_values,
+                    [output.of(bag_count), self.position_role.of(index.len())],
+                    &device,
+                )?;
+                let broadcast_shape = Shape::new([
+                    output.of(bag_count),
+                    self.position_role.of(index.len()),
+                    self.feature.axis.of(self.feature.extent),
+                ])?;
+                rows.broadcast_to(&broadcast_shape)?
+                    .add(&offset.broadcast_to(&broadcast_shape)?)?
+                    .max(self.position_role)
+            }
+        }
+    }
+}

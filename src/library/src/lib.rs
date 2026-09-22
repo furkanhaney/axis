@@ -65,10 +65,12 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    Embedding, ExactGELU, GELU, IntoLayers, LeakyReLU, Linear, Module, ParamId, Parameter,
-    PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU, SignStraightThrough, Tanh,
+    Bilinear, Embedding, EmbeddingBag, EmbeddingBagMode, ExactGELU, Flatten, GELU, Identity,
+    IntoLayers, LeakyReLU, Linear, Module, ModuleDict, ModuleList, ParamId, Parameter,
+    ParameterDict, ParameterList, PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU,
+    SignStraightThrough, Tanh, Unflatten,
 };
-pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
+pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, LocalResponseNorm, RmsNorm};
 pub use optim::{
     Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD, clip_grad_norm,
     cosine_annealing_lr, one_cycle_lr,
@@ -106,19 +108,22 @@ mod window_tests;
 
 pub mod prelude {
     pub use crate::{
-        Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
+        Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, Bilinear, CategoricalAccuracy,
         CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
-        Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
-        EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
-        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
-        Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
-        LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
-        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
-        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear,
-        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot,
-        ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD,
-        Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh,
-        Tensor, TrainStep, Trainer, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmbeddingBag,
+        EmbeddingBagMode, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, EmpiricalResidual,
+        EmpiricalResidualReceipt, ExactGELU, FinitePasses, FinitePassesLoader,
+        FinitePassesReceipt, Flatten, GELU, GroupNorm, Identity, IdentityScheme, Idr, IdrLimits,
+        IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm, LeakyReLU,
+        LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
+        LearningProgress, LearningProgressReceipt, Linear, LocalResponseNorm, Lstm, LstmCell,
+        LstmRun, LstmState, MaxPool2d, MaxPool3d, Module, ModuleDict, ModuleList,
+        MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        MuonWithAuxAdamW, Optimizer, ParamId, Parameter, ParameterDict, ParameterList,
+        PopulationLinear, PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding,
+        ReLU, RegimeSnapshot, ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope,
+        Result, RmsNorm, SGD, Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass,
+        Standardizer, Tanh, Tensor, TrainStep, Trainer, Unflatten, clip_grad_norm,
+        cosine_annealing_lr, one_cycle_lr,
     };
 }
