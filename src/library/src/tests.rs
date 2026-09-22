@@ -3389,7 +3389,7 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     // Rejections: axis must already exist (unlike `stack`), axis sets must
     // match exactly, and with more than two operands a mismatched
     // non-concat-axis extent must be rejected before any device work.
-    assert!(Tensor::concat(&[a.clone()], missing).is_err());
+    assert!(Tensor::concat(std::slice::from_ref(&a), missing).is_err());
     let wrong_axes = Tensor::from_slice(&[0.0, 1.0], [missing.of(2)], &device)?;
     assert!(Tensor::concat(&[a.clone(), wrong_axes], feature).is_err());
     let mismatched_batch =
