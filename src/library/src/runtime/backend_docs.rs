@@ -184,6 +184,25 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn binary_cross_entropy_weighted(
+        &self,
+        _logits: &Buffer,
+        _targets: &Buffer,
+        _pos_weight: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn binary_cross_entropy_weighted_backward(
+        &self,
+        _gradient: &Buffer,
+        _logits: &Buffer,
+        _targets: &Buffer,
+        _pos_weight: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn categorical_cross_entropy(
         &self,
         _logits: &Buffer,
