@@ -5894,3 +5894,191 @@ fn broadcast_to_matches_hand_computed_pairwise_squared_distance_under_reordered_
     println!("reordered-storage outer-broadcast pairwise squared distance PASS");
     Ok(())
 }
+
+/// Issue #80: `energy-output/fit_readout_sweep.py:46` computes `q = a + torch.logsumexp(z,
+/// dim=1)` as one of its four swept readouts. Hand-computed literals: row 0's inputs are
+/// `[ln(1), ln(2), ln(3)]`, whose exponentials sum to `6`, so `logsumexp = ln(6)`; row 1's
+/// are `[ln(4), ln(4), ln(8)]`, summing to `16`, so `logsumexp = ln(16)`. The gradient of
+/// `logsumexp` is exactly `softmax` along the reduced axis (`exp(x - m) / sum(exp(x - m))`,
+/// independent of the detached shift `m`), so `mean(batch)`'s backward should land precisely
+/// on each row's softmax scaled by `1 / batch_extent`.
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_matches_hand_computed_literals_and_gradient_equals_softmax() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            0.0_f32,
+            2.0_f32.ln(),
+            3.0_f32.ln(),
+            4.0_f32.ln(),
+            4.0_f32.ln(),
+            8.0_f32.ln(),
+        ],
+        [batch.of(2), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let reduced = values.logsumexp(candidate)?;
+    assert_eq!(reduced.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "logsumexp hand-computed forward",
+        &reduced.to_vec()?,
+        &[6.0_f64.ln(), 16.0_f64.ln()],
+    );
+
+    reduced.mean(batch)?.backward()?;
+    close(
+        "logsumexp gradient equals softmax/batch_extent",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[
+            0.5 / 6.0,
+            1.0 / 6.0,
+            1.5 / 6.0,
+            0.5 / 4.0,
+            0.5 / 4.0,
+            1.0 / 4.0,
+        ],
+    );
+
+    let error = values
+        .logsumexp(Axis::new("missing"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
+    println!("logsumexp hand-computed forward and gradient PASS");
+    Ok(())
+}
+
+/// Same evidence bar, at a magnitude where naively exponentiating `x` directly (without
+/// subtracting the per-row maximum first) would overflow `f32`. Row 0 has one dominant
+/// entry (`1000` against two `0`s, a large spread); row 1 is a near-tie shifted onto the
+/// same large magnitude (`1000 + ln(k)`, a small spread). Both rows stay exactly the shape
+/// of the small-magnitude case above -- `logsumexp` is shift-invariant, so row 1's softmax
+/// gradient reproduces row 0's from the previous test bit for bit.
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_large_magnitude_input_does_not_overflow() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            1000.0_f32,
+            0.0_f32,
+            0.0_f32,
+            1000.0_f32,
+            1000.0_f32 + 2.0_f32.ln(),
+            1000.0_f32 + 3.0_f32.ln(),
+        ],
+        [batch.of(2), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let reduced = values.logsumexp(candidate)?;
+    close(
+        "logsumexp large-magnitude forward",
+        &reduced.to_vec()?,
+        &[1000.0, 1000.0 + 6.0_f64.ln()],
+    );
+
+    reduced.mean(batch)?.backward()?;
+    close(
+        "logsumexp large-magnitude gradient equals softmax/batch_extent",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[0.5, 0.0, 0.0, 0.5 / 6.0, 1.0 / 6.0, 1.5 / 6.0],
+    );
+    println!("logsumexp large-magnitude forward and gradient PASS");
+    Ok(())
+}
+
+/// Documents the one place `logsumexp` diverges from `torch.logsumexp`: a group with no
+/// finite candidate at all. `Tensor::max`'s own convention (see its doc comment) ignores
+/// non-finite candidates and returns `NaN`, with zero derivative, for a group that has no
+/// finite one -- rather than PyTorch's `-infinity` for an all-`-infinity` `max`. `logsumexp`
+/// reuses `max` verbatim for its shift `m`, so an all-`-infinity` (or otherwise all
+/// non-finite) group produces `m = NaN` and therefore `logsumexp = NaN` too, where
+/// `torch.logsumexp` returns `-infinity`. Unlike `max`, `logsumexp` has no dedicated
+/// backward rule to zero that group's gradient: `NaN` propagates through the ordinary
+/// `sub`/`exp`/`sum`/`ln` composition, so the gradient is `NaN`, not zero.
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_all_nonfinite_group_returns_nan_unlike_pytorchs_negative_infinity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
+        [batch.of(1), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let reduced = values.logsumexp(candidate)?;
+    assert!(reduced.to_vec()?[0].is_nan(), "expected NaN, matching max's empty-group convention, not PyTorch's -infinity");
+
+    reduced.mean(batch)?.backward()?;
+    let gradient = values.grad().expect("values gradient").to_vec()?;
+    assert!(
+        gradient.iter().all(|g| g.is_nan()),
+        "logsumexp has no dedicated backward rule to zero an empty group's gradient the way max does: {gradient:?}"
+    );
+    println!("logsumexp all-nonfinite group PASS");
+    Ok(())
+}
+
+/// Reordered-storage CUDA case: physical storage is transposed relative to the declared
+/// `[batch, candidate]` logical order, so `logsumexp`'s internal `max`/`sub`/`sum` calls
+/// must all read through `self.0.layout`'s permuted strides rather than assume contiguous
+/// storage in axis order. Row 0's inputs are `[ln(1), ln(1), ln(2), ln(4)]` (exponentials
+/// sum to `8`); row 1's are `[ln(3), ln(5), ln(5), ln(3)]` (sum to `16`).
+#[test]
+#[ignore = "requires CUDA"]
+fn logsumexp_reordered_storage_matches_hand_computed_forward_and_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, group) = (Axis::new("row"), Axis::new("group"));
+    let values = Tensor::from_slice(
+        &[
+            0.0_f32,
+            0.0_f32,
+            2.0_f32.ln(),
+            4.0_f32.ln(),
+            3.0_f32.ln(),
+            5.0_f32.ln(),
+            5.0_f32.ln(),
+            3.0_f32.ln(),
+        ],
+        [row.of(2), group.of(4)],
+        &device,
+    )?
+    .with_layout([group, row])?
+    .with_grad();
+
+    let reduced = values.logsumexp(group)?;
+    assert_eq!(reduced.shape(), &Shape::new([row.of(2)])?);
+    close(
+        "logsumexp reordered-storage forward",
+        &reduced.to_vec()?,
+        &[8.0_f64.ln(), 16.0_f64.ln()],
+    );
+
+    reduced.mean(row)?.backward()?;
+    close(
+        "logsumexp reordered-storage gradient equals softmax/row_extent",
+        &values.grad().expect("values gradient").to_vec()?,
+        &[
+            0.5 / 8.0,
+            0.5 / 8.0,
+            1.0 / 8.0,
+            2.0 / 8.0,
+            1.5 / 16.0,
+            2.5 / 16.0,
+            2.5 / 16.0,
+            1.5 / 16.0,
+        ],
+    );
+    println!("logsumexp reordered-storage forward and gradient PASS");
+    Ok(())
+}
