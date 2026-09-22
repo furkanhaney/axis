@@ -1072,7 +1072,8 @@ impl Tensor {
     }
     /// Elementwise `self > scalar` as a `{0.0, 1.0}` mask, IEEE-ordered so any
     /// comparison against `NaN` is `false` (`0.0`), exactly like PyTorch's `>`.
-    /// No autograd edge; see [`Self::compare_scalar`].
+    /// No autograd edge, even when `self` requires grad: like PyTorch, a
+    /// comparison is not differentiable.
     pub fn gt(&self, scalar: f32) -> Result<Self> {
         self.compare_scalar(scalar, 0)
     }

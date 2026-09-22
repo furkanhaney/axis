@@ -3865,13 +3865,37 @@ fn comparison_scalar_ops_match_hand_computed_edge_cases_including_nan() -> Resul
     let values = [-2.0f32, -0.5, 0.0, 0.5, 1.5, 2.0, f32::NAN];
     let x = Tensor::from_slice(&values, [sample.of(values.len())], &device)?;
 
-    close("gt(0.0)", &x.gt(0.0)?.to_vec()?, &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0]);
-    close("ge(0.0)", &x.ge(0.0)?.to_vec()?, &[0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0]);
-    close("lt(0.0)", &x.lt(0.0)?.to_vec()?, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-    close("le(0.0)", &x.le(0.0)?.to_vec()?, &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
-    close("eq(0.0)", &x.eq(0.0)?.to_vec()?, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+    close(
+        "gt(0.0)",
+        &x.gt(0.0)?.to_vec()?,
+        &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0],
+    );
+    close(
+        "ge(0.0)",
+        &x.ge(0.0)?.to_vec()?,
+        &[0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0],
+    );
+    close(
+        "lt(0.0)",
+        &x.lt(0.0)?.to_vec()?,
+        &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    close(
+        "le(0.0)",
+        &x.le(0.0)?.to_vec()?,
+        &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    close(
+        "eq(0.0)",
+        &x.eq(0.0)?.to_vec()?,
+        &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    );
     // Exact equality at a representable non-zero value: only index 4 (1.5) matches.
-    close("eq(1.5)", &x.eq(1.5)?.to_vec()?, &[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    close(
+        "eq(1.5)",
+        &x.eq(1.5)?.to_vec()?,
+        &[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    );
 
     // Comparisons carry no autograd edge at all, matching PyTorch (`>` etc. are
     // non-differentiable): even when the input requires grad, the mask does not.
@@ -3920,7 +3944,11 @@ fn comparison_masks_gate_multiplication_and_compose_with_logical_and_not() -> Re
     let observed = Tensor::from_slice(&[1.0f32, 1.0, 0.0, 1.0], [feature.of(4)], &device)?;
     let draws = Tensor::from_slice(&[0.1f32, 0.9, 0.2, 0.4], [feature.of(4)], &device)?;
     let hidden = draws.lt(0.5)?.logical_and(&observed)?;
-    close("hidden mask (rand < rate) & observed", &hidden.to_vec()?, &[1.0, 0.0, 0.0, 1.0]);
+    close(
+        "hidden mask (rand < rate) & observed",
+        &hidden.to_vec()?,
+        &[1.0, 0.0, 0.0, 1.0],
+    );
     let visible = observed.logical_and(&hidden.logical_not()?)?;
     close(
         "visible mask observed & ~hidden",
