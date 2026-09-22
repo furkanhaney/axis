@@ -6017,7 +6017,10 @@ fn logsumexp_all_nonfinite_group_returns_nan_unlike_pytorchs_negative_infinity()
     .with_grad();
 
     let reduced = values.logsumexp(candidate)?;
-    assert!(reduced.to_vec()?[0].is_nan(), "expected NaN, matching max's empty-group convention, not PyTorch's -infinity");
+    assert!(
+        reduced.to_vec()?[0].is_nan(),
+        "expected NaN, matching max's empty-group convention, not PyTorch's -infinity"
+    );
 
     reduced.mean(batch)?.backward()?;
     let gradient = values.grad().expect("values gradient").to_vec()?;
