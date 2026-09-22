@@ -3885,11 +3885,6 @@ fn sum_matches_hand_computed_values_and_gradient_over_multiple_axes() -> Result<
     assert!(x.sum([batch, batch]).is_err());
     println!("sum forward, multi-axis gradient, and axis rejection PASS");
     Ok(())
-fn clip_grad_norm_rejects_invalid_max_norm() {
-    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), 0.0).is_err());
-    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), -1.0).is_err());
-    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), f32::NAN).is_err());
-    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), f32::INFINITY).is_err());
 }
 
 #[test]
@@ -3943,6 +3938,156 @@ fn sum_over_reordered_asymmetric_storage_matches_hand_computed_values_and_gradie
         &x.grad().unwrap().to_vec()?,
         &expected_gradient,
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn sum_composes_with_divide_for_masked_counts_including_a_zero_count() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, feature) = (Axis::new("row"), Axis::new("feature"));
+    // Per-feature masked squared error, already zeroed where the mask is zero, mirroring
+    // energy-output's fit_reconstruction.py loss_fn (`losses.sum(dim=0) /
+    // counts.clamp(min=1)`) and fluid's train.py batch_loss (`num = (... * mb).sum()`).
+    #[rustfmt::skip]
+    let masked_losses = Tensor::from_slice(
+        &[
+            2.0, 0.0, 0.0,
+            4.0, 0.0, 6.0,
+            0.0, 0.0, 3.0,
+            8.0, 0.0, 0.0,
+        ],
+        [row.of(4), feature.of(3)],
+        &device,
+    )?;
+    #[rustfmt::skip]
+    let mask = Tensor::from_slice(
+        &[
+            1.0, 0.0, 0.0,
+            1.0, 0.0, 1.0,
+            0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0,
+        ],
+        [row.of(4), feature.of(3)],
+        &device,
+    )?;
+
+    let counts = mask.sum(row)?;
+    close("mask.sum(row) counts", &counts.to_vec()?, &[3.0, 0.0, 2.0]);
+
+    let losses = masked_losses.sum(row)?.div(&counts)?;
+    let actual = losses.to_vec()?;
+    // feature 0: 14/3; feature 2: 9/2 -- ordinary division, matching PyTorch's
+    // `(...).sum(dim=0) / counts.clamp(min=1)` at those columns exactly, since the clamp
+    // is a no-op once the count is already positive.
+    assert!(
+        (f64::from(actual[0]) - 14.0 / 3.0).abs() < 1e-6,
+        "{actual:?}"
+    );
+    assert!((f64::from(actual[2]) - 4.5).abs() < 1e-6, "{actual:?}");
+    // feature 1 has zero mask everywhere, so both the summed numerator and the summed
+    // count are exactly zero. `div` applies no clamp (documented on `Tensor::div`), so
+    // this is IEEE `0.0 / 0.0 = NaN` -- exactly the case the consumer studies' own
+    // `counts.clamp(min=1)` exists to avoid; `sum` itself makes no such policy choice.
+    assert!(actual[1].is_nan(), "{actual:?}");
+    println!("sum composed with divide over masked counts, including a zero count, PASS");
+    Ok(())
+}
+
+#[test]
+fn clip_grad_norm_rejects_invalid_max_norm() {
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), 0.0).is_err());
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), -1.0).is_err());
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), f32::NAN).is_err());
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), f32::INFINITY).is_err());
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clip_grad_norm_scales_every_gradient_by_one_global_factor_when_the_norm_exceeds_max_norm()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let f = Axis::new("feature");
+    // mean(x*x) over a single-element axis has derivative 2*x/1 = 2*x, so
+    // x = 1.5 and x = 2.0 give clean gradients 3.0 and 4.0 by construction —
+    // a closed form independent of clip_grad_norm itself, the same trick
+    // `parameter_versions_accumulation_and_shared_updates` above uses.
+    let a = Parameter::new(Tensor::from_slice(&[1.5], [f.of(1)], &device)?);
+    a.tensor().mul(&a.tensor())?.mean(f)?.backward()?;
+    let b = Parameter::new(Tensor::from_slice(&[2.0], [f.of(1)], &device)?);
+    b.tensor().mul(&b.tensor())?.mean(f)?.backward()?;
+    // A third parameter with no gradient yet must be skipped, not erred on.
+    let untouched = Parameter::new(Tensor::from_slice(&[9.0], [f.of(1)], &device)?);
+    close(
+        "gradient a before clipping",
+        &a.grad().unwrap().to_vec()?,
+        &[3.0],
+    );
+    close(
+        "gradient b before clipping",
+        &b.grad().unwrap().to_vec()?,
+        &[4.0],
+    );
+
+    // total_norm = sqrt(3.0^2 + 4.0^2) = sqrt(25) = 5.0, hand-computed and
+    // independent of the op under test. `a` is listed twice below (as a
+    // stand-in for a tied/shared parameter reachable through two paths): if
+    // ParamId deduplication failed, the sum of squares would double-count it
+    // to 2*9 + 16 = 34 and total_norm would be sqrt(34) =/= 5.0, failing the
+    // very next assertion.
+    let total_norm = clip_grad_norm([a.clone(), b.clone(), untouched.clone(), a.clone()], 4.0)?;
+    close("pre-clip total norm", &[total_norm], &[5.0]);
+
+    // 5.0 > max_norm (4.0), so every gradient is scaled by the SAME factor
+    // max_norm / (total_norm + 1e-6) = 4.0 / 5.000001 = 0.79999984 (by hand,
+    // long division to 8 significant figures): 3.0*0.79999984 = 2.39999952,
+    // 4.0*0.79999984 = 3.19999936.
+    close(
+        "gradient a scaled by the global factor",
+        &a.grad().unwrap().to_vec()?,
+        &[2.39999952],
+    );
+    close(
+        "gradient b scaled by the SAME global factor",
+        &b.grad().unwrap().to_vec()?,
+        &[3.19999936],
+    );
+    assert!(
+        untouched.grad().is_none(),
+        "a parameter with no gradient must not gain one"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clip_grad_norm_leaves_gradients_bit_exact_below_max_norm() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let f = Axis::new("feature");
+    let a = Parameter::new(Tensor::from_slice(&[1.5], [f.of(1)], &device)?);
+    a.tensor().mul(&a.tensor())?.mean(f)?.backward()?;
+    let b = Parameter::new(Tensor::from_slice(&[2.0], [f.of(1)], &device)?);
+    b.tensor().mul(&b.tensor())?.mean(f)?.backward()?;
+
+    // Same hand-computed total_norm = 5.0 as above, but max_norm = 10.0 is
+    // above it: a no-op, never a silent renormalization to exactly max_norm.
+    let total_norm = clip_grad_norm([a.clone(), b.clone()], 10.0)?;
+    close("pre-clip total norm below threshold", &[total_norm], &[5.0]);
+    assert_eq!(
+        a.grad().unwrap().to_vec()?,
+        vec![3.0_f32],
+        "untouched gradient a must be bit-exact"
+    );
+    assert_eq!(
+        b.grad().unwrap().to_vec()?,
+        vec![4.0_f32],
+        "untouched gradient b must be bit-exact"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn named_axis_nearest_upsample_matches_hand_computed_values_and_gradient() -> Result<()> {
     // Mirrors morpheus's `upsample2x` helper (proven bit-exact against a real
     // `F.interpolate(mode="nearest")` oracle in
@@ -4000,179 +4145,11 @@ fn named_axis_nearest_upsample_matches_hand_computed_values_and_gradient() -> Re
     let missing = Axis::new("missing");
     assert!(x.upsample_nearest(missing, 2).is_err());
     println!("nearest upsample values, gradient, and rejections PASS");
-fn named_axis_maximum_preserves_axes_across_layouts_and_routes_ties() -> Result<()> {
-    let device = Device::cuda(0)?;
-    let (batch, candidate, time) = (
-        Axis::new("batch"),
-        Axis::new("candidate"),
-        Axis::new("time"),
-    );
-    let values = Tensor::from_slice(
-        &[
-            2.0, -5.0, 9.0, 9.0, 4.0, 9.0, 4.0, 0.0, -2.0, 5.0, 6.0, -1.0,
-        ],
-        [batch.of(2), candidate.of(3), time.of(2)],
-        &device,
-    )?
-    .with_layout([candidate, time, batch])?
-    .with_grad();
-
-    let maximum = values.max(candidate)?;
-    assert_eq!(maximum.shape(), &Shape::new([batch.of(2), time.of(2)])?);
-    close(
-        "named-axis maximum",
-        &maximum.to_vec()?,
-        &[9.0, 9.0, 6.0, 5.0],
-    );
-    maximum.mean([batch, time])?.backward()?;
-    close(
-        "named-axis maximum gradient",
-        &values.grad().unwrap().to_vec()?,
-        &[
-            0.0, 0.0, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25, 0.0,
-        ],
-    );
-    let error = values.max(Axis::new("missing")).err().unwrap().to_string();
-    assert!(error.contains("missing axis missing#"), "{error}");
-fn gather_scatter_add_matches_hand_computed_oracle_on_repeated_index() -> Result<()> {
-    // render's hash_grid.py picks HashGrid table rows by a computed integer
-    // hash; upscale_eval's SwinIR picks relative_position_bias_table rows by
-    // a precomputed geometry index. Both need forward row copies AND a
-    // gradient that ACCUMULATES into a row picked more than once — the case
-    // a one-hot-matmul implementation gets wrong silently (correct forward,
-    // dropped accumulated gradient) unless backward is a real scatter-add.
-    let device = Device::cuda(0)?;
-    let (row, feature, pick) = (Axis::new("row"), Axis::new("feature"), Axis::new("pick"));
-    let table_values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-    let table = Tensor::from_slice(&table_values, [row.of(5), feature.of(2)], &device)?.with_grad();
-
-    // Non-monotonic order; row 2 is picked twice, at positions 1 and 3.
-    let index = [0usize, 2, 4, 2, 1];
-    let gathered = table.gather(row, &index, pick)?;
-    assert_eq!(gathered.shape(), &Shape::new([pick.of(5), feature.of(2)])?);
-    close(
-        "gather forward",
-        &gathered.to_vec()?,
-        &[1.0, 2.0, 5.0, 6.0, 9.0, 10.0, 5.0, 6.0, 3.0, 4.0],
-    );
-
-    gathered.mean([pick, feature])?.backward()?;
-    close(
-        "gather scatter-add gradient",
-        &table.grad().expect("table gradient").to_vec()?,
-        &[0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.0, 0.0, 0.1, 0.1],
-    );
-
-    // Rejected before any device work: empty index, an index outside the
-    // row extent, and an axis the table does not have.
-    assert!(table.gather(row, &[], pick).is_err());
-    assert!(table.gather(row, &[0, 5], pick).is_err());
-    assert!(table.gather(Axis::new("missing"), &[0], pick).is_err());
     Ok(())
 }
 
 #[test]
 #[ignore = "requires CUDA"]
-fn sum_composes_with_divide_for_masked_counts_including_a_zero_count() -> Result<()> {
-    let device = Device::cuda(0)?;
-    let (row, feature) = (Axis::new("row"), Axis::new("feature"));
-    // Per-feature masked squared error, already zeroed where the mask is zero, mirroring
-    // energy-output's fit_reconstruction.py loss_fn (`losses.sum(dim=0) /
-    // counts.clamp(min=1)`) and fluid's train.py batch_loss (`num = (... * mb).sum()`).
-    #[rustfmt::skip]
-    let masked_losses = Tensor::from_slice(
-        &[
-            2.0, 0.0, 0.0,
-            4.0, 0.0, 6.0,
-            0.0, 0.0, 3.0,
-            8.0, 0.0, 0.0,
-        ],
-        [row.of(4), feature.of(3)],
-        &device,
-    )?;
-    #[rustfmt::skip]
-    let mask = Tensor::from_slice(
-        &[
-            1.0, 0.0, 0.0,
-            1.0, 0.0, 1.0,
-            0.0, 0.0, 1.0,
-            1.0, 0.0, 0.0,
-        ],
-        [row.of(4), feature.of(3)],
-        &device,
-    )?;
-
-    let counts = mask.sum(row)?;
-    close("mask.sum(row) counts", &counts.to_vec()?, &[3.0, 0.0, 2.0]);
-
-    let losses = masked_losses.sum(row)?.div(&counts)?;
-    let actual = losses.to_vec()?;
-    // feature 0: 14/3; feature 2: 9/2 -- ordinary division, matching PyTorch's
-    // `(...).sum(dim=0) / counts.clamp(min=1)` at those columns exactly, since the clamp
-    // is a no-op once the count is already positive.
-    assert!(
-        (f64::from(actual[0]) - 14.0 / 3.0).abs() < 1e-6,
-        "{actual:?}"
-    );
-    assert!((f64::from(actual[2]) - 4.5).abs() < 1e-6, "{actual:?}");
-    // feature 1 has zero mask everywhere, so both the summed numerator and the summed
-    // count are exactly zero. `div` applies no clamp (documented on `Tensor::div`), so
-    // this is IEEE `0.0 / 0.0 = NaN` -- exactly the case the consumer studies' own
-    // `counts.clamp(min=1)` exists to avoid; `sum` itself makes no such policy choice.
-    assert!(actual[1].is_nan(), "{actual:?}");
-    println!("sum composed with divide over masked counts, including a zero count, PASS");
-fn clip_grad_norm_scales_every_gradient_by_one_global_factor_when_the_norm_exceeds_max_norm()
--> Result<()> {
-    let device = Device::cuda(0)?;
-    let f = Axis::new("feature");
-    // mean(x*x) over a single-element axis has derivative 2*x/1 = 2*x, so
-    // x = 1.5 and x = 2.0 give clean gradients 3.0 and 4.0 by construction —
-    // a closed form independent of clip_grad_norm itself, the same trick
-    // `parameter_versions_accumulation_and_shared_updates` above uses.
-    let a = Parameter::new(Tensor::from_slice(&[1.5], [f.of(1)], &device)?);
-    a.tensor().mul(&a.tensor())?.mean(f)?.backward()?;
-    let b = Parameter::new(Tensor::from_slice(&[2.0], [f.of(1)], &device)?);
-    b.tensor().mul(&b.tensor())?.mean(f)?.backward()?;
-    // A third parameter with no gradient yet must be skipped, not erred on.
-    let untouched = Parameter::new(Tensor::from_slice(&[9.0], [f.of(1)], &device)?);
-    close(
-        "gradient a before clipping",
-        &a.grad().unwrap().to_vec()?,
-        &[3.0],
-    );
-    close(
-        "gradient b before clipping",
-        &b.grad().unwrap().to_vec()?,
-        &[4.0],
-    );
-
-    // total_norm = sqrt(3.0^2 + 4.0^2) = sqrt(25) = 5.0, hand-computed and
-    // independent of the op under test. `a` is listed twice below (as a
-    // stand-in for a tied/shared parameter reachable through two paths): if
-    // ParamId deduplication failed, the sum of squares would double-count it
-    // to 2*9 + 16 = 34 and total_norm would be sqrt(34) =/= 5.0, failing the
-    // very next assertion.
-    let total_norm = clip_grad_norm([a.clone(), b.clone(), untouched.clone(), a.clone()], 4.0)?;
-    close("pre-clip total norm", &[total_norm], &[5.0]);
-
-    // 5.0 > max_norm (4.0), so every gradient is scaled by the SAME factor
-    // max_norm / (total_norm + 1e-6) = 4.0 / 5.000001 = 0.79999984 (by hand,
-    // long division to 8 significant figures): 3.0*0.79999984 = 2.39999952,
-    // 4.0*0.79999984 = 3.19999936.
-    close(
-        "gradient a scaled by the global factor",
-        &a.grad().unwrap().to_vec()?,
-        &[2.39999952],
-    );
-    close(
-        "gradient b scaled by the SAME global factor",
-        &b.grad().unwrap().to_vec()?,
-        &[3.19999936],
-    );
-    assert!(
-        untouched.grad().is_none(),
-        "a parameter with no gradient must not gain one"
-    );
 fn named_axis_nearest_upsample_matches_a_non_power_of_two_reordered_storage_case() -> Result<()> {
     // The proven composition this wraps was only checked at extents that
     // stay whole under repeated halving (2x3); this exercises extent 5
@@ -4270,28 +4247,6 @@ fn named_axis_bilinear_upsample_matches_hand_computed_values_and_mass_conserving
 
 #[test]
 #[ignore = "requires CUDA"]
-fn clip_grad_norm_leaves_gradients_bit_exact_below_max_norm() -> Result<()> {
-    let device = Device::cuda(0)?;
-    let f = Axis::new("feature");
-    let a = Parameter::new(Tensor::from_slice(&[1.5], [f.of(1)], &device)?);
-    a.tensor().mul(&a.tensor())?.mean(f)?.backward()?;
-    let b = Parameter::new(Tensor::from_slice(&[2.0], [f.of(1)], &device)?);
-    b.tensor().mul(&b.tensor())?.mean(f)?.backward()?;
-
-    // Same hand-computed total_norm = 5.0 as above, but max_norm = 10.0 is
-    // above it: a no-op, never a silent renormalization to exactly max_norm.
-    let total_norm = clip_grad_norm([a.clone(), b.clone()], 10.0)?;
-    close("pre-clip total norm below threshold", &[total_norm], &[5.0]);
-    assert_eq!(
-        a.grad().unwrap().to_vec()?,
-        vec![3.0_f32],
-        "untouched gradient a must be bit-exact"
-    );
-    assert_eq!(
-        b.grad().unwrap().to_vec()?,
-        vec![4.0_f32],
-        "untouched gradient b must be bit-exact"
-    );
 fn named_axis_bilinear_upsample_matches_a_reordered_storage_weighted_gradient_case() -> Result<()> {
     // A second, independently-derived gradient check (the raw per-element
     // transpose-weight sum, unlike the mass-conservation shortcut above) on
@@ -4340,6 +4295,50 @@ fn named_axis_bilinear_upsample_matches_a_reordered_storage_weighted_gradient_ca
         ],
     );
     println!("bilinear upsample reordered-storage forward and gradient PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_axis_maximum_preserves_axes_across_layouts_and_routes_ties() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate, time) = (
+        Axis::new("batch"),
+        Axis::new("candidate"),
+        Axis::new("time"),
+    );
+    let values = Tensor::from_slice(
+        &[
+            2.0, -5.0, 9.0, 9.0, 4.0, 9.0, 4.0, 0.0, -2.0, 5.0, 6.0, -1.0,
+        ],
+        [batch.of(2), candidate.of(3), time.of(2)],
+        &device,
+    )?
+    .with_layout([candidate, time, batch])?
+    .with_grad();
+
+    let maximum = values.max(candidate)?;
+    assert_eq!(maximum.shape(), &Shape::new([batch.of(2), time.of(2)])?);
+    close(
+        "named-axis maximum",
+        &maximum.to_vec()?,
+        &[9.0, 9.0, 6.0, 5.0],
+    );
+    maximum.mean([batch, time])?.backward()?;
+    close(
+        "named-axis maximum gradient",
+        &values.grad().unwrap().to_vec()?,
+        &[
+            0.0, 0.0, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25, 0.0,
+        ],
+    );
+    let error = values.max(Axis::new("missing")).err().unwrap().to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn named_axis_maximum_ignores_nonfinite_values_and_marks_empty_groups() -> Result<()> {
     let device = Device::cuda(0)?;
     let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
@@ -4424,6 +4423,50 @@ fn named_axis_maximum_matches_negate_min_negate_composition_bit_exact() -> Resul
         &native_gradient,
         &[0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gather_scatter_add_matches_hand_computed_oracle_on_repeated_index() -> Result<()> {
+    // render's hash_grid.py picks HashGrid table rows by a computed integer
+    // hash; upscale_eval's SwinIR picks relative_position_bias_table rows by
+    // a precomputed geometry index. Both need forward row copies AND a
+    // gradient that ACCUMULATES into a row picked more than once — the case
+    // a one-hot-matmul implementation gets wrong silently (correct forward,
+    // dropped accumulated gradient) unless backward is a real scatter-add.
+    let device = Device::cuda(0)?;
+    let (row, feature, pick) = (Axis::new("row"), Axis::new("feature"), Axis::new("pick"));
+    let table_values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    let table = Tensor::from_slice(&table_values, [row.of(5), feature.of(2)], &device)?.with_grad();
+
+    // Non-monotonic order; row 2 is picked twice, at positions 1 and 3.
+    let index = [0usize, 2, 4, 2, 1];
+    let gathered = table.gather(row, &index, pick)?;
+    assert_eq!(gathered.shape(), &Shape::new([pick.of(5), feature.of(2)])?);
+    close(
+        "gather forward",
+        &gathered.to_vec()?,
+        &[1.0, 2.0, 5.0, 6.0, 9.0, 10.0, 5.0, 6.0, 3.0, 4.0],
+    );
+
+    gathered.mean([pick, feature])?.backward()?;
+    close(
+        "gather scatter-add gradient",
+        &table.grad().expect("table gradient").to_vec()?,
+        &[0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.0, 0.0, 0.1, 0.1],
+    );
+
+    // Rejected before any device work: empty index, an index outside the
+    // row extent, and an axis the table does not have.
+    assert!(table.gather(row, &[], pick).is_err());
+    assert!(table.gather(row, &[0, 5], pick).is_err());
+    assert!(table.gather(Axis::new("missing"), &[0], pick).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn gather_matches_hand_computed_oracle_under_reordered_table_storage() -> Result<()> {
     // Same accumulation contract as the test above, this time with the
     // table's PHYSICAL storage transposed relative to its logical
