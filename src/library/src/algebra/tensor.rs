@@ -1616,16 +1616,108 @@ impl Tensor {
     pub fn adaptive_avg_pool3d(&self, spatial: [Axis; 3], target: [usize; 3]) -> Result<Self> {
         self.adaptive_avg_pool(spatial, target)
     }
-    fn adaptive_avg_pool<const N: usize>(
+    /// Same contract as [`Self::adaptive_avg_pool3d`] over one named spatial axis.
+    pub fn adaptive_avg_pool1d(&self, spatial: Axis, target: usize) -> Result<Self> {
+        self.adaptive_avg_pool([spatial], [target])
+    }
+    /// Same contract as [`Self::adaptive_avg_pool3d`] over two named spatial axes.
+    pub fn adaptive_avg_pool2d(&self, spatial: [Axis; 2], target: [usize; 2]) -> Result<Self> {
+        self.adaptive_avg_pool(spatial, target)
+    }
+    /// Reduce three named spatial axes to a fixed target extent each, taking each of
+    /// [`Self::adaptive_avg_pool3d`]'s own bins to its maximum instead of its weighted mean.
+    /// Ties break to the first (lowest-coordinate) maximum within a bin, matching [`Self::max`].
+    ///
+    /// Composed entirely from [`Self::gather`] and [`Self::max`] -- no dedicated kernel -- by
+    /// reducing one spatial axis at a time: for that axis, every output bin's (host-computed,
+    /// data-independent) member positions are gathered onto a fresh axis, padding a bin shorter
+    /// than the widest one by repeating its own last real position (which can only tie, never
+    /// beat, that position, so padding can never change which position wins), then
+    /// [`Self::max`] removes the padding axis. `gather`'s backward is an exact scatter-add, so a
+    /// position shared by two adjacent bins (the same uneven-division case
+    /// [`Self::adaptive_avg_pool3d`] documents) correctly receives a gradient contribution from
+    /// every bin it wins, exactly like PyTorch's autograd summing a value's use in more than one
+    /// downstream op. Reducing axes one at a time is exact for the forward value (max over a
+    /// Cartesian-product window is separable: the max of maxes along each axis in turn equals
+    /// the joint max), but it means a tie spanning *more than one* axis breaks to the axis
+    /// reduced last first, not necessarily to PyTorch's own row-major scan order -- an honest,
+    /// low-stakes difference from PyTorch for the zero-probability case of an exact
+    /// floating-point tie across axes.
+    pub fn adaptive_max_pool3d(&self, spatial: [Axis; 3], target: [usize; 3]) -> Result<Self> {
+        self.adaptive_max_pool(spatial, target)
+    }
+    /// Same contract as [`Self::adaptive_max_pool3d`] over one named spatial axis.
+    pub fn adaptive_max_pool1d(&self, spatial: Axis, target: usize) -> Result<Self> {
+        self.adaptive_max_pool([spatial], [target])
+    }
+    /// Same contract as [`Self::adaptive_max_pool3d`] over two named spatial axes.
+    pub fn adaptive_max_pool2d(&self, spatial: [Axis; 2], target: [usize; 2]) -> Result<Self> {
+        self.adaptive_max_pool(spatial, target)
+    }
+    fn adaptive_bins(input_extent: usize, out_extent: usize) -> Vec<(usize, usize)> {
+        (0..out_extent)
+            .map(|i| {
+                let start = i * input_extent / out_extent;
+                let end = ((i + 1) * input_extent).div_ceil(out_extent);
+                (start, end)
+            })
+            .collect()
+    }
+    pub(crate) fn adaptive_max_pool<const N: usize>(
+        &self,
+        spatial: [Axis; N],
+        target: [usize; N],
+    ) -> Result<Self> {
+        let name = format!("adaptive_max_pool{N}d");
+        if !(N == 1 || N == 2 || N == 3) {
+            return Err(
+                "Axis adaptive max pooling supports exactly one, two, or three spatial axes".into(),
+            );
+        }
+        for (index, &axis) in spatial.iter().enumerate() {
+            if spatial[..index].contains(&axis) {
+                return Err(format!("{name} requires distinct spatial axes").into());
+            }
+        }
+        if target.contains(&0) {
+            return Err(format!("{name} target extents must be positive").into());
+        }
+        let mut current = self.clone();
+        for index in 0..N {
+            let axis = spatial[index];
+            let input_extent = current.extent(axis)?;
+            let bins = Self::adaptive_bins(input_extent, target[index]);
+            let window = bins
+                .iter()
+                .map(|&(start, end)| end - start)
+                .max()
+                .ok_or_else(|| format!("{name} target extents must be positive"))?;
+            let combined = axis.role("adaptive_max_pool_combined");
+            let patch = axis.role("adaptive_max_pool_patch");
+            let mut gather_index = Vec::with_capacity(target[index] * window);
+            for &(start, end) in &bins {
+                let last = end - start - 1;
+                for w in 0..window {
+                    gather_index.push(start + w.min(last));
+                }
+            }
+            let gathered = current.gather(axis, &gather_index, combined)?;
+            let split = gathered.split(combined, [axis.of(target[index]), patch.of(window)])?;
+            current = split.max(patch)?;
+        }
+        Ok(current)
+    }
+    pub(crate) fn adaptive_avg_pool<const N: usize>(
         &self,
         spatial: [Axis; N],
         target: [usize; N],
     ) -> Result<Self> {
         let started = Instant::now();
         let name = format!("adaptive_avg_pool{N}d");
-        if !(N == 2 || N == 3) {
+        if !(N == 1 || N == 2 || N == 3) {
             return Err(
-                "Axis adaptive average pooling supports exactly two or three spatial axes".into(),
+                "Axis adaptive average pooling supports exactly one, two, or three spatial axes"
+                    .into(),
             );
         }
         for (index, &axis) in spatial.iter().enumerate() {
@@ -1639,14 +1731,7 @@ impl Tensor {
         let mut bins: [Vec<(usize, usize)>; N] = std::array::from_fn(|_| Vec::new());
         for index in 0..N {
             let input_extent = self.extent(spatial[index])?;
-            let out_extent = target[index];
-            let mut axis_bins = Vec::with_capacity(out_extent);
-            for i in 0..out_extent {
-                let start = i * input_extent / out_extent;
-                let end = ((i + 1) * input_extent).div_ceil(out_extent);
-                axis_bins.push((start, end));
-            }
-            bins[index] = axis_bins;
+            bins[index] = Self::adaptive_bins(input_extent, target[index]);
         }
         let dims: Vec<_> = self
             .shape()

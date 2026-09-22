@@ -46,7 +46,11 @@ mod train;
 
 pub use axis::{Axis, Dim, IntoAxes, Shape};
 pub use backend::Device;
-pub use convolution::{Conv2d, Conv3d, MaxPool2d, MaxPool3d};
+pub use convolution::{
+    AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveAvgPool3d, AdaptiveMaxPool1d, AdaptiveMaxPool2d,
+    AdaptiveMaxPool3d, AvgPool1d, AvgPool2d, AvgPool3d, Conv2d, Conv3d, LPPool1d, LPPool2d,
+    LPPool3d, MaxPool1d, MaxPool2d, MaxPool3d,
+};
 pub use data::{
     AdditionDataset, AdditionSample, Batch, DataLoader, DataRegimeReceipt, DataSource,
     FinitePassesLoader, InMemoryDataset, Sample,
@@ -106,19 +110,22 @@ mod window_tests;
 
 pub mod prelude {
     pub use crate::{
-        Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
-        CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
-        Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
-        EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
-        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
-        Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
+        Adam, AdamW, AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveAvgPool3d, AdaptiveMaxPool1d,
+        AdaptiveMaxPool2d, AdaptiveMaxPool3d, AdditionDataset, AdditionSample, AvgPool1d,
+        AvgPool2d, AvgPool3d, Axis, Batch, CategoricalAccuracy, CentralDifference, Conv2d, Conv3d,
+        DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness, DisjointnessEvidence,
+        DisjointnessReceipt, Embedding, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt,
+        EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU, FinitePasses, FinitePassesLoader,
+        FinitePassesReceipt, GELU, GroupNorm, IdentityScheme, Idr, IdrLimits, IdrReceipt,
+        InMemoryDataset, InstanceNorm, LPPool1d, LPPool2d, LPPool3d, LawIdentity, LayerNorm,
         LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
         LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
-        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear,
-        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot,
-        ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD,
-        Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh,
-        Tensor, TrainStep, Trainer, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        MaxPool1d, MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon,
+        MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter,
+        PopulationLinear, PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding,
+        ReLU, RegimeSnapshot, ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope,
+        Result, RmsNorm, SGD, Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass,
+        Standardizer, Tanh, Tensor, TrainStep, Trainer, clip_grad_norm, cosine_annealing_lr,
+        one_cycle_lr,
     };
 }
