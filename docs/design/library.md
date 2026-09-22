@@ -607,3 +607,46 @@ an accidental public restriction.
 Success is the existing training behavior expressed through short programs
 with these contracts enforced. The four golden programs remain acceptance
 targets, and each capability gains its status from a running witness.
+
+### RNN and GRU
+
+`RnnCell`/`Rnn` and `GruCell`/`Gru` extend the recurrent family with the same
+shape as `LstmCell`/`Lstm`: explicit hidden state, an input projection run
+once with the time axis intact, then an eager per-step transition retained
+for reverse mode. Like `Lstm`, this is a correctness path, not a fused scan
+or a sequence-throughput claim, and each is single-layer and unidirectional;
+`num_layers` stacking and `bidirectional` concatenation remain future work,
+exactly as they do for `Lstm`.
+
+`RnnCell::new(input, hidden)` is the Elman transition
+`h' = nonlinearity(W_ih x + b + W_hh h)`. `nonlinearity` defaults to `Tanh`
+(PyTorch's `RNNCell(nonlinearity="tanh")` default); `.nonlinearity(RnnNonlinearity::Relu)`
+before `build` matches `nonlinearity="relu"`. `Rnn::new(input, hidden, time)`
+wraps it over one named time axis with the same `.nonlinearity(...)` builder.
+
+`GruCell::new(input, hidden)` matches PyTorch's `GRUCell` gate order and
+equations exactly, including where the reset gate applies:
+`r = sigmoid(W_ir x + b_ir + W_hr h + b_hr)`,
+`z = sigmoid(W_iz x + b_iz + W_hz h + b_hz)`,
+`n = tanh(W_in x + b_in + r * (W_hn h + b_hn))`,
+`h' = (1 - z) * n + z * h`. The reset gate multiplies the hidden-side
+candidate contribution *after* its own matrix product -- PyTorch's form --
+not the raw previous hidden state, which is the original paper's form and
+gives a different value. `Gru::new(input, hidden, time)` wraps it over one
+named time axis.
+
+Both cells carry a single combined bias and Xavier-uniform initialization
+(`sqrt(6 / (fan_in + fan_out))`, the shared local xorshift stream `LstmCell`
+already uses), mirroring `LstmCell` rather than PyTorch's separate
+`bias_ih`/`bias_hh` parameters and `uniform(-1/sqrt(hidden), 1/sqrt(hidden))`
+init. `named_parameters` exposes `input_weight`, `recurrent_weight`, and
+`bias` for both, the same three names `LstmCell` uses -- Axis's own `Lstm`
+does not match PyTorch's parameter layout or init either, so the new cells
+follow the established Axis convention instead of introducing a second one.
+Neither cell exposes a bias toggle (`LstmCell` has none either); disabling
+the bias, like `Linear::bias(false)`, is unbuilt.
+
+No new backend kernel was needed: both compose existing tensor ops
+(`contract`, `split`, `select`, `rename`, `sigmoid`, `tanh`, `relu`, `add`,
+`sub`, `mul`) exactly as `LstmCell` composes its IFGO gates from the same
+primitives.
