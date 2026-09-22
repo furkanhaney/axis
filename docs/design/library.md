@@ -72,6 +72,20 @@ are pure functions of the step index that reproduce PyTorch's own
 loop to call once per step and feed to the setter — Axis has no stateful
 scheduler object.
 
+`clip_grad_norm` matches PyTorch's `clip_grad_norm_`: one global L2 norm over
+every listed parameter's gradient together (never a per-tensor norm), scaling
+all of them by the same `max_norm / (total_norm + 1e-6)` factor only when the
+norm exceeds `max_norm`, and returning the pre-clip norm either way. It is a
+free function over `impl IntoIterator<Item = Parameter>`, not a `Trainer`
+option or an `Optimizer`: consumers that clip call it once themselves between
+`loss.backward()` and the optimizer's own step, exactly where every sampled
+consumer's own Python loop already calls `clip_grad_norm_`. Each parameter's
+squared-sum reuses `Tensor::mean_square` over every axis, scaled back up by
+the element count it divided by, since the crate has no direct sum reduction
+yet; every reduction and the cross-parameter accumulation stay on device, and
+the whole parameter set costs exactly one host read (for one `sqrt`), not one
+per parameter.
+
 `Muon` applies EMA momentum, optional Nesterov interpolation, five-step
 Newton-Schulz orthogonalization, original rectangular-matrix scaling, and
 decoupled decay to explicitly oriented rank-2 parameters. `MuonWithAuxAdamW`
