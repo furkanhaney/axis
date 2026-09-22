@@ -46,7 +46,10 @@ mod train;
 
 pub use axis::{Axis, Dim, IntoAxes, Shape};
 pub use backend::Device;
-pub use convolution::{Conv2d, Conv3d, MaxPool2d, MaxPool3d};
+pub use convolution::{
+    Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d, ConvTranspose3d, Fold, MaxPool2d,
+    MaxPool3d, Unfold,
+};
 pub use data::{
     AdditionDataset, AdditionSample, Batch, DataLoader, DataRegimeReceipt, DataSource,
     FinitePassesLoader, InMemoryDataset, Sample,
@@ -107,18 +110,20 @@ mod window_tests;
 pub mod prelude {
     pub use crate::{
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
-        CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
-        Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
+        CentralDifference, Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d,
+        ConvTranspose3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim, Disjointness,
+        DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
         EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
-        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
-        Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
-        LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
-        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
-        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear,
-        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot,
-        ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD,
-        Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh,
-        Tensor, TrainStep, Trainer, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        FinitePasses, FinitePassesLoader, FinitePassesReceipt, Fold, GELU, GroupNorm,
+        IdentityScheme, Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity,
+        LayerNorm, LeakyReLU, LearningDirection, LearningEvidence, LearningLimits,
+        LearningObservation, LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell,
+        LstmRun, LstmState, MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits,
+        Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter,
+        PopulationLinear, PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding,
+        ReLU, RegimeSnapshot, ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope,
+        Result, RmsNorm, SGD, Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass,
+        Standardizer, Tanh, Tensor, TrainStep, Trainer, Unfold, clip_grad_norm,
+        cosine_annealing_lr, one_cycle_lr,
     };
 }

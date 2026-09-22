@@ -607,3 +607,45 @@ an accidental public restriction.
 Success is the existing training behavior expressed through short programs
 with these contracts enforced. The four golden programs remain acceptance
 targets, and each capability gains its status from a running witness.
+
+### Convolution, transposed convolution, fold and unfold
+
+`Conv1d` reuses `Conv2d`'s own geometry, weight layout, and xorshift
+initialization exactly, over a synthetic unit spatial axis appended for the
+call (kernel `1`, stride `1`, padding `0`): `Tensor::broadcast_to` adds that
+axis and `Tensor::select` removes it, both with an exact identity gradient at
+extent `1`, so this is a genuinely exact 1D convolution, not an approximation,
+and no separate rank-1 backend path exists. `ConvTranspose1d`/`2d`/`3d`
+(PyTorch's fractionally-strided convolution: `output = (input - 1) * stride -
+2 * padding + kernel + output_padding`, with `0 <= output_padding < stride`
+and dilation pinned at `1`, matching `Conv2d`/`Conv3d`) are the *adjoint* of
+`Convolution`, built the same way its own backward gradient already is: split
+the input channels into `[group, input_in_group]`, contract `input_in_group`
+against the weight (the same contraction `Convolution`'s own backward uses to
+turn an output gradient into a patch-shaped one), then `fold` -- the
+scatter/col2im that `Tensor::unfold`'s own backward already implements --
+into the larger spatial output, `Tensor::pad_zeros` for any `output_padding`,
+then add the bias. No new scatter kernel exists for it. Weight layout is
+`[group, patch(out_per_group, kh, kw), input_in_group]`: the same `[group,
+patch, other_side]` convention `Convolution` itself uses (`[group,
+patch(in_per_group, kh, kw), output]`, not PyTorch's `[out, in, kh, kw]`),
+with "the axis being patch-extracted" and "the axis being contracted to"
+swapped, and initialized by the identical `sqrt(6 / (patch + other_side))`
+xorshift draw `Convolution::build` uses (Glorot/Xavier-uniform-shaped, not
+PyTorch's default kaiming-uniform).
+
+`Unfold` and `Fold` are Axis-native `im2col`/`col2im` (PyTorch's
+`nn.Unfold`/`nn.Fold`): named spatial axes stay named and separate rather
+than flattening into PyTorch's single `L` dimension, so a `Fold` paired with
+a matching `Unfold` is the identity for non-overlapping windows and their
+general composition (`Fold(Unfold(x))`, summing overlapping contributions)
+is the tested reference consumer for both. `Fold`'s own forward is `col2im`:
+`Tensor::fold_grouped`/`fold_ungrouped` call the same device kernel
+`Tensor::unfold`'s own backward calls (`unfold_backward`), sharing its
+geometry, plan cache, and cached compiled spec with a real `Unfold`/`Conv2d`
+call of the same shape; `Fold`'s own gradient reuses `unfold`'s forward
+gather in exactly the same way, so the whole family composes from the two
+existing device kernels with no new one. `Fold` rejects an input whose
+extents are inconsistent with its `output_size`/kernel/stride/padding before
+any device call, the same "before launch" contract every other row in this
+family holds.
