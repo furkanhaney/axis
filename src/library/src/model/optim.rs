@@ -360,6 +360,70 @@ fn annealing_cos(start: f64, end: f64, pct: f64) -> f64 {
     end + (start - end) / 2.0 * cos_out
 }
 
+/// PyTorch's `clip_grad_norm_`
+/// (<https://docs.pytorch.org/docs/2.14/generated/torch.nn.utils.clip_grad_norm_.html>):
+/// one global L2 norm over every listed parameter's accumulated gradient
+/// together, not a per-tensor norm. Every gradient is rescaled by the SAME
+/// factor `max_norm / (total_norm + 1e-6)`, and only when `total_norm`
+/// exceeds `max_norm`; below the threshold every gradient is left bit-exact,
+/// never renormalized to exactly `max_norm`. Returns the pre-clip total norm
+/// either way, matching PyTorch's own return value.
+///
+/// A parameter with no gradient yet does not contribute and is left alone,
+/// matching PyTorch's handling of `param.grad is None`. A shared (tied)
+/// parameter that appears more than once in `parameters` contributes to the
+/// norm, and is scaled, exactly once, mirroring [`SGD::step_parameters`]'s
+/// and [`Adam::step_parameters`]'s own `ParamId` deduplication.
+///
+/// Each parameter's squared-sum is an existing reduction, not a new one:
+/// [`Tensor::mean_square`] over every axis, scaled back up by the element
+/// count it just divided by (the crate has no direct sum reduction yet).
+/// The per-parameter results are added on device and only their total is
+/// read to host, for one `sqrt` on one scalar; a parameter set of any size
+/// costs exactly one host synchronization, not one per parameter.
+pub fn clip_grad_norm(
+    parameters: impl IntoIterator<Item = Parameter>,
+    max_norm: f32,
+) -> Result<f32> {
+    if !max_norm.is_finite() || max_norm <= 0.0 {
+        return Err("clip_grad_norm max_norm must be finite and positive".into());
+    }
+    let mut seen = HashSet::new();
+    let mut gradients = vec![];
+    let mut total_squared: Option<Tensor> = None;
+    for parameter in parameters {
+        if !seen.insert(parameter.id()) {
+            continue;
+        }
+        let Some(grad) = parameter.grad() else {
+            continue;
+        };
+        let axes = grad.shape().axes();
+        let squared_sum = if axes.is_empty() {
+            // A rank-0 gradient has no axis to reduce; it is already its own square.
+            grad.mul(&grad)?
+        } else {
+            grad.mean_square(axes)?.scale(grad.shape().len() as f32)?
+        };
+        total_squared = Some(match total_squared {
+            Some(accumulated) => accumulated.add(&squared_sum)?,
+            None => squared_sum,
+        });
+        gradients.push(parameter);
+    }
+    let Some(total_squared) = total_squared else {
+        return Ok(0.0);
+    };
+    let total_norm = total_squared.item()?.sqrt();
+    if total_norm > max_norm {
+        let factor = max_norm / (total_norm + 1e-6);
+        for parameter in gradients {
+            parameter.scale_grad(factor)?;
+        }
+    }
+    Ok(total_norm)
+}
+
 const NEWTON_SCHULZ_A: f32 = 3.4445;
 const NEWTON_SCHULZ_B: f32 = -4.7750;
 const NEWTON_SCHULZ_C: f32 = 2.0315;

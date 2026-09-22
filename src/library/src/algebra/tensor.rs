@@ -293,6 +293,18 @@ impl Tensor {
     pub fn zero_grad(&self) {
         self.0.grad.borrow_mut().take();
     }
+    /// Rescale this leaf's accumulated gradient in place by a global factor,
+    /// without touching the forward value or building any autograd edge. A
+    /// no-op when there is no gradient yet. Used by [`crate::clip_grad_norm`]
+    /// to apply one global-norm scale factor to every parameter after the
+    /// norm has already been computed from the unscaled gradients.
+    pub(crate) fn scale_grad(&self, factor: f32) -> Result<()> {
+        let mut grad = self.0.grad.borrow_mut();
+        if let Some(buffer) = grad.as_ref() {
+            *grad = Some(self.device().scale(buffer, factor)?);
+        }
+        Ok(())
+    }
     pub(crate) fn parameter_leaf(&self, version: Rc<Cell<u64>>) -> Self {
         let expected = version.get();
         Self::node(
