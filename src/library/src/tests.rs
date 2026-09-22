@@ -10871,10 +10871,10 @@ fn pooling_family_rejects_invalid_configuration_before_launch() {
     assert!(error.contains("distinct"), "{error}");
 
     // LPPool rejects a non-positive `p` before any shape is even consulted.
-    assert!(LPPool1d::new(channel, height, 0, 2).is_err());
-    assert!(LPPool2d::new(channel, [height, width], 0, [2, 2]).is_err());
-    assert!(LPPool3d::new(channel, [height, width, channel.role("d")], 0, [2, 2, 2]).is_err());
-    let pool = LPPool2d::new(channel, [height, width], 2, [2, 2]).unwrap();
+    assert!(LPPool1d::new(channel, height, 0.0, 2).is_err());
+    assert!(LPPool2d::new(channel, [height, width], 0.0, [2, 2]).is_err());
+    assert!(LPPool3d::new(channel, [height, width, channel.role("d")], 0.0, [2, 2, 2]).is_err());
+    let pool = LPPool2d::new(channel, [height, width], 2.0, [2, 2]).unwrap();
     assert_eq!(
         pool.output_shape(&shape).unwrap(),
         Shape::new([height.of(2), width.of(2), channel.of(2)]).unwrap()
@@ -11149,7 +11149,7 @@ fn lp_pool1d_matches_sum_pooling_at_p_one() -> Result<()> {
     let inputs: [f32; 4] = [3.0, -5.0, 2.0, -1.0];
     let input = Tensor::from_slice(&inputs, [channel.of(1), length.of(4)], &device)?.with_grad();
 
-    let mut pool = LPPool1d::new(channel, length, 1, 2)?;
+    let mut pool = LPPool1d::new(channel, length, 1.0, 2)?;
     let output_shape = pool.build(input.shape(), &device, 0)?;
     assert_eq!(output_shape, Shape::new([length.of(2), channel.of(1)])?);
     let actual = pool.forward(&input)?;
@@ -11180,7 +11180,7 @@ fn lp_pool2d_matches_hand_computed_l2_forward_and_gradient_under_reordered_stora
         .with_layout([width, height, channel])?
         .with_grad();
 
-    let mut pool = LPPool2d::new(channel, [height, width], 2, [2, 2])?;
+    let mut pool = LPPool2d::new(channel, [height, width], 2.0, [2, 2])?;
     let output_shape = pool.build(input.shape(), &device, 0)?;
     assert_eq!(
         output_shape,
@@ -11222,7 +11222,7 @@ fn lp_pool3d_matches_hand_computed_forward_and_gradient_with_negative_sum() -> R
     )?
     .with_grad();
 
-    let mut pool = LPPool3d::new(channel, [depth, height, width], 3, [1, 1, 3])?;
+    let mut pool = LPPool3d::new(channel, [depth, height, width], 3.0, [1, 1, 3])?;
     let output_shape = pool.build(input.shape(), &device, 0)?;
     assert_eq!(
         output_shape,
@@ -12942,6 +12942,584 @@ fn gaussian_nll_loss_full_matches_hand_computed_oracle_with_full_true_constant()
         "gaussian_nll_loss / gaussian_nll_loss_full(eps, false) bit-exact delegation",
         &base.to_vec()?,
         &delegated_f64,
+    );
+    Ok(())
+}
+
+#[test]
+fn pooling_options_and_unpooling_reject_invalid_configurations_before_launch() {
+    let (channel, length, height, width) = (
+        Axis::new("channel"),
+        Axis::new("length"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let line = Shape::new([channel.of(1), length.of(5)]).unwrap();
+
+    // ceil_mode drops a last window that would start in the right padding: L=5, k=2, s=2,
+    // p=1 rounds (5 + 2 - 2) / 2 up to 3, +1 = 4 windows, but window 3 would start at
+    // padded 6 >= L + p = 6, so PyTorch keeps 3.
+    let pool = AvgPool1d::new(channel, length, 2)
+        .padding(1)
+        .ceil_mode(true);
+    assert_eq!(
+        pool.output_shape(&line).unwrap(),
+        Shape::new([length.of(3), channel.of(1)]).unwrap()
+    );
+    // ceil_mode keeps an overhanging window that still starts inside the input: L=5, k=2,
+    // s=2, no padding gives 3 windows (floor mode gives 2).
+    let pool = AvgPool1d::new(channel, length, 2).ceil_mode(true);
+    assert_eq!(
+        pool.output_shape(&line).unwrap(),
+        Shape::new([length.of(3), channel.of(1)]).unwrap()
+    );
+    // ceil_mode admits a kernel wider than the input when the stride rounds it in, as
+    // PyTorch does (L=1, k=2, s=2 -> 1 window).
+    let unit = Shape::new([channel.of(1), length.of(1)]).unwrap();
+    assert_eq!(
+        LPPool1d::new(channel, length, 2.0, 2)
+            .unwrap()
+            .ceil_mode(true)
+            .output_shape(&unit)
+            .unwrap(),
+        Shape::new([length.of(1), channel.of(1)]).unwrap()
+    );
+    assert!(
+        LPPool1d::new(channel, length, 2.0, 2)
+            .unwrap()
+            .output_shape(&unit)
+            .is_err()
+    );
+
+    let error = AvgPool2d::new(channel, [height, width], [2, 2])
+        .divisor_override(0)
+        .output_shape(&Shape::new([channel.of(1), height.of(4), width.of(4)]).unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("divisor_override must be positive"),
+        "{error}"
+    );
+
+    // Any finite positive real `p` is accepted; zero, negative and non-finite are not.
+    assert!(LPPool1d::new(channel, length, 1.5, 2).is_ok());
+    for p in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert!(LPPool1d::new(channel, length, p, 2).is_err(), "{p}");
+    }
+
+    // MaxUnpool: default size `(in - 1) * s - 2p + k`, explicit sizes strictly within one
+    // stride of it, distinct axes.
+    let pooled = Shape::new([height.of(2), width.of(3), channel.of(1)]).unwrap();
+    let unpool = MaxUnpool2d::new([height, width], [2, 2]);
+    assert_eq!(
+        unpool.output_shape(&pooled).unwrap(),
+        Shape::new([height.of(4), width.of(6), channel.of(1)]).unwrap()
+    );
+    let unpool = MaxUnpool2d::new([height, width], [3, 3])
+        .stride([2, 2])
+        .padding([1, 1]);
+    assert_eq!(
+        unpool.output_shape(&pooled).unwrap(),
+        Shape::new([height.of(3), width.of(5), channel.of(1)]).unwrap()
+    );
+    let error = MaxUnpool2d::new([height, height], [2, 2])
+        .output_shape(&pooled)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("distinct"), "{error}");
+    let error = MaxUnpool1d::new(length, 0)
+        .output_shape(&line)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("positive"), "{error}");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool1d_ceil_mode_count_include_pad_and_divisor_override_match_hand_computed() -> Result<()> {
+    // L=6, k=3, s=2, p=1, ceil_mode: 4 windows over padded [pad, 1..6, pad] plus one
+    // overhang slot; padded starts 0, 2, 4, 6. Window 3 holds x5, the right padding and the
+    // overhang: PyTorch divides it by 2 (clipped to the padded input) with
+    // count_include_pad=True, by 1 (real elements) without it, by 4 under divisor_override=4.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let inputs: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, AvgPool1d, [f64; 4], [f64; 6]); 3] = [
+        (
+            "count_include_pad=True",
+            AvgPool1d::new(channel, length, 3)
+                .stride(2)
+                .padding(1)
+                .ceil_mode(true),
+            [1.0, 3.0, 5.0, 3.0],
+            [
+                1.0 / 3.0,
+                2.0 / 3.0,
+                1.0 / 3.0,
+                2.0 / 3.0,
+                1.0 / 3.0,
+                5.0 / 6.0,
+            ],
+        ),
+        (
+            "count_include_pad=False",
+            AvgPool1d::new(channel, length, 3)
+                .stride(2)
+                .padding(1)
+                .ceil_mode(true)
+                .count_include_pad(false),
+            [1.5, 3.0, 5.0, 6.0],
+            [0.5, 5.0 / 6.0, 1.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0, 4.0 / 3.0],
+        ),
+        (
+            "divisor_override=4",
+            AvgPool1d::new(channel, length, 3)
+                .stride(2)
+                .padding(1)
+                .ceil_mode(true)
+                .divisor_override(4),
+            [0.75, 2.25, 3.75, 1.5],
+            [0.25, 0.5, 0.25, 0.5, 0.25, 0.5],
+        ),
+    ];
+    for (name, mut pool, forward, gradient) in cases {
+        let input =
+            Tensor::from_slice(&inputs, [channel.of(1), length.of(6)], &device)?.with_grad();
+        assert_eq!(
+            pool.build(input.shape(), &device, 0)?,
+            Shape::new([length.of(4), channel.of(1)])?
+        );
+        let actual = pool.forward(&input)?;
+        close(
+            &format!("AvgPool1d ceil_mode {name} forward"),
+            &actual.to_vec()?,
+            &forward,
+        );
+        actual.sum([channel, length])?.backward()?;
+        close(
+            &format!("AvgPool1d ceil_mode {name} gradient"),
+            &input.grad().unwrap().to_vec()?,
+            &gradient,
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool2d_ceil_mode_matches_hand_computed_under_reordered_storage() -> Result<()> {
+    // 2x3 input, 2x2 kernel, stride 2, ceil_mode: height keeps 1 window, width rounds up to
+    // 2, the second clipped to column 2 alone. Divisors: 4 and 2 (no padding, so both
+    // count_include_pad settings agree).
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let inputs: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    for include in [true, false] {
+        let input =
+            Tensor::from_slice(&inputs, [channel.of(1), height.of(2), width.of(3)], &device)?
+                .with_layout([width, height, channel])?
+                .with_grad();
+        let mut pool = AvgPool2d::new(channel, [height, width], [2, 2])
+            .ceil_mode(true)
+            .count_include_pad(include);
+        assert_eq!(
+            pool.build(input.shape(), &device, 0)?,
+            Shape::new([height.of(1), width.of(2), channel.of(1)])?
+        );
+        let actual = pool.forward(&input)?;
+        close(
+            "reordered-storage ceil_mode AvgPool2d forward",
+            &actual.to_vec()?,
+            &[3.0, 4.5],
+        );
+        actual.sum([channel, height, width])?.backward()?;
+        close(
+            "reordered-storage ceil_mode AvgPool2d gradient",
+            &input.grad().unwrap().to_vec()?,
+            &[0.25, 0.25, 0.5, 0.25, 0.25, 0.5],
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool3d_count_exclude_pad_matches_hand_computed() -> Result<()> {
+    // Width [2, 4], kernel 2, stride 2, padding 1: windows [pad, 2] and [4, pad]. Without
+    // count_include_pad each divides by its one real element.
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[2.0, 4.0],
+        [channel.of(1), depth.of(1), height.of(1), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let mut pool = AvgPool3d::new(channel, [depth, height, width], [1, 1, 2])
+        .padding([0, 0, 1])
+        .count_include_pad(false);
+    pool.build(input.shape(), &device, 0)?;
+    let actual = pool.forward(&input)?;
+    close(
+        "AvgPool3d count_include_pad=False forward",
+        &actual.to_vec()?,
+        &[2.0, 4.0],
+    );
+    actual.sum([channel, depth, height, width])?.backward()?;
+    close(
+        "AvgPool3d count_include_pad=False gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[1.0, 1.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn lp_pool_real_p_matches_hand_computed_forward_and_gradient() -> Result<()> {
+    // p = 1.5 over [1, 4] and [0, 9]: sums 1 + 8 = 9 and 0 + 27 = 27, roots 9^(2/3) and 9.
+    // Gradient x_i^(p-1) * S^(1/p-1): sqrt(x_i) * S^(-1/3); zero input has zero gradient.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let input = Tensor::from_slice(
+        &[1.0, 4.0, 0.0, 9.0],
+        [channel.of(1), length.of(4)],
+        &device,
+    )?
+    .with_grad();
+    let mut pool = LPPool1d::new(channel, length, 1.5, 2)?;
+    pool.build(input.shape(), &device, 0)?;
+    let actual = pool.forward(&input)?;
+    close(
+        "LPPool1d(p=1.5) forward",
+        &actual.to_vec()?,
+        &[4.3267487109222245, 9.0],
+    );
+    actual.sum([channel, length])?.backward()?;
+    close(
+        "LPPool1d(p=1.5) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.4807498567691362, 0.9614997135382723, 0.0, 1.0],
+    );
+
+    // p = 0.5 over [4, 9]: (2 + 3)^2 = 25; gradient S / sqrt(x_i) = 2.5, 5/3.
+    let (depth, height, width) = (Axis::new("depth"), Axis::new("height"), Axis::new("width"));
+    let input = Tensor::from_slice(
+        &[4.0, 9.0],
+        [channel.of(1), depth.of(1), height.of(1), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let mut pool = LPPool3d::new(channel, [depth, height, width], 0.5, [1, 1, 2])?;
+    pool.build(input.shape(), &device, 0)?;
+    let actual = pool.forward(&input)?;
+    close("LPPool3d(p=0.5) forward", &actual.to_vec()?, &[25.0]);
+    actual.sum([channel, depth, height, width])?.backward()?;
+    close(
+        "LPPool3d(p=0.5) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[2.5, 5.0 / 3.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn lp_pool2d_real_p_ceil_mode_matches_hand_computed_under_reordered_storage() -> Result<()> {
+    // p = 2.5, kernel [1, 2], stride [1, 2], ceil_mode over rows [1, 2, 4] and [3, 1, 1]: the
+    // second window of each row is clipped to one element, which PyTorch's
+    // `avg_pool(x^p) * k` composition scales by k / 1 = 2: `(2 x^p)^(1/p) = 2^0.4 x`.
+    // Full windows: `(a^p + b^p)^(1/p)`, gradient `x_i^(p-1) S^(1/p-1)`.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 2.0, 4.0, 3.0, 1.0, 1.0],
+        [channel.of(1), height.of(2), width.of(3)],
+        &device,
+    )?
+    .with_layout([width, channel, height])?
+    .with_grad();
+    let mut pool = LPPool2d::new(channel, [height, width], 2.5, [1, 2])?.ceil_mode(true);
+    assert_eq!(
+        pool.build(input.shape(), &device, 0)?,
+        Shape::new([height.of(2), width.of(2), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "reordered-storage ceil_mode LPPool2d(p=2.5) forward",
+        &actual.to_vec()?,
+        &[
+            2.1345563259430547,
+            5.278031643091578,
+            3.0755472204062158,
+            1.3195079107728942,
+        ],
+    );
+    actual.sum([channel, height, width])?.backward()?;
+    close(
+        "reordered-storage ceil_mode LPPool2d(p=2.5) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            0.3206554095886695,
+            0.9069504581771924,
+            1.3195079107728942,
+            0.9633814574894259,
+            0.18540284793793801,
+            1.3195079107728942,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_max_pool_cross_axis_ties_route_to_pytorch_scan_order() -> Result<()> {
+    // PyTorch's adaptive max kernel scans a window with the last spatial axis innermost and
+    // keeps the first strict maximum. [[1, 5], [5, 2]] ties at (0, 1) and (1, 0): PyTorch
+    // keeps (0, 1), flat index 1. (Reducing height first, then width, would pick (1, 0).)
+    let device = Device::cuda(0)?;
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    let input = Tensor::from_slice(&[1.0, 5.0, 5.0, 2.0], [height.of(2), width.of(2)], &device)?
+        .with_layout([width, height])?
+        .with_grad();
+    let actual = AdaptiveMaxPool2d::new([height, width], [1, 1]).forward(&input)?;
+    close(
+        "AdaptiveMaxPool2d cross-axis tie forward",
+        &actual.to_vec()?,
+        &[5.0],
+    );
+    actual.sum([height, width])?.backward()?;
+    close(
+        "reordered-storage AdaptiveMaxPool2d cross-axis tie gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 1.0, 0.0, 0.0],
+    );
+
+    // Depth x width tie in 3D: depth 0 = [1, 7], depth 1 = [7, 0]. Scan order (d, h, w)
+    // reaches (0, 0, 1) first.
+    let depth = Axis::new("depth");
+    let input = Tensor::from_slice(
+        &[1.0, 7.0, 7.0, 0.0],
+        [depth.of(2), height.of(1), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let actual = AdaptiveMaxPool3d::new([depth, height, width], [1, 1, 1]).forward(&input)?;
+    close(
+        "AdaptiveMaxPool3d cross-axis tie forward",
+        &actual.to_vec()?,
+        &[7.0],
+    );
+    actual.sum([depth, height, width])?.backward()?;
+    close(
+        "AdaptiveMaxPool3d cross-axis tie gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 1.0, 0.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool2d_indices_and_max_unpool2d_match_hand_computed() -> Result<()> {
+    // [[1, 6, 3, 2], [5, 4, 8, 8]], 2x2 windows: maxima 6 at flat 1 and 8 at flat 6 (the
+    // first of the tied pair in row-major scan). Unpooling puts them back in a zero 2x4
+    // plane; with weights w = 1..8 on the unpooled output, each pooled value's gradient is
+    // w[index] (2 and 7), which max pooling routes to its winner.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[1.0, 6.0, 3.0, 2.0, 5.0, 4.0, 8.0, 8.0],
+        [channel.of(1), height.of(2), width.of(4)],
+        &device,
+    )?
+    .with_grad();
+    let pool = MaxPool2d::new(channel, [height, width], [2, 2]);
+    let (pooled, indices) = pool.forward_with_indices(&input)?;
+    assert_eq!(indices, vec![1, 6]);
+    close(
+        "MaxPool2d return_indices forward",
+        &pooled.to_vec()?,
+        &[6.0, 8.0],
+    );
+    let unpool = MaxUnpool2d::new([height, width], [2, 2]);
+    let unpooled = unpool.forward(&pooled, &indices)?;
+    assert_eq!(
+        unpooled.shape(),
+        &Shape::new([height.of(2), width.of(4), channel.of(1)])?
+    );
+    close(
+        "MaxUnpool2d forward",
+        &unpooled.to_vec()?,
+        &[0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0],
+    );
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [height.of(2), width.of(4), channel.of(1)],
+        &device,
+    )?;
+    unpooled
+        .mul(&weights)?
+        .sum([height, width, channel])?
+        .backward()?;
+    close(
+        "MaxUnpool2d then MaxPool2d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_unpool1d_duplicates_output_size_and_bounds_match_pytorch() -> Result<()> {
+    // Overlapping MaxPool1d(k=3, s=1) over [1, 5, 2, 0] picks index 1 twice.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let input = Tensor::from_slice(
+        &[1.0, 5.0, 2.0, 0.0],
+        [channel.of(1), length.of(4)],
+        &device,
+    )?;
+    let (pooled, indices) = MaxPool1d::new(channel, length, 3)
+        .stride(1)
+        .forward_with_indices(&input)?;
+    assert_eq!(indices, vec![1, 1]);
+    close(
+        "overlapping MaxPool1d forward",
+        &pooled.to_vec()?,
+        &[5.0, 5.0],
+    );
+
+    // Unpool distinct values at the duplicate index: the last write (20) wins, as in
+    // PyTorch's CPU kernel, and both inputs receive the upstream gradient at index 1 (2.0).
+    let values =
+        Tensor::from_slice(&[10.0, 20.0], [length.of(2), channel.of(1)], &device)?.with_grad();
+    let unpool = MaxUnpool1d::new(length, 3).stride(1);
+    let unpooled = unpool.forward(&values, &indices)?;
+    close(
+        "MaxUnpool1d duplicate index forward (last write wins)",
+        &unpooled.to_vec()?,
+        &[0.0, 20.0, 0.0, 0.0],
+    );
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0],
+        [length.of(4), channel.of(1)],
+        &device,
+    )?;
+    unpooled.mul(&weights)?.sum([length, channel])?.backward()?;
+    close(
+        "MaxUnpool1d duplicate index gradient (gather by index)",
+        &values.grad().unwrap().to_vec()?,
+        &[2.0, 2.0],
+    );
+
+    // MaxPool1d(k=2) over odd length 5 drops the tail; output_size=5 restores it, within
+    // PyTorch's (default - stride, default + stride) = (2, 6) window.
+    let input = Tensor::from_slice(
+        &[3.0, 1.0, 4.0, 1.0, 5.0],
+        [channel.of(1), length.of(5)],
+        &device,
+    )?;
+    let (pooled, indices) = MaxPool1d::new(channel, length, 2).forward_with_indices(&input)?;
+    assert_eq!(indices, vec![0, 2]);
+    let unpool = MaxUnpool1d::new(length, 2);
+    close(
+        "MaxUnpool1d output_size forward",
+        &unpool.forward_sized(&pooled, &indices, 5)?.to_vec()?,
+        &[3.0, 0.0, 4.0, 0.0, 0.0],
+    );
+    let error = unpool
+        .forward_sized(&pooled, &indices, 6)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("outside"), "{error}");
+    let error = pooled
+        .max_unpool1d(length, &[0, 4], 4)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("outside the output volume"), "{error}");
+    let error = pooled
+        .max_unpool1d(length, &[0], 4)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("indices"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool3d_indices_and_max_unpool3d_match_hand_computed_under_reordered_storage() -> Result<()> {
+    // Two channels, kernel [1, 2, 1] over height: channel 0 [3, 7] -> 7 at flat 1, channel 1
+    // [9, -1] -> 9 at flat 0. Indices follow the pooled output's logical order (channel
+    // last). Weighted unpooled gradients: w(h1, c0) = 3, w(h0, c1) = 2.
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let input = Tensor::from_slice(
+        &[3.0, 7.0, 9.0, -1.0],
+        [channel.of(2), depth.of(1), height.of(2), width.of(1)],
+        &device,
+    )?
+    .with_layout([height, width, channel, depth])?
+    .with_grad();
+    let (pooled, indices) =
+        MaxPool3d::new(channel, [depth, height, width], [1, 2, 1]).forward_with_indices(&input)?;
+    assert_eq!(indices, vec![1, 0]);
+    close(
+        "MaxPool3d return_indices forward",
+        &pooled.to_vec()?,
+        &[7.0, 9.0],
+    );
+    let unpooled =
+        MaxUnpool3d::new([depth, height, width], [1, 2, 1]).forward(&pooled, &indices)?;
+    assert_eq!(
+        unpooled.shape(),
+        &Shape::new([depth.of(1), height.of(2), width.of(1), channel.of(2)])?
+    );
+    close(
+        "MaxUnpool3d forward",
+        &unpooled.to_vec()?,
+        &[0.0, 9.0, 7.0, 0.0],
+    );
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0],
+        [depth.of(1), height.of(2), width.of(1), channel.of(2)],
+        &device,
+    )?;
+    unpooled
+        .mul(&weights)?
+        .sum([depth, height, width, channel])?
+        .backward()?;
+    close(
+        "reordered-storage MaxUnpool3d then MaxPool3d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 3.0, 2.0, 0.0],
     );
     Ok(())
 }
