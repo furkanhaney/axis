@@ -6427,3 +6427,683 @@ fn masked_softmax_matches_hand_computed_oracle_under_reordered_storage() -> Resu
     );
     Ok(())
 }
+
+#[test]
+fn containers_have_no_single_forward_and_reject_duplicate_module_keys() -> Result<()> {
+    let shape = Shape::new([Axis::new("feature").of(3)])?;
+
+    let mut list = ModuleList::new(vec![Box::new(ReLU), Box::new(Tanh)]);
+    assert_eq!(list.len(), 2);
+    assert!(!list.is_empty());
+    assert!(list.output_shape(&shape).is_err());
+    assert_eq!(list.get(0).unwrap().output_shape(&shape)?, shape);
+    assert!(list.get_mut(1).is_some());
+    list.push(Box::new(SiLU));
+    assert_eq!(list.len(), 3);
+    assert_eq!(list.iter().count(), 3);
+    assert!(list.get(5).is_none());
+
+    let entries: Vec<(String, Box<dyn Module>)> = vec![
+        ("a".into(), Box::new(ReLU)),
+        ("b".into(), Box::new(Tanh)),
+    ];
+    let mut dict = ModuleDict::new(entries)?;
+    assert_eq!(dict.len(), 2);
+    assert!(dict.output_shape(&shape).is_err());
+    assert_eq!(dict.get("a").unwrap().output_shape(&shape)?, shape);
+    assert!(
+        ModuleDict::new(vec![("dup".into(), Box::new(ReLU)), ("dup".into(), Box::new(Tanh))])
+            .is_err()
+    );
+    assert!(dict.insert("a", Box::new(SiLU)).is_err());
+    dict.insert("c", Box::new(SiLU))?;
+    assert_eq!(dict.len(), 3);
+    assert!(dict.get("c").is_some());
+    assert!(dict.get("missing").is_none());
+    Ok(())
+}
+
+#[test]
+fn flatten_and_unflatten_shapes_invert_and_reject_bad_configuration() -> Result<()> {
+    let (sample, row, col, merged, bogus) = (
+        Axis::new("sample"),
+        Axis::new("row"),
+        Axis::new("col"),
+        Axis::new("merged"),
+        Axis::new("bogus"),
+    );
+    let input = Shape::new([sample.of(2), row.of(2), col.of(3)])?;
+
+    let flatten = Flatten::new([col, row], merged);
+    assert_eq!(
+        flatten.output_shape(&input)?,
+        Shape::new([sample.of(2), merged.of(6)])?
+    );
+    assert!(Flatten::new(Vec::<Axis>::new(), merged).output_shape(&input).is_err());
+    assert!(Flatten::new([col, bogus], merged).output_shape(&input).is_err());
+    assert!(Flatten::new([col, col], merged).output_shape(&input).is_err());
+
+    let packed = Shape::new([sample.of(2), merged.of(6)])?;
+    let unflatten = Unflatten::new(merged, [col.of(3), row.of(2)]);
+    assert_eq!(
+        unflatten.output_shape(&packed)?,
+        Shape::new([sample.of(2), col.of(3), row.of(2)])?
+    );
+    assert!(
+        Unflatten::new(merged, [col.of(4), row.of(2)])
+            .output_shape(&packed)
+            .is_err()
+    );
+    assert!(Unflatten::new(bogus, [col.of(3), row.of(2)]).output_shape(&packed).is_err());
+
+    assert_eq!(Identity.output_shape(&input)?, input);
+    Ok(())
+}
+
+#[test]
+fn bilinear_and_local_response_norm_reject_invalid_configuration_before_allocation() -> Result<()> {
+    let (batch, in1, in2, output, bogus) = (
+        Axis::new("batch"),
+        Axis::new("in1"),
+        Axis::new("in2"),
+        Axis::new("output"),
+        Axis::new("bogus"),
+    );
+    let x1 = Shape::new([batch.of(2), in1.of(2)])?;
+    let x2 = Shape::new([batch.of(2), in2.of(2)])?;
+    let bilinear = Bilinear::new(in1, in2, output.of(2));
+    assert_eq!(
+        bilinear.output_shape(&x1, &x2)?,
+        Shape::new([batch.of(2), output.of(2)])?
+    );
+    assert!(
+        bilinear
+            .output_shape(&Shape::new([batch.of(2), bogus.of(2)])?, &x2)
+            .is_err()
+    );
+    let mismatched_batch = Shape::new([batch.of(3), in2.of(2)])?;
+    assert!(bilinear.output_shape(&x1, &mismatched_batch).is_err());
+
+    let channel = Axis::new("channel");
+    assert!(LocalResponseNorm::new(channel, 0).is_err());
+    let mut norm = LocalResponseNorm::new(channel, 4)?;
+    assert!(norm.output_shape(&x1).is_err());
+    let signal = Shape::new([channel.of(4)])?;
+    assert_eq!(norm.output_shape(&signal)?, signal);
+    assert!(LocalResponseNorm::new(channel, 4)?.alpha(f32::NAN).is_err());
+    assert!(LocalResponseNorm::new(channel, 4)?.beta(f32::INFINITY).is_err());
+    assert!(LocalResponseNorm::new(channel, 4)?.k(f32::NEG_INFINITY).is_err());
+    norm = norm.alpha(0.5)?.beta(0.5)?.k(1.0)?;
+    assert_eq!(norm.output_shape(&signal)?, signal);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn flatten_and_unflatten_match_tensor_merge_and_split_forward_and_gradient() -> Result<()> {
+    // Merge order [col, row] is the reverse of the input's own physical storage order
+    // ([sample, row, col], `col` fastest), so `Flatten` must force a real permutation
+    // through `Tensor::merge`'s own `with_layout` rather than reinterpret storage in place.
+    let device = Device::cuda(0)?;
+    let (sample, row, col, merged) = (
+        Axis::new("sample"),
+        Axis::new("row"),
+        Axis::new("col"),
+        Axis::new("merged"),
+    );
+    let values = [
+        0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 100.0, 101.0, 102.0, 110.0, 111.0, 112.0,
+    ];
+    let input = Tensor::from_slice(&values, [sample.of(2), row.of(2), col.of(3)], &device)?
+        .with_grad();
+    let mut flatten = Flatten::new([col, row], merged);
+    let expected_shape = Shape::new([sample.of(2), merged.of(6)])?;
+    assert_eq!(flatten.build(input.shape(), &device, 0)?, expected_shape);
+    let flattened = flatten.forward(&input)?;
+    close(
+        "Flatten forward under a reversed merge order",
+        &flattened.to_vec()?,
+        &[
+            0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 100.0, 110.0, 101.0, 111.0, 102.0, 112.0,
+        ],
+    );
+
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        [sample.of(2), merged.of(6)],
+        &device,
+    )?;
+    flattened.mul(&weights)?.mean([sample, merged])?.backward()?;
+    close(
+        "Flatten gradient under a reversed merge order",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            1.0 / 12.0,
+            3.0 / 12.0,
+            5.0 / 12.0,
+            2.0 / 12.0,
+            4.0 / 12.0,
+            6.0 / 12.0,
+            7.0 / 12.0,
+            9.0 / 12.0,
+            11.0 / 12.0,
+            8.0 / 12.0,
+            10.0 / 12.0,
+            12.0 / 12.0,
+        ],
+    );
+
+    let merged_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+    let packed = Tensor::from_slice(&merged_values, [sample.of(2), merged.of(6)], &device)?
+        .with_grad();
+    let mut unflatten = Unflatten::new(merged, [col.of(3), row.of(2)]);
+    let split_shape = Shape::new([sample.of(2), col.of(3), row.of(2)])?;
+    assert_eq!(unflatten.build(packed.shape(), &device, 0)?, split_shape);
+    let split = unflatten.forward(&packed)?;
+    close(
+        "Unflatten forward is a pure reshape (identical physical values)",
+        &split.to_vec()?,
+        &merged_values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+
+    let split_weights = Tensor::from_slice(
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
+        [sample.of(2), col.of(3), row.of(2)],
+        &device,
+    )?;
+    split
+        .mul(&split_weights)?
+        .mean([sample, col, row])?
+        .backward()?;
+    close(
+        "Unflatten gradient reshapes back onto the source axis",
+        &packed.grad().unwrap().to_vec()?,
+        &[
+            1.0 / 12.0,
+            2.0 / 12.0,
+            3.0 / 12.0,
+            4.0 / 12.0,
+            5.0 / 12.0,
+            6.0 / 12.0,
+            7.0 / 12.0,
+            8.0 / 12.0,
+            9.0 / 12.0,
+            10.0 / 12.0,
+            11.0 / 12.0,
+            12.0 / 12.0,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn identity_module_passes_through_values_and_gradients_unchanged() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let input = Tensor::from_slice(&[1.0, -2.0, 3.5], [feature.of(3)], &device)?.with_grad();
+    let mut identity = Identity;
+    assert_eq!(
+        identity.build(input.shape(), &device, 0)?,
+        input.shape().clone()
+    );
+    let output = identity.forward(&input)?;
+    close("Identity forward", &output.to_vec()?, &[1.0, -2.0, 3.5]);
+    let weights = Tensor::from_slice(&[2.0, 3.0, 4.0], [feature.of(3)], &device)?;
+    output.mul(&weights)?.mean([feature])?.backward()?;
+    close(
+        "Identity gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[2.0 / 3.0, 3.0 / 3.0, 4.0 / 3.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn bilinear_matches_hand_computed_quadratic_form_forward_and_every_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, in1, in2, output) = (
+        Axis::new("batch"),
+        Axis::new("in1"),
+        Axis::new("in2"),
+        Axis::new("output"),
+    );
+    let x1 = Tensor::from_slice(&[1.0, 2.0, 3.0, -1.0], [batch.of(2), in1.of(2)], &device)?
+        .with_grad();
+    let x2 = Tensor::from_slice(&[0.5, -2.0, 1.0, 2.0], [batch.of(2), in2.of(2)], &device)?
+        .with_grad();
+
+    let mut bilinear = Bilinear::new(in1, in2, output.of(2));
+    let expected_shape = Shape::new([batch.of(2), output.of(2)])?;
+    assert_eq!(bilinear.build(x1.shape(), x2.shape(), &device, 0)?, expected_shape);
+    bilinear
+        .named_parameters()
+        .iter()
+        .find(|(name, _)| name == "weight")
+        .unwrap()
+        .1
+        .set_values(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])?;
+    bilinear
+        .named_parameters()
+        .iter()
+        .find(|(name, _)| name == "bias")
+        .unwrap()
+        .1
+        .set_values(&[0.1, -0.2])?;
+
+    let y = bilinear.forward(&x1, &x2)?;
+    close(
+        "Bilinear forward",
+        &y.to_vec()?,
+        &[-28.4, -33.2, 2.1, 7.8],
+    );
+
+    // Reordered physical storage for both operands must not change the forward value: same
+    // logical [batch, in*] shapes and values as `x1`/`x2`, transposed in physical storage.
+    let x1_reordered = Tensor::from_slice(&[1.0, 2.0, 3.0, -1.0], [batch.of(2), in1.of(2)], &device)?
+        .with_layout([in1, batch])?;
+    let x2_reordered = Tensor::from_slice(&[0.5, -2.0, 1.0, 2.0], [batch.of(2), in2.of(2)], &device)?
+        .with_layout([in2, batch])?;
+    close(
+        "Bilinear forward is unaffected by reordered operand storage",
+        &bilinear.forward(&x1_reordered, &x2_reordered)?.to_vec()?,
+        &[-28.4, -33.2, 2.1, 7.8],
+    );
+
+    let weight_tensor = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0],
+        [batch.of(2), output.of(2)],
+        &device,
+    )?;
+    y.mul(&weight_tensor)?.mean([batch, output])?.backward()?;
+    close(
+        "Bilinear bias gradient",
+        &bilinear
+            .named_parameters()
+            .iter()
+            .find(|(name, _)| name == "bias")
+            .unwrap()
+            .1
+            .grad()
+            .unwrap()
+            .to_vec()?,
+        &[1.0, 1.5],
+    );
+    close(
+        "Bilinear weight gradient",
+        &bilinear
+            .named_parameters()
+            .iter()
+            .find(|(name, _)| name == "weight")
+            .unwrap()
+            .1
+            .grad()
+            .unwrap()
+            .to_vec()?,
+        &[2.375, 3.25, 4.0, 5.0, -0.5, -0.5, -2.5, -4.0],
+    );
+    close(
+        "Bilinear x1 gradient",
+        &x1.grad().unwrap().to_vec()?,
+        &[-4.875, -9.375, 15.25, 36.25],
+    );
+    close(
+        "Bilinear x2 gradient",
+        &x2.grad().unwrap().to_vec()?,
+        &[9.75, 14.25, -1.5, 5.5],
+    );
+
+    assert!(Bilinear::new(in1, in2, output.of(2)).forward(&x1, &x2).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn embedding_bag_sum_mean_max_match_hand_computed_pooling_oracle() -> Result<()> {
+    // Asymmetric extents throughout (vocabulary 5, feature 3, 3 bags of sizes 3/0/2) so no
+    // dimension coincidentally hides a transposition bug. Bag 1 is deliberately empty: `Sum`
+    // and `Mean` must read it back as an exact zero row, and `Max` as `NaN` (documented, a
+    // deliberate divergence from PyTorch's zero-filled empty bag for that one mode).
+    let device = Device::cuda(0)?;
+    let (vocabulary, feature, bag) = (
+        Axis::new("vocabulary"),
+        Axis::new("feature"),
+        Axis::new("bag"),
+    );
+    let table_values: Vec<f32> = (1..=15).map(|v| v as f32).collect();
+    let index = [0usize, 2, 4, 1, 3];
+    let offsets = [0usize, 3, 3];
+
+    let mut sum_bag = EmbeddingBag::new(vocabulary.of(5), feature.of(3), EmbeddingBagMode::Sum);
+    sum_bag.build(&device, 0)?;
+    sum_bag.named_parameters()[0].1.set_values(&table_values)?;
+    let sum_output = sum_bag.forward(&index, &offsets, bag)?;
+    close(
+        "EmbeddingBag Sum forward",
+        &sum_output.to_vec()?,
+        &[21.0, 24.0, 27.0, 0.0, 0.0, 0.0, 14.0, 16.0, 18.0],
+    );
+    let sum_weight = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 4.0, 5.0, 6.0],
+        [bag.of(3), feature.of(3)],
+        &device,
+    )?;
+    sum_output
+        .mul(&sum_weight)?
+        .mean([bag, feature])?
+        .backward()?;
+    close(
+        "EmbeddingBag Sum table gradient",
+        &sum_bag.named_parameters()[0].1.grad().unwrap().to_vec()?,
+        &[
+            1.0 / 9.0,
+            2.0 / 9.0,
+            3.0 / 9.0,
+            4.0 / 9.0,
+            5.0 / 9.0,
+            6.0 / 9.0,
+            1.0 / 9.0,
+            2.0 / 9.0,
+            3.0 / 9.0,
+            4.0 / 9.0,
+            5.0 / 9.0,
+            6.0 / 9.0,
+            1.0 / 9.0,
+            2.0 / 9.0,
+            3.0 / 9.0,
+        ],
+    );
+
+    let mut mean_bag = EmbeddingBag::new(vocabulary.of(5), feature.of(3), EmbeddingBagMode::Mean);
+    mean_bag.build(&device, 0)?;
+    mean_bag.named_parameters()[0].1.set_values(&table_values)?;
+    let mean_output = mean_bag.forward(&index, &offsets, bag)?;
+    close(
+        "EmbeddingBag Mean forward (empty bag reads back as an exact zero row)",
+        &mean_output.to_vec()?,
+        &[7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 7.0, 8.0, 9.0],
+    );
+    mean_output
+        .mul(&sum_weight)?
+        .mean([bag, feature])?
+        .backward()?;
+    close(
+        "EmbeddingBag Mean table gradient",
+        &mean_bag.named_parameters()[0].1.grad().unwrap().to_vec()?,
+        &[
+            1.0 / 27.0,
+            2.0 / 27.0,
+            3.0 / 27.0,
+            2.0 / 9.0,
+            2.5 / 9.0,
+            3.0 / 9.0,
+            1.0 / 27.0,
+            2.0 / 27.0,
+            3.0 / 27.0,
+            2.0 / 9.0,
+            2.5 / 9.0,
+            3.0 / 9.0,
+            1.0 / 27.0,
+            2.0 / 27.0,
+            3.0 / 27.0,
+        ],
+    );
+
+    let mut max_bag = EmbeddingBag::new(vocabulary.of(5), feature.of(3), EmbeddingBagMode::Max);
+    max_bag.build(&device, 0)?;
+    max_bag.named_parameters()[0].1.set_values(&table_values)?;
+    let max_output = max_bag.forward(&index, &offsets, bag)?.detach();
+    let max_values = max_output.to_vec()?;
+    close(
+        "EmbeddingBag Max forward, bag 0",
+        &max_values[0..3],
+        &[13.0, 14.0, 15.0],
+    );
+    assert!(max_values[3..6].iter().all(|v| v.is_nan()));
+    close(
+        "EmbeddingBag Max forward, bag 2",
+        &max_values[6..9],
+        &[10.0, 11.0, 12.0],
+    );
+
+    // A separate, entirely nonempty two-bag configuration isolates the gradient check from the
+    // empty bag's `NaN`: `max`'s own "no finite candidate" rule would otherwise poison a
+    // reduction that touches it at all, even multiplied by a zero weight (`NaN * 0.0 = NaN`).
+    let two_bag_offsets = [0usize, 3];
+    let max_output_two = max_bag.forward(&index, &two_bag_offsets, bag)?;
+    let max_weight = Tensor::from_slice(
+        &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+        [bag.of(2), feature.of(3)],
+        &device,
+    )?;
+    max_output_two
+        .mul(&max_weight)?
+        .mean([bag, feature])?
+        .backward()?;
+    close(
+        "EmbeddingBag Max table gradient (nonempty bags only)",
+        &max_bag.named_parameters()[0].1.grad().unwrap().to_vec()?,
+        &[
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 6.0,
+            1.0 / 6.0,
+            1.0 / 6.0,
+        ],
+    );
+
+    assert!(sum_bag.forward(&[], &offsets, bag).is_err());
+    assert!(sum_bag.forward(&index, &[], bag).is_err());
+    assert!(sum_bag.forward(&index, &[1, 0], bag).is_err());
+    assert!(sum_bag.forward(&index, &[0, 2, 10], bag).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn local_response_norm_matches_hand_computed_oracle_under_asymmetric_window() -> Result<()> {
+    // size = 4 is even, so PyTorch's own `size // 2` / `(size - 1) // 2` split is asymmetric
+    // (2 channels before, 1 after); oracle values are independent central differences.
+    let device = Device::cuda(0)?;
+    let (batch, channel) = (Axis::new("batch"), Axis::new("channel"));
+    let input = Tensor::from_slice(
+        &[1.0, -2.0, 0.5, 3.0, 2.0, 1.0, -1.5, 0.5],
+        [batch.of(2), channel.of(4)],
+        &device,
+    )?
+    .with_grad();
+    let mut norm = LocalResponseNorm::new(channel, 4)?.alpha(0.5)?.beta(0.5)?.k(1.0)?;
+    assert_eq!(norm.build(input.shape(), &device, 0)?, input.shape().clone());
+    let output = norm.forward(&input)?;
+    close(
+        "LocalResponseNorm forward under an asymmetric window",
+        &output.to_vec()?,
+        &[
+            0.7844645405527362,
+            -1.5540573797716226,
+            0.29981267559834457,
+            1.8407159732336889,
+            1.5689290811054724,
+            0.7242859683401482,
+            -1.0776318121606494,
+            0.41702882811414954,
+        ],
+    );
+
+    // Reordered physical storage (channel-major instead of batch-major) must not change it.
+    let reordered = Tensor::from_slice(
+        &[1.0, -2.0, 0.5, 3.0, 2.0, 1.0, -1.5, 0.5],
+        [batch.of(2), channel.of(4)],
+        &device,
+    )?
+    .with_layout([channel, batch])?;
+    close(
+        "LocalResponseNorm forward is unaffected by reordered channel storage",
+        &norm.forward(&reordered)?.to_vec()?,
+        &[
+            0.7844645405527362,
+            -1.5540573797716226,
+            0.29981267559834457,
+            1.8407159732336889,
+            1.5689290811054724,
+            0.7242859683401482,
+            -1.0776318121606494,
+            0.41702882811414954,
+        ],
+    );
+
+    let weights = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 0.5, 1.5, 2.5, 3.5],
+        [batch.of(2), channel.of(4)],
+        &device,
+    )?;
+    output.mul(&weights)?.mean([batch, channel])?.backward()?;
+    close(
+        "LocalResponseNorm gradient under an asymmetric window",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            0.11478395397890306,
+            0.24742732767868425,
+            0.21533843197807379,
+            0.1616940354942642,
+            0.05958576218323408,
+            0.12521675608834215,
+            0.22907252950454815,
+            0.3678308347854209,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn module_list_and_module_dict_named_parameters_stay_addressable_like_sequential() -> Result<()> {
+    // A representative composition: two parallel branches held in a container instead of a
+    // chain, each built and run directly (`ModuleList`/`ModuleDict` define no forward order of
+    // their own), summed by the caller -- exactly the multi-branch pattern PyTorch users reach
+    // for a `ModuleList`/`ModuleDict` over a plain `Vec`/`HashMap` for: parameter registration.
+    let device = Device::cuda(0)?;
+    let (input, output) = (Axis::new("input"), Axis::new("output"));
+    let x = Tensor::from_slice(&[3.0, 5.0], [input.of(2)], &device)?.with_grad();
+    let input_shape = Shape::new([input.of(2)])?;
+
+    let mut list = ModuleList::new(vec![
+        Box::new(Linear::new(input, output.of(2)).bias(false)) as Box<dyn Module>,
+        Box::new(Linear::new(input, output.of(2)).bias(false)) as Box<dyn Module>,
+    ]);
+    list.get_mut(0).unwrap().build(&input_shape, &device, 0)?;
+    list.get_mut(1).unwrap().build(&input_shape, &device, 0)?;
+    list.get_mut(0)
+        .unwrap()
+        .named_parameters()
+        .iter()
+        .find(|(name, _)| name == "weight")
+        .unwrap()
+        .1
+        .set_values(&[1.0, 0.0, 0.0, 1.0])?;
+    list.get_mut(1)
+        .unwrap()
+        .named_parameters()
+        .iter()
+        .find(|(name, _)| name == "weight")
+        .unwrap()
+        .1
+        .set_values(&[0.0, 1.0, 1.0, 0.0])?;
+    let paths: Vec<_> = list
+        .named_parameters()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(paths, vec!["0.weight".to_string(), "1.weight".to_string()]);
+
+    let branch0 = list.get(0).unwrap().forward(&x)?;
+    let branch1 = list.get(1).unwrap().forward(&x)?;
+    let sum = branch0.add(&branch1)?;
+    close("ModuleList branch sum forward", &sum.to_vec()?, &[8.0, 8.0]);
+    sum.mean([output])?.backward()?;
+    close(
+        "ModuleList branch 0 weight gradient",
+        &list.get(0).unwrap().parameter("weight")?.grad().unwrap().to_vec()?,
+        &[1.5, 1.5, 2.5, 2.5],
+    );
+    close(
+        "ModuleList branch 1 weight gradient",
+        &list.get(1).unwrap().parameter("weight")?.grad().unwrap().to_vec()?,
+        &[1.5, 1.5, 2.5, 2.5],
+    );
+
+    let mut dict = ModuleDict::new(vec![
+        (
+            "even".to_string(),
+            Box::new(Linear::new(input, output.of(2)).bias(false)) as Box<dyn Module>,
+        ),
+        (
+            "odd".to_string(),
+            Box::new(Linear::new(input, output.of(2)).bias(false)) as Box<dyn Module>,
+        ),
+    ])?;
+    dict.get_mut("even").unwrap().build(&input_shape, &device, 0)?;
+    dict.get_mut("odd").unwrap().build(&input_shape, &device, 0)?;
+    let dict_paths: Vec<_> = dict
+        .named_parameters()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        dict_paths,
+        vec!["even.weight".to_string(), "odd.weight".to_string()]
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn parameter_list_and_parameter_dict_named_parameters_stay_addressable() -> Result<()> {
+    // A representative composition: standalone parameters combined directly by the caller
+    // (PyTorch's own use case for `ParameterList`/`ParameterDict` over a bare `Vec`/`HashMap`
+    // of tensors -- automatic registration for the optimizer to find).
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let p0 = Parameter::new(Tensor::from_slice(&[1.0, 2.0], [feature.of(2)], &device)?);
+    let p1 = Parameter::new(Tensor::from_slice(&[3.0, 4.0], [feature.of(2)], &device)?);
+
+    let list = ParameterList::new(vec![p0.clone(), p1.clone()]);
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap().id(), p0.id());
+    let list_paths: Vec<_> = list
+        .named_parameters()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(list_paths, vec!["0".to_string(), "1".to_string()]);
+
+    let residual = p0.tensor().add(&p1.tensor())?;
+    residual.mean([feature])?.backward()?;
+    close("ParameterList p0 gradient", &p0.grad().unwrap().to_vec()?, &[0.5, 0.5]);
+    close("ParameterList p1 gradient", &p1.grad().unwrap().to_vec()?, &[0.5, 0.5]);
+
+    let mut dict = ParameterDict::new(vec![("a".to_string(), p0.clone())])?;
+    assert!(dict.insert("a", p1.clone()).is_err());
+    dict.insert("b", p1.clone())?;
+    assert_eq!(dict.get("a").unwrap().id(), p0.id());
+    assert_eq!(dict.get("b").unwrap().id(), p1.id());
+    assert!(dict.get("missing").is_none());
+    assert!(
+        ParameterDict::new(vec![("dup".to_string(), p0.clone()), ("dup".to_string(), p1.clone())])
+            .is_err()
+    );
+    Ok(())
+}
