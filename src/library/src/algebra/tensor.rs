@@ -2098,7 +2098,7 @@ impl Tensor {
     /// volume`), the input/output spatial extents, and `channels_per_group` itself. Builds no
     /// layout or plan and never touches the device or the plan cache, so a `Module` can call it
     /// from `output_shape`/`build` with no tensor in hand.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn unfold_shape<const N: usize>(
         name: &str,
         image_shape: &Shape,

@@ -6599,12 +6599,8 @@ fn conv_transpose2d_matches_scalar_forward_and_all_gradients_under_reordered_sto
     // `output = conv_transpose_no_bias + bias`.
     let element_count = expected.len() as f64;
     let upstream = 1.0 / element_count;
-    for _oy in 0..OUT_H {
-        for _ox in 0..OUT_W {
-            for oc in 0..OUT_CHANNELS {
-                bias_gradient[oc] += upstream;
-            }
-        }
+    for gradient in bias_gradient.iter_mut() {
+        *gradient += upstream * (OUT_H * OUT_W) as f64;
     }
     for group in 0..GROUPS {
         for ic_in_group in 0..IN_PER_GROUP {
@@ -6738,10 +6734,8 @@ fn conv_transpose1d_matches_scalar_oracle_and_reuses_conv_transpose2d_exactly() 
     let mut weight_gradient = vec![0.0_f64; weights.len()];
     let mut bias_gradient = vec![0.0_f64; biases.len()];
     let upstream = 1.0 / expected.len() as f64;
-    for _o in 0..OUT_LEN {
-        for oc in 0..OUT_CHANNELS {
-            bias_gradient[oc] += upstream;
-        }
+    for gradient in bias_gradient.iter_mut() {
+        *gradient += upstream * OUT_LEN as f64;
     }
     for ic in 0..IN_CHANNELS {
         for i in 0..LEN {
@@ -7131,7 +7125,7 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
     );
 
     let mismatched = Tensor::from_slice(
-        &vec![0.0; PATCH],
+        &[0.0; PATCH],
         [batch.of(1), height.of(1), width.of(1), patch.of(PATCH)],
         &device,
     )?;
