@@ -27,6 +27,16 @@ what order rows should flip; that table says which have.
 
 ## Current surface
 
+The torch.nn spec in [../nn/catalog.md](../nn/catalog.md) is the itemized
+inventory: every class with its verdict and the PR and tests behind it. On
+2026-09-22 nine families landed at once (piecewise and smooth activations,
+regression, likelihood and margin losses, distances, the pooling family,
+`Conv1d` and transposed convolution with `Fold`/`Unfold`, padding and pixel
+shuffles, `Rnn`/`Gru`, and the containers with `Flatten`, `Identity`,
+`Bilinear`, `EmbeddingBag` and `LocalResponseNorm`); their contracts are in
+[../design/library.md](../design/library.md). The paragraph below predates
+that wave.
+
 Axis already has `Linear` (bias on by default; `.bias(false)` before `build`
 omits the bias parameter entirely, so `named_parameters` then has only
 `weight`), `PopulationLinear` (bias always present; not yet given the same
