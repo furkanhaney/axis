@@ -65,6 +65,14 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn abs(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn abs_backward(&self, _gradient: &Buffer, _input: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn mask_gradient(&self, _gradient: &Buffer, _winners: &Buffer) -> Result<Buffer> {
         unavailable()
     }
