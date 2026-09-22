@@ -533,9 +533,9 @@ impl<const N: usize> TransposedConvolution<N> {
             let doubled_padding = self.padding[index]
                 .checked_mul(2)
                 .ok_or_else(|| format!("{name} padding overflow"))?;
-            let unpadded = with_kernel.checked_sub(doubled_padding).ok_or_else(|| {
-                format!("{name} padding exceeds the expanded spatial extent")
-            })?;
+            let unpadded = with_kernel
+                .checked_sub(doubled_padding)
+                .ok_or_else(|| format!("{name} padding exceeds the expanded spatial extent"))?;
             output_spatial[index] = unpadded
                 .checked_add(self.output_padding[index])
                 .ok_or_else(|| format!("{name} expanded spatial extent overflow"))?;
@@ -994,7 +994,9 @@ impl Fold {
         let kernel_volume: usize = self.kernel.iter().product();
         let patch_extent = input.extent(self.patch)?;
         if kernel_volume == 0 || patch_extent == 0 || !patch_extent.is_multiple_of(kernel_volume) {
-            return Err("Fold patch extent must be a positive multiple of the kernel volume".into());
+            return Err(
+                "Fold patch extent must be a positive multiple of the kernel volume".into(),
+            );
         }
         let channel_extent = patch_extent / kernel_volume;
         let mut dims: Vec<Dim> = input

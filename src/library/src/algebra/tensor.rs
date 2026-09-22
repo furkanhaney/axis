@@ -2051,7 +2051,16 @@ impl Tensor {
         stride: [usize; N],
         padding: [usize; N],
     ) -> Result<Self> {
-        self.fold_configured(image_shape, channels, spatial, None, patch, kernel, stride, padding)
+        self.fold_configured(
+            image_shape,
+            channels,
+            spatial,
+            None,
+            patch,
+            kernel,
+            stride,
+            padding,
+        )
     }
 
     /// `fold` (col2im), grouped: the adjoint of [`Self::unfold_grouped`]. Backs
@@ -2171,7 +2180,13 @@ impl Tensor {
             dims.extend([group, patch.of(expected_patch)]);
         }
         let shape = Shape::new(dims)?;
-        Ok((shape, expected_patch, input_spatial, output_spatial, channels_per_group))
+        Ok((
+            shape,
+            expected_patch,
+            input_spatial,
+            output_spatial,
+            channels_per_group,
+        ))
     }
 
     /// Spec-building shared by `unfold_configured` (a real gather) and `fold_configured` (a real
@@ -2199,7 +2214,15 @@ impl Tensor {
         }
         let (shape, expected_patch, input_spatial, output_spatial, channels_per_group) =
             Self::unfold_shape(
-                name, image_shape, channels, spatial, group, patch.axis, kernel, stride, padding,
+                name,
+                image_shape,
+                channels,
+                spatial,
+                group,
+                patch.axis,
+                kernel,
+                stride,
+                padding,
             )?;
         if patch.extent != expected_patch {
             return Err(format!(
@@ -2362,7 +2385,12 @@ impl Tensor {
             UNFOLD_PLAN_METADATA_MAX
                 .with(|maximum| maximum.set(maximum.get().max(spec.metadata_len())));
         }
-        Ok((shape, output_layout, output_order, UnfoldPlans::Implicit(spec)))
+        Ok((
+            shape,
+            output_layout,
+            output_order,
+            UnfoldPlans::Implicit(spec),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

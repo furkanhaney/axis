@@ -6448,7 +6448,9 @@ fn conv1d_matches_scalar_oracle_and_reuses_conv2d_exactly() -> Result<()> {
         Axis::new("length"),
         Axis::new("output"),
     );
-    let inputs: Vec<_> = (0..CHANNELS * LEN).map(|i| (i as f32 - 7.0) / 5.0).collect();
+    let inputs: Vec<_> = (0..CHANNELS * LEN)
+        .map(|i| (i as f32 - 7.0) / 5.0)
+        .collect();
     let weights: Vec<_> = (0..CHANNELS * KERNEL * OUT_CHANNELS)
         .map(|i| ((i * 5 % 23) as f32 - 11.0) / 13.0)
         .collect();
@@ -6623,7 +6625,8 @@ fn conv_transpose2d_matches_scalar_forward_and_all_gradients_under_reordered_sto
                             }
                             for oc_in_group in 0..OUT_PER_GROUP {
                                 let oc = group * OUT_PER_GROUP + oc_in_group;
-                                let patch_index = oc_in_group * (KERNEL[0] * KERNEL[1]) + ky * KERNEL[1] + kx;
+                                let patch_index =
+                                    oc_in_group * (KERNEL[0] * KERNEL[1]) + ky * KERNEL[1] + kx;
                                 let weight_index =
                                     (group * PATCH + patch_index) * IN_PER_GROUP + ic_in_group;
                                 let output_index = (oy * OUT_W + ox) * OUT_CHANNELS + oc;
@@ -6701,7 +6704,9 @@ fn conv_transpose1d_matches_scalar_oracle_and_reuses_conv_transpose2d_exactly() 
         Axis::new("length"),
         Axis::new("output"),
     );
-    let inputs: Vec<_> = (0..IN_CHANNELS * LEN).map(|i| (i as f32 - 2.5) / 3.0).collect();
+    let inputs: Vec<_> = (0..IN_CHANNELS * LEN)
+        .map(|i| (i as f32 - 2.5) / 3.0)
+        .collect();
     let weights: Vec<_> = (0..PATCH * IN_CHANNELS)
         .map(|i| ((i * 3 % 17) as f32 - 8.0) / 9.0)
         .collect();
@@ -6712,11 +6717,10 @@ fn conv_transpose1d_matches_scalar_oracle_and_reuses_conv_transpose2d_exactly() 
         &device,
     )?
     .with_grad();
-    let mut conv =
-        ConvTranspose1d::new(channel, output.of(OUT_CHANNELS), length, KERNEL)
-            .stride(STRIDE)
-            .padding(PADDING)
-            .output_padding(OUTPUT_PADDING);
+    let mut conv = ConvTranspose1d::new(channel, output.of(OUT_CHANNELS), length, KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING)
+        .output_padding(OUTPUT_PADDING);
     assert_eq!(
         conv.build(input.shape(), &device, 41)?,
         Shape::new([batch.of(1), length.of(OUT_LEN), output.of(OUT_CHANNELS)])?
@@ -6961,7 +6965,12 @@ fn unfold_module_matches_scalar_patches_and_gradient_under_reordered_storage() -
         .padding(PADDING);
     assert_eq!(
         unfold.output_shape(input.shape())?,
-        Shape::new([batch.of(1), patch.of(PATCH), height.of(OUT_H), width.of(OUT_W)])?
+        Shape::new([
+            batch.of(1),
+            patch.of(PATCH),
+            height.of(OUT_H),
+            width.of(OUT_W)
+        ])?
     );
 
     let mut expected = vec![0.0_f64; OUT_H * OUT_W * PATCH];
@@ -7066,7 +7075,10 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
     close(
         "Fold(Unfold(x)) reconstructs x exactly under non-overlapping windows",
         &folded.to_vec()?,
-        &image_values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+        &image_values
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
     );
 
     // An independent scalar oracle for Fold's own forward (col2im: sum overlapping patch
@@ -7077,7 +7089,12 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
         .collect();
     let patches_input = Tensor::from_slice(
         &patch_values,
-        [batch.of(1), height.of(IN_H), width.of(IN_W), patch.of(PATCH)],
+        [
+            batch.of(1),
+            height.of(IN_H),
+            width.of(IN_W),
+            patch.of(PATCH),
+        ],
         &device,
     )?
     .with_grad();
@@ -7127,4 +7144,3 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
     assert!(error.contains("does not match"), "{error}");
     Ok(())
 }
-
