@@ -1156,3 +1156,37 @@ existing device kernels with no new one. `Fold` rejects an input whose
 extents are inconsistent with its `output_size`/kernel/stride/padding before
 any device call, the same "before launch" contract every other row in this
 family holds.
+
+### Multi-head attention
+
+`MultiheadAttention::new(feature, time, embed_dim, num_heads, dropout)`
+(`model/nn.rs`) is PyTorch's `nn.MultiheadAttention` at its own default
+`dropout=0.0`: `Attention(Q, K, V) = softmax(QK^T / sqrt(head_feature)) V`
+computed independently per head and concatenated before one output
+projection. `query`, `key`, and `value` are separate tensors sharing one
+`feature` embedding axis and one `time` sequence axis (self-attention passes
+the same tensor three times); `key` and `value` must share a `time` extent
+with each other, but `query` may differ for cross-attention. `feature` splits
+into `num_heads` heads of `embed_dim / num_heads` each, which must divide
+evenly. It does not implement `Module`, the same reason `Bilinear` does not:
+`forward` takes three tensors, not one. Four separate `Linear` layers do the
+in- and out-projections with a learned bias by default, `Linear`'s own
+Xavier-uniform initialization, and the same `.bias(false)` opt-out before
+`build`.
+
+`attn_mask` is an `AttentionMask::Additive` (added to pre-softmax scores) or
+`AttentionMask::Boolean` value, and `key_padding_mask` is always boolean;
+both booleans use PyTorch's own convention (`1.0` forbids/ignores a
+position, the opposite of `Tensor::masked_softmax`'s validity sense). Either
+or both may be absent. Present boolean masks compose by validity AND and
+broadcast onto the score tensor before one `masked_softmax` call over the key
+axis, so an excluded position gets exactly zero probability and gradient;
+with neither mask present, forward runs ordinary `softmax`. `query_time` and
+`key_time` are the private per-call roles the shared `time` axis is renamed
+to once split into heads, exposed as accessors so a caller can build a
+correctly-tagged mask tensor. `forward_with_weights`'s `need_weights` flag
+additionally returns the attention probabilities averaged over heads
+(PyTorch's own default `average_attn_weights=True`); `forward` skips that
+reduction. Nonzero `dropout` is rejected by `new`: it needs the seeded,
+per-step training-pass contract (`TrainingPass`, Axis issue #127), which has
+not landed.

@@ -12211,3 +12211,297 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
     assert!(error.contains("does not match"), "{error}");
     Ok(())
 }
+
+#[test]
+fn multihead_attention_rejects_invalid_configuration_before_allocation() {
+    let (feature, time) = (Axis::new("feature"), Axis::new("time"));
+    assert!(MultiheadAttention::new(feature, feature, 4, 2, 0.0).is_err());
+    assert!(MultiheadAttention::new(feature, time, 4, 2, 0.1).is_err());
+    assert!(MultiheadAttention::new(feature, time, 0, 2, 0.0).is_err());
+    assert!(MultiheadAttention::new(feature, time, 4, 0, 0.0).is_err());
+    assert!(MultiheadAttention::new(feature, time, 5, 2, 0.0).is_err());
+
+    let mha = MultiheadAttention::new(feature, time, 4, 2, 0.0).unwrap();
+    let q = Shape::new([time.of(2), feature.of(4)]).unwrap();
+    let k = Shape::new([time.of(3), feature.of(4)]).unwrap();
+    let v_mismatched = Shape::new([time.of(4), feature.of(4)]).unwrap();
+    assert!(mha.output_shape(&q, &k, &k).is_ok());
+    assert!(mha.output_shape(&q, &k, &v_mismatched).is_err());
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multihead_attention_two_head_self_attention_matches_hand_computed_oracle_with_key_padding_mask()
+-> Result<()> {
+    // Independent f64 oracle (finite differences of a from-scratch numpy forward, Richardson
+    // checked at eps in {1e-4, 5e-5} to under 1e-10 before being frozen as literals here) for
+    // embed_dim=4, num_heads=2 (head_feature=2), 3 self-attended time steps, and a key padding
+    // mask that excludes the last key from every query. `bk`'s gradient is exactly zero: adding
+    // a bias to every key shifts every score for a fixed (head, query) by the SAME amount
+    // (independent of the key position being scored), and softmax is invariant to a constant
+    // shift along its own reduced axis -- a property of the mechanism, not a coincidence of
+    // these particular weights.
+    let device = Device::cuda(0)?;
+    let (time, feature) = (Axis::new("time"), Axis::new("feature"));
+    let x_values: [f32; 12] = [
+        0.6, -0.3, 0.9, 0.15, -1.2, 0.45, -0.6, 0.3, 0.15, 0.75, -1.05, 0.6,
+    ];
+    let x = Tensor::from_slice(&x_values, [time.of(3), feature.of(4)], &device)?.with_grad();
+
+    let mut mha = MultiheadAttention::new(feature, time, 4, 2, 0.0)?;
+    let expected_shape = Shape::new([time.of(3), feature.of(4)])?;
+    assert_eq!(
+        mha.build(x.shape(), x.shape(), x.shape(), &device, 0)?,
+        expected_shape
+    );
+
+    let set = |mha: &MultiheadAttention, name: &str, values: &[f32]| -> Result<()> {
+        mha.named_parameters()
+            .iter()
+            .find(|(n, _)| n == name)
+            .ok_or("missing parameter")?
+            .1
+            .set_values(values)
+    };
+    set(
+        &mha,
+        "query.weight",
+        &[
+            0.4, 0.8, -0.4, 0.2, 0.2, -0.8, 1.2, 0.4, -0.6, 0.4, 0.8, -0.2, 0.8, 0.2, -0.4, 0.6,
+        ],
+    )?;
+    set(&mha, "query.bias", &[0.05, -0.1, 0.15, 0.0])?;
+    set(
+        &mha,
+        "key.weight",
+        &[
+            0.8, -0.4, 0.2, 0.4, -0.2, 0.6, 0.8, -0.4, 0.4, 0.2, -0.8, 0.6, -0.4, 0.8, 0.4, -0.2,
+        ],
+    )?;
+    set(&mha, "key.bias", &[-0.05, 0.1, 0.0, 0.05])?;
+    set(
+        &mha,
+        "value.weight",
+        &[
+            0.2, 0.4, -0.6, 0.8, 0.8, -0.2, 0.4, -0.4, -0.4, 0.6, 0.2, 0.4, 0.4, -0.4, 0.8, 0.2,
+        ],
+    )?;
+    set(&mha, "value.bias", &[0.0, 0.05, -0.05, 0.1])?;
+    set(
+        &mha,
+        "output.weight",
+        &[
+            0.6, -0.4, 0.2, 0.4, 0.4, 0.8, -0.4, -0.2, -0.2, 0.4, 0.6, 0.8, 0.8, -0.6, 0.4, 0.2,
+        ],
+    )?;
+    set(&mha, "output.bias", &[0.1, 0.0, -0.1, 0.05])?;
+
+    // PyTorch's own key_padding_mask convention: 1.0 = ignore that key for every query. The last
+    // key (index 2) is padding.
+    let key_padding = Tensor::from_slice(&[0.0, 0.0, 1.0], [mha.key_time().of(3)], &device)?;
+
+    let (output, weights) = mha.forward_with_weights(&x, &x, &x, None, Some(&key_padding), true)?;
+    close(
+        "MultiheadAttention forward",
+        &output.to_vec()?,
+        &[
+            -0.2659694341,
+            -0.1575912433,
+            0.3308803281,
+            0.5738299373,
+            -0.1220312472,
+            0.8221968242,
+            -0.1720345522,
+            0.1616877521,
+            0.6524414440,
+            0.3693247401,
+            -0.2079593236,
+            -0.1045806274,
+        ],
+    );
+    close(
+        "MultiheadAttention head-averaged weights (masked key gets zero weight)",
+        &weights.unwrap().to_vec()?,
+        &[
+            0.3406310228,
+            0.6593689772,
+            0.0,
+            0.6272801610,
+            0.3727198390,
+            0.0,
+            0.8671724567,
+            0.1328275433,
+            0.0,
+        ],
+    );
+
+    // Reordered physical storage for the input must not change the forward value.
+    let x_reordered = Tensor::from_slice(&x_values, [time.of(3), feature.of(4)], &device)?
+        .with_layout([feature, time])?;
+    close(
+        "MultiheadAttention forward is unaffected by reordered input storage",
+        &mha.forward(
+            &x_reordered,
+            &x_reordered,
+            &x_reordered,
+            None,
+            Some(&key_padding),
+        )?
+        .to_vec()?,
+        &[
+            -0.2659694341,
+            -0.1575912433,
+            0.3308803281,
+            0.5738299373,
+            -0.1220312472,
+            0.8221968242,
+            -0.1720345522,
+            0.1616877521,
+            0.6524414440,
+            0.3693247401,
+            -0.2079593236,
+            -0.1045806274,
+        ],
+    );
+
+    output.mean([time, feature])?.backward()?;
+    let grad = |name: &str| -> Vec<f32> {
+        mha.named_parameters()
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap()
+            .1
+            .grad()
+            .unwrap()
+            .to_vec()
+            .unwrap()
+    };
+    close(
+        "MultiheadAttention x gradient",
+        &x.grad().unwrap().to_vec()?,
+        &[
+            0.0251251226,
+            0.1364713234,
+            0.0885826173,
+            0.2129792737,
+            -0.0063528112,
+            0.0850940605,
+            0.0714196287,
+            0.1755497389,
+            -0.0005616756,
+            0.0022137745,
+            -0.0009979275,
+            0.0006980926,
+        ],
+    );
+    close(
+        "MultiheadAttention query.weight gradient",
+        &grad("query.weight"),
+        &[
+            -0.0024837483,
+            0.0010928493,
+            -0.0007901254,
+            0.0010271630,
+            0.0023874106,
+            -0.0010504607,
+            0.0010260336,
+            -0.0013338437,
+            0.0015863129,
+            -0.0006979777,
+            -0.0006484385,
+            0.0008429700,
+            0.0052972790,
+            -0.0023308027,
+            0.0013293262,
+            -0.0017281241,
+        ],
+    );
+    close(
+        "MultiheadAttention query.bias gradient",
+        &grad("query.bias"),
+        &[0.0198445104, -0.0087315846, 0.0041543950, -0.0054007134],
+    );
+    close(
+        "MultiheadAttention key.weight gradient",
+        &grad("key.weight"),
+        &[
+            0.0030097950,
+            -0.0033499178,
+            -0.0013439622,
+            -0.0014156062,
+            -0.0012540812,
+            0.0013957991,
+            0.0005599843,
+            0.0005898359,
+            0.0025081625,
+            -0.0027915982,
+            -0.0011199685,
+            -0.0011796718,
+            -0.0002508162,
+            0.0002791598,
+            0.0001119969,
+            0.0001179672,
+        ],
+    );
+    close(
+        "MultiheadAttention key.bias gradient is exactly zero (uniform shift along the softmax's own reduced axis)",
+        &grad("key.bias"),
+        &[0.0, 0.0, 0.0, 0.0],
+    );
+    close(
+        "MultiheadAttention value.weight gradient",
+        &grad("value.weight"),
+        &[
+            0.0038524380,
+            0.0028893285,
+            -0.0868647285,
+            -0.0434323642,
+            -0.0116051825,
+            -0.0087038869,
+            0.0161936369,
+            0.0080968184,
+            0.0832103650,
+            0.0624077737,
+            0.0876127263,
+            0.0438063631,
+            0.0396789635,
+            0.0297592226,
+            0.0872387274,
+            0.0436193637,
+        ],
+    );
+    close(
+        "MultiheadAttention value.bias gradient",
+        &grad("value.bias"),
+        &[0.2, 0.15, 0.4, 0.2],
+    );
+    close(
+        "MultiheadAttention output.weight gradient",
+        &grad("output.weight"),
+        &[
+            -0.0324077737,
+            -0.0324077737,
+            -0.0324077737,
+            -0.0324077737,
+            0.0598958066,
+            0.0598958066,
+            0.0598958066,
+            0.0598958066,
+            0.0786936369,
+            0.0786936369,
+            0.0786936369,
+            0.0786936369,
+            0.0103272490,
+            0.0103272490,
+            0.0103272490,
+            0.0103272490,
+        ],
+    );
+    close(
+        "MultiheadAttention output.bias gradient",
+        &grad("output.bias"),
+        &[0.25, 0.25, 0.25, 0.25],
+    );
+
+    Ok(())
+}
