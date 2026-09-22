@@ -3995,6 +3995,7 @@ impl Tensor {
     /// positive that sits closer to the negative than the anchor does), computed by stacking
     /// the two distances on a fresh axis and reducing with [`Self::min`]. `margin` (PyTorch
     /// default `1.0`) must be finite. Unreduced over every axis but `axis`.
+    #[allow(clippy::too_many_arguments)]
     pub fn triplet_margin_loss(
         &self,
         positive: &Self,
@@ -4106,13 +4107,13 @@ impl Tensor {
         if width < 2 {
             return Err("multi_margin_loss requires at least two classes".into());
         }
-        if let Some(w) = weight {
-            if w.shape().rank() != 1 || !w.shape().contains(class) || w.extent(class)? != width {
-                return Err(
-                    "multi_margin_loss weight must carry exactly the class axis, at the same extent"
-                        .into(),
-                );
-            }
+        if let Some(w) = weight
+            && (w.shape().rank() != 1 || !w.shape().contains(class) || w.extent(class)? != width)
+        {
+            return Err(
+                "multi_margin_loss weight must carry exactly the class axis, at the same extent"
+                    .into(),
+            );
         }
         let mut ordered_dims: Vec<_> = self
             .shape()
