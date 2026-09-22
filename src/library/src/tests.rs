@@ -3291,3 +3291,83 @@ fn binary_alignment_of_permuted_layouts_matches_values_and_gradients() -> Result
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn elementwise_division_matches_hand_computed_forward_and_both_gradients() -> Result<()> {
+    // world/energy-output and world/fluid both divide a per-feature sum by a
+    // per-feature, data-dependent count; upscale_eval divides one MSE by
+    // another. All three need forward plus the gradient with respect to BOTH
+    // operands, matching hand-derived d/da = g/b and d/db = -g*a/b^2.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let a_values = [2.0f32, -3.0, 4.5, 0.5];
+    let b_values = [4.0f32, 1.5, -2.0, 0.25];
+    let a = Tensor::from_slice(&a_values, [sample.of(4)], &device)?.with_grad();
+    let b = Tensor::from_slice(&b_values, [sample.of(4)], &device)?.with_grad();
+    let quotient = a.div(&b)?;
+    close(
+        "division forward",
+        &quotient.to_vec()?,
+        &[0.5, -2.0, -2.25, 2.0],
+    );
+    quotient.mean(sample)?.backward()?;
+    close(
+        "division numerator gradient",
+        &a.grad().expect("numerator gradient").to_vec()?,
+        &[0.0625, 1.0 / 6.0, -0.125, 1.0],
+    );
+    close(
+        "division denominator gradient",
+        &b.grad().expect("denominator gradient").to_vec()?,
+        &[-0.03125, 1.0 / 3.0, -0.28125, -2.0],
+    );
+
+    // Masked-mean shape from energy-output's `losses / counts.clamp(min=1)`:
+    // a per-column sum divided by a per-column count that the CONSUMER has
+    // already clamped away from zero before calling div. Axis performs no
+    // clamping or epsilon of its own; division by an actual zero yields IEEE
+    // inf/nan, as in PyTorch.
+    let feature = Axis::new("feature");
+    let sums = Tensor::from_slice(&[10.0f32, 6.0, 0.0], [feature.of(3)], &device)?.with_grad();
+    let counts = Tensor::from_slice(&[5.0f32, 1.0, 1.0], [feature.of(3)], &device)?.with_grad();
+    let ratio = sums.div(&counts)?;
+    close("masked-mean forward", &ratio.to_vec()?, &[2.0, 6.0, 0.0]);
+    ratio.mean(feature)?.backward()?;
+    close(
+        "masked-mean sums gradient",
+        &sums.grad().expect("sums gradient").to_vec()?,
+        &[1.0 / 15.0, 1.0 / 3.0, 1.0 / 3.0],
+    );
+    close(
+        "masked-mean counts gradient",
+        &counts.grad().expect("counts gradient").to_vec()?,
+        &[-2.0 / 15.0, -2.0, 0.0],
+    );
+
+    // Reordered-layout CUDA case: numerator and denominator share axes but
+    // keep different storage orders, mirroring
+    // binary_alignment_of_permuted_layouts for add.
+    let (batch, time) = (Axis::new("batch"), Axis::new("time"));
+    let num_values: Vec<_> = (0..6).map(|v| v as f32 + 1.0).collect();
+    let den_values: Vec<_> = (0..6).map(|v| 2.0 + v as f32 * 0.5).collect();
+    let numerator = Tensor::from_slice(&num_values, [batch.of(2), time.of(3)], &device)?
+        .with_layout([time, batch])?
+        .with_grad();
+    let denominator =
+        Tensor::from_slice(&den_values, [time.of(3), batch.of(2)], &device)?.with_grad();
+    let reordered = numerator.div(&denominator)?;
+    let shape = reordered.shape().clone();
+    let actual = reordered.to_vec()?;
+    let mut expected = Vec::with_capacity(6);
+    for index in 0..shape.len() {
+        let coords = shape.coords(index);
+        let at = |axis: Axis| coords[shape.index(axis).expect("shared axis")];
+        let (b, t) = (at(batch), at(time));
+        let numerator_value = f64::from(num_values[b * 3 + t]);
+        let denominator_value = f64::from(den_values[t * 2 + b]);
+        expected.push(numerator_value / denominator_value);
+    }
+    close("reordered division values", &actual, &expected);
+    Ok(())
+}
