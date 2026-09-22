@@ -1956,6 +1956,56 @@ impl Tensor {
             None,
         ))
     }
+    /// Concatenate two or more tensors along a named axis they already share,
+    /// extending that axis's extent by the sum of each operand's extent. Every
+    /// other axis must match exactly across operands (same identity, same
+    /// extent); the output's axis order follows the first operand's. This is
+    /// the wave-1-proven composition of `pad_zeros` and `add`: each operand is
+    /// zero-padded into its own slice of the concatenated axis, then the
+    /// padded tensors are summed, so backward automatically narrows the
+    /// incoming gradient back to each operand's slice with no dedicated rule.
+    pub fn concat(values: &[Self], axis: Axis) -> Result<Self> {
+        let first = values
+            .first()
+            .ok_or("concat requires at least one tensor")?;
+        first.shape().index(axis)?;
+        let mut total = 0usize;
+        for value in values {
+            first.compatible_device(value)?;
+            if value.shape().rank() != first.shape().rank()
+                || first
+                    .shape()
+                    .axes()
+                    .iter()
+                    .any(|candidate| !value.shape().contains(*candidate))
+            {
+                return Err("concat requires identical input axis sets".into());
+            }
+            for dim in first.shape().dims() {
+                if dim.axis != axis && value.extent(dim.axis)? != dim.extent {
+                    return Err(
+                        format!("concat requires matching extent for {:?}", dim.axis).into(),
+                    );
+                }
+            }
+            total = total
+                .checked_add(value.extent(axis)?)
+                .ok_or("concat extent overflow")?;
+        }
+        let mut offset = 0usize;
+        let mut result: Option<Self> = None;
+        for value in values {
+            let extent = value.extent(axis)?;
+            let after = total - offset - extent;
+            let padded = value.pad_zeros(axis, offset, after)?;
+            result = Some(match result {
+                Some(accumulated) => accumulated.add(&padded)?,
+                None => padded,
+            });
+            offset += extent;
+        }
+        Ok(result.expect("validated at least one tensor above"))
+    }
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
         let started = Instant::now();

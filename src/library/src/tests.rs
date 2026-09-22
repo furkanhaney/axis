@@ -3584,5 +3584,107 @@ fn trainer_driven_sgd_consumes_a_cosine_annealing_schedule_each_step() -> Result
         );
     }
     assert_eq!(trainer.completed_steps(), 2);
+fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature, group, combined, missing) = (
+        Axis::new("batch"),
+        Axis::new("feature"),
+        Axis::new("group"),
+        Axis::new("combined"),
+        Axis::new("missing"),
+    );
+
+    // Three unequal-width operands (mirrors the gastric PhaseSeparableFusion
+    // 5*256+3+512 unequal-width cat): declared axis order [batch, feature] on
+    // the first operand, a physically permuted layout on the second (same
+    // declared order, transposed storage), and a swapped declared axis order
+    // on the third, checking that the output follows the FIRST operand only.
+    let a = Tensor::from_slice(
+        &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let b = Tensor::from_slice(
+        &[10.0, 11.0, 12.0, 13.0],
+        [batch.of(2), feature.of(2)],
+        &device,
+    )?
+    .with_layout([feature, batch])?
+    .with_grad();
+    let c = Tensor::from_slice(&[100.0, 101.0], [feature.of(1), batch.of(2)], &device)?.with_grad();
+
+    let concatenated = Tensor::concat(&[a.clone(), b.clone(), c.clone()], feature)?;
+    assert_eq!(
+        concatenated.shape(),
+        &Shape::new([batch.of(2), feature.of(6)])?
+    );
+    close(
+        "unequal-width concat values",
+        &concatenated.to_vec()?,
+        &[
+            0.0, 1.0, 2.0, 10.0, 11.0, 100.0, 3.0, 4.0, 5.0, 12.0, 13.0, 101.0,
+        ],
+    );
+
+    let upstream = Tensor::from_slice(
+        &(1..=12).map(|v| v as f32).collect::<Vec<_>>(),
+        [batch.of(2), feature.of(6)],
+        &device,
+    )?;
+    concatenated
+        .mul(&upstream)?
+        .mean([batch, feature])?
+        .backward()?;
+    close(
+        "unequal-width concat gradient a",
+        &a.grad().expect("a gradient").to_vec()?,
+        &[
+            1.0 / 12.0,
+            2.0 / 12.0,
+            3.0 / 12.0,
+            7.0 / 12.0,
+            8.0 / 12.0,
+            9.0 / 12.0,
+        ],
+    );
+    close(
+        "unequal-width concat gradient b",
+        &b.grad().expect("b gradient").to_vec()?,
+        &[4.0 / 12.0, 5.0 / 12.0, 10.0 / 12.0, 11.0 / 12.0],
+    );
+    close(
+        "unequal-width concat gradient c",
+        &c.grad().expect("c gradient").to_vec()?,
+        &[6.0 / 12.0, 12.0 / 12.0],
+    );
+
+    // Equal-width cross-check: concat must agree bit-for-bit with the
+    // already-proven stack+merge composition (group outer, feature inner).
+    let x = Tensor::from_slice(
+        &[1.0, -2.0, 3.0, -4.0, 5.0, -6.0],
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let y = Tensor::from_slice(
+        &[7.0, -8.0, 9.0, -10.0, 11.0, -12.0],
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let by_concat = Tensor::concat(&[x.clone(), y.clone()], feature)?;
+    let stacked = Tensor::stack(&[x, y], group, 2)?;
+    let by_stack_and_merge = stacked.merge([group, feature], combined)?;
+    assert_eq!(by_concat.to_vec()?, by_stack_and_merge.to_vec()?);
+
+    // Rejections: axis must already exist (unlike `stack`), axis sets must
+    // match exactly, and with more than two operands a mismatched
+    // non-concat-axis extent must be rejected before any device work.
+    assert!(Tensor::concat(std::slice::from_ref(&a), missing).is_err());
+    let wrong_axes = Tensor::from_slice(&[0.0, 1.0], [missing.of(2)], &device)?;
+    assert!(Tensor::concat(&[a.clone(), wrong_axes], feature).is_err());
+    let mismatched_batch =
+        Tensor::from_slice(&[0.0, 1.0, 2.0], [batch.of(1), feature.of(3)], &device)?;
+    assert!(Tensor::concat(&[a.clone(), b.clone(), mismatched_batch], feature).is_err());
+    println!("concat values, gradients, and composed-path cross-check PASS");
     Ok(())
 }
