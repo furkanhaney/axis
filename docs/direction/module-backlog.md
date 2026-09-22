@@ -36,11 +36,17 @@ resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
 composition, named reductions, an arbitrary-index `gather` (a host-side integer
 index, not a one-hot contraction, so it scales to a large table where
 `Embedding` cannot), data regimes, metrics, trainers, and optimizers.
+`gt`/`ge`/`lt`/`le`/`eq` compare a tensor against a scalar into a `{0.0, 1.0}`
+mask with no gradient of its own; `logical_and`/`logical_not` compose masks the
+same way PyTorch's `&`/`~` do on 0/1 tensors (`mul`, `1 - x`).
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
 `one_cycle_lr` schedule functions (`optim.rs`), and a global-norm
 `clip_grad_norm` matching `torch.nn.utils.clip_grad_norm_` (`optim.rs`);
-there is still no mixed precision.
+there is still no mixed precision. `Tensor::uniform` and `Tensor::normal` are the
+public, seeded random tensor constructors: generated host-side from the same
+shared xorshift stream that initializes parameters, then uploaded, with no
+gradient edge, since a random draw is a constant, not a parameter.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
 

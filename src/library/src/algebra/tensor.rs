@@ -20,6 +20,56 @@ fn profile(label: &str, started: Instant) {
     }
 }
 
+/// Deterministic raw stream in `[0, 1)` from a xorshift64 generator, seeded `seed.max(1)`.
+/// Parameter initialization (`model::nn::uniform_values`) and `Tensor::uniform`/`Tensor::normal`
+/// all draw from this one stream, so a seed reproduces bit-exact values everywhere it is used.
+/// A seed below 2^40 has no high bits set yet, so the first raw sample is exactly `0.0`; the
+/// stream is well mixed from the second sample on. This quirk is not fixed here: recorded
+/// initialization baselines depend on it.
+pub(crate) fn xorshift_unit_stream(seed: u64, count: usize) -> Vec<f32> {
+    let mut rng = seed.max(1);
+    (0..count)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 40) as f32 / (1_u32 << 24) as f32
+        })
+        .collect()
+}
+
+/// Host-side values for [`Tensor::uniform`]: each raw `[0, 1)` sample rescaled to `[low, high)`.
+/// Kept as a pure function so its exact sequence is checkable against an independent oracle
+/// without a device.
+pub(crate) fn uniform_host_values(seed: u64, count: usize, low: f32, high: f32) -> Vec<f32> {
+    xorshift_unit_stream(seed, count)
+        .into_iter()
+        .map(|raw| low + raw * (high - low))
+        .collect()
+}
+
+/// Host-side values for [`Tensor::normal`]: consecutive raw `[0, 1)` pairs `(u1, u2)` become one
+/// Box-Muller pair of independent standard-normal values, `z0 = sqrt(-2 * ln(1 - u1)) *
+/// cos(2*pi*u2)` and `z1 = sqrt(-2 * ln(1 - u1)) * sin(2*pi*u2)`, each scaled to `mean + std *
+/// z`. Using `1 - u1` rather than `u1` keeps the logarithm's argument in `(0, 1]` even on the
+/// shared stream's documented first-sample-exactly-zero seeds (where it collapses the first
+/// pair to exactly `mean`), so no draw ever requires discarding or resampling. An odd element
+/// count drops the unused second value of the final pair. Kept as a pure function for the same
+/// reason as [`uniform_host_values`].
+pub(crate) fn normal_host_values(seed: u64, count: usize, mean: f32, std: f32) -> Vec<f32> {
+    let raw = xorshift_unit_stream(seed, count.div_ceil(2) * 2);
+    let mut values = Vec::with_capacity(count);
+    for pair in raw.chunks_exact(2) {
+        let radius = (-2.0 * (1.0 - pair[0]).ln()).sqrt();
+        let angle = 2.0 * std::f32::consts::PI * pair[1];
+        values.push(mean + std * (radius * angle.cos()));
+        if values.len() < count {
+            values.push(mean + std * (radius * angle.sin()));
+        }
+    }
+    values
+}
+
 #[derive(Clone)]
 enum UnfoldPlans {
     Implicit(Rc<UnfoldSpec>),
@@ -233,6 +283,52 @@ impl Tensor {
             false,
             None,
         ))
+    }
+    /// Deterministic uniform draw in `[low, high)` from the shared xorshift stream that
+    /// initializes parameters, generated host-side then uploaded like [`Tensor::from_slice`].
+    /// A random draw has no upstream input, so the result carries no gradient edge; it is a
+    /// constant, not a parameter. The same seed, shape and range reproduce identical values on
+    /// any run or machine; distinct seeds diverge. Inherits the shared stream's documented
+    /// quirk: a seed below 2^40 draws exactly `low` first.
+    pub fn uniform(
+        dims: impl IntoIterator<Item = Dim>,
+        seed: u64,
+        low: f32,
+        high: f32,
+        device: &Device,
+    ) -> Result<Self> {
+        if !(low.is_finite() && high.is_finite() && low < high) {
+            return Err(
+                format!("uniform requires finite low < high, got low={low} high={high}").into(),
+            );
+        }
+        let shape = Shape::new(dims)?;
+        let values = uniform_host_values(seed, shape.len(), low, high);
+        Self::from_slice(&values, shape.dims().iter().copied(), device)
+    }
+    /// Deterministic normal draw with the given `mean` and standard deviation `std`, from the
+    /// same shared xorshift stream as [`Tensor::uniform`] via the Box-Muller transform: two raw
+    /// `[0, 1)` stream samples `u1, u2` become one pair `z0 = sqrt(-2 * ln(1 - u1)) *
+    /// cos(2*pi*u2)`, `z1 = sqrt(-2 * ln(1 - u1)) * sin(2*pi*u2)` of independent standard-normal
+    /// values, each scaled to `mean + std * z`; an odd element count drops the unused second
+    /// value of the final pair. Generated host-side then uploaded, with no gradient edge,
+    /// exactly like [`Tensor::uniform`].
+    pub fn normal(
+        dims: impl IntoIterator<Item = Dim>,
+        seed: u64,
+        mean: f32,
+        std: f32,
+        device: &Device,
+    ) -> Result<Self> {
+        if !(mean.is_finite() && std.is_finite() && std >= 0.0) {
+            return Err(format!(
+                "normal requires finite mean and non-negative std, got mean={mean} std={std}"
+            )
+            .into());
+        }
+        let shape = Shape::new(dims)?;
+        let values = normal_host_values(seed, shape.len(), mean, std);
+        Self::from_slice(&values, shape.dims().iter().copied(), device)
     }
     pub fn shape(&self) -> &Shape {
         &self.0.shape
@@ -1063,6 +1159,70 @@ impl Tensor {
             false,
             None,
         ))
+    }
+    /// Shared body for the scalar comparison family below. `op` selects the cuTile
+    /// comparison the same way [`Self::binary`]'s `op` selects add/sub/mul/div: 0
+    /// (`>`), 1 (`>=`), 2 (`<`), 3 (`<=`), 4 (`==`). Output has the same [`Shape`]
+    /// as the input, holds exactly `0.0` or `1.0`, and carries no autograd edge:
+    /// like PyTorch's comparison operators, a comparison is not differentiable, so
+    /// the result is built the same way a leaf constant is (`Tensor::from_slice`) --
+    /// empty edges, not a leaf -- rather than routing a `Rule` through `self`. A
+    /// downstream op such as `x.mul(&mask)` still back-propagates correctly to `x`:
+    /// only the mask's own gradient path is absent, matching the masking
+    /// convention `causal_mask` and `minimum_winner_mask` already use for their
+    /// constant 0/1 outputs.
+    fn compare_scalar(&self, scalar: f32, op: i32) -> Result<Self> {
+        let value = self.device().compare_scalar(&self.0.value, scalar, op)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise `self > scalar` as a `{0.0, 1.0}` mask, IEEE-ordered so any
+    /// comparison against `NaN` is `false` (`0.0`), exactly like PyTorch's `>`.
+    /// No autograd edge, even when `self` requires grad: like PyTorch, a
+    /// comparison is not differentiable.
+    pub fn gt(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 0)
+    }
+    /// Elementwise `self >= scalar`. Same NaN and no-gradient contract as [`Self::gt`].
+    pub fn ge(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 1)
+    }
+    /// Elementwise `self < scalar`. Same NaN and no-gradient contract as [`Self::gt`].
+    pub fn lt(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 2)
+    }
+    /// Elementwise `self <= scalar`. Same NaN and no-gradient contract as [`Self::gt`].
+    pub fn le(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 3)
+    }
+    /// Elementwise `self == scalar`, bit-for-bit IEEE equality (no epsilon). Same
+    /// NaN and no-gradient contract as [`Self::gt`].
+    pub fn eq(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 4)
+    }
+    /// Elementwise logical AND of two `{0.0, 1.0}` masks, spelled as their product
+    /// (`mask * mask` is exactly PyTorch's `&` on 0/1 tensors). Same axis-agreement
+    /// contract as [`Self::mul`]; the result carries a gradient only if `mul` would
+    /// give one, which is never the case for two comparison-derived masks since
+    /// neither operand has an autograd edge to begin with.
+    pub fn logical_and(&self, rhs: &Self) -> Result<Self> {
+        self.mul(rhs)
+    }
+    /// Elementwise logical NOT of a `{0.0, 1.0}` mask, spelled as `1.0 - mask`
+    /// (PyTorch's `~` on a 0/1 tensor). Logical OR has no named method because no
+    /// migrated consumer calls it; on 0/1 masks it is an elementwise maximum
+    /// (`a | b` == `max(a, b)`, since both are `{0.0, 1.0}`), which Axis has no
+    /// tensor/tensor primitive for yet -- add one only when a consumer needs it.
+    pub fn logical_not(&self) -> Result<Self> {
+        let one = Self::from_slice(&[1.0], [], self.device())?;
+        one.sub(self)
     }
     /// Elementwise `(x + epsilon)^-1/2`; inputs plus epsilon must be positive.
     pub fn inverse_sqrt(&self, epsilon: f32) -> Result<Self> {
