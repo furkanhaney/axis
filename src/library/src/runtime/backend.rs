@@ -941,7 +941,46 @@ impl Device {
         )
         .enqueue_on(&self.0.stream)?;
         let mut winner_mask = self.zeros(a.shape()[0] as usize)?;
-        kernels::minimum_winner_mask(
+        kernels::reduction_winner_mask(
+            (&mut winner_mask).partition([1]),
+            &winner_indices,
+            reverse_plan.left.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        self.0
+            .pending_device_i32
+            .borrow_mut()
+            .push(Arc::new(winner_indices));
+        Ok((self.track(out), self.track(winner_mask)))
+    }
+
+    /// One maximum per CSR group plus a one-hot winner mask in input storage order.
+    /// Exact mirror of [`Self::grouped_minimum`].
+    pub(crate) fn grouped_maximum(
+        &self,
+        a: &Buffer,
+        forward: &Plan,
+        reverse: &Plan,
+    ) -> Result<(Buffer, Buffer)> {
+        let forward_plan = self.device_plan(forward, false)?;
+        let reverse_plan = self.device_plan(reverse, false)?;
+        let groups = forward.offsets.len() - 1;
+        let mut out = self.zeros(groups)?;
+        let mut winner_indices = api::zeros::<i32>(&[groups]).enqueue_on(&self.0.stream)?;
+        kernels::grouped_maximum(
+            (&mut out).partition([1]),
+            (&mut winner_indices).partition([1]),
+            a.as_ref(),
+            forward_plan.offsets.as_ref(),
+            forward_plan.left.as_ref(),
+            f32::MIN,
+            f32::MAX,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        )
+        .enqueue_on(&self.0.stream)?;
+        let mut winner_mask = self.zeros(a.shape()[0] as usize)?;
+        kernels::reduction_winner_mask(
             (&mut winner_mask).partition([1]),
             &winner_indices,
             reverse_plan.left.as_ref(),
@@ -2362,7 +2401,50 @@ mod kernels {
     }
 
     #[cutile::entry()]
-    fn minimum_winner_mask(
+    fn grouped_maximum(
+        out: &mut Tensor<f32, { [1] }>,
+        winners: &mut Tensor<i32, { [1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        offsets: &Tensor<i32, { [-1] }>,
+        left: &Tensor<i32, { [-1] }>,
+        minimum_finite: f32,
+        maximum_finite: f32,
+        negative_infinity: f32,
+        no_finite_value: f32,
+    ) {
+        let pid = get_tile_block_id().0;
+        let op = offsets.partition(shape![1]);
+        let start: i32 = tile_to_scalar(op.load([pid]).reshape(shape![]));
+        let end: i32 = tile_to_scalar(op.load([pid + 1i32]).reshape(shape![]));
+        let lp = left.partition(shape![1]);
+        let ap = a.partition(shape![1]);
+        let mut winner = constant(-1i32, shape![1]);
+        let mut maximum = broadcast_scalar(negative_infinity, shape![1]);
+        let finite_low = broadcast_scalar(minimum_finite, shape![1]);
+        let finite_high = broadcast_scalar(maximum_finite, shape![1]);
+        for i in start..end {
+            let candidate: i32 = tile_to_scalar(lp.load([i]).reshape(shape![]));
+            let value = ap.load([candidate]);
+            let finite = ge_tile(value, finite_low) & le_tile(value, finite_high);
+            let better = finite & gt_tile(value, maximum);
+            maximum = select(better, value, maximum);
+            let candidate_tile: Tile<i32, { [1] }> = scalar_to_tile(candidate).reshape(shape![1]);
+            winner = select(better, candidate_tile, winner);
+        }
+        let found = ge_tile(maximum, finite_low);
+        winners.store(winner);
+        out.store(select(
+            found,
+            maximum,
+            broadcast_scalar(no_finite_value, shape![1]),
+        ));
+    }
+
+    /// One-hot mask, in input storage order, of the position each group's `grouped_minimum`/
+    /// `grouped_maximum` winner index names. Shared by both reductions: it only compares winner
+    /// indices, so it carries no min/max-specific logic.
+    #[cutile::entry()]
+    fn reduction_winner_mask(
         out: &mut Tensor<f32, { [1] }>,
         winners: &Tensor<i32, { [-1] }>,
         groups: &Tensor<i32, { [-1] }>,

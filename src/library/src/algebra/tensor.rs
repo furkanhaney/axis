@@ -149,6 +149,10 @@ enum Rule {
         plan: Rc<Plan>,
         winners: Buffer,
     },
+    Maximum {
+        plan: Rc<Plan>,
+        winners: Buffer,
+    },
     Unfold(Rc<UnfoldSpec>),
     Select(Rc<SelectSpec>),
     Window(Rc<WindowSpec>),
@@ -1222,6 +1226,79 @@ impl Tensor {
             None,
         );
         profile("min", started);
+        Ok(result)
+    }
+    /// Reduce one named axis to its maximum finite value.
+    ///
+    /// Non-finite candidates are ignored. A group without a finite candidate returns NaN and
+    /// has zero derivative even if its upstream derivative is non-finite. Ties route the
+    /// derivative to the first logical coordinate along `axis`, independently of physical
+    /// layout. Exact mirror of [`Self::min`].
+    pub fn max(&self, axis: Axis) -> Result<Self> {
+        let started = Instant::now();
+        let reduced_index = self.shape().index(axis)?;
+        let extent = self.extent(axis)?;
+        let key = (1, self.shape().clone(), self.0.layout.clone(), vec![axis]);
+        let cached = REDUCTION_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let plans = match cached {
+            Some(plans) => plans,
+            None => {
+                let output = Shape::new(
+                    self.shape()
+                        .dims()
+                        .iter()
+                        .copied()
+                        .filter(|d| d.axis != axis),
+                )?;
+                let layout = Layout::contiguous(&output);
+                let mut map = vec![0; self.shape().len()];
+                let mut groups = Vec::with_capacity(output.len());
+                for output_index in 0..output.len() {
+                    let output_coords = output.coords(output_index);
+                    let mut group = Vec::with_capacity(extent);
+                    for coordinate in 0..extent {
+                        let mut input_coords = output_coords.clone();
+                        input_coords.insert(reduced_index, coordinate);
+                        let physical = self.0.layout.offset(&input_coords);
+                        map[physical] = output_index;
+                        group.push((physical, 0));
+                    }
+                    groups.push(group);
+                }
+                let plans = ReductionPlans {
+                    output: output.clone(),
+                    layout,
+                    factor: 1.0,
+                    forward: Rc::new(Plan::groups(groups, false)?),
+                    reverse: Rc::new(Plan::gather(&map)?),
+                };
+                REDUCTION_PLANS.with(|cache| {
+                    cache.borrow_mut().insert(key, plans.clone());
+                });
+                plans
+            }
+        };
+        let (value, winners) = self.device().grouped_maximum(
+            &self.0.value,
+            plans.forward.as_ref(),
+            plans.reverse.as_ref(),
+        )?;
+        let result = Self::node(
+            plans.output,
+            plans.layout,
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Maximum {
+                    plan: plans.reverse,
+                    winners,
+                },
+            )],
+            false,
+            None,
+        );
+        profile("max", started);
         Ok(result)
     }
     /// Reduce a tensor to the mean of elements selected by a constant binary mask.
@@ -2328,7 +2405,7 @@ impl Tensor {
                             plan.as_ref(),
                             *factor,
                         )?,
-                        Rule::Minimum { plan, winners } => {
+                        Rule::Minimum { plan, winners } | Rule::Maximum { plan, winners } => {
                             let expanded =
                                 self.device().grouped(&gradient, None, plan.as_ref(), 1.0)?;
                             self.device().mask_gradient(&expanded, winners)?
