@@ -3634,6 +3634,10 @@ fn elementwise_division_matches_hand_computed_forward_and_both_gradients() -> Re
         expected.push(numerator_value / denominator_value);
     }
     close("reordered division values", &actual, &expected);
+    Ok(())
+}
+
+#[test]
 fn cosine_annealing_lr_matches_pytorch_closed_form_at_exact_angles() -> Result<()> {
     // torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=4, eta_min=0.0) from a base
     // learning rate of 0.1: eta_t = eta_min + (eta_max - eta_min) * (1 + cos(pi * t / T_max)) / 2.
@@ -3736,6 +3740,11 @@ fn trainer_driven_sgd_consumes_a_cosine_annealing_schedule_each_step() -> Result
         );
     }
     assert_eq!(trainer.completed_steps(), 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -> Result<()> {
     let device = Device::cuda(0)?;
     let (batch, feature, group, combined, missing) = (
