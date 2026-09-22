@@ -1558,7 +1558,14 @@ impl Tensor {
         ))
     }
     /// Elementwise ELU (`torch.nn.functional.elu`): `x` where `x > 0`, otherwise
-    /// `alpha * (exp(x) - 1)`. `alpha` must be finite and positive. Composed from
+    /// `alpha * (exp(x) - 1)`. `alpha` must be finite and nonzero -- PyTorch's own documented
+    /// domain places no sign restriction on `alpha` (`torch.nn.ELU`'s docs give only "the alpha
+    /// value for the ELU formulation. Default: 1.0", and the piecewise formula itself is applied
+    /// as written for any nonzero `alpha`, negative included: unlike `celu` below there is no
+    /// `max(0, x) + min(0, ...)` wrapper in PyTorch's ELU definition, so the negative branch is
+    /// used exactly as `alpha * (exp(x) - 1)` regardless of `alpha`'s sign). The positive branch
+    /// (`x` itself) never reads `alpha`, so every already-recorded `alpha > 0` output and
+    /// gradient stays bit-exact; only the guard widens. Composed from
     /// [`Self::gt`]/[`Self::logical_not`], [`Self::clamp`] and [`Self::exp`]
     /// rather than a dedicated kernel: clamping the input to `(-inf, 0]` before
     /// `exp` keeps the positive branch -- masked out of the result anyway -- from
@@ -1567,8 +1574,8 @@ impl Tensor {
     /// there is `alpha`, not `1`): `clamp`'s own pass-through gradient at its
     /// upper bound keeps that boundary case exact through the chain rule.
     pub fn elu(&self, alpha: f32) -> Result<Self> {
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Err("elu alpha must be finite and positive".into());
+        if !alpha.is_finite() || alpha == 0.0 {
+            return Err("elu alpha must be finite and nonzero".into());
         }
         let positive = self.gt(0.0)?;
         let negative = positive.logical_not()?;
@@ -1581,17 +1588,23 @@ impl Tensor {
         positive.mul(self)?.add(&negative.mul(&branch)?)
     }
     /// Elementwise CELU (`torch.nn.functional.celu`, the continuously
-    /// differentiable exponential linear unit): `x` where `x > 0`, otherwise
-    /// `alpha * (exp(x / alpha) - 1)`. `alpha` must be finite and positive --
-    /// PyTorch's own definition allows any nonzero `alpha`, but a negative one
-    /// makes the negative branch diverge instead of saturate, so Axis narrows
-    /// the accepted range to the saturating case every consumer wants. Composed
-    /// exactly like [`Self::elu`], scaling the clamped input by `1 / alpha`
-    /// before `exp` and the branch result back up by `alpha`; the same
-    /// `x == 0` boundary reasoning applies.
+    /// differentiable exponential linear unit): PyTorch's documented
+    /// `max(0, x) + min(0, alpha * (exp(x / alpha) - 1))`, "valid for alpha != 0" per
+    /// `torch.nn.CELU`'s own docs, negative `alpha` included. Composed as `x` where `x > 0`,
+    /// otherwise `alpha * (exp(x / alpha) - 1)`, exactly like [`Self::elu`]'s two-branch split,
+    /// WITHOUT an explicit `min(0, ...)`/`max(0, ...)`: for `x > 0` and any nonzero `alpha`,
+    /// `x / alpha` and `alpha` always land on opposite sides of the sign that makes
+    /// `alpha * (exp(x / alpha) - 1) >= 0` (so `min(0, ...)` collapses to `0` and the sum is
+    /// exactly `x`), and for `x <= 0` the same sign algebra makes `alpha * (exp(x / alpha) -
+    /// 1)` land on the correct sign to equal `min(0, ...)` unclamped -- so the two-branch form
+    /// already equals PyTorch's `max`/`min` form for every nonzero `alpha`, not only positive
+    /// ones. The positive branch never reads `alpha`, so every already-recorded `alpha > 0`
+    /// output and gradient stays bit-exact; only the guard widens. Scales the clamped input by
+    /// `1 / alpha` before `exp` and the branch result back up by `alpha`; the same `x == 0`
+    /// boundary reasoning as `elu` applies.
     pub fn celu(&self, alpha: f32) -> Result<Self> {
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Err("celu alpha must be finite and positive".into());
+        if !alpha.is_finite() || alpha == 0.0 {
+            return Err("celu alpha must be finite and nonzero".into());
         }
         let positive = self.gt(0.0)?;
         let negative = positive.logical_not()?;
@@ -3785,13 +3798,21 @@ impl Tensor {
 
     /// Cosine similarity along one named feature axis: [PyTorch's `CosineSimilarity`](
     /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.CosineSimilarity.html),
-    /// `cos = (x1 . x2) / (max(||x1||_2, eps) * max(||x2||_2, eps))`. Each L2 norm is clamped to
-    /// `eps` INDIVIDUALLY before the product -- PyTorch's own C++ kernel instead clamps the
-    /// product of the squared norms to `eps^2` before one shared square root; the two formulas
-    /// agree whenever either input has a norm above `eps`, and diverge only in the degenerate
-    /// near-zero-vector regime neither treats as a meaningful similarity. `eps` matches
-    /// PyTorch's default `1e-8` and must be finite and positive. `self`/`rhs` require identical
-    /// axis sets including `axis`; every other axis is preserved unreduced.
+    /// `cos = (x1 . x2) / max(||x1||_2 * ||x2||_2, eps)`. **Semantic fix (was wave 1's #125,
+    /// landed with a documented divergence):** PyTorch's own kernel
+    /// (`aten/src/ATen/native/Distance.cpp`'s `cosine_similarity`) computes
+    /// `x1_norm = x1.mul(x1).sum(dim)`, `x2_norm` likewise, then
+    /// `at::clamp_min(x1_norm * x2_norm, eps * eps).sqrt()` as the ONE shared denominator --
+    /// a single joint clamp on the PRODUCT of squared norms, not two per-vector clamps each
+    /// floored to `eps` individually. The previous Axis composition clamped `||x1||` and
+    /// `||x2||` separately before multiplying, which is a different function whenever exactly
+    /// one operand's norm falls below `eps` (the joint form still lets that operand's real,
+    /// sub-`eps` norm shrink the denominator, since only the PRODUCT is floored). Every
+    /// consumer's existing PairwiseDistance-family test used inputs with both norms comfortably
+    /// above `eps`, where the two formulas agree exactly, so no other row's recorded output
+    /// changes. `eps` matches PyTorch's default `1e-8` and must be finite and positive.
+    /// `self`/`rhs` require identical axis sets including `axis`; every other axis is preserved
+    /// unreduced.
     pub fn cosine_similarity(&self, rhs: &Self, axis: Axis, eps: f32) -> Result<Self> {
         if !eps.is_finite() || eps <= 0.0 {
             return Err("cosine_similarity eps must be finite and positive".into());
@@ -3799,36 +3820,54 @@ impl Tensor {
         self.require_identical_axes(rhs, "cosine_similarity")?;
         self.extent(axis)?;
         let dot = self.mul(rhs)?.sum(axis)?;
-        let norm_self = self
-            .mul(self)?
-            .sum(axis)?
-            .stable_sqrt(f32::MIN_POSITIVE)?
-            .clamp(Some(eps), None)?;
-        let norm_rhs = rhs
-            .mul(rhs)?
-            .sum(axis)?
-            .stable_sqrt(f32::MIN_POSITIVE)?
-            .clamp(Some(eps), None)?;
-        dot.div(&norm_self.mul(&norm_rhs)?)
+        let squared_norm_self = self.mul(self)?.sum(axis)?;
+        let squared_norm_rhs = rhs.mul(rhs)?.sum(axis)?;
+        let denominator = squared_norm_self
+            .mul(&squared_norm_rhs)?
+            .clamp(Some(eps * eps), None)?
+            .stable_sqrt(f32::MIN_POSITIVE)?;
+        dot.div(&denominator)
     }
 
-    /// Euclidean pairwise distance along one named feature axis: [PyTorch's `PairwiseDistance`](
-    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.PairwiseDistance.html) at its
-    /// default `p=2`, `((self - rhs + eps)^2).sum(axis).sqrt()`. `eps` (PyTorch's default
-    /// `1e-6`) is added to the raw difference before squaring -- exactly where PyTorch's own
-    /// `F.pairwise_distance` adds it, not as a denominator floor. `keepdim=False` is automatic:
-    /// `axis` is removed like every other Axis reduction. Only `p=2` is implemented; PyTorch's
-    /// general `p`-norm is not, since every consumer below uses the Euclidean default.
+    /// `p`-norm pairwise distance along one named feature axis: [PyTorch's `PairwiseDistance`](
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.PairwiseDistance.html),
+    /// `norm(self - rhs + eps, p)`. `eps` (PyTorch's default `1e-6`) is added to the raw
+    /// difference BEFORE the norm -- exactly where PyTorch's own `F.pairwise_distance` adds it
+    /// (`aten/src/ATen/native/Distance.cpp`'s `pairwise_distance` computes `at::norm(x1 - x2 +
+    /// eps, p, ...)`), not as a denominator floor. `keepdim=False` is automatic: `axis` is
+    /// removed like every other Axis reduction. `p` (PyTorch's default `2.0`) must be a
+    /// positive real or `f32::INFINITY` (PyTorch's own `p`-norm domain, `torch.norm`'s
+    /// `ord`). `p == 2.0` keeps the exact `((self - rhs + eps)^2).sum(axis).sqrt()` composition
+    /// wave 1 shipped, bit-exact; `p == 1.0` is `abs(self - rhs + eps).sum(axis)`; `p ==
+    /// f32::INFINITY` is `abs(self - rhs + eps).max(axis)` (PyTorch's `p -> inf` limit); every
+    /// other `p` is the general `(sum(abs(diff)^p))^(1/p)`, composed from `ln`/`exp` since
+    /// there is no dedicated elementwise power op (`x^p = exp(p * ln(x))` for `x >= 0`; `ln(0)
+    /// = -inf` and `exp(-inf) = 0` give the mathematically correct zero contribution at an
+    /// exactly-zero coordinate, matching `f32`/PyTorch's own IEEE `ln`/`exp` at that boundary).
     /// `self`/`rhs` require identical axis sets including `axis`.
-    pub fn pairwise_distance(&self, rhs: &Self, axis: Axis, eps: f32) -> Result<Self> {
+    pub fn pairwise_distance(&self, rhs: &Self, axis: Axis, p: f32, eps: f32) -> Result<Self> {
         if !eps.is_finite() {
             return Err("pairwise_distance eps must be finite".into());
+        }
+        if p.is_nan() || p <= 0.0 {
+            return Err("pairwise_distance p must be a positive real or +inf".into());
         }
         self.require_identical_axes(rhs, "pairwise_distance")?;
         self.extent(axis)?;
         let eps_tensor = Self::from_slice(&[eps], [], self.device())?;
         let diff = self.sub(rhs)?.add(&eps_tensor)?;
-        diff.mul(&diff)?.sum(axis)?.stable_sqrt(f32::MIN_POSITIVE)
+        if p == 2.0 {
+            return diff.mul(&diff)?.sum(axis)?.stable_sqrt(f32::MIN_POSITIVE);
+        }
+        let magnitude = diff.abs()?;
+        if p == 1.0 {
+            return magnitude.sum(axis);
+        }
+        if p.is_infinite() {
+            return magnitude.max(axis);
+        }
+        let powered = magnitude.ln()?.scale(p)?.exp()?;
+        powered.sum(axis)?.ln()?.scale(1.0 / p)?.exp()
     }
 
     /// [PyTorch's `MarginRankingLoss`](
@@ -3947,30 +3986,32 @@ impl Tensor {
     }
 
     /// [PyTorch's `TripletMarginLoss`](
-    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.TripletMarginLoss.html) at its
-    /// default `p=2`: `max(0, margin + d(self, positive) - d(self, negative))`, where `d` is
-    /// [`Self::pairwise_distance`] along `axis` with the given `eps`. When `swap` is true
-    /// (PyTorch default `false`), `d(self, negative)` is instead the smaller of itself and
-    /// `d(positive, negative)` (Balntas et al.'s swap term, penalizing a positive that sits
-    /// closer to the negative than the anchor does), computed by stacking the two distances on
-    /// a fresh axis and reducing with [`Self::min`]. `margin` (PyTorch default `1.0`) must be
-    /// finite. Unreduced over every axis but `axis`.
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.TripletMarginLoss.html):
+    /// `max(0, margin + d(self, positive) - d(self, negative))`, where `d` is
+    /// [`Self::pairwise_distance`] along `axis` at the given `p` (PyTorch default `2.0`, any
+    /// positive real or `f32::INFINITY`, exactly `pairwise_distance`'s own domain) and `eps`.
+    /// When `swap` is true (PyTorch default `false`), `d(self, negative)` is instead the
+    /// smaller of itself and `d(positive, negative)` (Balntas et al.'s swap term, penalizing a
+    /// positive that sits closer to the negative than the anchor does), computed by stacking
+    /// the two distances on a fresh axis and reducing with [`Self::min`]. `margin` (PyTorch
+    /// default `1.0`) must be finite. Unreduced over every axis but `axis`.
     pub fn triplet_margin_loss(
         &self,
         positive: &Self,
         negative: &Self,
         axis: Axis,
         margin: f32,
+        p: f32,
         eps: f32,
         swap: bool,
     ) -> Result<Self> {
         if !margin.is_finite() {
             return Err("triplet_margin_loss margin must be finite".into());
         }
-        let distance_positive = self.pairwise_distance(positive, axis, eps)?;
-        let mut distance_negative = self.pairwise_distance(negative, axis, eps)?;
+        let distance_positive = self.pairwise_distance(positive, axis, p, eps)?;
+        let mut distance_negative = self.pairwise_distance(negative, axis, p, eps)?;
         if swap {
-            let distance_swap = positive.pairwise_distance(negative, axis, eps)?;
+            let distance_swap = positive.pairwise_distance(negative, axis, p, eps)?;
             let pair = axis.role("triplet_margin_loss_swap_pair");
             distance_negative =
                 Tensor::stack(&[distance_negative, distance_swap], pair, 0)?.min(pair)?;
@@ -3990,7 +4031,8 @@ impl Tensor {
     /// meaning `PairwiseDistance()`; Rust has no `Option`-shaped default that keeps a plain,
     /// statically dispatched closure parameter, so the default is spelled explicitly by the
     /// caller, e.g. `anchor.triplet_margin_with_distance_loss(&pos, &neg, margin, swap, |a, b|
-    /// a.pairwise_distance(b, axis, eps))?`. `margin` (PyTorch default `1.0`) must be finite.
+    /// a.pairwise_distance(b, axis, 2.0, eps))?`. `margin` (PyTorch default `1.0`) must be
+    /// finite.
     pub fn triplet_margin_with_distance_loss(
         &self,
         positive: &Self,
@@ -4018,18 +4060,33 @@ impl Tensor {
     }
 
     /// [PyTorch's `MultiMarginLoss`](
-    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.MultiMarginLoss.html) at its
-    /// default `p=1`: for each class `i`, `max(0, margin - self[target] + self[i])`, summed over
-    /// `i != target` and scaled by `1 / class.extent()`. `target` is a constant one-hot
-    /// indicator over `class` (checked before launch: every value `0.0`/`1.0`, summing to
-    /// exactly `1.0`), matching how `categorical_cross_entropy_with_logits` already spells a
-    /// class label as a tensor rather than a host index. `margin` (PyTorch default `1.0`) must
-    /// be finite; `class` must have at least two classes. PyTorch's optional per-class `weight`
-    /// and its general `p` are not implemented -- every consumer below uses the defaults.
-    /// Unreduced over every axis but `class`.
-    pub fn multi_margin_loss(&self, target: &Self, class: Axis, margin: f32) -> Result<Self> {
+    /// https://docs.pytorch.org/docs/2.14/generated/torch.nn.MultiMarginLoss.html): for each
+    /// class `i`, `w[target] * max(0, margin - self[target] + self[i])^p`, summed over `i !=
+    /// target` and scaled by `1 / class.extent()`. `target` is a constant one-hot indicator
+    /// over `class` (checked before launch: every value `0.0`/`1.0`, summing to exactly `1.0`),
+    /// matching how `categorical_cross_entropy_with_logits` already spells a class label as a
+    /// tensor rather than a host index. `p` (PyTorch default `1.0`) must be exactly `1.0` or
+    /// `2.0`, PyTorch's own documented domain (`p == 1` or `p == 2` are the only values its
+    /// forward formula supports). `weight` (PyTorch default `None`, meaning every class weighs
+    /// `1.0`) is an optional length-`class.extent()` per-class tensor indexed by `class` alone;
+    /// when given, PyTorch's kernel (`aten/src/ATen/native/LossMulti.h`'s `multi_margin_loss`)
+    /// multiplies the WHOLE per-sample hinge sum by `weight[target]` -- the true class's own
+    /// weight, gathered once per sample via `target.mul(weight).sum(class)` -- never a weight
+    /// averaged or looked up per competing class `i`. `margin` (PyTorch default `1.0`) must be
+    /// finite; `class` must have at least two classes. Unreduced over every axis but `class`.
+    pub fn multi_margin_loss(
+        &self,
+        target: &Self,
+        class: Axis,
+        p: f32,
+        margin: f32,
+        weight: Option<&Self>,
+    ) -> Result<Self> {
         if !margin.is_finite() {
             return Err("multi_margin_loss margin must be finite".into());
+        }
+        if p != 1.0 && p != 2.0 {
+            return Err("multi_margin_loss p must be exactly 1.0 or 2.0".into());
         }
         if target.requires_grad() {
             return Err("multi_margin_loss target cannot require gradients".into());
@@ -4048,6 +4105,14 @@ impl Tensor {
         let width = self.extent(class)?;
         if width < 2 {
             return Err("multi_margin_loss requires at least two classes".into());
+        }
+        if let Some(w) = weight {
+            if w.shape().rank() != 1 || !w.shape().contains(class) || w.extent(class)? != width {
+                return Err(
+                    "multi_margin_loss weight must carry exactly the class axis, at the same extent"
+                        .into(),
+                );
+            }
         }
         let mut ordered_dims: Vec<_> = self
             .shape()
@@ -4075,12 +4140,24 @@ impl Tensor {
         }
         let target_score = self.mul(target)?.sum(class)?.broadcast_to(self.shape())?;
         let margin_tensor = Self::from_slice(&[margin], [], self.device())?;
-        let hinge = margin_tensor.sub(&target_score)?.add(self)?.relu()?;
+        let hinge_linear = margin_tensor.sub(&target_score)?.add(self)?.relu()?;
+        let hinge = if p == 2.0 {
+            hinge_linear.mul(&hinge_linear)?
+        } else {
+            hinge_linear
+        };
         let not_target = target.logical_not()?;
-        hinge
+        let loss = hinge
             .mul(&not_target)?
             .sum(class)?
-            .scale(1.0 / width as f32)
+            .scale(1.0 / width as f32)?;
+        match weight {
+            Some(w) => {
+                let target_weight = target.mul(w)?.sum(class)?;
+                loss.mul(&target_weight)
+            }
+            None => Ok(loss),
+        }
     }
 
     /// [PyTorch's `MultiLabelMarginLoss`](
