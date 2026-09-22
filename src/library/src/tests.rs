@@ -6309,3 +6309,121 @@ fn logsumexp_reordered_storage_matches_hand_computed_forward_and_gradient() -> R
     println!("logsumexp reordered-storage forward and gradient PASS");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn masked_softmax_zeroes_masked_positions_and_a_fully_masked_bag_returns_zero() -> Result<()> {
+    // gastric `InterfaceMIL`/`PhaseSeparableFusion` pattern: `scores.masked_fill(~valid,
+    // -inf).softmax(dim)` over a variable-length token bank, but with one bag whose validity
+    // mask is entirely zero -- PyTorch's composition leaves that whole row `NaN` and every
+    // consumer calls `nan_to_num(neginf=0.0)` on it by hand; `masked_softmax` folds that
+    // cleanup into the op itself.
+    let device = Device::cuda(0)?;
+    let (bag, token) = (Axis::new("bag"), Axis::new("token"));
+    // Bag 0: token 1 is masked out; its huge score (5.0) must never influence the result.
+    // Bag 1: every token is masked out.
+    let scores = Tensor::from_slice(
+        &[1.0, 5.0, 2.0, 3.0, -1.0, 0.5],
+        [bag.of(2), token.of(3)],
+        &device,
+    )?
+    .with_grad();
+    // Built in [token, bag] order -- the transpose of `scores`'s own axis order -- so the
+    // mask must be realigned before use, exactly like `masked_mean`'s own test.
+    let mask = Tensor::from_slice(
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        [token.of(3), bag.of(2)],
+        &device,
+    )?;
+
+    let probability = scores.masked_softmax(token, &mask)?;
+    close(
+        "masked softmax forward",
+        &probability.to_vec()?,
+        &[0.2689414213699951, 0.0, 0.7310585786300049, 0.0, 0.0, 0.0],
+    );
+
+    let weights = Tensor::from_slice(&[1.0, 2.0, 4.0], [token.of(3)], &device)?;
+    probability.mul(&weights)?.mean([bag, token])?.backward()?;
+    close(
+        "masked softmax gradient",
+        &scores.grad().unwrap().to_vec()?,
+        &[
+            -0.09830596662074094,
+            0.0,
+            0.09830596662074088,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    );
+
+    let grad_mask = Tensor::from_slice(&[1.0; 6], [bag.of(2), token.of(3)], &device)?.with_grad();
+    assert!(scores.detach().masked_softmax(token, &grad_mask).is_err());
+    let fractional = Tensor::from_slice(
+        &[1.0, 0.5, 1.0, 0.0, 1.0, 0.0],
+        [bag.of(2), token.of(3)],
+        &device,
+    )?;
+    assert!(scores.detach().masked_softmax(token, &fractional).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn masked_softmax_matches_hand_computed_oracle_under_reordered_storage() -> Result<()> {
+    // Same capability, asymmetric extents (2 bags x 4 tokens) with both `scores` and `mask`
+    // stored transposed relative to their logical [bag, token] axis order, so the composition
+    // must read through `with_layout`'s permuted strides rather than assume either operand is
+    // already contiguous in its declared axis order. Bag 0 keeps 3 of 4 tokens valid (an
+    // ordinary partial mask); bag 1 is fully masked.
+    let device = Device::cuda(0)?;
+    let (bag, token) = (Axis::new("bag"), Axis::new("token"));
+    let scores = Tensor::from_slice(
+        &[0.5, -0.5, 2.0, 7.0, 1.0, 1.0, 1.0, 1.0],
+        [bag.of(2), token.of(4)],
+        &device,
+    )?
+    .with_layout([token, bag])?
+    .with_grad();
+    let mask = Tensor::from_slice(
+        &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [bag.of(2), token.of(4)],
+        &device,
+    )?
+    .with_layout([token, bag])?;
+
+    let probability = scores.masked_softmax(token, &mask)?;
+    close(
+        "masked softmax forward under reordered storage",
+        &probability.to_vec()?,
+        &[
+            0.17095278019779028,
+            0.0628900132458675,
+            0.7661572065563422,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    );
+
+    let weights = Tensor::from_slice(&[2.0, 0.5, 1.0, 100.0], [token.of(4)], &device)?;
+    probability.mul(&weights)?.mean([bag, token])?.backward()?;
+    close(
+        "masked softmax gradient under reordered storage",
+        &scores.grad().unwrap().to_vec()?,
+        &[
+            0.018387942305745593,
+            -0.005027331543869745,
+            -0.013360610761875839,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    );
+    Ok(())
+}
