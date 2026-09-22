@@ -386,6 +386,9 @@ impl<const N: usize> Pooling<N> {
         }
         let channel_extent = input.extent(self.channels)?;
         let mut output_spatial = [0; N];
+        // Four parallel small arrays share one index; a `.zip()` chain would read worse than
+        // the loop it replaces.
+        #[allow(clippy::needless_range_loop)]
         for index in 0..N {
             let doubled_padding = self.padding[index]
                 .checked_mul(2)
