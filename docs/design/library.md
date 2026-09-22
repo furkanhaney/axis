@@ -737,3 +737,64 @@ nine carry PyTorch's own defaults (`Hardtanh`'s `-1`/`1`, `Hardshrink`'s and
 existing precedent of requiring every argument explicitly; `Threshold` has no
 PyTorch default to omit; `ReLU6`, `Hardsigmoid`, `Hardswish`, `Softsign`, and
 `Tanhshrink` take no arguments at all.
+
+### Distances and margin losses
+
+`Tensor::cosine_similarity(rhs, axis, eps)` and `Tensor::pairwise_distance(rhs, axis, eps)`
+reduce one named feature `axis` -- PyTorch's positional `dim` -- rather than a fixed rank
+suffix, and every margin loss below is built from them (or, for
+`TripletMarginWithDistanceLoss`, from a caller-supplied replacement). Both, and every loss
+that composes them, sit immediately after `Tensor::broadcast_to` in `algebra/tensor.rs`,
+since that outer-broadcast primitive is what lets two operands merge onto a shared
+`[..., axis]` shape without an implicit outer product. `cosine_similarity` matches
+PyTorch's default `eps = 1e-8` by clamping each input's own L2 norm to `eps`
+*individually* before the product, rather than PyTorch's C++ kernel, which clamps the
+squared-norm product to `eps^2`; the two formulas agree everywhere except the degenerate
+near-zero-vector regime neither treats as meaningful. `pairwise_distance` implements only
+PyTorch's default `p = 2` (Euclidean); its `eps` (default `1e-6`) is added to the raw
+difference before squaring, exactly where `F.pairwise_distance` adds it, and `keepdim` has
+no knob to set because every Axis reduction already removes its axis. Both share a small
+private `Tensor::stable_sqrt(epsilon)` helper, `x * (x + epsilon)^-1/2`, the same
+regularized-norm trick Muon's `normalized_l2` already uses, so the composed gradient stays
+finite as a norm goes to zero instead of dividing by it.
+
+Every margin loss is a plain tensor-level method, not a `Module`, matching how
+`categorical_cross_entropy_with_logits` and `binary_cross_entropy_with_logits` already
+earn a `torch.nn` "yes": `margin`, `eps`, and `swap` are explicit arguments with PyTorch's
+default cited in the doc comment, never a Rust `Default`, and a `target`/label tensor is
+always a constant, rejected before launch if it requires gradients. `MarginRankingLoss`
+and `HingeEmbeddingLoss` take a `{1.0, -1.0}` label per element, checked exactly like
+`masked_mean`'s `{0.0, 1.0}` mask. `CosineEmbeddingLoss` reduces a named `feature` axis
+through `cosine_similarity` at that method's own `1e-8` default -- PyTorch's public formula
+names no `eps` at all; its kernel instead adds an undocumented `1e-12` inside the sum of
+squares, so reusing `CosineSimilarity`'s own contract keeps one canonical epsilon across
+the family instead of inventing a second undocumented constant.
+
+`TripletMarginLoss` composes two (or, with `swap = true`, three) `pairwise_distance` calls;
+`swap` -- PyTorch default `false` -- is implemented by stacking the ordinary and swapped
+negative distances on a fresh axis and reducing with `Tensor::min`, rather than a dedicated
+elementwise binary minimum, which Axis does not otherwise have. `TripletMarginWithDistanceLoss`
+is the same `max(0, margin + d(anchor, positive) - d(anchor, negative))` shape with `d` an
+arbitrary `Fn(&Tensor, &Tensor) -> Result<Tensor>` closure in place of a fixed `p`-norm.
+PyTorch defaults `distance_function` to `None`, meaning `PairwiseDistance()`; Rust has no
+`Option`-shaped default that stays a plain, statically dispatched closure parameter, so the
+default is spelled explicitly by the caller, e.g. `anchor.triplet_margin_with_distance_loss(
+&positive, &negative, margin, swap, |a, b| a.pairwise_distance(b, axis, eps))?`.
+
+`MultiMarginLoss` and `MultiLabelMarginLoss` only implement their PyTorch defaults (`p = 1`
+for the former; the latter has no configurable margin at all) and take their label as a
+constant tensor over a named `class` axis rather than PyTorch's host index or
+index-array-terminated-by--1 encoding -- the same floating-point-tensor spelling
+`categorical_cross_entropy_with_logits` already uses for a single label. `MultiMarginLoss`'s
+`target` is a one-hot indicator (checked to sum to exactly `1`, like
+`categorical_cross_entropy_with_logits`'s own check); `MultiLabelMarginLoss`'s `target` is a
+multi-hot `{0.0, 1.0}` indicator (checked like `masked_mean`'s mask) naming the whole
+positive-label *set* at once, which the two encodings agree on even though they are spelled
+differently. `MultiLabelMarginLoss`'s `sum_{i,j}` over class positions `i` that are *not* a
+positive label and `j` that *are* is built by relabeling the class axis onto a second, fresh
+axis with `Tensor::rename`, broadcasting both the input and target onto the combined
+`[..., class, class']` shape with `Tensor::broadcast_to`, and masking with `target' * (1 -
+target)` before summing both axes -- the same "outer-broadcast then combine" pattern
+`docs/design/library.md`'s own `broadcast_to` row documents for a `torch.cdist`-style pairwise
+op, applied here to a single tensor against a relabeled view of itself. Neither loss exposes
+PyTorch's optional per-class `weight`.

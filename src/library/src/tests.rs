@@ -7520,3 +7520,919 @@ fn softsign_and_tanhshrink_modules_match_independent_oracles() -> Result<()> {
     );
     Ok(())
 }
+
+fn to_f32(values: &[f64]) -> Vec<f32> {
+    values.iter().map(|value| *value as f32).collect()
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cosine_similarity_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("cos_sim_batch"), Axis::new("cos_sim_feature"));
+    let x1_values = [1.0_f64, 2.0, 2.0, 3.0, 4.0, 0.0];
+    let x2_values = [2.0_f64, 0.0, 0.0, 0.0, 3.0, 4.0];
+    let x1 =
+        Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let x2 =
+        Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+
+    let similarity = x1.cosine_similarity(&x2, feature, 1e-8)?;
+    // x1=[1,2,2], x2=[2,0,0]: dot=2, |x1|=3, |x2|=2 -> 2/6 = 1/3.
+    // x1=[3,4,0], x2=[0,3,4]: dot=12, |x1|=5, |x2|=5 -> 12/25 = 0.48.
+    close(
+        "cosine similarity forward",
+        &similarity.to_vec()?,
+        &[1.0 / 3.0, 0.48],
+    );
+
+    fn cos_scalar_loss(a: &[f64], b: &[f64]) -> f64 {
+        let row = |a: &[f64], b: &[f64]| {
+            let dot: f64 = a.iter().zip(b).map(|(p, q)| p * q).sum();
+            let na = a.iter().map(|p| p * p).sum::<f64>().sqrt().max(1e-8);
+            let nb = b.iter().map(|q| q * q).sum::<f64>().sqrt().max(1e-8);
+            dot / (na * nb)
+        };
+        (row(&a[0..3], &b[0..3]) + row(&a[3..6], &b[3..6])) / 2.0
+    }
+
+    similarity.mean(batch)?.backward()?;
+    close(
+        "cosine similarity gradient wrt x1",
+        &x1.grad().unwrap().to_vec()?,
+        &central_difference(&x1_values, 1e-4, |candidate| {
+            cos_scalar_loss(candidate, &x2_values)
+        }),
+    );
+    close(
+        "cosine similarity gradient wrt x2",
+        &x2.grad().unwrap().to_vec()?,
+        &central_difference(&x2_values, 1e-4, |candidate| {
+            cos_scalar_loss(&x1_values, candidate)
+        }),
+    );
+
+    let other = Axis::new("cos_sim_other");
+    let wrong = Tensor::from_slice(&[1.0_f32, 2.0], [other.of(2)], &device)?;
+    assert!(
+        x1.detach()
+            .cosine_similarity(&wrong, feature, 1e-8)
+            .is_err()
+    );
+    assert!(
+        x1.detach()
+            .cosine_similarity(&x2.detach(), feature, 0.0)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn pairwise_distance_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("pdist_batch"), Axis::new("pdist_feature"));
+    let x1_values = [0.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let x2_values = [3.0_f64, 4.0, 0.0, 0.0, 0.0, 0.0];
+    let eps = 1e-6_f64;
+    let x1 =
+        Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let x2 =
+        Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+
+    let distance = x1.pairwise_distance(&x2, feature, eps as f32)?;
+    close(
+        "pairwise distance forward",
+        &distance.to_vec()?,
+        &[4.9999986000001035, 1.7320525396196849],
+    );
+
+    fn pdist_row(a: &[f64], b: &[f64], eps: f64) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(p, q)| (p - q + eps).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+    fn pdist_scalar_loss(a: &[f64], b: &[f64], eps: f64) -> f64 {
+        (pdist_row(&a[0..3], &b[0..3], eps) + pdist_row(&a[3..6], &b[3..6], eps)) / 2.0
+    }
+
+    distance.mean(batch)?.backward()?;
+    close(
+        "pairwise distance gradient wrt x1",
+        &x1.grad().unwrap().to_vec()?,
+        &central_difference(&x1_values, 1e-4, |candidate| {
+            pdist_scalar_loss(candidate, &x2_values, eps)
+        }),
+    );
+    close(
+        "pairwise distance gradient wrt x2",
+        &x2.grad().unwrap().to_vec()?,
+        &central_difference(&x2_values, 1e-4, |candidate| {
+            pdist_scalar_loss(&x1_values, candidate, eps)
+        }),
+    );
+
+    let other = Axis::new("pdist_other");
+    let wrong = Tensor::from_slice(&[1.0_f32, 2.0], [other.of(2)], &device)?;
+    assert!(
+        x1.detach()
+            .pairwise_distance(&wrong, feature, eps as f32)
+            .is_err()
+    );
+    assert!(
+        x1.detach()
+            .pairwise_distance(&x2.detach(), feature, f32::NAN)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn pairwise_distance_broadcasts_over_reordered_storage_and_asymmetric_extents() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("pdist_layout_batch"),
+        Axis::new("pdist_layout_feature"),
+    );
+    // 3 batch rows, 4 features: asymmetric, non-square extents.
+    let x1_values = [
+        0.0_f64, 1.0, 2.0, 3.0, // batch0
+        1.0, 0.0, -1.0, 2.0, // batch1
+        -2.0, 2.0, 0.0, 1.0, // batch2
+    ];
+    let x2_values = [
+        3.0_f64, 1.0, 2.0, 0.0, // batch0
+        1.0, 3.0, -1.0, -1.0, // batch1
+        0.0, 0.0, 0.0, 0.0, // batch2
+    ];
+    let eps = 1e-6_f64;
+    // Logical [batch, feature] order stays what `to_vec()`'s coordinate walk uses; physical
+    // storage is requested feature-major, forcing the op to read a genuinely permuted,
+    // non-contiguous buffer rather than one that already matches its own shape order.
+    let x1 = Tensor::from_slice(&to_f32(&x1_values), [batch.of(3), feature.of(4)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let x2 = Tensor::from_slice(&to_f32(&x2_values), [batch.of(3), feature.of(4)], &device)?
+        .with_layout([feature, batch])?;
+
+    let distance = x1.pairwise_distance(&x2, feature, eps as f32)?;
+    fn pdist_row(a: &[f64], b: &[f64], eps: f64) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(p, q)| (p - q + eps).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+    let expected: Vec<f64> = (0..3)
+        .map(|row| {
+            pdist_row(
+                &x1_values[row * 4..row * 4 + 4],
+                &x2_values[row * 4..row * 4 + 4],
+                eps,
+            )
+        })
+        .collect();
+    close(
+        "pairwise distance forward (reordered storage, asymmetric extents)",
+        &distance.to_vec()?,
+        &expected,
+    );
+
+    distance.mean(batch)?.backward()?;
+    fn pdist_scalar_loss(a: &[f64], b: &[f64], eps: f64) -> f64 {
+        (0..3)
+            .map(|row| pdist_row(&a[row * 4..row * 4 + 4], &b[row * 4..row * 4 + 4], eps))
+            .sum::<f64>()
+            / 3.0
+    }
+    close(
+        "pairwise distance gradient (reordered storage, asymmetric extents)",
+        &x1.grad().unwrap().to_vec()?,
+        &central_difference(&x1_values, 1e-4, |candidate| {
+            pdist_scalar_loss(candidate, &x2_values, eps)
+        }),
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn margin_ranking_loss_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("mrl_batch"), Axis::new("mrl_feature"));
+    let x1_values = [2.0_f64, 0.0, 1.2, -1.0, 3.0, 0.0];
+    let x2_values = [0.0_f64, 1.3, 1.0, 2.0, 1.0, 0.3];
+    let target_values = [1.0_f32, -1.0, 1.0, -1.0, 1.0, -1.0];
+    let margin = 1.0_f32;
+    let x1 =
+        Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let x2 =
+        Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?;
+
+    let loss = x1.margin_ranking_loss(&x2, &target, margin)?;
+    close(
+        "margin ranking loss forward",
+        &loss.to_vec()?,
+        &[0.0, 0.0, 0.8, 0.0, 0.0, 0.7],
+    );
+
+    fn mrl_scalar_loss(a: &[f64], b: &[f64], t: &[f32], margin: f64) -> f64 {
+        a.iter()
+            .zip(b)
+            .zip(t)
+            .map(|((p, q), &y)| (-f64::from(y) * (p - q) + margin).max(0.0))
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "margin ranking loss gradient wrt x1",
+        &x1.grad().unwrap().to_vec()?,
+        &central_difference(&x1_values, 1e-4, |candidate| {
+            mrl_scalar_loss(candidate, &x2_values, &target_values, f64::from(margin))
+        }),
+    );
+    close(
+        "margin ranking loss gradient wrt x2",
+        &x2.grad().unwrap().to_vec()?,
+        &central_difference(&x2_values, 1e-4, |candidate| {
+            mrl_scalar_loss(&x1_values, candidate, &target_values, f64::from(margin))
+        }),
+    );
+
+    assert!(
+        x1.detach()
+            .margin_ranking_loss(&x2.detach(), &target.with_grad(), margin)
+            .is_err()
+    );
+    let bad_target = Tensor::from_slice(&[0.5_f32; 6], [batch.of(2), feature.of(3)], &device)?;
+    assert!(
+        x1.detach()
+            .margin_ranking_loss(&x2.detach(), &bad_target, margin)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn hinge_embedding_loss_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("hinge_batch"), Axis::new("hinge_feature"));
+    let x_values = [0.5_f64, -2.0, 3.0, -0.5, 2.0, -3.0];
+    let target_values = [1.0_f32, -1.0, 1.0, -1.0, 1.0, -1.0];
+    let margin = 1.0_f32;
+    let x =
+        Tensor::from_slice(&to_f32(&x_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?;
+
+    let loss = x.hinge_embedding_loss(&target, margin)?;
+    close(
+        "hinge embedding loss forward",
+        &loss.to_vec()?,
+        &[0.5, 3.0, 3.0, 1.5, 2.0, 4.0],
+    );
+
+    fn hinge_scalar_loss(x: &[f64], t: &[f32], margin: f64) -> f64 {
+        x.iter()
+            .zip(t)
+            .map(|(&v, &y)| if y > 0.0 { v } else { (margin - v).max(0.0) })
+            .sum::<f64>()
+            / x.len() as f64
+    }
+
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "hinge embedding loss gradient",
+        &x.grad().unwrap().to_vec()?,
+        &central_difference(&x_values, 1e-4, |candidate| {
+            hinge_scalar_loss(candidate, &target_values, f64::from(margin))
+        }),
+    );
+
+    assert!(
+        x.detach()
+            .hinge_embedding_loss(&target.with_grad(), margin)
+            .is_err()
+    );
+    let bad_target = Tensor::from_slice(&[0.5_f32; 6], [batch.of(2), feature.of(3)], &device)?;
+    assert!(
+        x.detach()
+            .hinge_embedding_loss(&bad_target, margin)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cosine_embedding_loss_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("cel_batch"), Axis::new("cel_feature"));
+    let x1_values = [1.0_f64, 2.0, 2.0, 3.0, 4.0, 0.0];
+    let x2_values = [2.0_f64, 0.0, 0.0, 0.0, 3.0, 4.0];
+    let target_values = [1.0_f32, -1.0];
+    let margin = 0.5_f32;
+    let x1 =
+        Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let x2 =
+        Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2)], &device)?;
+
+    let loss = x1.cosine_embedding_loss(&x2, &target, feature, margin)?;
+    close(
+        "cosine embedding loss forward",
+        &loss.to_vec()?,
+        &[0.6666666666666667, 0.0],
+    );
+
+    fn cel_scalar_loss(a: &[f64], b: &[f64], t: &[f32], margin: f64) -> f64 {
+        let row = |a: &[f64], b: &[f64]| {
+            let dot: f64 = a.iter().zip(b).map(|(p, q)| p * q).sum();
+            let na = a.iter().map(|p| p * p).sum::<f64>().sqrt().max(1e-8);
+            let nb = b.iter().map(|q| q * q).sum::<f64>().sqrt().max(1e-8);
+            dot / (na * nb)
+        };
+        let c0 = row(&a[0..3], &b[0..3]);
+        let c1 = row(&a[3..6], &b[3..6]);
+        let per = |c: f64, y: f32| {
+            if y > 0.0 {
+                1.0 - c
+            } else {
+                (c - margin).max(0.0)
+            }
+        };
+        (per(c0, t[0]) + per(c1, t[1])) / 2.0
+    }
+
+    loss.mean(batch)?.backward()?;
+    close(
+        "cosine embedding loss gradient wrt x1",
+        &x1.grad().unwrap().to_vec()?,
+        &central_difference(&x1_values, 1e-4, |candidate| {
+            cel_scalar_loss(candidate, &x2_values, &target_values, f64::from(margin))
+        }),
+    );
+    close(
+        "cosine embedding loss gradient wrt x2",
+        &x2.grad().unwrap().to_vec()?,
+        &central_difference(&x2_values, 1e-4, |candidate| {
+            cel_scalar_loss(&x1_values, candidate, &target_values, f64::from(margin))
+        }),
+    );
+
+    assert!(
+        x1.detach()
+            .cosine_embedding_loss(&x2.detach(), &target.with_grad(), feature, margin)
+            .is_err()
+    );
+    let contains_feature =
+        Tensor::from_slice(&[0.0_f32; 6], [batch.of(2), feature.of(3)], &device)?;
+    assert!(
+        x1.detach()
+            .cosine_embedding_loss(&x2.detach(), &contains_feature, feature, margin)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn triplet_margin_loss_matches_hand_computed_oracle_with_and_without_swap() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("triplet_batch"), Axis::new("triplet_feature"));
+    let anchor_values = [0.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let positive_values = [0.0_f64, 0.0, 1.0, 1.0, 1.0, 2.0];
+    let negative_values = [0.0_f64, 0.0, 2.5, -1.0, -1.0, -1.0];
+    let margin = 1.0_f32;
+    let eps = 1e-6_f64;
+
+    fn pdist_row(a: &[f64], b: &[f64], eps: f64) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(p, q)| (p - q + eps).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+    fn triplet_scalar_loss(
+        anchor: &[f64],
+        positive: &[f64],
+        negative: &[f64],
+        margin: f64,
+        eps: f64,
+        swap: bool,
+    ) -> f64 {
+        (0..2)
+            .map(|row| {
+                let a = &anchor[row * 3..row * 3 + 3];
+                let p = &positive[row * 3..row * 3 + 3];
+                let n = &negative[row * 3..row * 3 + 3];
+                let d_pos = pdist_row(a, p, eps);
+                let mut d_neg = pdist_row(a, n, eps);
+                if swap {
+                    d_neg = d_neg.min(pdist_row(p, n, eps));
+                }
+                (margin + d_pos - d_neg).max(0.0)
+            })
+            .sum::<f64>()
+            / 2.0
+    }
+
+    // swap = false.
+    {
+        let anchor = Tensor::from_slice(
+            &to_f32(&anchor_values),
+            [batch.of(2), feature.of(3)],
+            &device,
+        )?
+        .with_grad();
+        let positive = Tensor::from_slice(
+            &to_f32(&positive_values),
+            [batch.of(2), feature.of(3)],
+            &device,
+        )?
+        .with_grad();
+        let negative = Tensor::from_slice(
+            &to_f32(&negative_values),
+            [batch.of(2), feature.of(3)],
+            &device,
+        )?
+        .with_grad();
+        let loss =
+            anchor.triplet_margin_loss(&positive, &negative, feature, margin, eps as f32, false)?;
+        close(
+            "triplet margin loss forward (no swap)",
+            &loss.to_vec()?,
+            &[0.0, 0.0],
+        );
+        loss.mean(batch)?.backward()?;
+        close(
+            "triplet margin loss gradient wrt anchor (no swap)",
+            &anchor.grad().unwrap().to_vec()?,
+            &central_difference(&anchor_values, 1e-4, |candidate| {
+                triplet_scalar_loss(
+                    candidate,
+                    &positive_values,
+                    &negative_values,
+                    f64::from(margin),
+                    eps,
+                    false,
+                )
+            }),
+        );
+        close(
+            "triplet margin loss gradient wrt positive (no swap)",
+            &positive.grad().unwrap().to_vec()?,
+            &central_difference(&positive_values, 1e-4, |candidate| {
+                triplet_scalar_loss(
+                    &anchor_values,
+                    candidate,
+                    &negative_values,
+                    f64::from(margin),
+                    eps,
+                    false,
+                )
+            }),
+        );
+        close(
+            "triplet margin loss gradient wrt negative (no swap)",
+            &negative.grad().unwrap().to_vec()?,
+            &central_difference(&negative_values, 1e-4, |candidate| {
+                triplet_scalar_loss(
+                    &anchor_values,
+                    &positive_values,
+                    candidate,
+                    f64::from(margin),
+                    eps,
+                    false,
+                )
+            }),
+        );
+    }
+
+    // swap = true: sample0's positive sits closer to its negative than the anchor does, so the
+    // swap term becomes the binding one and the loss goes from clamped-zero to active.
+    {
+        let anchor = Tensor::from_slice(
+            &to_f32(&anchor_values),
+            [batch.of(2), feature.of(3)],
+            &device,
+        )?
+        .with_grad();
+        let positive = Tensor::from_slice(
+            &to_f32(&positive_values),
+            [batch.of(2), feature.of(3)],
+            &device,
+        )?
+        .with_grad();
+        let negative = Tensor::from_slice(
+            &to_f32(&negative_values),
+            [batch.of(2), feature.of(3)],
+            &device,
+        )?
+        .with_grad();
+        let loss =
+            anchor.triplet_margin_loss(&positive, &negative, feature, margin, eps as f32, true)?;
+        close(
+            "triplet margin loss forward (swap)",
+            &loss.to_vec()?,
+            &[0.5000000000003333, 0.0],
+        );
+        loss.mean(batch)?.backward()?;
+        close(
+            "triplet margin loss gradient wrt anchor (swap)",
+            &anchor.grad().unwrap().to_vec()?,
+            &central_difference(&anchor_values, 1e-4, |candidate| {
+                triplet_scalar_loss(
+                    candidate,
+                    &positive_values,
+                    &negative_values,
+                    f64::from(margin),
+                    eps,
+                    true,
+                )
+            }),
+        );
+        close(
+            "triplet margin loss gradient wrt positive (swap)",
+            &positive.grad().unwrap().to_vec()?,
+            &central_difference(&positive_values, 1e-4, |candidate| {
+                triplet_scalar_loss(
+                    &anchor_values,
+                    candidate,
+                    &negative_values,
+                    f64::from(margin),
+                    eps,
+                    true,
+                )
+            }),
+        );
+        close(
+            "triplet margin loss gradient wrt negative (swap)",
+            &negative.grad().unwrap().to_vec()?,
+            &central_difference(&negative_values, 1e-4, |candidate| {
+                triplet_scalar_loss(
+                    &anchor_values,
+                    &positive_values,
+                    candidate,
+                    f64::from(margin),
+                    eps,
+                    true,
+                )
+            }),
+        );
+    }
+
+    let a_err = Tensor::from_slice(
+        &to_f32(&anchor_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let p_err = Tensor::from_slice(
+        &to_f32(&positive_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let n_err = Tensor::from_slice(&[1.0_f32, 2.0], [Axis::new("triplet_bad").of(2)], &device)?;
+    assert!(
+        a_err
+            .triplet_margin_loss(&p_err, &n_err, feature, margin, eps as f32, false)
+            .is_err()
+    );
+    assert!(
+        a_err
+            .triplet_margin_loss(&p_err, &n_err, feature, f32::NAN, eps as f32, false)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn triplet_margin_with_distance_loss_uses_the_supplied_distance_closure() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("tmwd_batch"), Axis::new("tmwd_feature"));
+    let anchor_values = [0.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let positive_values = [0.0_f64, 0.0, 1.0, 1.0, 1.0, 2.0];
+    let negative_values = [0.0_f64, 0.0, 2.5, -1.0, -1.0, -1.0];
+    let margin = 4.0_f32;
+    let anchor = Tensor::from_slice(
+        &to_f32(&anchor_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let positive = Tensor::from_slice(
+        &to_f32(&positive_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let negative = Tensor::from_slice(
+        &to_f32(&negative_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    // Manhattan (L1) distance closure, in place of the Euclidean `pairwise_distance` default,
+    // proving the caller's own distance function drives the computation.
+    let l1_distance =
+        |a: &Tensor, b: &Tensor| -> Result<Tensor> { a.absolute_error(b)?.sum(feature) };
+
+    let loss = anchor.triplet_margin_with_distance_loss(
+        &positive,
+        &negative,
+        margin,
+        false,
+        l1_distance,
+    )?;
+    close(
+        "triplet margin with distance loss forward (L1)",
+        &loss.to_vec()?,
+        &[2.5, 0.0],
+    );
+
+    fn l1_row(a: &[f64], b: &[f64]) -> f64 {
+        a.iter().zip(b).map(|(p, q)| (p - q).abs()).sum()
+    }
+    fn triplet_l1_scalar_loss(
+        anchor: &[f64],
+        positive: &[f64],
+        negative: &[f64],
+        margin: f64,
+    ) -> f64 {
+        (0..2)
+            .map(|row| {
+                let a = &anchor[row * 3..row * 3 + 3];
+                let p = &positive[row * 3..row * 3 + 3];
+                let n = &negative[row * 3..row * 3 + 3];
+                (margin + l1_row(a, p) - l1_row(a, n)).max(0.0)
+            })
+            .sum::<f64>()
+            / 2.0
+    }
+
+    loss.mean(batch)?.backward()?;
+    close(
+        "triplet margin with distance loss gradient wrt anchor (L1)",
+        &anchor.grad().unwrap().to_vec()?,
+        &central_difference(&anchor_values, 1e-4, |candidate| {
+            triplet_l1_scalar_loss(
+                candidate,
+                &positive_values,
+                &negative_values,
+                f64::from(margin),
+            )
+        }),
+    );
+    close(
+        "triplet margin with distance loss gradient wrt positive (L1)",
+        &positive.grad().unwrap().to_vec()?,
+        &central_difference(&positive_values, 1e-4, |candidate| {
+            triplet_l1_scalar_loss(
+                &anchor_values,
+                candidate,
+                &negative_values,
+                f64::from(margin),
+            )
+        }),
+    );
+    close(
+        "triplet margin with distance loss gradient wrt negative (L1)",
+        &negative.grad().unwrap().to_vec()?,
+        &central_difference(&negative_values, 1e-4, |candidate| {
+            triplet_l1_scalar_loss(
+                &anchor_values,
+                &positive_values,
+                candidate,
+                f64::from(margin),
+            )
+        }),
+    );
+
+    // The default distance -- a closure composed from `pairwise_distance` -- reproduces
+    // `triplet_margin_loss` exactly, witnessing the "PairwiseDistance is the default" contract.
+    let eps = 1e-6_f32;
+    let anchor2 = Tensor::from_slice(
+        &to_f32(&anchor_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let positive2 = Tensor::from_slice(
+        &to_f32(&positive_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let negative2 = Tensor::from_slice(
+        &to_f32(&negative_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let via_closure = anchor2.triplet_margin_with_distance_loss(
+        &positive2,
+        &negative2,
+        1.0,
+        false,
+        |a: &Tensor, b: &Tensor| a.pairwise_distance(b, feature, eps),
+    )?;
+    let via_direct =
+        anchor2.triplet_margin_loss(&positive2, &negative2, feature, 1.0, eps, false)?;
+    close(
+        "triplet margin with distance loss matches triplet_margin_loss under the default closure",
+        &via_closure.to_vec()?,
+        &via_direct
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    assert!(
+        anchor2
+            .triplet_margin_with_distance_loss(
+                &positive2,
+                &negative2,
+                f32::NAN,
+                false,
+                |a: &Tensor, b: &Tensor| { a.pairwise_distance(b, feature, eps) }
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multi_margin_loss_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("mml_batch"), Axis::new("mml_class"));
+    let x_values = [2.0_f64, 1.5, -1.0, 0.0, 2.5, 3.0];
+    let target_values = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0];
+    let margin = 1.0_f32;
+    let x =
+        Tensor::from_slice(&to_f32(&x_values), [batch.of(2), class.of(3)], &device)?.with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?;
+
+    let loss = x.multi_margin_loss(&target, class, margin)?;
+    close(
+        "multi margin loss forward",
+        &loss.to_vec()?,
+        &[1.0 / 6.0, 1.0 / 6.0],
+    );
+
+    fn multi_margin_scalar_loss(x: &[f64], t: &[f32], margin: f64) -> f64 {
+        (0..2)
+            .map(|row| {
+                let xs = &x[row * 3..row * 3 + 3];
+                let ts = &t[row * 3..row * 3 + 3];
+                let y = ts.iter().position(|&v| v == 1.0).unwrap();
+                let xy = xs[y];
+                let total: f64 = (0..3)
+                    .filter(|&i| i != y)
+                    .map(|i| (margin - xy + xs[i]).max(0.0))
+                    .sum();
+                total / 3.0
+            })
+            .sum::<f64>()
+            / 2.0
+    }
+
+    loss.mean(batch)?.backward()?;
+    close(
+        "multi margin loss gradient",
+        &x.grad().unwrap().to_vec()?,
+        &central_difference(&x_values, 1e-4, |candidate| {
+            multi_margin_scalar_loss(candidate, &target_values, f64::from(margin))
+        }),
+    );
+
+    assert!(
+        x.detach()
+            .multi_margin_loss(&target.with_grad(), class, margin)
+            .is_err()
+    );
+    let bad_target = Tensor::from_slice(&[0.5_f32; 6], [batch.of(2), class.of(3)], &device)?;
+    assert!(
+        x.detach()
+            .multi_margin_loss(&bad_target, class, margin)
+            .is_err()
+    );
+    let solo_class = Axis::new("mml_solo_class");
+    let solo_x = Tensor::from_slice(&[1.0_f32, 2.0], [batch.of(2), solo_class.of(1)], &device)?;
+    let solo_t = Tensor::from_slice(&[1.0_f32, 1.0], [batch.of(2), solo_class.of(1)], &device)?;
+    assert!(
+        solo_x
+            .multi_margin_loss(&solo_t, solo_class, margin)
+            .is_err()
+    );
+    Ok(())
+}
+
+fn mlml_scalar_loss(x: &[f64], t: &[f32]) -> f64 {
+    (0..2)
+        .map(|row| {
+            let xs = &x[row * 3..row * 3 + 3];
+            let ts = &t[row * 3..row * 3 + 3];
+            let mut total = 0.0;
+            for i in 0..3 {
+                if ts[i] == 1.0 {
+                    continue;
+                }
+                for j in 0..3 {
+                    if ts[j] == 1.0 {
+                        total += (1.0 - (xs[j] - xs[i])).max(0.0);
+                    }
+                }
+            }
+            total / 3.0
+        })
+        .sum::<f64>()
+        / 2.0
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multi_label_margin_loss_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("mlml_batch"), Axis::new("mlml_class"));
+    let x_values = [1.0_f64, 0.5, -1.0, 0.7, 2.0, 1.0];
+    let target_values = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 1.0];
+    let x =
+        Tensor::from_slice(&to_f32(&x_values), [batch.of(2), class.of(3)], &device)?.with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?;
+
+    let loss = x.multi_label_margin_loss(&target, class)?;
+    close(
+        "multi label margin loss forward",
+        &loss.to_vec()?,
+        &[1.0 / 6.0, 0.7 / 3.0],
+    );
+
+    loss.mean(batch)?.backward()?;
+    close(
+        "multi label margin loss gradient",
+        &x.grad().unwrap().to_vec()?,
+        &central_difference(&x_values, 1e-4, |candidate| {
+            mlml_scalar_loss(candidate, &target_values)
+        }),
+    );
+
+    assert!(
+        x.detach()
+            .multi_label_margin_loss(&target.with_grad(), class)
+            .is_err()
+    );
+    let bad_target = Tensor::from_slice(&[0.3_f32; 6], [batch.of(2), class.of(3)], &device)?;
+    assert!(
+        x.detach()
+            .multi_label_margin_loss(&bad_target, class)
+            .is_err()
+    );
+    let solo_class = Axis::new("mlml_solo_class");
+    let solo_x = Tensor::from_slice(&[1.0_f32, 2.0], [batch.of(2), solo_class.of(1)], &device)?;
+    let solo_t = Tensor::from_slice(&[1.0_f32, 1.0], [batch.of(2), solo_class.of(1)], &device)?;
+    assert!(solo_x.multi_label_margin_loss(&solo_t, solo_class).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multi_label_margin_loss_handles_reordered_storage() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, class) = (
+        Axis::new("mlml_layout_batch"),
+        Axis::new("mlml_layout_class"),
+    );
+    let x_values = [1.0_f64, 0.5, -1.0, 0.7, 2.0, 1.0];
+    let target_values = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 1.0];
+    // Logical [batch, class] order stays what `to_vec()`'s coordinate walk uses; physical
+    // storage is requested class-major, so the op reads a permuted, non-contiguous buffer.
+    let x = Tensor::from_slice(&to_f32(&x_values), [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+
+    let loss = x.multi_label_margin_loss(&target, class)?;
+    close(
+        "multi label margin loss forward (reordered storage)",
+        &loss.to_vec()?,
+        &[1.0 / 6.0, 0.7 / 3.0],
+    );
+
+    loss.mean(batch)?.backward()?;
+    close(
+        "multi label margin loss gradient (reordered storage)",
+        &x.grad().unwrap().to_vec()?,
+        &central_difference(&x_values, 1e-4, |candidate| {
+            mlml_scalar_loss(candidate, &target_values)
+        }),
+    );
+    Ok(())
+}
