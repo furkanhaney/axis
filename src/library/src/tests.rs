@@ -9130,3 +9130,971 @@ fn multilabel_soft_margin_loss_matches_composition_of_bce_with_logits_and_mean()
     );
     Ok(())
 }
+
+#[test]
+fn padding_rejects_invalid_configuration_before_launch() {
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    let shape = Shape::new([height.of(3), width.of(4)]).unwrap();
+
+    // Every padding mode requires at least one entry.
+    assert!(ZeroPad::new(Vec::<(Axis, usize, usize)>::new()).is_err());
+    assert!(ConstantPad::new(Vec::<(Axis, usize, usize)>::new(), 0.0).is_err());
+    assert!(ReflectionPad::new(Vec::<(Axis, usize, usize)>::new()).is_err());
+    assert!(ReplicationPad::new(Vec::<(Axis, usize, usize)>::new()).is_err());
+    assert!(CircularPad::new(Vec::<(Axis, usize, usize)>::new()).is_err());
+
+    // The same axis cannot be listed twice.
+    let error = ZeroPad::new([(height, 1, 1), (height, 0, 1)])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("more than once"), "{error}");
+
+    // An axis the input does not have is rejected before any device work.
+    let missing = Axis::new("missing");
+    let error = ZeroPad::new([(missing, 1, 1)])
+        .unwrap()
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not in the input shape"), "{error}");
+
+    // `ConstantPad` rejects a non-finite value.
+    assert!(ConstantPad::new([(height, 1, 1)], f32::NAN).is_err());
+    assert!(ConstantPad::new([(height, 1, 1)], f32::INFINITY).is_err());
+
+    // Reflection padding must stay strictly less than the axis extent
+    // (PyTorch's own `ReflectionPad*` constraint): height's extent is 3, so
+    // a pad of 3 on either side is rejected, but 2 is fine.
+    let error = ReflectionPad::new([(height, 3, 0)])
+        .unwrap()
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("less than"), "{error}");
+    assert!(
+        ReflectionPad::new([(height, 2, 2)])
+            .unwrap()
+            .output_shape(&shape)
+            .is_ok()
+    );
+
+    // Circular padding allows padding equal to the extent (a full wrap) but
+    // not more.
+    assert!(
+        CircularPad::new([(height, 3, 3)])
+            .unwrap()
+            .output_shape(&shape)
+            .is_ok()
+    );
+    let error = CircularPad::new([(height, 4, 0)])
+        .unwrap()
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("at most"), "{error}");
+
+    // Replication padding has no upper bound: a pad larger than the extent
+    // is still accepted (it just repeats the edge value further).
+    assert!(
+        ReplicationPad::new([(height, 10, 10)])
+            .unwrap()
+            .output_shape(&shape)
+            .is_ok()
+    );
+
+    // A well-formed `ZeroPad` reports the expected shape purely from shape
+    // math; every axis not listed (`width`) is preserved unchanged.
+    let pad = ZeroPad::new([(height, 1, 2)]).unwrap();
+    assert_eq!(
+        pad.output_shape(&shape).unwrap(),
+        Shape::new([height.of(6), width.of(4)]).unwrap()
+    );
+}
+
+#[test]
+fn pixel_and_channel_shuffle_reject_invalid_configuration_before_launch() {
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let shape = Shape::new([channel.of(9), height.of(2), width.of(3)]).unwrap();
+
+    // PixelShuffle requires distinct channel/spatial axes and factor >= 1.
+    assert!(PixelShuffle::new(channel, [channel, width], 3).is_err());
+    assert!(PixelShuffle::new(channel, [height, height], 3).is_err());
+    assert!(PixelShuffle::new(channel, [height, width], 0).is_err());
+
+    // Channel extent 9 is not divisible by upscale_factor^2 (4).
+    let error = PixelShuffle::new(channel, [height, width], 2)
+        .unwrap()
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not divisible"), "{error}");
+    // ...but it is divisible by 3^2 = 9.
+    assert_eq!(
+        PixelShuffle::new(channel, [height, width], 3)
+            .unwrap()
+            .output_shape(&shape)
+            .unwrap(),
+        Shape::new([channel.of(1), height.of(6), width.of(9)]).unwrap()
+    );
+
+    // PixelUnshuffle requires height/width divisible by the downscale factor.
+    let error = PixelUnshuffle::new(channel, [height, width], 2)
+        .unwrap()
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must both be divisible"), "{error}");
+    assert!(PixelUnshuffle::new(channel, [height, width], 0).is_err());
+
+    // ChannelShuffle requires the channel extent divisible by groups, and
+    // at least one group.
+    assert!(ChannelShuffle::new(channel, 0).is_err());
+    let error = ChannelShuffle::new(channel, 2)
+        .unwrap()
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not divisible"), "{error}");
+    assert!(
+        ChannelShuffle::new(channel, 3)
+            .unwrap()
+            .output_shape(&shape)
+            .is_ok()
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn zero_pad_matches_hand_computed_forward_and_gradient_across_1d_2d_3d() -> Result<()> {
+    // Independent oracle: real PyTorch 2.14 `F.pad(mode="constant", value=0.0)`,
+    // run offline and transcribed as literals -- never computed by the op
+    // under test.
+    let device = Device::cuda(0)?;
+    let (channel, height, width, depth) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+
+    // "1d": pad only `height`, asymmetric (before=1, after=2).
+    let x1: Vec<f32> = (0..6).map(|v| v as f32).collect();
+    let input1 = Tensor::from_slice(&x1, [channel.of(2), height.of(3)], &device)?.with_grad();
+    let mut pad1 = ZeroPad::new([(height, 1, 2)])?;
+    assert_eq!(
+        pad1.build(input1.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6)])?
+    );
+    let out1 = pad1.forward(&input1)?;
+    close(
+        "ZeroPad 1-axis forward",
+        &out1.to_vec()?,
+        &[0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0, 0.0, 0.0],
+    );
+    let w1: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let weight1 = Tensor::from_slice(&w1, [channel.of(2), height.of(6)], &device)?;
+    out1.mul(&weight1)?.mean([channel, height])?.backward()?;
+    close(
+        "ZeroPad 1-axis gradient",
+        &input1.grad().unwrap().to_vec()?,
+        &[0.166667, 0.250000, 0.333333, 0.666667, 0.750000, 0.833333],
+    );
+
+    // "2d": pad `height` and `width`, asymmetric on both, under physical
+    // storage transposed relative to the logical [channel, height, width]
+    // order.
+    let x2: Vec<f32> = (0..24).map(|v| v as f32).collect();
+    let input2 = Tensor::from_slice(&x2, [channel.of(2), height.of(3), width.of(4)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+    let mut pad2 = ZeroPad::new([(height, 1, 2), (width, 2, 1)])?;
+    assert_eq!(
+        pad2.build(input2.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6), width.of(7)])?
+    );
+    let out2 = pad2.forward(&input2)?;
+    close(
+        "ZeroPad 2-axis forward under reordered storage",
+        &out2.to_vec()?,
+        &[
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0,
+            5.0, 6.0, 7.0, 0.0, 0.0, 0.0, 8.0, 9.0, 10.0, 11.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            12.0, 13.0, 14.0, 15.0, 0.0, 0.0, 0.0, 16.0, 17.0, 18.0, 19.0, 0.0, 0.0, 0.0, 20.0,
+            21.0, 22.0, 23.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0,
+        ],
+    );
+    let w2: Vec<f32> = (1..=84).map(|v| v as f32).collect();
+    let weight2 = Tensor::from_slice(&w2, [channel.of(2), height.of(6), width.of(7)], &device)?;
+    out2.mul(&weight2)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "ZeroPad 2-axis gradient under reordered storage",
+        &input2.grad().unwrap().to_vec()?,
+        &[
+            0.119048, 0.130952, 0.142857, 0.154762, 0.202381, 0.214286, 0.226190, 0.238095,
+            0.285714, 0.297619, 0.309524, 0.321429, 0.619048, 0.630952, 0.642857, 0.654762,
+            0.702381, 0.714286, 0.726191, 0.738095, 0.785714, 0.797619, 0.809524, 0.821429,
+        ],
+    );
+
+    // "3d": pad `depth`, `height`, `width` simultaneously, symmetric.
+    let x3: Vec<f32> = (0..18).map(|v| v as f32).collect();
+    let input3 =
+        Tensor::from_slice(&x3, [depth.of(2), height.of(3), width.of(3)], &device)?.with_grad();
+    let mut pad3 = ZeroPad::new([(depth, 1, 1), (height, 1, 1), (width, 1, 1)])?;
+    assert_eq!(
+        pad3.build(input3.shape(), &device, 0)?,
+        Shape::new([depth.of(4), height.of(5), width.of(5)])?
+    );
+    let out3 = pad3.forward(&input3)?;
+    close(
+        "ZeroPad 3-axis forward",
+        &out3.to_vec()?,
+        &[
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0,
+            0.0, 0.0, 3.0, 4.0, 5.0, 0.0, 0.0, 6.0, 7.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 10.0, 11.0, 0.0, 0.0, 12.0, 13.0, 14.0, 0.0, 0.0, 15.0,
+            16.0, 17.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ],
+    );
+    let w3: Vec<f32> = (1..=100).map(|v| v as f32).collect();
+    let weight3 = Tensor::from_slice(&w3, [depth.of(4), height.of(5), width.of(5)], &device)?;
+    out3.mul(&weight3)?
+        .mean([depth, height, width])?
+        .backward()?;
+    close(
+        "ZeroPad 3-axis gradient",
+        &input3.grad().unwrap().to_vec()?,
+        &[
+            0.32, 0.33, 0.34, 0.37, 0.38, 0.39, 0.42, 0.43, 0.44, 0.57, 0.58, 0.59, 0.62, 0.63,
+            0.64, 0.67, 0.68, 0.69,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn constant_pad_matches_hand_computed_forward_and_gradient_across_1d_2d_3d() -> Result<()> {
+    // Independent oracle: real PyTorch 2.14 `F.pad(mode="constant", value=...)`.
+    let device = Device::cuda(0)?;
+    let (channel, height, width, depth) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+
+    // "1d": value=7.5.
+    let x1: Vec<f32> = (0..6).map(|v| v as f32).collect();
+    let input1 = Tensor::from_slice(&x1, [channel.of(2), height.of(3)], &device)?.with_grad();
+    let mut pad1 = ConstantPad::new([(height, 1, 2)], 7.5)?;
+    assert_eq!(
+        pad1.build(input1.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6)])?
+    );
+    let out1 = pad1.forward(&input1)?;
+    close(
+        "ConstantPad 1-axis forward (value=7.5)",
+        &out1.to_vec()?,
+        &[7.5, 0.0, 1.0, 2.0, 7.5, 7.5, 7.5, 3.0, 4.0, 5.0, 7.5, 7.5],
+    );
+    let w1: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let weight1 = Tensor::from_slice(&w1, [channel.of(2), height.of(6)], &device)?;
+    out1.mul(&weight1)?.mean([channel, height])?.backward()?;
+    close(
+        // Identical to ZeroPad's own gradient: the constant border term is
+        // detached and contributes zero derivative.
+        "ConstantPad 1-axis gradient",
+        &input1.grad().unwrap().to_vec()?,
+        &[0.166667, 0.250000, 0.333333, 0.666667, 0.750000, 0.833333],
+    );
+
+    // "2d": value=-3.25, asymmetric on both axes.
+    let x2: Vec<f32> = (0..24).map(|v| v as f32).collect();
+    let input2 =
+        Tensor::from_slice(&x2, [channel.of(2), height.of(3), width.of(4)], &device)?.with_grad();
+    let mut pad2 = ConstantPad::new([(height, 1, 2), (width, 2, 1)], -3.25)?;
+    assert_eq!(
+        pad2.build(input2.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6), width.of(7)])?
+    );
+    let out2 = pad2.forward(&input2)?;
+    close(
+        "ConstantPad 2-axis forward (value=-3.25)",
+        &out2.to_vec()?,
+        &[
+            -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, 0.0, 1.0, 2.0, 3.0,
+            -3.25, -3.25, -3.25, 4.0, 5.0, 6.0, 7.0, -3.25, -3.25, -3.25, 8.0, 9.0, 10.0, 11.0,
+            -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25,
+            -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25,
+            12.0, 13.0, 14.0, 15.0, -3.25, -3.25, -3.25, 16.0, 17.0, 18.0, 19.0, -3.25, -3.25,
+            -3.25, 20.0, 21.0, 22.0, 23.0, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25,
+            -3.25, -3.25, -3.25, -3.25, -3.25, -3.25, -3.25,
+        ],
+    );
+    let w2: Vec<f32> = (1..=84).map(|v| v as f32).collect();
+    let weight2 = Tensor::from_slice(&w2, [channel.of(2), height.of(6), width.of(7)], &device)?;
+    out2.mul(&weight2)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "ConstantPad 2-axis gradient",
+        &input2.grad().unwrap().to_vec()?,
+        &[
+            0.119048, 0.130952, 0.142857, 0.154762, 0.202381, 0.214286, 0.226190, 0.238095,
+            0.285714, 0.297619, 0.309524, 0.321429, 0.619048, 0.630952, 0.642857, 0.654762,
+            0.702381, 0.714286, 0.726191, 0.738095, 0.785714, 0.797619, 0.809524, 0.821429,
+        ],
+    );
+
+    // "3d": value=2.0, symmetric.
+    let x3: Vec<f32> = (0..18).map(|v| v as f32).collect();
+    let input3 =
+        Tensor::from_slice(&x3, [depth.of(2), height.of(3), width.of(3)], &device)?.with_grad();
+    let mut pad3 = ConstantPad::new([(depth, 1, 1), (height, 1, 1), (width, 1, 1)], 2.0)?;
+    assert_eq!(
+        pad3.build(input3.shape(), &device, 0)?,
+        Shape::new([depth.of(4), height.of(5), width.of(5)])?
+    );
+    let out3 = pad3.forward(&input3)?;
+    close(
+        "ConstantPad 3-axis forward (value=2.0)",
+        &out3.to_vec()?,
+        &[
+            2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+            2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 0.0, 1.0, 2.0,
+            2.0, 2.0, 3.0, 4.0, 5.0, 2.0, 2.0, 6.0, 7.0, 8.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+            2.0, 2.0, 2.0, 2.0, 2.0, 9.0, 10.0, 11.0, 2.0, 2.0, 12.0, 13.0, 14.0, 2.0, 2.0, 15.0,
+            16.0, 17.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+            2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+        ],
+    );
+    let w3: Vec<f32> = (1..=100).map(|v| v as f32).collect();
+    let weight3 = Tensor::from_slice(&w3, [depth.of(4), height.of(5), width.of(5)], &device)?;
+    out3.mul(&weight3)?
+        .mean([depth, height, width])?
+        .backward()?;
+    close(
+        "ConstantPad 3-axis gradient",
+        &input3.grad().unwrap().to_vec()?,
+        &[
+            0.32, 0.33, 0.34, 0.37, 0.38, 0.39, 0.42, 0.43, 0.44, 0.57, 0.58, 0.59, 0.62, 0.63,
+            0.64, 0.67, 0.68, 0.69,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn reflection_pad_matches_hand_computed_forward_and_gradient_across_1d_2d_3d() -> Result<()> {
+    // Independent oracle: real PyTorch 2.14 `F.pad(mode="reflect")`. PyTorch's
+    // whole-sample reflection never repeats the edge element (`-1` reflects
+    // to `1`, not `0`), and requires each side's pad strictly less than the
+    // axis's extent; both properties are exercised here.
+    let device = Device::cuda(0)?;
+    let (channel, height, width, depth) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+
+    // "1d": pad only `height` (extent 3), asymmetric (before=1, after=2),
+    // both strictly less than the extent.
+    let x1: Vec<f32> = (0..6).map(|v| v as f32).collect();
+    let input1 = Tensor::from_slice(&x1, [channel.of(2), height.of(3)], &device)?.with_grad();
+    let mut pad1 = ReflectionPad::new([(height, 1, 2)])?;
+    assert_eq!(
+        pad1.build(input1.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6)])?
+    );
+    let out1 = pad1.forward(&input1)?;
+    close(
+        "ReflectionPad 1-axis forward",
+        &out1.to_vec()?,
+        &[1.0, 0.0, 1.0, 2.0, 1.0, 0.0, 4.0, 3.0, 4.0, 5.0, 4.0, 3.0],
+    );
+    let w1: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let weight1 = Tensor::from_slice(&w1, [channel.of(2), height.of(6)], &device)?;
+    out1.mul(&weight1)?.mean([channel, height])?.backward()?;
+    close(
+        "ReflectionPad 1-axis gradient",
+        &input1.grad().unwrap().to_vec()?,
+        &[0.666667, 0.750000, 0.333333, 1.666667, 2.250000, 0.833333],
+    );
+
+    // "2d": under reordered physical storage.
+    let x2: Vec<f32> = (0..24).map(|v| v as f32).collect();
+    let input2 = Tensor::from_slice(&x2, [channel.of(2), height.of(3), width.of(4)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+    let mut pad2 = ReflectionPad::new([(height, 1, 2), (width, 2, 1)])?;
+    assert_eq!(
+        pad2.build(input2.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6), width.of(7)])?
+    );
+    let out2 = pad2.forward(&input2)?;
+    close(
+        "ReflectionPad 2-axis forward under reordered storage",
+        &out2.to_vec()?,
+        &[
+            6.0, 5.0, 4.0, 5.0, 6.0, 7.0, 6.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 6.0, 5.0, 4.0,
+            5.0, 6.0, 7.0, 6.0, 10.0, 9.0, 8.0, 9.0, 10.0, 11.0, 10.0, 6.0, 5.0, 4.0, 5.0, 6.0,
+            7.0, 6.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 18.0, 17.0, 16.0, 17.0, 18.0, 19.0, 18.0,
+            14.0, 13.0, 12.0, 13.0, 14.0, 15.0, 14.0, 18.0, 17.0, 16.0, 17.0, 18.0, 19.0, 18.0,
+            22.0, 21.0, 20.0, 21.0, 22.0, 23.0, 22.0, 18.0, 17.0, 16.0, 17.0, 18.0, 19.0, 18.0,
+            14.0, 13.0, 12.0, 13.0, 14.0, 15.0, 14.0,
+        ],
+    );
+    let w2: Vec<f32> = (1..=84).map(|v| v as f32).collect();
+    let weight2 = Tensor::from_slice(&w2, [channel.of(2), height.of(6), width.of(7)], &device)?;
+    out2.mul(&weight2)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "ReflectionPad 2-axis gradient under reordered storage",
+        &input2.grad().unwrap().to_vec()?,
+        &[
+            0.571429, 1.142857, 1.809524, 0.642857, 0.607143, 1.214286, 1.964286, 0.714286,
+            0.285714, 0.571429, 0.904762, 0.321429, 1.571429, 3.142857, 4.809524, 1.642857,
+            2.107143, 4.214286, 6.464286, 2.214286, 0.785714, 1.571429, 2.404762, 0.821429,
+        ],
+    );
+
+    // "3d": pad `depth`, `height`, `width` simultaneously, symmetric by 1
+    // (each axis's extent is at least 2, so before=after=1 stays strictly
+    // less than every extent).
+    let x3: Vec<f32> = (0..18).map(|v| v as f32).collect();
+    let input3 =
+        Tensor::from_slice(&x3, [depth.of(2), height.of(3), width.of(3)], &device)?.with_grad();
+    let mut pad3 = ReflectionPad::new([(depth, 1, 1), (height, 1, 1), (width, 1, 1)])?;
+    assert_eq!(
+        pad3.build(input3.shape(), &device, 0)?,
+        Shape::new([depth.of(4), height.of(5), width.of(5)])?
+    );
+    let out3 = pad3.forward(&input3)?;
+    close(
+        "ReflectionPad 3-axis forward",
+        &out3.to_vec()?,
+        &[
+            13.0, 12.0, 13.0, 14.0, 13.0, 10.0, 9.0, 10.0, 11.0, 10.0, 13.0, 12.0, 13.0, 14.0,
+            13.0, 16.0, 15.0, 16.0, 17.0, 16.0, 13.0, 12.0, 13.0, 14.0, 13.0, 4.0, 3.0, 4.0, 5.0,
+            4.0, 1.0, 0.0, 1.0, 2.0, 1.0, 4.0, 3.0, 4.0, 5.0, 4.0, 7.0, 6.0, 7.0, 8.0, 7.0, 4.0,
+            3.0, 4.0, 5.0, 4.0, 13.0, 12.0, 13.0, 14.0, 13.0, 10.0, 9.0, 10.0, 11.0, 10.0, 13.0,
+            12.0, 13.0, 14.0, 13.0, 16.0, 15.0, 16.0, 17.0, 16.0, 13.0, 12.0, 13.0, 14.0, 13.0,
+            4.0, 3.0, 4.0, 5.0, 4.0, 1.0, 0.0, 1.0, 2.0, 1.0, 4.0, 3.0, 4.0, 5.0, 4.0, 7.0, 6.0,
+            7.0, 8.0, 7.0, 4.0, 3.0, 4.0, 5.0, 4.0,
+        ],
+    );
+    let w3: Vec<f32> = (1..=100).map(|v| v as f32).collect();
+    let weight3 = Tensor::from_slice(&w3, [depth.of(4), height.of(5), width.of(5)], &device)?;
+    out3.mul(&weight3)?
+        .mean([depth, height, width])?
+        .backward()?;
+    close(
+        "ReflectionPad 3-axis gradient",
+        &input3.grad().unwrap().to_vec()?,
+        &[
+            1.14, 3.48, 1.18, 3.72, 11.34, 3.84, 1.34, 4.08, 1.38, 0.64, 1.98, 0.68, 2.22, 6.84,
+            2.34, 0.84, 2.58, 0.88,
+        ],
+    );
+
+    // Rejected before any device work: padding at or beyond the axis extent.
+    let shape = Shape::new([height.of(3)]).unwrap();
+    assert!(
+        ReflectionPad::new([(height, 3, 0)])
+            .unwrap()
+            .output_shape(&shape)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn replication_pad_matches_hand_computed_forward_and_gradient_across_1d_2d_3d() -> Result<()> {
+    // Independent oracle: real PyTorch 2.14 `F.pad(mode="replicate")`.
+    let device = Device::cuda(0)?;
+    let (channel, height, width, depth) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+
+    // "1d".
+    let x1: Vec<f32> = (0..6).map(|v| v as f32).collect();
+    let input1 = Tensor::from_slice(&x1, [channel.of(2), height.of(3)], &device)?.with_grad();
+    let mut pad1 = ReplicationPad::new([(height, 1, 2)])?;
+    assert_eq!(
+        pad1.build(input1.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6)])?
+    );
+    let out1 = pad1.forward(&input1)?;
+    close(
+        "ReplicationPad 1-axis forward",
+        &out1.to_vec()?,
+        &[0.0, 0.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 4.0, 5.0, 5.0, 5.0],
+    );
+    let w1: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let weight1 = Tensor::from_slice(&w1, [channel.of(2), height.of(6)], &device)?;
+    out1.mul(&weight1)?.mean([channel, height])?.backward()?;
+    close(
+        "ReplicationPad 1-axis gradient",
+        &input1.grad().unwrap().to_vec()?,
+        &[0.25, 0.25, 1.25, 1.25, 0.75, 2.75],
+    );
+
+    // "2d": under reordered physical storage.
+    let x2: Vec<f32> = (0..24).map(|v| v as f32).collect();
+    let input2 = Tensor::from_slice(&x2, [channel.of(2), height.of(3), width.of(4)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+    let mut pad2 = ReplicationPad::new([(height, 1, 2), (width, 2, 1)])?;
+    assert_eq!(
+        pad2.build(input2.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6), width.of(7)])?
+    );
+    let out2 = pad2.forward(&input2)?;
+    close(
+        "ReplicationPad 2-axis forward under reordered storage",
+        &out2.to_vec()?,
+        &[
+            0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 4.0, 4.0, 4.0,
+            5.0, 6.0, 7.0, 7.0, 8.0, 8.0, 8.0, 9.0, 10.0, 11.0, 11.0, 8.0, 8.0, 8.0, 9.0, 10.0,
+            11.0, 11.0, 8.0, 8.0, 8.0, 9.0, 10.0, 11.0, 11.0, 12.0, 12.0, 12.0, 13.0, 14.0, 15.0,
+            15.0, 12.0, 12.0, 12.0, 13.0, 14.0, 15.0, 15.0, 16.0, 16.0, 16.0, 17.0, 18.0, 19.0,
+            19.0, 20.0, 20.0, 20.0, 21.0, 22.0, 23.0, 23.0, 20.0, 20.0, 20.0, 21.0, 22.0, 23.0,
+            23.0, 20.0, 20.0, 20.0, 21.0, 22.0, 23.0, 23.0,
+        ],
+    );
+    let w2: Vec<f32> = (1..=84).map(|v| v as f32).collect();
+    let weight2 = Tensor::from_slice(&w2, [channel.of(2), height.of(6), width.of(7)], &device)?;
+    out2.mul(&weight2)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "ReplicationPad 2-axis gradient under reordered storage",
+        &input2.grad().unwrap().to_vec()?,
+        &[
+            0.392857, 0.178571, 0.202381, 0.476191, 0.571429, 0.214286, 0.226190, 0.488095,
+            3.214286, 1.142857, 1.178571, 2.464286, 3.392857, 1.178571, 1.202381, 2.476191,
+            2.071429, 0.714286, 0.726191, 1.488095, 7.714287, 2.642857, 2.678571, 5.464286,
+        ],
+    );
+
+    // "3d", symmetric by 1. Also demonstrates no upper bound on padding
+    // size: replicate does not share reflect's `pad < extent` constraint.
+    let x3: Vec<f32> = (0..18).map(|v| v as f32).collect();
+    let input3 =
+        Tensor::from_slice(&x3, [depth.of(2), height.of(3), width.of(3)], &device)?.with_grad();
+    let mut pad3 = ReplicationPad::new([(depth, 1, 1), (height, 1, 1), (width, 1, 1)])?;
+    assert_eq!(
+        pad3.build(input3.shape(), &device, 0)?,
+        Shape::new([depth.of(4), height.of(5), width.of(5)])?
+    );
+    let out3 = pad3.forward(&input3)?;
+    close(
+        "ReplicationPad 3-axis forward",
+        &out3.to_vec()?,
+        &[
+            0.0, 0.0, 1.0, 2.0, 2.0, 0.0, 0.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 5.0, 5.0, 6.0, 6.0,
+            7.0, 8.0, 8.0, 6.0, 6.0, 7.0, 8.0, 8.0, 0.0, 0.0, 1.0, 2.0, 2.0, 0.0, 0.0, 1.0, 2.0,
+            2.0, 3.0, 3.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 8.0, 8.0, 6.0, 6.0, 7.0, 8.0, 8.0, 9.0,
+            9.0, 10.0, 11.0, 11.0, 9.0, 9.0, 10.0, 11.0, 11.0, 12.0, 12.0, 13.0, 14.0, 14.0, 15.0,
+            15.0, 16.0, 17.0, 17.0, 15.0, 15.0, 16.0, 17.0, 17.0, 9.0, 9.0, 10.0, 11.0, 11.0, 9.0,
+            9.0, 10.0, 11.0, 11.0, 12.0, 12.0, 13.0, 14.0, 14.0, 15.0, 15.0, 16.0, 17.0, 17.0,
+            15.0, 15.0, 16.0, 17.0, 17.0,
+        ],
+    );
+    let w3: Vec<f32> = (1..=100).map(|v| v as f32).collect();
+    let weight3 = Tensor::from_slice(&w3, [depth.of(4), height.of(5), width.of(5)], &device)?;
+    out3.mul(&weight3)?
+        .mean([depth, height, width])?
+        .backward()?;
+    close(
+        "ReplicationPad 3-axis gradient",
+        &input3.grad().unwrap().to_vec()?,
+        &[
+            1.32, 0.72, 1.56, 0.96, 0.51, 1.08, 2.52, 1.32, 2.76, 5.32, 2.72, 5.559999, 2.96, 1.51,
+            3.08, 6.52, 3.32, 6.76,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn circular_pad_matches_hand_computed_forward_and_gradient_and_allows_full_wrap() -> Result<()> {
+    // Independent oracle: real PyTorch 2.14 `F.pad(mode="circular")`.
+    let device = Device::cuda(0)?;
+    let (channel, height, width, depth) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+
+    // "1d".
+    let x1: Vec<f32> = (0..6).map(|v| v as f32).collect();
+    let input1 = Tensor::from_slice(&x1, [channel.of(2), height.of(3)], &device)?.with_grad();
+    let mut pad1 = CircularPad::new([(height, 1, 2)])?;
+    assert_eq!(
+        pad1.build(input1.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6)])?
+    );
+    let out1 = pad1.forward(&input1)?;
+    close(
+        "CircularPad 1-axis forward",
+        &out1.to_vec()?,
+        &[2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 5.0, 3.0, 4.0, 5.0, 3.0, 4.0],
+    );
+    let w1: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let weight1 = Tensor::from_slice(&w1, [channel.of(2), height.of(6)], &device)?;
+    out1.mul(&weight1)?.mean([channel, height])?.backward()?;
+    close(
+        "CircularPad 1-axis gradient",
+        &input1.grad().unwrap().to_vec()?,
+        &[0.583333, 0.750000, 0.416667, 1.583333, 1.750000, 1.416667],
+    );
+
+    // "2d": under reordered physical storage.
+    let x2: Vec<f32> = (0..24).map(|v| v as f32).collect();
+    let input2 = Tensor::from_slice(&x2, [channel.of(2), height.of(3), width.of(4)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+    let mut pad2 = CircularPad::new([(height, 1, 2), (width, 2, 1)])?;
+    assert_eq!(
+        pad2.build(input2.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(6), width.of(7)])?
+    );
+    let out2 = pad2.forward(&input2)?;
+    close(
+        "CircularPad 2-axis forward under reordered storage",
+        &out2.to_vec()?,
+        &[
+            10.0, 11.0, 8.0, 9.0, 10.0, 11.0, 8.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0, 0.0, 6.0, 7.0,
+            4.0, 5.0, 6.0, 7.0, 4.0, 10.0, 11.0, 8.0, 9.0, 10.0, 11.0, 8.0, 2.0, 3.0, 0.0, 1.0,
+            2.0, 3.0, 0.0, 6.0, 7.0, 4.0, 5.0, 6.0, 7.0, 4.0, 22.0, 23.0, 20.0, 21.0, 22.0, 23.0,
+            20.0, 14.0, 15.0, 12.0, 13.0, 14.0, 15.0, 12.0, 18.0, 19.0, 16.0, 17.0, 18.0, 19.0,
+            16.0, 22.0, 23.0, 20.0, 21.0, 22.0, 23.0, 20.0, 14.0, 15.0, 12.0, 13.0, 14.0, 15.0,
+            12.0, 18.0, 19.0, 16.0, 17.0, 18.0, 19.0, 16.0,
+        ],
+    );
+    let w2: Vec<f32> = (1..=84).map(|v| v as f32).collect();
+    let weight2 = Tensor::from_slice(&w2, [channel.of(2), height.of(6), width.of(7)], &device)?;
+    out2.mul(&weight2)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "CircularPad 2-axis gradient under reordered storage",
+        &input2.grad().unwrap().to_vec()?,
+        &[
+            1.071429, 0.511905, 0.976191, 1.023810, 1.404762, 0.678571, 1.309524, 1.357143,
+            0.738095, 0.345238, 0.642857, 0.690476, 3.071429, 1.511905, 2.976191, 3.023809,
+            3.404762, 1.678571, 3.309524, 3.357143, 2.738095, 1.345238, 2.642857, 2.690476,
+        ],
+    );
+
+    // "3d", symmetric by 1.
+    let x3: Vec<f32> = (0..18).map(|v| v as f32).collect();
+    let input3 =
+        Tensor::from_slice(&x3, [depth.of(2), height.of(3), width.of(3)], &device)?.with_grad();
+    let mut pad3 = CircularPad::new([(depth, 1, 1), (height, 1, 1), (width, 1, 1)])?;
+    assert_eq!(
+        pad3.build(input3.shape(), &device, 0)?,
+        Shape::new([depth.of(4), height.of(5), width.of(5)])?
+    );
+    let out3 = pad3.forward(&input3)?;
+    close(
+        "CircularPad 3-axis forward",
+        &out3.to_vec()?,
+        &[
+            17.0, 15.0, 16.0, 17.0, 15.0, 11.0, 9.0, 10.0, 11.0, 9.0, 14.0, 12.0, 13.0, 14.0, 12.0,
+            17.0, 15.0, 16.0, 17.0, 15.0, 11.0, 9.0, 10.0, 11.0, 9.0, 8.0, 6.0, 7.0, 8.0, 6.0, 2.0,
+            0.0, 1.0, 2.0, 0.0, 5.0, 3.0, 4.0, 5.0, 3.0, 8.0, 6.0, 7.0, 8.0, 6.0, 2.0, 0.0, 1.0,
+            2.0, 0.0, 17.0, 15.0, 16.0, 17.0, 15.0, 11.0, 9.0, 10.0, 11.0, 9.0, 14.0, 12.0, 13.0,
+            14.0, 12.0, 17.0, 15.0, 16.0, 17.0, 15.0, 11.0, 9.0, 10.0, 11.0, 9.0, 8.0, 6.0, 7.0,
+            8.0, 6.0, 2.0, 0.0, 1.0, 2.0, 0.0, 5.0, 3.0, 4.0, 5.0, 3.0, 8.0, 6.0, 7.0, 8.0, 6.0,
+            2.0, 0.0, 1.0, 2.0, 0.0,
+        ],
+    );
+    let w3: Vec<f32> = (1..=100).map(|v| v as f32).collect();
+    let weight3 = Tensor::from_slice(&w3, [depth.of(4), height.of(5), width.of(5)], &device)?;
+    out3.mul(&weight3)?
+        .mean([depth, height, width])?
+        .backward()?;
+    close(
+        "CircularPad 3-axis gradient",
+        &input3.grad().unwrap().to_vec()?,
+        &[
+            5.28, 2.62, 5.2, 2.54, 1.26, 2.5, 4.88, 2.42, 4.8, 3.28, 1.62, 3.2, 1.54, 0.76, 1.5,
+            2.88, 1.42, 2.8,
+        ],
+    );
+
+    // A full wrap (padding equal to the extent) is allowed, unlike reflect.
+    let full: Vec<f32> = (0..4).map(|v| v as f32).collect();
+    let input4 = Tensor::from_slice(&full, [height.of(4)], &device)?;
+    let out4 = CircularPad::new([(height, 4, 4)])?.forward(&input4)?;
+    close(
+        "CircularPad forward, padding == extent (full wrap)",
+        &out4.to_vec()?,
+        &[0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn pixel_shuffle_matches_hand_computed_forward_and_gradient_under_reordered_storage() -> Result<()>
+{
+    // Independent oracle: real PyTorch 2.14 `F.pixel_shuffle`.
+    // C*r^2=8, r=2 -> out_channel=2; height=2, width=3 -> new height=4, width=6.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let values: Vec<f32> = (0..48).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(&values, [channel.of(8), height.of(2), width.of(3)], &device)?
+        // Reordered physical storage: PixelShuffle's `split`/`merge`
+        // composition must read through the permuted strides, not assume
+        // row-major.
+        .with_layout([width, channel, height])?
+        .with_grad();
+
+    let mut shuffle = PixelShuffle::new(channel, [height, width], 2)?;
+    assert_eq!(
+        shuffle.build(input.shape(), &device, 0)?,
+        Shape::new([channel.of(2), height.of(4), width.of(6)])?
+    );
+    let out = shuffle.forward(&input)?;
+    close(
+        "PixelShuffle forward under reordered storage",
+        &out.to_vec()?,
+        &[
+            0.0, 6.0, 1.0, 7.0, 2.0, 8.0, 12.0, 18.0, 13.0, 19.0, 14.0, 20.0, 3.0, 9.0, 4.0, 10.0,
+            5.0, 11.0, 15.0, 21.0, 16.0, 22.0, 17.0, 23.0, 24.0, 30.0, 25.0, 31.0, 26.0, 32.0,
+            36.0, 42.0, 37.0, 43.0, 38.0, 44.0, 27.0, 33.0, 28.0, 34.0, 29.0, 35.0, 39.0, 45.0,
+            40.0, 46.0, 41.0, 47.0,
+        ],
+    );
+    let w: Vec<f32> = (1..=48).map(|v| v as f32).collect();
+    let weight = Tensor::from_slice(&w, [channel.of(2), height.of(4), width.of(6)], &device)?;
+    out.mul(&weight)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "PixelShuffle gradient under reordered storage",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            0.020833, 0.062500, 0.104167, 0.270833, 0.312500, 0.354167, 0.041667, 0.083333,
+            0.125000, 0.291667, 0.333333, 0.375000, 0.145833, 0.187500, 0.229167, 0.395833,
+            0.437500, 0.479167, 0.166667, 0.208333, 0.250000, 0.416667, 0.458333, 0.500000,
+            0.520833, 0.562500, 0.604167, 0.770833, 0.812500, 0.854167, 0.541667, 0.583333,
+            0.625000, 0.791667, 0.833333, 0.875000, 0.645833, 0.687500, 0.729167, 0.895833,
+            0.937500, 0.979167, 0.666667, 0.708333, 0.750000, 0.916667, 0.958333, 1.000000,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn pixel_unshuffle_matches_hand_computed_forward_and_gradient_and_is_pixel_shuffles_inverse()
+-> Result<()> {
+    // Independent oracle: real PyTorch 2.14 `F.pixel_unshuffle`.
+    // channel=2, height=4, width=6, r=2 -> new_channel=8, height=2, width=3.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let values: Vec<f32> = (0..48).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(&values, [channel.of(2), height.of(4), width.of(6)], &device)?
+        .with_grad();
+
+    let mut unshuffle = PixelUnshuffle::new(channel, [height, width], 2)?;
+    assert_eq!(
+        unshuffle.build(input.shape(), &device, 0)?,
+        Shape::new([channel.of(8), height.of(2), width.of(3)])?
+    );
+    let out = unshuffle.forward(&input)?;
+    close(
+        "PixelUnshuffle forward",
+        &out.to_vec()?,
+        &[
+            0.0, 2.0, 4.0, 12.0, 14.0, 16.0, 1.0, 3.0, 5.0, 13.0, 15.0, 17.0, 6.0, 8.0, 10.0, 18.0,
+            20.0, 22.0, 7.0, 9.0, 11.0, 19.0, 21.0, 23.0, 24.0, 26.0, 28.0, 36.0, 38.0, 40.0, 25.0,
+            27.0, 29.0, 37.0, 39.0, 41.0, 30.0, 32.0, 34.0, 42.0, 44.0, 46.0, 31.0, 33.0, 35.0,
+            43.0, 45.0, 47.0,
+        ],
+    );
+    let w: Vec<f32> = (1..=48).map(|v| v as f32).collect();
+    let weight = Tensor::from_slice(&w, [channel.of(8), height.of(2), width.of(3)], &device)?;
+    out.mul(&weight)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "PixelUnshuffle gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            0.020833, 0.145833, 0.041667, 0.166667, 0.062500, 0.187500, 0.270833, 0.395833,
+            0.291667, 0.416667, 0.312500, 0.437500, 0.083333, 0.208333, 0.104167, 0.229167,
+            0.125000, 0.250000, 0.333333, 0.458333, 0.354167, 0.479167, 0.375000, 0.500000,
+            0.520833, 0.645833, 0.541667, 0.666667, 0.562500, 0.687500, 0.770833, 0.895833,
+            0.791667, 0.916667, 0.812500, 0.937500, 0.583333, 0.708333, 0.604167, 0.729167,
+            0.625000, 0.750000, 0.833333, 0.958333, 0.854167, 0.979167, 0.875000, 1.000000,
+        ],
+    );
+
+    // Exact round trip: PixelUnshuffle(PixelShuffle(x)) == x, for a fresh
+    // tensor unrelated to the oracle-derived values above.
+    let round_trip_values: Vec<f32> = (0..48).map(|v| (v as f32) * 0.5 - 3.0).collect();
+    let round_trip_input = Tensor::from_slice(
+        &round_trip_values,
+        [channel.of(2), height.of(4), width.of(6)],
+        &device,
+    )?;
+    let shuffled = PixelShuffle::new(channel, [height, width], 2)?
+        .forward(&PixelUnshuffle::new(channel, [height, width], 2)?.forward(&round_trip_input)?)?;
+    close(
+        "PixelShuffle(PixelUnshuffle(x)) round trip",
+        &shuffled.to_vec()?,
+        &round_trip_values
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_shuffle_matches_hand_computed_forward_and_gradient_under_reordered_storage() -> Result<()>
+{
+    // Independent oracle: real PyTorch 2.14 `F.channel_shuffle`. The
+    // small illustrative case first reproduces the PyTorch docs' own
+    // example ([ch0, ch1, ch2, ch3] at groups=2 becomes [ch0, ch2, ch1,
+    // ch3]) with real values, then a larger case checks the gradient
+    // under reordered storage.
+    let device = Device::cuda(0)?;
+    let channel = Axis::new("channel");
+    let doc_values: Vec<f32> = (0..4).map(|v| v as f32).collect();
+    let doc_input = Tensor::from_slice(&doc_values, [channel.of(4)], &device)?;
+    let doc_out = ChannelShuffle::new(channel, 2)?.forward(&doc_input)?;
+    close(
+        "ChannelShuffle doc example ([ch0,ch1,ch2,ch3] groups=2 -> [ch0,ch2,ch1,ch3])",
+        &doc_out.to_vec()?,
+        &[0.0, 2.0, 1.0, 3.0],
+    );
+
+    // C=6, groups=3, plus two trailing spatial axes (2x2) left untouched,
+    // under physical storage transposed relative to the logical
+    // [channel, height, width] order.
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    let values: Vec<f32> = (0..24).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(&values, [channel.of(6), height.of(2), width.of(2)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+
+    let mut shuffle = ChannelShuffle::new(channel, 3)?;
+    assert_eq!(
+        shuffle.build(input.shape(), &device, 0)?,
+        Shape::new([channel.of(6), height.of(2), width.of(2)])?
+    );
+    let out = shuffle.forward(&input)?;
+    close(
+        "ChannelShuffle forward under reordered storage",
+        &out.to_vec()?,
+        &[
+            0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0, 16.0, 17.0, 18.0, 19.0, 4.0, 5.0, 6.0, 7.0,
+            12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0,
+        ],
+    );
+    let w: Vec<f32> = (1..=24).map(|v| v as f32).collect();
+    let weight = Tensor::from_slice(&w, [channel.of(6), height.of(2), width.of(2)], &device)?;
+    out.mul(&weight)?
+        .mean([channel, height, width])?
+        .backward()?;
+    close(
+        "ChannelShuffle gradient under reordered storage",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            0.041667, 0.083333, 0.125000, 0.166667, 0.541667, 0.583333, 0.625000, 0.666667,
+            0.208333, 0.250000, 0.291667, 0.333333, 0.708333, 0.750000, 0.791667, 0.833333,
+            0.375000, 0.416667, 0.458333, 0.500000, 0.875000, 0.916667, 0.958333, 1.000000,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn trilinear_upsample_matches_composed_bilinear_against_independent_oracle() -> Result<()> {
+    // Closes part of `Upsample`'s "partial" gap (docs/nn/catalog.md: "no
+    // trilinear or bicubic"). `Tensor::resample_bilinear` already operates
+    // on ONE named axis at a time via a fixed per-axis weight matrix
+    // (`docs/design/library.md`); since 2D/3D linear interpolation is
+    // separable, applying it once per spatial axis -- already the documented
+    // pattern for 2D bilinear (`world/fluid`'s U-Net calls it on `height`
+    // then `width`) -- composes exact trilinear interpolation for free when
+    // applied to three axes, with no new code. Independent oracle: real
+    // PyTorch 2.14 `F.interpolate(mode="trilinear", align_corners=False)`.
+    // What remains open (not attempted here; a genuinely new interpolation
+    // kernel, not a composition): bicubic, and a literal `scale_factor=`
+    // spelling (`resample_bilinear` already takes an explicit output
+    // extent, which every real consumer computes itself).
+    let device = Device::cuda(0)?;
+    let (depth, height, width) = (Axis::new("depth"), Axis::new("height"), Axis::new("width"));
+    let values: Vec<f32> = (0..12).map(|v| v as f32).collect();
+    let input =
+        Tensor::from_slice(&values, [depth.of(2), height.of(2), width.of(3)], &device)?.with_grad();
+
+    let out = input
+        .resample_bilinear(depth, 4)?
+        .resample_bilinear(height, 3)?
+        .resample_bilinear(width, 5)?;
+    assert_eq!(
+        out.shape(),
+        &Shape::new([depth.of(4), height.of(3), width.of(5)])?
+    );
+    close(
+        "trilinear-by-composed-bilinear forward (depth2 height2 width3 -> depth4 height3 width5)",
+        &out.to_vec()?,
+        &[
+            0.0, 0.4, 1.0, 1.6, 2.0, 1.5, 1.9, 2.5, 3.1, 3.5, 3.0, 3.4, 4.0, 4.6, 5.0, 1.5, 1.9,
+            2.5, 3.1, 3.5, 3.0, 3.4, 4.0, 4.6, 5.0, 4.5, 4.9, 5.5, 6.1, 6.5, 4.5, 4.9, 5.5, 6.1,
+            6.5, 6.0, 6.4, 7.0, 7.6, 8.0, 7.5, 7.9, 8.5, 9.1, 9.5, 6.0, 6.4, 7.0, 7.6, 8.0, 7.5,
+            7.900001, 8.5, 9.1, 9.5, 9.0, 9.400001, 10.0, 10.6, 11.0,
+        ],
+    );
+    let w: Vec<f32> = (1..=60).map(|v| v as f32).collect();
+    let weight = Tensor::from_slice(&w, [depth.of(4), height.of(3), width.of(5)], &device)?;
+    out.mul(&weight)?.mean([depth, height, width])?.backward()?;
+    close(
+        "trilinear-by-composed-bilinear gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[
+            0.993333, 1.263750, 1.253334, 1.526667, 1.863750, 1.786667, 3.093333, 3.626250,
+            3.353334, 3.626667, 4.226250, 3.886667,
+        ],
+    );
+    Ok(())
+}
