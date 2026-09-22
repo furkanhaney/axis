@@ -1924,7 +1924,9 @@ impl Tensor {
     /// padded tensors are summed, so backward automatically narrows the
     /// incoming gradient back to each operand's slice with no dedicated rule.
     pub fn concat(values: &[Self], axis: Axis) -> Result<Self> {
-        let first = values.first().ok_or("concat requires at least one tensor")?;
+        let first = values
+            .first()
+            .ok_or("concat requires at least one tensor")?;
         first.shape().index(axis)?;
         let mut total = 0usize;
         for value in values {

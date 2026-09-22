@@ -3332,7 +3332,9 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     close(
         "unequal-width concat values",
         &concatenated.to_vec()?,
-        &[0.0, 1.0, 2.0, 10.0, 11.0, 100.0, 3.0, 4.0, 5.0, 12.0, 13.0, 101.0],
+        &[
+            0.0, 1.0, 2.0, 10.0, 11.0, 100.0, 3.0, 4.0, 5.0, 12.0, 13.0, 101.0,
+        ],
     );
 
     let upstream = Tensor::from_slice(
@@ -3347,7 +3349,14 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     close(
         "unequal-width concat gradient a",
         &a.grad().expect("a gradient").to_vec()?,
-        &[1.0 / 12.0, 2.0 / 12.0, 3.0 / 12.0, 7.0 / 12.0, 8.0 / 12.0, 9.0 / 12.0],
+        &[
+            1.0 / 12.0,
+            2.0 / 12.0,
+            3.0 / 12.0,
+            7.0 / 12.0,
+            8.0 / 12.0,
+            9.0 / 12.0,
+        ],
     );
     close(
         "unequal-width concat gradient b",
@@ -3383,11 +3392,8 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     assert!(Tensor::concat(&[a.clone()], missing).is_err());
     let wrong_axes = Tensor::from_slice(&[0.0, 1.0], [missing.of(2)], &device)?;
     assert!(Tensor::concat(&[a.clone(), wrong_axes], feature).is_err());
-    let mismatched_batch = Tensor::from_slice(
-        &[0.0, 1.0, 2.0],
-        [batch.of(1), feature.of(3)],
-        &device,
-    )?;
+    let mismatched_batch =
+        Tensor::from_slice(&[0.0, 1.0, 2.0], [batch.of(1), feature.of(3)], &device)?;
     assert!(Tensor::concat(&[a.clone(), b.clone(), mismatched_batch], feature).is_err());
     println!("concat values, gradients, and composed-path cross-check PASS");
     Ok(())
