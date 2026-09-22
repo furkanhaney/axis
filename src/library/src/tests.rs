@@ -6430,7 +6430,11 @@ fn masked_softmax_matches_hand_computed_oracle_under_reordered_storage() -> Resu
 
 #[test]
 fn pooling_family_rejects_invalid_configuration_before_launch() {
-    let (channel, height, width) = (Axis::new("channel"), Axis::new("height"), Axis::new("width"));
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
     let shape = Shape::new([channel.of(2), height.of(4), width.of(4)]).unwrap();
     let line = Shape::new([channel.of(2), height.of(5)]).unwrap();
 
@@ -6601,10 +6605,7 @@ fn max_pool1d_matches_hand_computed_forward_and_gradient_with_padding() -> Resul
 
     let mut pool = MaxPool1d::new(channel, length, 3).stride(1).padding(1);
     let output_shape = pool.build(input.shape(), &device, 0)?;
-    assert_eq!(
-        output_shape,
-        Shape::new([length.of(5), channel.of(1)])?
-    );
+    assert_eq!(output_shape, Shape::new([length.of(5), channel.of(1)])?);
     let actual = pool.forward(&input)?;
     close(
         "MaxPool1d forward",
@@ -6760,8 +6761,7 @@ fn lp_pool1d_matches_sum_pooling_at_p_one() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
-fn lp_pool2d_matches_hand_computed_l2_forward_and_gradient_under_reordered_storage() -> Result<()>
-{
+fn lp_pool2d_matches_hand_computed_l2_forward_and_gradient_under_reordered_storage() -> Result<()> {
     // `p = 2`: `sqrt(sum(x^2))`, the ordinary L2 norm, whose gradient `x_i / y` is an
     // independent closed form distinct from the op's own composition.
     let device = Device::cuda(0)?;
@@ -6846,7 +6846,8 @@ fn adaptive_avg_pool1d_and_2d_match_hand_computed_uneven_bins() -> Result<()> {
     // axes, over the same private bin/weighted-sum machinery.
     let device = Device::cuda(0)?;
     let length = Axis::new("length");
-    let input = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0], [length.of(5)], &device)?.with_grad();
+    let input =
+        Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0], [length.of(5)], &device)?.with_grad();
     let actual = input.adaptive_avg_pool1d(length, 2)?;
     assert_eq!(actual.shape(), &Shape::new([length.of(2)])?);
     close(
@@ -7066,7 +7067,9 @@ fn adaptive_avg_pool2d_global_head_composes_with_linear() -> Result<()> {
         pooled_shape,
         Shape::new([channel.of(3), height.of(1), width.of(1)])?
     );
-    let pooled = pool.forward(&input)?.merge([channel, height, width], feature)?;
+    let pooled = pool
+        .forward(&input)?
+        .merge([channel, height, width], feature)?;
 
     let mut head = Linear::new(feature, feature.role("out").of(1));
     head.build(pooled.shape(), &device, 1)?;

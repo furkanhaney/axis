@@ -808,7 +808,9 @@ impl Module for AvgPool3d {
 /// Named-channel 1D power-average pooling: `(sum(x^p))^(1/p)` over each kernel window,
 /// independently per channel, matching PyTorch's `nn.LPPool1d`
 /// (`f(X) = (sum_{x in X} x^p)^(1/p)`; at `p = 1` this is exactly sum pooling). `p` must be a
-/// positive integer (see [`PoolReduce::Lp`]); PyTorch's `LPPool` has no `padding` parameter, so
+/// positive integer (Axis's own restriction, narrower than PyTorch's `norm_type: float`, chosen
+/// because every practical use is an integer and a real, non-integer `1/p` root of a negative
+/// partial sum has no well-defined value). PyTorch's `LPPool` has no `padding` parameter, so
 /// none is exposed here either. `ceil_mode=True` is not implemented, matching [`AvgPool1d`].
 /// Stride defaults to the kernel extent, matching every other pooling family in this file.
 pub struct LPPool1d(Pooling1d);
