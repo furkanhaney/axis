@@ -37,8 +37,8 @@ beside it as a lower-level baseline.
 
 Implemented algebra includes identity/extent binding, strict subset-axis
 broadcasting, contraction with shared batch axes, physical layout changes,
-rename/role axes, split/merge, explicit outer products, causal masking,
-named-axis softmax, and differentiable named-axis minimum. Parameters have
+rename/role axes, split/merge, explicit outer products, causal and
+prefix-causal masking, named-axis softmax, and differentiable named-axis minimum. Parameters have
 stable IDs and version checks; repeated uses accumulate gradients and SGD
 updates each shared parameter once. Backward releases its saved graph; a
 second backward through it reports an error. Leaf gradients accumulate until
@@ -146,6 +146,27 @@ normalization remains deliberately absent until `Module` can represent an
 explicit train/evaluation mode and persistent non-parameter state; silently
 substituting batch-local statistics would give it the wrong experimental
 meaning.
+
+`Embedding::new(vocabulary, feature.of(d))` looks up one learned vector per
+vocabulary entry. Axis tensors are floating point, so a token arrives as a
+one-hot coordinate on the named vocabulary axis rather than as an integer
+index; the lookup is a contraction of that axis with a `[vocabulary, feature]`
+table and has the same value and derivative as an index gather, so a repeated
+token accumulates every contribution into its row. The device does not check
+that the input is one-hot; a soft input is a weighted mixture of rows.
+`PositionEmbedding::new(position, feature)` adds a `[position, feature]` table
+whose extents are read from the input at build and broadcast over every other
+axis. Both start uniform in `[-0.02, 0.02]`, expose one `table` parameter,
+and reject an extent that differs from the one they were built with. The byte
+autoencoder migration is their first consumer; Sudoku previously spelled both
+inline as a bias-carrying Linear and a raw Parameter.
+
+`Tensor::prefix_causal_mask(query, key, prefix)` keeps the first `prefix` key
+positions visible to every query and masks the remainder causally, which is
+the one pattern a plain causal mask cannot express: a block of memory or code
+tokens in front of an autoregressive sequence. `causal_mask` is the
+`prefix == 0` case. Both remain square, zero-offset, logical dense masks;
+cached decoding and padding masks still need their own contracts.
 
 `DataLoader` batches any `DataSource` and checks its regime before releasing a
 batch. Finite `InMemoryDataset` sources report corpus size; generated sources

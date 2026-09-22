@@ -915,6 +915,161 @@ fn causal_softmax_masks_values_and_gradients() -> Result<()> {
 }
 
 #[test]
+fn embedding_shapes_reject_missing_axes_before_allocation() -> Result<()> {
+    let (batch, position, vocabulary, feature) = (
+        Axis::new("batch"),
+        Axis::new("position"),
+        Axis::new("vocabulary"),
+        Axis::new("feature"),
+    );
+    let tokens = Shape::new([batch.of(2), position.of(5), vocabulary.of(7)])?;
+    let embedding = Embedding::new(vocabulary, feature.of(3));
+    assert_eq!(
+        embedding.output_shape(&tokens)?,
+        Shape::new([batch.of(2), position.of(5), feature.of(3)])?
+    );
+    assert!(
+        embedding
+            .output_shape(&Shape::new([batch.of(2), position.of(5)])?)
+            .is_err()
+    );
+    let positions = PositionEmbedding::new(position, feature);
+    let features = embedding.output_shape(&tokens)?;
+    assert_eq!(positions.output_shape(&features)?, features);
+    assert!(positions.output_shape(&tokens).is_err());
+    assert!(
+        PositionEmbedding::new(feature, feature)
+            .output_shape(&features)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn embedding_lookup_matches_table_rows_and_accumulates_gradients() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, position, vocabulary, feature) = (
+        Axis::new("batch"),
+        Axis::new("position"),
+        Axis::new("vocabulary"),
+        Axis::new("feature"),
+    );
+    // Token 1 appears twice so its table row must receive both gradient contributions.
+    let tokens = [[1_usize, 3], [0, 1]];
+    let mut one_hot = vec![0.0_f32; 2 * 2 * 4];
+    for (b, row) in tokens.iter().enumerate() {
+        for (p, &token) in row.iter().enumerate() {
+            one_hot[(b * 2 + p) * 4 + token] = 1.0;
+        }
+    }
+    let input = Tensor::from_slice(
+        &one_hot,
+        [batch.of(2), position.of(2), vocabulary.of(4)],
+        &device,
+    )?
+    .with_layout([vocabulary, batch, position])?;
+
+    let mut embedding = Embedding::new(vocabulary, feature.of(3));
+    let mut positions = PositionEmbedding::new(position, feature);
+    let shape = embedding.build(input.shape(), &device, 7)?;
+    positions.build(&shape, &device, 11)?;
+    assert_eq!(
+        shape,
+        Shape::new([batch.of(2), position.of(2), feature.of(3)])?
+    );
+    let table = embedding.parameter("table")?.tensor().to_vec()?;
+    let offsets = positions.parameter("table")?.tensor().to_vec()?;
+    assert!(table.iter().chain(&offsets).all(|v| v.abs() <= 0.02));
+
+    let output = positions.forward(&embedding.forward(&input)?)?;
+    let mut expected = Vec::new();
+    for row in &tokens {
+        for (p, &token) in row.iter().enumerate() {
+            for f in 0..3 {
+                expected.push(f64::from(table[token * 3 + f]) + f64::from(offsets[p * 3 + f]));
+            }
+        }
+    }
+    close("embedding forward", &output.to_vec()?, &expected);
+
+    output.mean([batch, position, feature])?.backward()?;
+    let counts = [1.0, 2.0, 0.0, 1.0];
+    let table_gradient: Vec<f64> = counts
+        .iter()
+        .flat_map(|&count| std::iter::repeat_n(count / 12.0, 3))
+        .collect();
+    close(
+        "embedding table gradient",
+        &embedding.parameter("table")?.grad().unwrap().to_vec()?,
+        &table_gradient,
+    );
+    close(
+        "position table gradient",
+        &positions.parameter("table")?.grad().unwrap().to_vec()?,
+        &[2.0 / 12.0; 6],
+    );
+
+    let wider = Shape::new([batch.of(2), position.of(2), vocabulary.of(5)])?;
+    assert!(embedding.output_shape(&wider).is_err());
+    assert!(embedding.build(&wider, &device, 7).is_err());
+    let longer = Shape::new([batch.of(2), position.of(3), feature.of(3)])?;
+    assert!(positions.build(&longer, &device, 11).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_causal_softmax_keeps_memory_keys_visible_to_every_query() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (query, key) = (Axis::new("query"), Axis::new("key"));
+    let logits = Tensor::from_slice(&[0.0; 16], [query.of(4), key.of(4)], &device)?.with_grad();
+    let probability = logits.prefix_causal_mask(query, key, 2)?.softmax(key)?;
+    let kept = |q: usize, k: usize| k <= q || k < 2;
+    let mut expected = Vec::new();
+    for q in 0..4 {
+        let visible = (0..4).filter(|&k| kept(q, k)).count() as f64;
+        for k in 0..4 {
+            expected.push(if kept(q, k) { 1.0 / visible } else { 0.0 });
+        }
+    }
+    close(
+        "prefix causal probabilities",
+        &probability.to_vec()?,
+        &expected,
+    );
+
+    let weights = [1.0, 2.0, 4.0, 8.0];
+    let weight_tensor = Tensor::from_slice(&weights.map(|w| w as f32), [key.of(4)], &device)?;
+    probability
+        .mul(&weight_tensor)?
+        .mean([query, key])?
+        .backward()?;
+    let mut gradient = Vec::new();
+    for q in 0..4 {
+        let row = &expected[q * 4..q * 4 + 4];
+        let mean: f64 = row.iter().zip(&weights).map(|(p, w)| p * w).sum();
+        for k in 0..4 {
+            gradient.push(row[k] * (weights[k] - mean) / 16.0);
+        }
+    }
+    close(
+        "prefix causal gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &gradient,
+    );
+
+    let plain = logits.detach().causal_mask(query, key)?.to_vec()?;
+    let zero_prefix = logits
+        .detach()
+        .prefix_causal_mask(query, key, 0)?
+        .to_vec()?;
+    assert_eq!(plain, zero_prefix);
+    assert!(logits.detach().prefix_causal_mask(query, key, 5).is_err());
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUDA"]
 fn conv2d_lowers_valid_patches_and_sums_overlapping_gradients() -> Result<()> {
     let device = Device::cuda(0)?;

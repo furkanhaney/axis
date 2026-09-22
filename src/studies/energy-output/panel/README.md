@@ -1,7 +1,7 @@
 # Axis country panel
 
 A bounded Rust mechanics migration of the ReLU path in
-[`research/energy-output/fit_panel_torch.py`](../../../../../research/energy-output/fit_panel_torch.py). It exercises the same
+[`research/src/world/energy-output/fit_panel_torch.py`](../../../../../research/src/world/energy-output/fit_panel_torch.py). It exercises the same
 country-year representation with `axis`: four logged capacity inputs,
 training-only missing-value imputation, four missingness indicators, linear
 time, training-only standardization, an 8-unit ReLU MLP, full-batch MSE,

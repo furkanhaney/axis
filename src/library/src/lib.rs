@@ -65,8 +65,8 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    ExactGELU, GELU, IntoLayers, LeakyReLU, Linear, Module, ParamId, Parameter, PopulationLinear,
-    ReLU, Sequential, SiLU, Tanh,
+    Embedding, ExactGELU, GELU, IntoLayers, LeakyReLU, Linear, Module, ParamId, Parameter,
+    PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU, Tanh,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
@@ -105,7 +105,7 @@ pub mod prelude {
     pub use crate::{
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
         CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
-        Disjointness, DisjointnessEvidence, DisjointnessReceipt, EmpiricalMonotonicity,
+        Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
         EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
         FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
         Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
@@ -113,8 +113,8 @@ pub mod prelude {
         LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
         Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
         MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
-        PopulationReceipt, PopulationSpec, ReLU, RegimeSnapshot, ResidualClaim, ResidualEvidence,
-        ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential, Shape, SiLU,
-        SinglePass, Standardizer, Tanh, Tensor, TrainStep, Trainer,
+        PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot, ResidualClaim,
+        ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential,
+        Shape, SiLU, SinglePass, Standardizer, Tanh, Tensor, TrainStep, Trainer,
     };
 }

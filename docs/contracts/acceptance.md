@@ -49,9 +49,9 @@ only. A future ability claim requires the versioned Lichess recipe and an
 independent game-level evaluation corpus; the migration explicitly rejects the
 old Python run's overlapping validation recipe.
 
-## ask_bro — long-range
+## ask_second_opinion — long-range
 
-`ask_bro` deliberately means the useful sub-30B model, not a particular host or
+`ask_second_opinion` deliberately means the useful sub-30B model, not a particular host or
 vendor. Running its model through Axis would require the production transformer
 stack that Sudoku does not:
 
@@ -68,5 +68,5 @@ stack that Sudoku does not:
 The first honest milestone is not “27B compiles.” It is one frozen layer matching
 a trusted implementation on recorded inputs, then a complete forward pass, then
 generation, then enough performance to replace the existing capability. Sudoku
-and Chess should supply the shared math; ask_bro should drive only the machinery
+and Chess should supply the shared math; ask_second_opinion should drive only the machinery
 that appears when the model becomes real-sized.

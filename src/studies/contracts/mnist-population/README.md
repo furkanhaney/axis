@@ -4,7 +4,7 @@ This program assumes familiarity with ordinary MNIST training. It exists to exer
 models, optimizer state, and learning rates on one named population axis; it is not the introductory
 MNIST example.
 
-Rust mechanics migration of [`research/training-dynamics/train_mlp_pop.py`](../../../../../research/training-dynamics/train_mlp_pop.py), the
+Rust mechanics migration of [`research/src/learning/training-dynamics/train_mlp_pop.py`](../../../../../research/src/learning/training-dynamics/train_mlp_pop.py), the
 population MNIST probe. It trains independently initialized 970-parameter
 classifiers at log-uniform learning rates, then reports held-out accuracy by
 learning-rate quartile.
@@ -15,7 +15,7 @@ src/studies/contracts/mnist-population/scripts/train.sh --pop 512
 ```
 
 The input is the canonical torchvision IDX data already stored under
-`../research/training-dynamics/data/MNIST/raw/`. Each model consumes the same declared
+`../research/src/learning/training-dynamics/data/MNIST/raw/`. Each model consumes the same declared
 number of independently shuffled complete training passes. This is explicitly
 a finite-data experiment, not IDR.
 

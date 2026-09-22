@@ -93,11 +93,26 @@ contracts and evidence bar.
   input-dependent geometric bias, policy and value heads, AdamW, exact finite
   passes, and game-disjoint evaluation. Its bounded smoke passes; it makes no
   chess-ability claim.
-- Causal masking is square and zero-offset. Softmax requires a finite entry
+- Causal masking is square and zero-offset; `prefix_causal_mask` additionally
+  keeps a leading block of memory keys visible to every query. Softmax requires a finite entry
   in each row and permits negative infinity elsewhere. Padding/all-masked
   rows and cached decoding still need explicit contracts and witnesses.
 
 ## Next useful implementation
+
+The byte autoencoder (`research/src/learning/bae`) is the next outside consumer: 125 bytes
+to a 256-bit sign code to an autoregressive byte decoder over memory tokens,
+with prefix (nested) dropout on the code. Its first slice landed `Embedding`,
+`PositionEmbedding`, and `prefix_causal_mask` with scalar oracles. The
+remaining pull, in the order it bites: a sign with straight-through gradient,
+prefix dropout as a named-axis module with a horizon-weighted loss, Bernoulli
+input dropout, and therefore explicit random-state and train/evaluation
+semantics recorded in the receipt. Its held-out residual tables
+(`bae/docs/NESTED.md`) are the replication oracle. A related finding: the
+shared xorshift initializer emits exactly `-scale` as its first sample for any
+seed below 2^40, so every module's first entry sits at the boundary; changing
+the generator would move recorded baselines and is deferred.
+
 
 Rerun the recorded Sudoku shapes and report utilization and elapsed time after
 the tiled contraction and softmax changes. The next implementation should be

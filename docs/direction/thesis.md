@@ -29,7 +29,7 @@ checklist:
 MLP                  tensors, reverse mode, optimizers
 CNN                  spatial structure and overlapping gradients
 Sudoku transformer   embeddings, bidirectional attention, masked objectives, IDR
-ask_bro              real sub-30B checkpoints, precision, caching, memory, generation
+ask_second_opinion              real sub-30B checkpoints, precision, caching, memory, generation
 ```
 
 An outside consumer must express a real workload through the public API, train

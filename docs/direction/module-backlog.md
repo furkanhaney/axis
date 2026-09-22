@@ -23,7 +23,8 @@ unexercised surface area.
 ## Current surface
 
 Axis already has `Linear`, `PopulationLinear`, `Conv2d`, `Conv3d`, named-axis
-`LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, `ReLU`, tanh-form
+`LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, one-hot
+`Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
 `GELU`, `ExactGELU`, `SiLU`, `LeakyReLU`, `Tanh`, and `Sequential`, with
 tensor-level losses, sine, differentiable central
 differences, softmax, causal masking, attention
@@ -38,7 +39,7 @@ and panel acceptances, but it is not yet a comfortable general module library.
 | Active | physics-informed residual consumers and independent numerical oracles | Central differences and empirical residual receipts now provide the first honest path; ODE and pendulum studies must establish defaults and expose missing composition. |
 | Recurrent foundation | `LstmCell` and `Lstm` correctness are implemented; fused recurrence, direction, and layer composition remain | Independent forward and complete gradient oracles protect the eager IFGO implementation before performance work. |
 | Stateful foundation | explicit training/evaluation mode and persistent non-parameter state, then named-axis `BatchNorm` | Running statistics cannot be represented honestly by the current stateless `Module` contract. |
-| Common composition | `Conv1d` or rank-general convolution, pooling, `ELU`, `Embedding`, dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. Exact GELU, `SiLU`, and `LeakyReLU` landed from Atlas and vision consumer pressure. |
+| Common composition | `Conv1d` or rank-general convolution, pooling, `ELU`, dropout, prefix (nested) dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. Exact GELU, `SiLU`, and `LeakyReLU` landed from Atlas and vision consumer pressure; `Embedding` and the prefix causal mask landed from the byte autoencoder migration, whose ordered binary code is also the consumer for prefix dropout and a sign straight-through estimator. |
 | Architecture families | recurrent variants, transpose convolution, reusable transformer encoder/decoder modules | Add them around measured consumers after the lower-level contracts settle. |
 | Specialized | sparse, quantized, distributed, adaptive and fractional pooling, lazy initialization | Each needs its own representation or execution contract; names alone would provide false parity. |
 

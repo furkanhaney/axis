@@ -302,7 +302,7 @@ The [project thesis](docs/direction/thesis.md) is to give coordinates to the who
 experiment, not only its tensors. It grows against an [acceptance
 ladder](docs/contracts/acceptance.md): the
 Sudoku and Chess transformers are current, and running the sub-30B model behind
-`ask_bro` is the long-range systems test.
+`ask_second_opinion` is the long-range systems test.
 
 The detailed contracts are in [library design](docs/design/library.md),
 [data regimes](docs/contracts/data-regimes.md), [semantic disjointness](docs/contracts/disjointness.md),

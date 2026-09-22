@@ -2,7 +2,7 @@
 
 This is the approachable end-to-end Axis example: recognizable data, one small MLP, categorical
 loss, finite shuffled passes, and held-out accuracy. It is a Rust mechanics and architecture migration of
-[`research/training-dynamics/train_mlp_1k.py`](../../../../../research/training-dynamics/train_mlp_1k.py), the small MNIST baseline used to
+[`research/src/learning/training-dynamics/train_mlp_1k.py`](../../../../../research/src/learning/training-dynamics/train_mlp_1k.py), the small MNIST baseline used to
 check the training-dynamics machinery. It keeps the 4x4 average pool,
 train-only normalization, 49 -> 16 -> 10 network, 970-parameter budget,
 shuffled finite passes, and held-out digit accuracy. It does not claim numerical
