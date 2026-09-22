@@ -2164,23 +2164,21 @@ impl Tensor {
     }
     /// Reduce three named spatial axes to a fixed target extent each, taking each of
     /// [`Self::adaptive_avg_pool3d`]'s own bins to its maximum instead of its weighted mean.
-    /// Ties break to the first (lowest-coordinate) maximum within a bin, matching [`Self::max`].
     ///
-    /// Composed entirely from [`Self::gather`] and [`Self::max`] -- no dedicated kernel -- by
-    /// reducing one spatial axis at a time: for that axis, every output bin's (host-computed,
-    /// data-independent) member positions are gathered onto a fresh axis, padding a bin shorter
-    /// than the widest one by repeating its own last real position (which can only tie, never
-    /// beat, that position, so padding can never change which position wins), then
-    /// [`Self::max`] removes the padding axis. `gather`'s backward is an exact scatter-add, so a
-    /// position shared by two adjacent bins (the same uneven-division case
-    /// [`Self::adaptive_avg_pool3d`] documents) correctly receives a gradient contribution from
-    /// every bin it wins, exactly like PyTorch's autograd summing a value's use in more than one
-    /// downstream op. Reducing axes one at a time is exact for the forward value (max over a
-    /// Cartesian-product window is separable: the max of maxes along each axis in turn equals
-    /// the joint max), but it means a tie spanning *more than one* axis breaks to the axis
-    /// reduced last first, not necessarily to PyTorch's own row-major scan order -- an honest,
-    /// low-stakes difference from PyTorch for the zero-probability case of an exact
-    /// floating-point tie across axes.
+    /// Composed from [`Self::gather`], [`Self::merge`] and [`Self::max`] -- no dedicated kernel.
+    /// Each spatial axis in turn gathers every output bin's (host-computed, data-independent)
+    /// member positions onto a fresh per-axis patch axis, padding a bin shorter than the widest
+    /// one by repeating its own last real position. The per-axis patch axes are then merged,
+    /// in the supplied spatial order with the last axis fastest, into ONE window axis that a
+    /// single [`Self::max`] removes. That merged axis visits the whole Cartesian window in
+    /// exactly PyTorch's `adaptive_max_pool` CPU scan order (nested loops, last spatial axis
+    /// innermost, strict `>` so the first maximum met is kept), and [`Self::max`] keeps the
+    /// first logical maximum, so a tie -- including one spanning two or more axes -- routes
+    /// the gradient to the element PyTorch's returned index names. A padding repeat always
+    /// comes after the real position it copies in that scan, so it can only tie, never win.
+    /// `gather`'s backward is an exact scatter-add, so a position shared by two adjacent bins
+    /// receives a gradient contribution from every bin it wins. Non-finite candidates are
+    /// ignored as [`Self::max`] ignores them.
     pub fn adaptive_max_pool3d(&self, spatial: [Axis; 3], target: [usize; 3]) -> Result<Self> {
         self.adaptive_max_pool(spatial, target)
     }
@@ -2221,6 +2219,7 @@ impl Tensor {
             return Err(format!("{name} target extents must be positive").into());
         }
         let mut current = self.clone();
+        let mut patches = Vec::with_capacity(N);
         for index in 0..N {
             let axis = spatial[index];
             let input_extent = current.extent(axis)?;
@@ -2240,10 +2239,140 @@ impl Tensor {
                 }
             }
             let gathered = current.gather(axis, &gather_index, combined)?;
-            let split = gathered.split(combined, [axis.of(target[index]), patch.of(window)])?;
-            current = split.max(patch)?;
+            current = gathered.split(combined, [axis.of(target[index]), patch.of(window)])?;
+            patches.push(patch);
         }
-        Ok(current)
+        let window = spatial[0].role("adaptive_max_pool_window");
+        current.merge(patches, window)?.max(window)
+    }
+    /// Scatter each element of `self` into a zero tensor whose three named spatial axes take
+    /// the extents `output`, at the flat spatial position `indices` names: PyTorch's
+    /// `F.max_unpool3d`. `indices` holds one entry per element of `self`, in `self`'s logical
+    /// ([`Self::to_vec`]) order, each a row-major offset into the `output` spatial volume (the
+    /// supplied spatial order, last axis fastest) -- the convention `MaxPool3d`'s
+    /// `forward_with_indices` returns, i.e. PyTorch's `return_indices=True` indices into the
+    /// flattened `D*H*W` plane of each batch/channel slice. Every other axis carries through
+    /// unchanged; a position no index names is an exact zero.
+    ///
+    /// When two elements of one slice name the same position (possible after an overlapping
+    /// max pool), the output holds the LAST such element in logical order, matching PyTorch's
+    /// sequential CPU kernel (`output[index] = input[i]`, last write wins); a non-finite value
+    /// at an overwritten (non-final) duplicate makes that output position NaN. The gradient
+    /// with respect to `self` is PyTorch's own: every element, overwritten or not, receives
+    /// the upstream gradient at the position it names (`grad_output.gather(indices)`); the
+    /// indices themselves carry none. Composed from [`Self::merge`], [`Self::gather`],
+    /// [`Self::scatter_add`] and [`Self::detach`], with no new kernel.
+    pub fn max_unpool3d(
+        &self,
+        spatial: [Axis; 3],
+        indices: &[usize],
+        output: [usize; 3],
+    ) -> Result<Self> {
+        self.max_unpool(spatial, indices, output)
+    }
+    /// Same contract as [`Self::max_unpool3d`] over one named spatial axis.
+    pub fn max_unpool1d(&self, spatial: Axis, indices: &[usize], output: usize) -> Result<Self> {
+        self.max_unpool([spatial], indices, [output])
+    }
+    /// Same contract as [`Self::max_unpool3d`] over two named spatial axes.
+    pub fn max_unpool2d(
+        &self,
+        spatial: [Axis; 2],
+        indices: &[usize],
+        output: [usize; 2],
+    ) -> Result<Self> {
+        self.max_unpool(spatial, indices, output)
+    }
+    pub(crate) fn max_unpool<const N: usize>(
+        &self,
+        spatial: [Axis; N],
+        indices: &[usize],
+        output: [usize; N],
+    ) -> Result<Self> {
+        let name = format!("max_unpool{N}d");
+        if !(N == 1 || N == 2 || N == 3) {
+            return Err(
+                "Axis max unpooling supports exactly one, two, or three spatial axes".into(),
+            );
+        }
+        for (index, &axis) in spatial.iter().enumerate() {
+            if spatial[..index].contains(&axis) {
+                return Err(format!("{name} requires distinct spatial axes").into());
+            }
+        }
+        if output.contains(&0) {
+            return Err(format!("{name} output extents must be positive").into());
+        }
+        let length = self.shape().len();
+        if indices.len() != length {
+            return Err(format!(
+                "{name} got {} indices for {length} input elements",
+                indices.len()
+            )
+            .into());
+        }
+        let plane = output
+            .iter()
+            .try_fold(1usize, |volume, &extent| volume.checked_mul(extent))
+            .ok_or_else(|| format!("{name} output volume overflow"))?;
+        let mut positions = [0usize; N];
+        for index in 0..N {
+            positions[index] = self.shape().index(spatial[index])?;
+        }
+        let dims: Vec<_> = self
+            .shape()
+            .dims()
+            .iter()
+            .map(|dim| {
+                spatial
+                    .iter()
+                    .position(|&axis| axis == dim.axis)
+                    .map_or(*dim, |index| dim.axis.of(output[index]))
+            })
+            .collect();
+        let target = Shape::new(dims)?;
+        let target_layout = Layout::contiguous(&target);
+        let mut buckets = Vec::with_capacity(length);
+        let mut last = vec![usize::MAX; target.len()];
+        for (element, &flat) in indices.iter().enumerate() {
+            if flat >= plane {
+                return Err(format!(
+                    "{name} index {flat} at element {element} is outside the output volume {plane}"
+                )
+                .into());
+            }
+            let mut coords = self.shape().coords(element);
+            let mut remainder = flat;
+            for index in (0..N).rev() {
+                coords[positions[index]] = remainder % output[index];
+                remainder /= output[index];
+            }
+            let bucket = target_layout.offset(&coords);
+            last[bucket] = element;
+            buckets.push(bucket);
+        }
+        let source = spatial[0].role("max_unpool_source");
+        let picked = spatial[0].role("max_unpool_picked");
+        let bucket = spatial[0].role("max_unpool_bucket");
+        let flat = self.merge(self.shape().axes(), source)?;
+        let (winners, losers): (Vec<usize>, Vec<usize>) =
+            (0..length).partition(|&element| last[buckets[element]] == element);
+        let scattered = if losers.is_empty() {
+            flat.scatter_add(source, &buckets, bucket, target.len())?
+        } else {
+            let scatter = |elements: &[usize], values: &Self| {
+                let targets: Vec<usize> = elements.iter().map(|&e| buckets[e]).collect();
+                values.scatter_add(picked, &targets, bucket, target.len())
+            };
+            let kept = scatter(&winners, &flat.gather(source, &winners, picked)?)?;
+            // Overwritten duplicates contribute `x - detach(x)`: exactly zero forward, but
+            // an identity gradient, so they still receive `grad_output[index]` as PyTorch's
+            // gather-shaped backward gives them.
+            let overwritten = flat.gather(source, &losers, picked)?;
+            let zero = overwritten.sub(&overwritten.detach())?;
+            kept.add(&scatter(&losers, &zero)?)?
+        };
+        scattered.split(bucket, target.dims().iter().copied())
     }
     pub(crate) fn adaptive_avg_pool<const N: usize>(
         &self,
