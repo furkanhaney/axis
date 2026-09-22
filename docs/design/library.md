@@ -64,7 +64,13 @@ remain independent of optimizer and tensor execution; see
 `Adam` and `AdamW` keep first/second moments and parameter updates on the GPU.
 Their constructor defaults use beta1 `0.9`, beta2 `0.999`, and epsilon `1e-8`;
 learning rate remains explicit, and AdamW also requires explicit decoupled
-weight decay.
+weight decay. `SGD`, `Adam`, and `AdamW` each expose `set_learning_rate` to
+overwrite that rate before a step; `cosine_annealing_lr` and `one_cycle_lr`
+are pure functions of the step index that reproduce PyTorch's own
+`CosineAnnealingLR` and default-configuration `OneCycleLR` value sequences
+(`optim.rs` doc comments cite both closed forms) for a consumer's training
+loop to call once per step and feed to the setter — Axis has no stateful
+scheduler object.
 
 `Muon` applies EMA momentum, optional Nesterov interpolation, five-step
 Newton-Schulz orthogonalization, original rectangular-matrix scaling, and
