@@ -12,7 +12,9 @@ The crate currently provides:
 
 - named-axis tensor algebra and reverse-mode differentiation, including
   deterministic finite minimum reductions, asymmetric zero-padding, contiguous
-  slicing, and compact device copies for layout, merge, and alignment;
+  slicing, compact device copies for layout, merge, and alignment, and
+  integer-factor nearest and half-pixel bilinear resampling along a named
+  axis;
 - `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
   grouped/depthwise channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
   and stateless `InstanceNorm`, one-hot `Embedding` and `PositionEmbedding`,
