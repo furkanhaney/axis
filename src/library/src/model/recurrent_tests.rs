@@ -1581,7 +1581,8 @@ fn rnn_cell_step(
     let previous = hidden.to_vec();
     for (previous_feature, &previous_value) in previous.iter().enumerate() {
         for feature in 0..hidden_extent {
-            total[feature] += previous_value * recurrent_weight[previous_feature * hidden_extent + feature];
+            total[feature] +=
+                previous_value * recurrent_weight[previous_feature * hidden_extent + feature];
         }
     }
     for feature in 0..hidden_extent {
@@ -1607,13 +1608,15 @@ fn gru_cell_step(
     let mut hidden_gates = vec![0.0; gate_extent];
     for (previous_feature, &previous_value) in hidden.iter().enumerate() {
         for gate in 0..gate_extent {
-            hidden_gates[gate] += previous_value * recurrent_weight[previous_feature * gate_extent + gate];
+            hidden_gates[gate] +=
+                previous_value * recurrent_weight[previous_feature * gate_extent + gate];
         }
     }
     for feature in 0..hidden_extent {
         let reset = sigmoid_f64(input_gates[feature] + hidden_gates[feature]);
-        let update =
-            sigmoid_f64(input_gates[hidden_extent + feature] + hidden_gates[hidden_extent + feature]);
+        let update = sigmoid_f64(
+            input_gates[hidden_extent + feature] + hidden_gates[hidden_extent + feature],
+        );
         let candidate = (input_gates[2 * hidden_extent + feature]
             + reset * hidden_gates[2 * hidden_extent + feature])
             .tanh();
@@ -1701,11 +1704,19 @@ fn rnn_cell_standalone_asymmetric_geometry_with_reordered_layout() -> Result<()>
         .set_values(&f32s(&recurrent_weight))?;
     cell.parameter("bias")?.set_values(&f32s(&bias))?;
 
-    let x = Tensor::from_slice(&f32s(&input_values), input_shape.dims().iter().copied(), &device)?
-        .with_layout([patient, input, replica])?;
+    let x = Tensor::from_slice(
+        &f32s(&input_values),
+        input_shape.dims().iter().copied(),
+        &device,
+    )?
+    .with_layout([patient, input, replica])?;
     let state = Tensor::from_slice(
         &f32s(&initial_values),
-        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(CELL_H)],
+        [
+            replica.of(REPLICAS),
+            patient.of(PATIENTS),
+            hidden.of(CELL_H),
+        ],
         &device,
     )?
     .with_layout([hidden, replica, patient])?;
@@ -1767,11 +1778,19 @@ fn gru_cell_standalone_asymmetric_geometry_with_reordered_layout() -> Result<()>
         .set_values(&f32s(&recurrent_weight))?;
     cell.parameter("bias")?.set_values(&f32s(&bias))?;
 
-    let x = Tensor::from_slice(&f32s(&input_values), input_shape.dims().iter().copied(), &device)?
-        .with_layout([patient, input, replica])?;
+    let x = Tensor::from_slice(
+        &f32s(&input_values),
+        input_shape.dims().iter().copied(),
+        &device,
+    )?
+    .with_layout([patient, input, replica])?;
     let state = Tensor::from_slice(
         &f32s(&initial_values),
-        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(CELL_H)],
+        [
+            replica.of(REPLICAS),
+            patient.of(PATIENTS),
+            hidden.of(CELL_H),
+        ],
         &device,
     )?
     .with_layout([hidden, replica, patient])?;
@@ -1833,17 +1852,29 @@ fn lstm_cell_standalone_asymmetric_geometry_with_reordered_layout() -> Result<()
         .set_values(&f32s(&recurrent_weight))?;
     cell.parameter("bias")?.set_values(&f32s(&bias))?;
 
-    let x = Tensor::from_slice(&f32s(&input_values), input_shape.dims().iter().copied(), &device)?
-        .with_layout([patient, input, replica])?;
+    let x = Tensor::from_slice(
+        &f32s(&input_values),
+        input_shape.dims().iter().copied(),
+        &device,
+    )?
+    .with_layout([patient, input, replica])?;
     let hidden_state = Tensor::from_slice(
         &f32s(&initial_hidden),
-        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(CELL_H)],
+        [
+            replica.of(REPLICAS),
+            patient.of(PATIENTS),
+            hidden.of(CELL_H),
+        ],
         &device,
     )?
     .with_layout([hidden, replica, patient])?;
     let cell_state = Tensor::from_slice(
         &f32s(&initial_cell),
-        [replica.of(REPLICAS), patient.of(PATIENTS), hidden.of(CELL_H)],
+        [
+            replica.of(REPLICAS),
+            patient.of(PATIENTS),
+            hidden.of(CELL_H),
+        ],
         &device,
     )?
     .with_layout([replica, hidden, patient])?;
@@ -1980,7 +2011,13 @@ where
         let mut c = case.initial_cell[0][batch * H..(batch + 1) * H].to_vec();
         for t in 0..T {
             let off = (batch * T + t) * I;
-            step(H, &case.input[off..off + I], &mut h, &mut c, &case.stack.layer0_forward);
+            step(
+                H,
+                &case.input[off..off + I],
+                &mut h,
+                &mut c,
+                &case.stack.layer0_forward,
+            );
             layer0_seq[t * 2 * H..t * 2 * H + H].copy_from_slice(&h);
         }
         finals_hidden[0][batch * H..(batch + 1) * H].copy_from_slice(&h);
@@ -1990,7 +2027,13 @@ where
         let mut c = case.initial_cell[1][batch * H..(batch + 1) * H].to_vec();
         for t in (0..T).rev() {
             let off = (batch * T + t) * I;
-            step(H, &case.input[off..off + I], &mut h, &mut c, &case.stack.layer0_backward);
+            step(
+                H,
+                &case.input[off..off + I],
+                &mut h,
+                &mut c,
+                &case.stack.layer0_backward,
+            );
             layer0_seq[t * 2 * H + H..t * 2 * H + 2 * H].copy_from_slice(&h);
         }
         finals_hidden[1][batch * H..(batch + 1) * H].copy_from_slice(&h);
@@ -2031,7 +2074,8 @@ where
 
         for t in 0..T {
             let out_off = (batch * T + t) * 2 * H;
-            sequence[out_off..out_off + 2 * H].copy_from_slice(&layer1_seq[t * 2 * H..t * 2 * H + 2 * H]);
+            sequence[out_off..out_off + 2 * H]
+                .copy_from_slice(&layer1_seq[t * 2 * H..t * 2 * H + 2 * H]);
         }
     }
     BiReference {
@@ -2066,7 +2110,11 @@ fn bi_objective(result: &BiReference) -> f64 {
     total
 }
 
-fn bi_finite_difference<F>(case: &BiCase, step: F, field: impl Fn(&mut BiCase) -> &mut Vec<f64>) -> Vec<f64>
+fn bi_finite_difference<F>(
+    case: &BiCase,
+    step: F,
+    field: impl Fn(&mut BiCase) -> &mut Vec<f64>,
+) -> Vec<f64>
 where
     F: Fn(usize, &[f64], &mut [f64], &mut [f64], &DirectionWeights) + Copy,
 {
@@ -2107,7 +2155,15 @@ fn rnn_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
     );
     let case = bi_case(1, 200);
     let step = |h: usize, x: &[f64], hid: &mut [f64], _cell: &mut [f64], w: &DirectionWeights| {
-        rnn_cell_step(h, x, hid, &w.input_weight, &w.recurrent_weight, &w.bias, f64::tanh);
+        rnn_cell_step(
+            h,
+            x,
+            hid,
+            &w.input_weight,
+            &w.recurrent_weight,
+            &w.bias,
+            f64::tanh,
+        );
     };
     let expected = bi_reference(&case, step);
 
@@ -2117,14 +2173,22 @@ fn rnn_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         bias: true,
     };
     let mut model = Rnn::with_config(input, hidden.of(H), time, config)?;
-    model.build(&Shape::new([batch.of(B), time.of(T), input.of(I)])?, &device, 11)?;
+    model.build(
+        &Shape::new([batch.of(B), time.of(T), input.of(I)])?,
+        &device,
+        11,
+    )?;
     install_bi_direction(&model, &case.stack.layer0_forward, "layer0_forward")?;
     install_bi_direction(&model, &case.stack.layer0_backward, "layer0_backward")?;
     install_bi_direction(&model, &case.stack.layer1_forward, "layer1_forward")?;
     install_bi_direction(&model, &case.stack.layer1_backward, "layer1_backward")?;
 
-    let x = Tensor::from_slice(&f32s(&case.input), [batch.of(B), time.of(T), input.of(I)], &device)?
-        .with_grad();
+    let x = Tensor::from_slice(
+        &f32s(&case.input),
+        [batch.of(B), time.of(T), input.of(I)],
+        &device,
+    )?
+    .with_grad();
     let initial: Vec<Tensor> = case
         .initial
         .iter()
@@ -2138,7 +2202,12 @@ fn rnn_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         run.sequence.shape(),
         &Shape::new([batch.of(B), time.of(T), hidden.of(2 * H)])?
     );
-    close("2-layer bidirectional RNN sequence", &run.sequence.to_vec()?, &expected.sequence, 4e-5);
+    close(
+        "2-layer bidirectional RNN sequence",
+        &run.sequence.to_vec()?,
+        &expected.sequence,
+        4e-5,
+    );
     for slot in 0..4 {
         close(
             &format!("2-layer bidirectional RNN final state {slot}"),
@@ -2149,10 +2218,18 @@ fn rnn_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
     }
 
     let sequence_coefficients = f32s(&synth(B * T * 2 * H, 900));
-    let mut loss = weighted_sum(&run.sequence, &sequence_coefficients, &[batch, time, hidden])?;
+    let mut loss = weighted_sum(
+        &run.sequence,
+        &sequence_coefficients,
+        &[batch, time, hidden],
+    )?;
     for slot in 0..4 {
         let hidden_coefficients = f32s(&synth(B * H, 910 + slot as u64));
-        loss = loss.add(&weighted_sum(&run.state[slot], &hidden_coefficients, &[batch, hidden])?)?;
+        loss = loss.add(&weighted_sum(
+            &run.state[slot],
+            &hidden_coefficients,
+            &[batch, hidden],
+        )?)?;
     }
     loss.backward()?;
 
@@ -2172,18 +2249,38 @@ fn rnn_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         );
     }
     let weight_fields: [(&str, fn(&mut BiCase) -> &mut Vec<f64>); 12] = [
-        ("layer0_forward_input_weight", |c| &mut c.stack.layer0_forward.input_weight),
-        ("layer0_forward_recurrent_weight", |c| &mut c.stack.layer0_forward.recurrent_weight),
+        ("layer0_forward_input_weight", |c| {
+            &mut c.stack.layer0_forward.input_weight
+        }),
+        ("layer0_forward_recurrent_weight", |c| {
+            &mut c.stack.layer0_forward.recurrent_weight
+        }),
         ("layer0_forward_bias", |c| &mut c.stack.layer0_forward.bias),
-        ("layer0_backward_input_weight", |c| &mut c.stack.layer0_backward.input_weight),
-        ("layer0_backward_recurrent_weight", |c| &mut c.stack.layer0_backward.recurrent_weight),
-        ("layer0_backward_bias", |c| &mut c.stack.layer0_backward.bias),
-        ("layer1_forward_input_weight", |c| &mut c.stack.layer1_forward.input_weight),
-        ("layer1_forward_recurrent_weight", |c| &mut c.stack.layer1_forward.recurrent_weight),
+        ("layer0_backward_input_weight", |c| {
+            &mut c.stack.layer0_backward.input_weight
+        }),
+        ("layer0_backward_recurrent_weight", |c| {
+            &mut c.stack.layer0_backward.recurrent_weight
+        }),
+        ("layer0_backward_bias", |c| {
+            &mut c.stack.layer0_backward.bias
+        }),
+        ("layer1_forward_input_weight", |c| {
+            &mut c.stack.layer1_forward.input_weight
+        }),
+        ("layer1_forward_recurrent_weight", |c| {
+            &mut c.stack.layer1_forward.recurrent_weight
+        }),
         ("layer1_forward_bias", |c| &mut c.stack.layer1_forward.bias),
-        ("layer1_backward_input_weight", |c| &mut c.stack.layer1_backward.input_weight),
-        ("layer1_backward_recurrent_weight", |c| &mut c.stack.layer1_backward.recurrent_weight),
-        ("layer1_backward_bias", |c| &mut c.stack.layer1_backward.bias),
+        ("layer1_backward_input_weight", |c| {
+            &mut c.stack.layer1_backward.input_weight
+        }),
+        ("layer1_backward_recurrent_weight", |c| {
+            &mut c.stack.layer1_backward.recurrent_weight
+        }),
+        ("layer1_backward_bias", |c| {
+            &mut c.stack.layer1_backward.bias
+        }),
     ];
     for (name, field) in weight_fields {
         let actual = model.parameter(name)?.grad().unwrap().to_vec()?;
@@ -2219,14 +2316,22 @@ fn gru_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         bias: true,
     };
     let mut model = Gru::with_config(input, hidden.of(H), time, config)?;
-    model.build(&Shape::new([batch.of(B), time.of(T), input.of(I)])?, &device, 12)?;
+    model.build(
+        &Shape::new([batch.of(B), time.of(T), input.of(I)])?,
+        &device,
+        12,
+    )?;
     install_bi_direction(&model, &case.stack.layer0_forward, "layer0_forward")?;
     install_bi_direction(&model, &case.stack.layer0_backward, "layer0_backward")?;
     install_bi_direction(&model, &case.stack.layer1_forward, "layer1_forward")?;
     install_bi_direction(&model, &case.stack.layer1_backward, "layer1_backward")?;
 
-    let x = Tensor::from_slice(&f32s(&case.input), [batch.of(B), time.of(T), input.of(I)], &device)?
-        .with_grad();
+    let x = Tensor::from_slice(
+        &f32s(&case.input),
+        [batch.of(B), time.of(T), input.of(I)],
+        &device,
+    )?
+    .with_grad();
     let initial: Vec<Tensor> = case
         .initial
         .iter()
@@ -2240,7 +2345,12 @@ fn gru_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         run.sequence.shape(),
         &Shape::new([batch.of(B), time.of(T), hidden.of(2 * H)])?
     );
-    close("2-layer bidirectional GRU sequence", &run.sequence.to_vec()?, &expected.sequence, 4e-5);
+    close(
+        "2-layer bidirectional GRU sequence",
+        &run.sequence.to_vec()?,
+        &expected.sequence,
+        4e-5,
+    );
     for slot in 0..4 {
         close(
             &format!("2-layer bidirectional GRU final state {slot}"),
@@ -2251,10 +2361,18 @@ fn gru_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
     }
 
     let sequence_coefficients = f32s(&synth(B * T * 2 * H, 900));
-    let mut loss = weighted_sum(&run.sequence, &sequence_coefficients, &[batch, time, hidden])?;
+    let mut loss = weighted_sum(
+        &run.sequence,
+        &sequence_coefficients,
+        &[batch, time, hidden],
+    )?;
     for slot in 0..4 {
         let hidden_coefficients = f32s(&synth(B * H, 910 + slot as u64));
-        loss = loss.add(&weighted_sum(&run.state[slot], &hidden_coefficients, &[batch, hidden])?)?;
+        loss = loss.add(&weighted_sum(
+            &run.state[slot],
+            &hidden_coefficients,
+            &[batch, hidden],
+        )?)?;
     }
     loss.backward()?;
 
@@ -2274,18 +2392,38 @@ fn gru_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         );
     }
     let weight_fields: [(&str, fn(&mut BiCase) -> &mut Vec<f64>); 12] = [
-        ("layer0_forward_input_weight", |c| &mut c.stack.layer0_forward.input_weight),
-        ("layer0_forward_recurrent_weight", |c| &mut c.stack.layer0_forward.recurrent_weight),
+        ("layer0_forward_input_weight", |c| {
+            &mut c.stack.layer0_forward.input_weight
+        }),
+        ("layer0_forward_recurrent_weight", |c| {
+            &mut c.stack.layer0_forward.recurrent_weight
+        }),
         ("layer0_forward_bias", |c| &mut c.stack.layer0_forward.bias),
-        ("layer0_backward_input_weight", |c| &mut c.stack.layer0_backward.input_weight),
-        ("layer0_backward_recurrent_weight", |c| &mut c.stack.layer0_backward.recurrent_weight),
-        ("layer0_backward_bias", |c| &mut c.stack.layer0_backward.bias),
-        ("layer1_forward_input_weight", |c| &mut c.stack.layer1_forward.input_weight),
-        ("layer1_forward_recurrent_weight", |c| &mut c.stack.layer1_forward.recurrent_weight),
+        ("layer0_backward_input_weight", |c| {
+            &mut c.stack.layer0_backward.input_weight
+        }),
+        ("layer0_backward_recurrent_weight", |c| {
+            &mut c.stack.layer0_backward.recurrent_weight
+        }),
+        ("layer0_backward_bias", |c| {
+            &mut c.stack.layer0_backward.bias
+        }),
+        ("layer1_forward_input_weight", |c| {
+            &mut c.stack.layer1_forward.input_weight
+        }),
+        ("layer1_forward_recurrent_weight", |c| {
+            &mut c.stack.layer1_forward.recurrent_weight
+        }),
         ("layer1_forward_bias", |c| &mut c.stack.layer1_forward.bias),
-        ("layer1_backward_input_weight", |c| &mut c.stack.layer1_backward.input_weight),
-        ("layer1_backward_recurrent_weight", |c| &mut c.stack.layer1_backward.recurrent_weight),
-        ("layer1_backward_bias", |c| &mut c.stack.layer1_backward.bias),
+        ("layer1_backward_input_weight", |c| {
+            &mut c.stack.layer1_backward.input_weight
+        }),
+        ("layer1_backward_recurrent_weight", |c| {
+            &mut c.stack.layer1_backward.recurrent_weight
+        }),
+        ("layer1_backward_bias", |c| {
+            &mut c.stack.layer1_backward.bias
+        }),
     ];
     for (name, field) in weight_fields {
         let actual = model.parameter(name)?.grad().unwrap().to_vec()?;
@@ -2311,7 +2449,15 @@ fn lstm_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
     );
     let case = bi_case(4, 400);
     let step = |h: usize, x: &[f64], hid: &mut [f64], cell: &mut [f64], w: &DirectionWeights| {
-        lstm_cell_step(h, x, hid, cell, &w.input_weight, &w.recurrent_weight, &w.bias);
+        lstm_cell_step(
+            h,
+            x,
+            hid,
+            cell,
+            &w.input_weight,
+            &w.recurrent_weight,
+            &w.bias,
+        );
     };
     let expected = bi_reference(&case, step);
 
@@ -2321,19 +2467,31 @@ fn lstm_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         bias: true,
     };
     let mut model = Lstm::with_config(input, hidden.of(H), time, config)?;
-    model.build(&Shape::new([batch.of(B), time.of(T), input.of(I)])?, &device, 13)?;
+    model.build(
+        &Shape::new([batch.of(B), time.of(T), input.of(I)])?,
+        &device,
+        13,
+    )?;
     install_bi_direction(&model, &case.stack.layer0_forward, "layer0_forward")?;
     install_bi_direction(&model, &case.stack.layer0_backward, "layer0_backward")?;
     install_bi_direction(&model, &case.stack.layer1_forward, "layer1_forward")?;
     install_bi_direction(&model, &case.stack.layer1_backward, "layer1_backward")?;
 
-    let x = Tensor::from_slice(&f32s(&case.input), [batch.of(B), time.of(T), input.of(I)], &device)?
-        .with_grad();
+    let x = Tensor::from_slice(
+        &f32s(&case.input),
+        [batch.of(B), time.of(T), input.of(I)],
+        &device,
+    )?
+    .with_grad();
     let initial: Vec<LstmState> = (0..4)
         .map(|slot| {
             LstmState::new(
-                Tensor::from_slice(&f32s(&case.initial[slot]), [batch.of(B), hidden.of(H)], &device)?
-                    .with_grad(),
+                Tensor::from_slice(
+                    &f32s(&case.initial[slot]),
+                    [batch.of(B), hidden.of(H)],
+                    &device,
+                )?
+                .with_grad(),
                 Tensor::from_slice(
                     &f32s(&case.initial_cell[slot]),
                     [batch.of(B), hidden.of(H)],
@@ -2348,7 +2506,12 @@ fn lstm_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         run.sequence.shape(),
         &Shape::new([batch.of(B), time.of(T), hidden.of(2 * H)])?
     );
-    close("2-layer bidirectional LSTM sequence", &run.sequence.to_vec()?, &expected.sequence, 4e-5);
+    close(
+        "2-layer bidirectional LSTM sequence",
+        &run.sequence.to_vec()?,
+        &expected.sequence,
+        4e-5,
+    );
     for slot in 0..4 {
         close(
             &format!("2-layer bidirectional LSTM final hidden {slot}"),
@@ -2365,13 +2528,25 @@ fn lstm_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
     }
 
     let sequence_coefficients = f32s(&synth(B * T * 2 * H, 900));
-    let mut loss = weighted_sum(&run.sequence, &sequence_coefficients, &[batch, time, hidden])?;
+    let mut loss = weighted_sum(
+        &run.sequence,
+        &sequence_coefficients,
+        &[batch, time, hidden],
+    )?;
     for slot in 0..4 {
         let hidden_coefficients = f32s(&synth(B * H, 910 + slot as u64));
         let cell_coefficients = f32s(&synth(B * H, 920 + slot as u64));
         loss = loss
-            .add(&weighted_sum(&run.state[slot].hidden, &hidden_coefficients, &[batch, hidden])?)?
-            .add(&weighted_sum(&run.state[slot].cell, &cell_coefficients, &[batch, hidden])?)?;
+            .add(&weighted_sum(
+                &run.state[slot].hidden,
+                &hidden_coefficients,
+                &[batch, hidden],
+            )?)?
+            .add(&weighted_sum(
+                &run.state[slot].cell,
+                &cell_coefficients,
+                &[batch, hidden],
+            )?)?;
     }
     loss.backward()?;
 
@@ -2397,18 +2572,38 @@ fn lstm_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         );
     }
     let weight_fields: [(&str, fn(&mut BiCase) -> &mut Vec<f64>); 12] = [
-        ("layer0_forward_input_weight", |c| &mut c.stack.layer0_forward.input_weight),
-        ("layer0_forward_recurrent_weight", |c| &mut c.stack.layer0_forward.recurrent_weight),
+        ("layer0_forward_input_weight", |c| {
+            &mut c.stack.layer0_forward.input_weight
+        }),
+        ("layer0_forward_recurrent_weight", |c| {
+            &mut c.stack.layer0_forward.recurrent_weight
+        }),
         ("layer0_forward_bias", |c| &mut c.stack.layer0_forward.bias),
-        ("layer0_backward_input_weight", |c| &mut c.stack.layer0_backward.input_weight),
-        ("layer0_backward_recurrent_weight", |c| &mut c.stack.layer0_backward.recurrent_weight),
-        ("layer0_backward_bias", |c| &mut c.stack.layer0_backward.bias),
-        ("layer1_forward_input_weight", |c| &mut c.stack.layer1_forward.input_weight),
-        ("layer1_forward_recurrent_weight", |c| &mut c.stack.layer1_forward.recurrent_weight),
+        ("layer0_backward_input_weight", |c| {
+            &mut c.stack.layer0_backward.input_weight
+        }),
+        ("layer0_backward_recurrent_weight", |c| {
+            &mut c.stack.layer0_backward.recurrent_weight
+        }),
+        ("layer0_backward_bias", |c| {
+            &mut c.stack.layer0_backward.bias
+        }),
+        ("layer1_forward_input_weight", |c| {
+            &mut c.stack.layer1_forward.input_weight
+        }),
+        ("layer1_forward_recurrent_weight", |c| {
+            &mut c.stack.layer1_forward.recurrent_weight
+        }),
         ("layer1_forward_bias", |c| &mut c.stack.layer1_forward.bias),
-        ("layer1_backward_input_weight", |c| &mut c.stack.layer1_backward.input_weight),
-        ("layer1_backward_recurrent_weight", |c| &mut c.stack.layer1_backward.recurrent_weight),
-        ("layer1_backward_bias", |c| &mut c.stack.layer1_backward.bias),
+        ("layer1_backward_input_weight", |c| {
+            &mut c.stack.layer1_backward.input_weight
+        }),
+        ("layer1_backward_recurrent_weight", |c| {
+            &mut c.stack.layer1_backward.recurrent_weight
+        }),
+        ("layer1_backward_bias", |c| {
+            &mut c.stack.layer1_backward.bias
+        }),
     ];
     for (name, field) in weight_fields {
         let actual = model.parameter(name)?.grad().unwrap().to_vec()?;

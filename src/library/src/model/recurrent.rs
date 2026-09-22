@@ -392,7 +392,12 @@ impl Lstm {
         Self::with_config(input, hidden, time, RecurrentConfig::default())
     }
 
-    pub fn with_config(input: Axis, hidden: Dim, time: Axis, config: RecurrentConfig) -> Result<Self> {
+    pub fn with_config(
+        input: Axis,
+        hidden: Dim,
+        time: Axis,
+        config: RecurrentConfig,
+    ) -> Result<Self> {
         if time == input || time == hidden.axis {
             return Err("LSTM time must be distinct from its input and hidden axes".into());
         }
@@ -505,7 +510,10 @@ impl Lstm {
             };
             let time_position = full_layer_shape.index(self.time)?;
 
-            let run_direction = |cell: &LstmCell, reverse: bool, state0: &LstmState| -> Result<(Tensor, LstmState)> {
+            let run_direction = |cell: &LstmCell,
+                                 reverse: bool,
+                                 state0: &LstmState|
+             -> Result<(Tensor, LstmState)> {
                 let expected = cell.output_shape_for(&stripped)?;
                 if !layer_input.device().same(state0.hidden.device())
                     || !layer_input.device().same(state0.cell.device())
@@ -515,9 +523,11 @@ impl Lstm {
                 if !same_named_shape(state0.hidden.shape(), &expected)
                     || !same_named_shape(state0.cell.shape(), &expected)
                 {
-                    return Err(
-                        format!("LSTM state named shape mismatch: expected {:?}", expected).into(),
-                    );
+                    return Err(format!(
+                        "LSTM state named shape mismatch: expected {:?}",
+                        expected
+                    )
+                    .into());
                 }
                 let projected = cell.project_input(&layer_input)?;
                 let mut state = state0.clone();
@@ -568,7 +578,9 @@ impl Module for Lstm {
         let mut layer_input_shape = without(input, self.time)?;
         let mut layer_seed = seed;
         for layer in &mut self.layers {
-            layer.forward.build(&layer_input_shape, device, layer_seed)?;
+            layer
+                .forward
+                .build(&layer_input_shape, device, layer_seed)?;
             layer_seed = layer_seed.wrapping_add(1);
             if let Some(backward) = &mut layer.backward {
                 backward.build(&layer_input_shape, device, layer_seed)?;
@@ -892,7 +904,12 @@ impl Rnn {
         Self::with_config(input, hidden, time, RecurrentConfig::default())
     }
 
-    pub fn with_config(input: Axis, hidden: Dim, time: Axis, config: RecurrentConfig) -> Result<Self> {
+    pub fn with_config(
+        input: Axis,
+        hidden: Dim,
+        time: Axis,
+        config: RecurrentConfig,
+    ) -> Result<Self> {
         if time == input || time == hidden.axis {
             return Err("RNN time must be distinct from its input and hidden axes".into());
         }
@@ -1030,7 +1047,10 @@ impl Rnn {
             };
             let time_position = full_layer_shape.index(self.time)?;
 
-            let run_direction = |cell: &RnnCell, reverse: bool, state0: &Tensor| -> Result<(Tensor, Tensor)> {
+            let run_direction = |cell: &RnnCell,
+                                 reverse: bool,
+                                 state0: &Tensor|
+             -> Result<(Tensor, Tensor)> {
                 let expected = cell.output_shape_for(&stripped)?;
                 if !layer_input.device().same(state0.device()) {
                     return Err("RNN input and state must use the same Device handle".into());
@@ -1089,7 +1109,9 @@ impl Module for Rnn {
         let mut layer_input_shape = without(input, self.time)?;
         let mut layer_seed = seed;
         for layer in &mut self.layers {
-            layer.forward.build(&layer_input_shape, device, layer_seed)?;
+            layer
+                .forward
+                .build(&layer_input_shape, device, layer_seed)?;
             layer_seed = layer_seed.wrapping_add(1);
             if let Some(backward) = &mut layer.backward {
                 backward.build(&layer_input_shape, device, layer_seed)?;
@@ -1432,7 +1454,12 @@ impl Gru {
         Self::with_config(input, hidden, time, RecurrentConfig::default())
     }
 
-    pub fn with_config(input: Axis, hidden: Dim, time: Axis, config: RecurrentConfig) -> Result<Self> {
+    pub fn with_config(
+        input: Axis,
+        hidden: Dim,
+        time: Axis,
+        config: RecurrentConfig,
+    ) -> Result<Self> {
         if time == input || time == hidden.axis {
             return Err("GRU time must be distinct from its input and hidden axes".into());
         }
@@ -1545,7 +1572,10 @@ impl Gru {
             };
             let time_position = full_layer_shape.index(self.time)?;
 
-            let run_direction = |cell: &GruCell, reverse: bool, state0: &Tensor| -> Result<(Tensor, Tensor)> {
+            let run_direction = |cell: &GruCell,
+                                 reverse: bool,
+                                 state0: &Tensor|
+             -> Result<(Tensor, Tensor)> {
                 let expected = cell.output_shape_for(&stripped)?;
                 if !layer_input.device().same(state0.device()) {
                     return Err("GRU input and state must use the same Device handle".into());
@@ -1604,7 +1634,9 @@ impl Module for Gru {
         let mut layer_input_shape = without(input, self.time)?;
         let mut layer_seed = seed;
         for layer in &mut self.layers {
-            layer.forward.build(&layer_input_shape, device, layer_seed)?;
+            layer
+                .forward
+                .build(&layer_input_shape, device, layer_seed)?;
             layer_seed = layer_seed.wrapping_add(1);
             if let Some(backward) = &mut layer.backward {
                 backward.build(&layer_input_shape, device, layer_seed)?;
