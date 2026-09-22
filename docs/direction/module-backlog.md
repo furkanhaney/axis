@@ -29,7 +29,7 @@ option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
 `Tensor::adaptive_avg_pool3d`, named-axis
 `LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, one-hot
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
-`GELU`, `ExactGELU`, `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
+`GELU` and erf-form `ExactGELU` (PyTorch's default `nn.GELU` is the exact form), `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
 `Sequential`, with tensor-level losses, sine, differentiable central
 differences, softmax, causal masking, named-axis nearest and bilinear
 resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
