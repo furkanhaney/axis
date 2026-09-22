@@ -69,7 +69,10 @@ pub use nn::{
     PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU, SignStraightThrough, Tanh,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
-pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
+pub use optim::{
+    Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD,
+    cosine_annealing_lr, one_cycle_lr,
+};
 pub use preprocess::Standardizer;
 pub use recurrent::{Lstm, LstmCell, LstmRun, LstmState};
 pub use regime::{
@@ -116,6 +119,6 @@ pub mod prelude {
         PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot, ResidualClaim,
         ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential,
         Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh, Tensor, TrainStep,
-        Trainer,
+        Trainer, cosine_annealing_lr, one_cycle_lr,
     };
 }

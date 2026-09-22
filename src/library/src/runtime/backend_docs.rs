@@ -56,6 +56,15 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn divide_backward_denominator(
+        &self,
+        _gradient: &Buffer,
+        _numerator: &Buffer,
+        _denominator: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn mask_gradient(&self, _gradient: &Buffer, _winners: &Buffer) -> Result<Buffer> {
         unavailable()
     }
@@ -171,6 +180,25 @@ impl Device {
         _gradient: &Buffer,
         _logits: &Buffer,
         _targets: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn binary_cross_entropy_weighted(
+        &self,
+        _logits: &Buffer,
+        _targets: &Buffer,
+        _pos_weight: &Buffer,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn binary_cross_entropy_weighted_backward(
+        &self,
+        _gradient: &Buffer,
+        _logits: &Buffer,
+        _targets: &Buffer,
+        _pos_weight: &Buffer,
     ) -> Result<Buffer> {
         unavailable()
     }

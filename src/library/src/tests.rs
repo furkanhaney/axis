@@ -502,6 +502,76 @@ fn odd_features_short_batch_unrelated_axes_and_storage_order() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn bias_disabled_linear_has_only_a_weight_parameter_and_matches_a_hand_computed_oracle()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature, output) = (
+        Axis::new("batch"),
+        Axis::new("feature"),
+        Axis::new("output"),
+    );
+    let values = [1.0, -2.0, 0.5, 3.0, -0.25, 1.5]; // [batch=3, feature=2]
+    let weights = [0.5, -1.0, 2.0, 0.25]; // [feature=2, output=2]
+    let x = Tensor::from_slice(&values, [batch.of(3), feature.of(2)], &device)?.with_grad();
+    let mut model = Linear::new(feature, output.of(2)).bias(false);
+    model.build(&Shape::new([batch.of(3), feature.of(2)])?, &device, 3)?;
+
+    let named = model.named_parameters();
+    assert_eq!(
+        named.len(),
+        1,
+        "a bias-disabled Linear must expose only its weight"
+    );
+    assert_eq!(named[0].0, "weight");
+    let weight = model.parameters()[0].clone();
+    assert_eq!(
+        weight.tensor().shape().len(),
+        2 * 2,
+        "parameter count must be exactly in * out, with no + out for a bias"
+    );
+    weight.set_values(&weights)?;
+
+    let prediction = model.forward(&x)?;
+    let mut expected = vec![0.0_f64; 3 * 2];
+    for r in 0..3 {
+        for j in 0..2 {
+            expected[r * 2 + j] = (0..2)
+                .map(|i| f64::from(values[r * 2 + i]) * f64::from(weights[i * 2 + j]))
+                .sum();
+        }
+    }
+    close("bias-disabled forward", &prediction.to_vec()?, &expected);
+
+    prediction
+        .mul(&prediction)?
+        .mean([batch, output])?
+        .backward()?;
+    let mut dx = vec![0.0_f64; values.len()];
+    let mut dw = vec![0.0_f64; weights.len()];
+    for r in 0..3 {
+        for j in 0..2 {
+            let dy = 2.0 * expected[r * 2 + j] / 6.0;
+            for i in 0..2 {
+                dx[r * 2 + i] += dy * f64::from(weights[i * 2 + j]);
+                dw[i * 2 + j] += dy * f64::from(values[r * 2 + i]);
+            }
+        }
+    }
+    close(
+        "bias-disabled input gradients",
+        &x.grad().unwrap().to_vec()?,
+        &dx,
+    );
+    close(
+        "bias-disabled weight gradients",
+        &weight.grad().unwrap().to_vec()?,
+        &dw,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn shared_axes_contract_and_both_input_derivatives() -> Result<()> {
     let device = Device::cuda(0)?;
     let (b, h, f, time) = (
@@ -864,6 +934,158 @@ fn binary_cross_entropy_is_stable_and_differentiable() -> Result<()> {
     assert!(logits.item().is_err());
     assert!(logits.scale(f32::NAN).is_err());
     assert!(logits.inverse_sqrt(0.0).is_err());
+    Ok(())
+}
+
+// Independent derivation for `binary_cross_entropy_with_logits_weighted`, matching
+// `torch.nn.BCEWithLogitsLoss(pos_weight=p)`:
+//   loss = -[p*y*log(sigma(x)) + (1-y)*log(1-sigma(x))]
+// Using log(sigma(x)) = x - softplus(x) and log(1-sigma(x)) = -softplus(x):
+//   loss = -p*y*x + softplus(x)*(p*y + 1 - y) = log_weight*softplus(x) - p*y*x
+// where log_weight = 1 + (p-1)*y and softplus(x) is the same stable
+// max(x,0) + log(1+exp(-|x|)) form the unweighted kernel already uses (log_weight == 1
+// at p == 1, recovering the unweighted formula exactly — the shared oracle case).
+//   d(loss)/dx = log_weight*sigma(x) - p*y
+#[test]
+#[ignore = "requires CUDA"]
+fn binary_cross_entropy_weighted_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let values = [-1000.0_f32, -2.0, 0.0, 2.0, 1000.0];
+    let target_values = [0.0_f32, 1.0, 0.0, 1.0, 1.0];
+    let logits = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let targets = Tensor::from_slice(&target_values, [feature.of(target_values.len())], &device)?;
+    // gastric's AxialMIL sets one scalar `pos_weight` per fold from its class balance
+    // (`train_axial_mil.py:336`); a nontrivial scalar (!= 1) is this test's scalar case.
+    let pos_weight = Tensor::from_slice(&[3.0_f32], [], &device)?;
+
+    let losses = logits.binary_cross_entropy_with_logits_weighted(&targets, &pos_weight)?;
+    // Hand-computed at p = 3, from the derivation above:
+    //   x=-1000, y=0: log_weight=1, softplus=0                 -> loss=0
+    //   x=-2,    y=1: log_weight=3, softplus=0.12692801104297  -> loss=3*0.12692801104297 - 3*1*(-2) = 6.38078403312892
+    //   x=0,     y=0: log_weight=1, softplus=ln(2)=0.69314718056 -> loss=0.69314718056
+    //   x=2,     y=1: log_weight=3, softplus=2.12692801104297  -> loss=3*2.12692801104297 - 3*1*2 = 0.38078403312892
+    //   x=1000,  y=1: log_weight=3, softplus=1000               -> loss=3*1000 - 3*1*1000 = 0
+    let expected = [
+        0.0,
+        6.380_784_033_128_92,
+        std::f64::consts::LN_2, // x=0, y=0: loss = softplus(0) - 0 = ln(1 + e^0) = ln(2) exactly
+        0.380_784_033_128_92,
+        0.0,
+    ];
+    close(
+        "weighted binary cross-entropy",
+        &losses.to_vec()?,
+        &expected,
+    );
+
+    losses.mean(feature)?.backward()?;
+    // d(loss)/dx above, divided by the 5-element mean:
+    //   x=-1000: 1*0 - 3*0 = 0                     -> 0
+    //   x=-2:    3*0.11920292202212 - 3*1 = -2.64239123393365 -> /5 = -0.52847824678673
+    //   x=0:     1*0.5 - 3*0 = 0.5                  -> /5 = 0.1
+    //   x=2:     3*0.88079707797788 - 3*1 = -0.35760876606635 -> /5 = -0.07152175321327
+    //   x=1000:  3*1 - 3*1 = 0                      -> 0
+    let expected_gradient = [0.0, -0.528_478_246_786_73, 0.1, -0.071_521_753_213_27, 0.0];
+    close(
+        "weighted binary cross-entropy gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits_weighted(&targets, &pos_weight.with_grad())
+            .is_err()
+    );
+    let other = Axis::new("other");
+    let wrong_axes = Tensor::from_slice(&target_values, [other.of(5)], &device)?;
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits_weighted(&targets, &wrong_axes)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn binary_cross_entropy_weighted_broadcasts_a_per_class_tensor_over_reordered_storage() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let (batch, class) = (
+        Axis::new("weighted_bce_batch"),
+        Axis::new("weighted_bce_class"),
+    );
+    // morpheus's objectness head weights `F.binary_cross_entropy_with_logits` by a
+    // per-class tensor broadcast over batch and spatial axes
+    // (`train_sup.py:156-157`, `pos_weight=pw[None,:,None,None]`); batch/class stand in
+    // for that broadcast shape here. `with_layout` keeps the tensor's own logical
+    // [class, batch] axis order (so `to_vec()`'s coordinate walk stays class-major) but
+    // requests batch-major physical strides, forcing the op to read a genuinely permuted,
+    // non-contiguous buffer rather than one that already matches its own shape order --
+    // the CUDA non-trivial-layout case.
+    let logit_values = [0.5_f32, -0.25, -1.5, 1.0, 2.0, -2.0]; // [class, batch]: c0b0,c0b1,c1b0,c1b1,c2b0,c2b1
+    let target_values = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0];
+    let pos_weight_values = [2.0_f32, 0.5, 4.0]; // per class, matches pw[None,:,None,None]
+
+    let logits = Tensor::from_slice(&logit_values, [class.of(3), batch.of(2)], &device)?
+        .with_layout([batch, class])?
+        .with_grad();
+    let targets = Tensor::from_slice(&target_values, [class.of(3), batch.of(2)], &device)?
+        .with_layout([batch, class])?;
+    let pos_weight = Tensor::from_slice(&pos_weight_values, [class.of(3)], &device)?;
+
+    let losses = logits.binary_cross_entropy_with_logits_weighted(&targets, &pos_weight)?;
+
+    // (x, y, p) in [class, batch] row-major order -- the tensors' own logical shape,
+    // unchanged by `with_layout` -- matching `to_vec()`'s coordinate walk.
+    let logical = [
+        (0.5_f64, 1.0_f64, 2.0_f64), // class0, batch0
+        (-0.25, 0.0, 2.0),           // class0, batch1
+        (-1.5, 0.0, 0.5),            // class1, batch0
+        (1.0, 1.0, 0.5),             // class1, batch1
+        (2.0, 1.0, 4.0),             // class2, batch0
+        (-2.0, 0.0, 4.0),            // class2, batch1
+    ];
+    let softplus = |x: f64| x.max(0.0) + (-x.abs()).exp().ln_1p();
+    let expected_loss: Vec<f64> = logical
+        .iter()
+        .map(|&(x, y, p)| {
+            let log_weight = 1.0 + (p - 1.0) * y;
+            log_weight * softplus(x) - p * y * x
+        })
+        .collect();
+    close(
+        "weighted binary cross-entropy (per-class broadcast, reordered storage)",
+        &losses.to_vec()?,
+        &expected_loss,
+    );
+
+    losses.mean([batch, class])?.backward()?;
+    let expected_gradient: Vec<f64> = logical
+        .iter()
+        .map(|&(x, y, p)| {
+            let log_weight = 1.0 + (p - 1.0) * y;
+            let sigma = 1.0 / (1.0 + (-x).exp());
+            (log_weight * sigma - p * y) / logical.len() as f64
+        })
+        .collect();
+    close(
+        "weighted binary cross-entropy gradient (per-class broadcast, reordered storage)",
+        &logits.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    let wrong_extent = Tensor::from_slice(&[1.0_f32, 2.0], [class.of(2)], &device)?;
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits_weighted(&targets, &wrong_extent)
+            .is_err()
+    );
     Ok(())
 }
 
@@ -3332,5 +3554,298 @@ fn binary_alignment_of_permuted_layouts_matches_values_and_gradients() -> Result
         &field.grad().expect("field gradient").to_vec()?,
         &[1.0 / 6.0; 6],
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn elementwise_division_matches_hand_computed_forward_and_both_gradients() -> Result<()> {
+    // world/energy-output and world/fluid both divide a per-feature sum by a
+    // per-feature, data-dependent count; upscale_eval divides one MSE by
+    // another. All three need forward plus the gradient with respect to BOTH
+    // operands, matching hand-derived d/da = g/b and d/db = -g*a/b^2.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let a_values = [2.0f32, -3.0, 4.5, 0.5];
+    let b_values = [4.0f32, 1.5, -2.0, 0.25];
+    let a = Tensor::from_slice(&a_values, [sample.of(4)], &device)?.with_grad();
+    let b = Tensor::from_slice(&b_values, [sample.of(4)], &device)?.with_grad();
+    let quotient = a.div(&b)?;
+    close(
+        "division forward",
+        &quotient.to_vec()?,
+        &[0.5, -2.0, -2.25, 2.0],
+    );
+    quotient.mean(sample)?.backward()?;
+    close(
+        "division numerator gradient",
+        &a.grad().expect("numerator gradient").to_vec()?,
+        &[0.0625, 1.0 / 6.0, -0.125, 1.0],
+    );
+    close(
+        "division denominator gradient",
+        &b.grad().expect("denominator gradient").to_vec()?,
+        &[-0.03125, 1.0 / 3.0, -0.28125, -2.0],
+    );
+
+    // Masked-mean shape from energy-output's `losses / counts.clamp(min=1)`:
+    // a per-column sum divided by a per-column count that the CONSUMER has
+    // already clamped away from zero before calling div. Axis performs no
+    // clamping or epsilon of its own; division by an actual zero yields IEEE
+    // inf/nan, as in PyTorch.
+    let feature = Axis::new("feature");
+    let sums = Tensor::from_slice(&[10.0f32, 6.0, 0.0], [feature.of(3)], &device)?.with_grad();
+    let counts = Tensor::from_slice(&[5.0f32, 1.0, 1.0], [feature.of(3)], &device)?.with_grad();
+    let ratio = sums.div(&counts)?;
+    close("masked-mean forward", &ratio.to_vec()?, &[2.0, 6.0, 0.0]);
+    ratio.mean(feature)?.backward()?;
+    close(
+        "masked-mean sums gradient",
+        &sums.grad().expect("sums gradient").to_vec()?,
+        &[1.0 / 15.0, 1.0 / 3.0, 1.0 / 3.0],
+    );
+    close(
+        "masked-mean counts gradient",
+        &counts.grad().expect("counts gradient").to_vec()?,
+        &[-2.0 / 15.0, -2.0, 0.0],
+    );
+
+    // Reordered-layout CUDA case: numerator and denominator share axes but
+    // keep different storage orders, mirroring
+    // binary_alignment_of_permuted_layouts for add.
+    let (batch, time) = (Axis::new("batch"), Axis::new("time"));
+    let num_values: Vec<_> = (0..6).map(|v| v as f32 + 1.0).collect();
+    let den_values: Vec<_> = (0..6).map(|v| 2.0 + v as f32 * 0.5).collect();
+    let numerator = Tensor::from_slice(&num_values, [batch.of(2), time.of(3)], &device)?
+        .with_layout([time, batch])?
+        .with_grad();
+    let denominator =
+        Tensor::from_slice(&den_values, [time.of(3), batch.of(2)], &device)?.with_grad();
+    let reordered = numerator.div(&denominator)?;
+    let shape = reordered.shape().clone();
+    let actual = reordered.to_vec()?;
+    let mut expected = Vec::with_capacity(6);
+    for index in 0..shape.len() {
+        let coords = shape.coords(index);
+        let at = |axis: Axis| coords[shape.index(axis).expect("shared axis")];
+        let (b, t) = (at(batch), at(time));
+        let numerator_value = f64::from(num_values[b * 3 + t]);
+        let denominator_value = f64::from(den_values[t * 2 + b]);
+        expected.push(numerator_value / denominator_value);
+    }
+    close("reordered division values", &actual, &expected);
+    Ok(())
+}
+
+#[test]
+fn cosine_annealing_lr_matches_pytorch_closed_form_at_exact_angles() -> Result<()> {
+    // torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=4, eta_min=0.0) from a base
+    // learning rate of 0.1: eta_t = eta_min + (eta_max - eta_min) * (1 + cos(pi * t / T_max)) / 2.
+    // Steps 0..=4 land exactly on cos(0), cos(pi/4), cos(pi/2), cos(3pi/4), cos(pi)
+    // = 1, sqrt(2)/2, 0, -sqrt(2)/2, -1 — well-known values, not approximated by the op
+    // under test.
+    let actual: Vec<f32> = (0u32..=4)
+        .map(|step| cosine_annealing_lr(0.1, 0.0, 4, step))
+        .collect::<Result<_>>()?;
+    close(
+        "cosine annealing at exact trig angles",
+        &actual,
+        &[0.1, 0.08535533905932738, 0.05, 0.014644660940672627, 0.0],
+    );
+    assert!(cosine_annealing_lr(0.1, 0.2, 4, 0).is_err());
+    assert!(cosine_annealing_lr(0.1, 0.0, 0, 0).is_err());
+    Ok(())
+}
+
+#[test]
+fn one_cycle_lr_matches_pytorch_default_schedule() -> Result<()> {
+    // torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1.0, total_steps=10) at PyTorch's
+    // own defaults (pct_start=0.3, div_factor=25, final_div_factor=1e4, anneal_strategy="cos"):
+    // step_size_up = 0.3*10 - 1 = 2, step_size_down = (10-1) - 2 = 7; initial_lr = 1/25 = 0.04,
+    // min_lr = 0.04/1e4 = 0.000004. Ten values, one per call to get_last_lr() after each
+    // .step(), computed independently from the same public closed form (not the op under
+    // test): warmup crosses exactly through max_lr at step 2 (the phase boundary), and the
+    // final value at step 9 is the exact rational 1/25/10000.
+    let actual: Vec<f32> = (0u32..10)
+        .map(|step| one_cycle_lr(1.0, 10, step))
+        .collect::<Result<_>>()?;
+    close(
+        "one-cycle default schedule",
+        &actual,
+        &[
+            0.040000000000000036,
+            0.52,
+            1.0,
+            0.9504846320134737,
+            0.8117456539497631,
+            0.6112620219362893,
+            0.38874197806371075,
+            0.18825834605023697,
+            0.049519367986526286,
+            0.000004,
+        ],
+    );
+    assert!(one_cycle_lr(1.0, 10, 10).is_err());
+    assert!(one_cycle_lr(1.0, 1, 0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn trainer_driven_sgd_consumes_a_cosine_annealing_schedule_each_step() -> Result<()> {
+    // The consumer's own training loop shape: call the pure schedule function, hand the
+    // result to the optimizer's setter, then let Trainer::step order zero_grad/loss/
+    // backward/optimizer.step as usual. This is the end-to-end witness that Trainer and SGD
+    // actually consume the scheduled rate, not just that the schedule function is correct in
+    // isolation (that is covered independently above).
+    struct ConstantGradientParameter(Parameter);
+    impl Module for ConstantGradientParameter {
+        fn output_shape(&self, input: &Shape) -> Result<Shape> {
+            Ok(input.clone())
+        }
+        fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+            Ok(input.clone())
+        }
+        fn forward(&self, _input: &Tensor) -> Result<Tensor> {
+            Ok(self.0.tensor())
+        }
+        fn named_parameters(&self) -> Vec<(String, Parameter)> {
+            vec![("weight".into(), self.0.clone())]
+        }
+    }
+
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let parameter = Parameter::new(Tensor::from_slice(&[1.0, 2.0], [feature.of(2)], &device)?);
+    let dummy = Tensor::from_slice(&[0.0, 0.0], [feature.of(2)], &device)?;
+    let mut model = ConstantGradientParameter(parameter.clone());
+    let mut trainer = Trainer::new(SGD::new(1.0)?);
+
+    // eta_max=0.5, eta_min=0.1, t_max=2: step 0 -> 0.5 (cos(0)=1), step 1 -> 0.3 (cos(pi/2)=0).
+    let mut expected = [1.0_f64, 2.0_f64];
+    for step in 0..2u32 {
+        let rate = cosine_annealing_lr(0.5, 0.1, 2, step)?;
+        trainer.optimizer_mut().set_learning_rate(rate)?;
+        trainer.step(&mut model, |model| model.forward(&dummy)?.mean(feature))?;
+        // The identity forward's mean over 2 elements has a constant gradient of 1/2 per
+        // element regardless of the parameter's value, so the expected update is exact
+        // arithmetic independent of both the schedule and SGD implementations.
+        for value in &mut expected {
+            *value -= f64::from(rate) * 0.5;
+        }
+        close(
+            &format!("trainer-driven SGD step {step} at scheduled rate {rate}"),
+            &parameter.tensor().to_vec()?,
+            &expected,
+        );
+    }
+    assert_eq!(trainer.completed_steps(), 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature, group, combined, missing) = (
+        Axis::new("batch"),
+        Axis::new("feature"),
+        Axis::new("group"),
+        Axis::new("combined"),
+        Axis::new("missing"),
+    );
+
+    // Three unequal-width operands (mirrors the gastric PhaseSeparableFusion
+    // 5*256+3+512 unequal-width cat): declared axis order [batch, feature] on
+    // the first operand, a physically permuted layout on the second (same
+    // declared order, transposed storage), and a swapped declared axis order
+    // on the third, checking that the output follows the FIRST operand only.
+    let a = Tensor::from_slice(
+        &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let b = Tensor::from_slice(
+        &[10.0, 11.0, 12.0, 13.0],
+        [batch.of(2), feature.of(2)],
+        &device,
+    )?
+    .with_layout([feature, batch])?
+    .with_grad();
+    let c = Tensor::from_slice(&[100.0, 101.0], [feature.of(1), batch.of(2)], &device)?.with_grad();
+
+    let concatenated = Tensor::concat(&[a.clone(), b.clone(), c.clone()], feature)?;
+    assert_eq!(
+        concatenated.shape(),
+        &Shape::new([batch.of(2), feature.of(6)])?
+    );
+    close(
+        "unequal-width concat values",
+        &concatenated.to_vec()?,
+        &[
+            0.0, 1.0, 2.0, 10.0, 11.0, 100.0, 3.0, 4.0, 5.0, 12.0, 13.0, 101.0,
+        ],
+    );
+
+    let upstream = Tensor::from_slice(
+        &(1..=12).map(|v| v as f32).collect::<Vec<_>>(),
+        [batch.of(2), feature.of(6)],
+        &device,
+    )?;
+    concatenated
+        .mul(&upstream)?
+        .mean([batch, feature])?
+        .backward()?;
+    close(
+        "unequal-width concat gradient a",
+        &a.grad().expect("a gradient").to_vec()?,
+        &[
+            1.0 / 12.0,
+            2.0 / 12.0,
+            3.0 / 12.0,
+            7.0 / 12.0,
+            8.0 / 12.0,
+            9.0 / 12.0,
+        ],
+    );
+    close(
+        "unequal-width concat gradient b",
+        &b.grad().expect("b gradient").to_vec()?,
+        &[4.0 / 12.0, 5.0 / 12.0, 10.0 / 12.0, 11.0 / 12.0],
+    );
+    close(
+        "unequal-width concat gradient c",
+        &c.grad().expect("c gradient").to_vec()?,
+        &[6.0 / 12.0, 12.0 / 12.0],
+    );
+
+    // Equal-width cross-check: concat must agree bit-for-bit with the
+    // already-proven stack+merge composition (group outer, feature inner).
+    let x = Tensor::from_slice(
+        &[1.0, -2.0, 3.0, -4.0, 5.0, -6.0],
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let y = Tensor::from_slice(
+        &[7.0, -8.0, 9.0, -10.0, 11.0, -12.0],
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?;
+    let by_concat = Tensor::concat(&[x.clone(), y.clone()], feature)?;
+    let stacked = Tensor::stack(&[x, y], group, 2)?;
+    let by_stack_and_merge = stacked.merge([group, feature], combined)?;
+    assert_eq!(by_concat.to_vec()?, by_stack_and_merge.to_vec()?);
+
+    // Rejections: axis must already exist (unlike `stack`), axis sets must
+    // match exactly, and with more than two operands a mismatched
+    // non-concat-axis extent must be rejected before any device work.
+    assert!(Tensor::concat(std::slice::from_ref(&a), missing).is_err());
+    let wrong_axes = Tensor::from_slice(&[0.0, 1.0], [missing.of(2)], &device)?;
+    assert!(Tensor::concat(&[a.clone(), wrong_axes], feature).is_err());
+    let mismatched_batch =
+        Tensor::from_slice(&[0.0, 1.0, 2.0], [batch.of(1), feature.of(3)], &device)?;
+    assert!(Tensor::concat(&[a.clone(), b.clone(), mismatched_batch], feature).is_err());
+    println!("concat values, gradients, and composed-path cross-check PASS");
     Ok(())
 }

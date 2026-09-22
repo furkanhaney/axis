@@ -64,7 +64,13 @@ remain independent of optimizer and tensor execution; see
 `Adam` and `AdamW` keep first/second moments and parameter updates on the GPU.
 Their constructor defaults use beta1 `0.9`, beta2 `0.999`, and epsilon `1e-8`;
 learning rate remains explicit, and AdamW also requires explicit decoupled
-weight decay.
+weight decay. `SGD`, `Adam`, and `AdamW` each expose `set_learning_rate` to
+overwrite that rate before a step; `cosine_annealing_lr` and `one_cycle_lr`
+are pure functions of the step index that reproduce PyTorch's own
+`CosineAnnealingLR` and default-configuration `OneCycleLR` value sequences
+(`optim.rs` doc comments cite both closed forms) for a consumer's training
+loop to call once per step and feed to the setter — Axis has no stateful
+scheduler object.
 
 `Muon` applies EMA momentum, optional Nesterov interpolation, five-step
 Newton-Schulz orthogonalization, original rectangular-matrix scaling, and
@@ -349,14 +355,14 @@ provenance contract; reading a file is not itself a research guarantee.
 
 | Operation | Contract |
 |---|---|
-| `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. |
+| `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. Carries a learned `[output]` bias by default; `.bias(false)` before `build` omits it entirely, so `named_parameters` has only `weight`. |
 | `x.squared_error(y)` | Align identical axis sets by identity, require equal extents, preserve the unreduced shape. |
 | `x.mean(axes)` | Remove precisely those axes; backward broadcasts and divides by their extent product. Scalar `.backward()` requires all loss axes to have been reduced. |
 | `x.moments(axes)` / `x.mean_square(axes)` | Require at least one named axis and return population statistics with precisely those axes removed. Gradients broadcast through the original logical axes. |
 | `x.sin()` | Apply elementwise sine in radians without changing axes or layout; backward multiplies by cosine of the saved input. |
 | `CentralDifference(coordinate, step)` | Record which coordinate was shifted, require a finite positive step and identically ordered shapes on one device, and construct differentiable first or second centered stencils. It does not prove the caller's sampling or discretization method. |
 | `x.min(axis)` | Remove one named axis and preserve unrelated axes. Ignore NaN and infinities, choose the first logical coordinate on finite ties, and route backward only to that winner. A group with no finite value returns NaN with zero derivative even under a non-finite upstream derivative. Forward and backward remain device-resident. |
-| Elementwise add/multiply | Align shared identities with equal extents. Permit scalar or subset-axis broadcasting, such as a `[hidden]` bias on `[batch, hidden]`. |
+| Elementwise add/multiply/divide | Align shared identities with equal extents. Permit scalar or subset-axis broadcasting, such as a `[hidden]` bias on `[batch, hidden]`. `x.div(y)` applies no epsilon or clamping; division by zero yields IEEE `inf`/`nan`, as in PyTorch, and callers that need a safe denominator (such as a masked-mean count) must clamp it themselves before dividing. |
 | Incomparable axis sets | Require explicit expansion. `[batch, time] + [batch, hidden]` must not silently create `[batch, time, hidden]`. |
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
@@ -364,6 +370,7 @@ provenance contract; reading a file is not itself a research guarantee.
 | `pad_zeros(axis, before, after)` | Preserve logical axis order and add exact zero-valued coordinates independently on each side. Backward crops to the original extent and layout. Zero/zero padding shares storage. |
 | `narrow(axis, start, length)` | Preserve the named axis and select a checked nonempty contiguous interval. Backward inserts exact zeros outside the interval. A full-axis interval shares storage. |
 | `Tensor::stack(values, axis, position)` | Require identical named input shapes and devices; insert the new logical axis at the declared position. Store sources contiguously under a stack-major physical layout and slice each derivative back to its source. |
+| `Tensor::concat(values, axis)` | Require an axis every operand already has, with every other axis identical by identity and extent; sum each operand's extent on that axis and preserve the first operand's axis order. Composed from `pad_zeros` and `add`: each operand is zero-padded into its own slice, then summed, so backward narrows the incoming gradient to each operand without a dedicated rule. |
 | `causal_mask(query, key)` | Require distinct axes with equal extents; replace key positions greater than query positions with negative infinity and give them zero derivative. Square, zero-offset self-attention only. |
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
 | `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |
@@ -372,6 +379,7 @@ provenance contract; reading a file is not itself a research guarantee.
 | Named normalization | Normalize only the declared axes. Layer/RMS affine parameters span the declared normalized shape; group/instance affine parameters span the channel axis. Preserve every input axis and reject changed built extents or group geometry. |
 | `Lstm(input, hidden, time)` | Apply a standard IFGO transition in logical time-coordinate order. Preserve unrelated stream axes, replace input with hidden, accept explicit hidden/cell state, and return both the complete sequence and connected terminal state. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
+| `binary_cross_entropy_with_logits_weighted(target, pos_weight)` | Same contract, plus a positive-class weight (`torch.nn.BCEWithLogitsLoss(pos_weight=...)`) that scales the positive term before the negative term is added, changing the loss value itself. `pos_weight` follows the same subset-axis broadcasting as elementwise `add`/`mul` (a scalar or, e.g., one weight per class); targets and `pos_weight` are both constants. |
 | `categorical_cross_entropy_with_logits(target, class)` | Accept constant one-hot/probability targets over the same axes, stably reduce the named class axis, and preserve all other axes. Backward is `softmax(logits) - target`. |
 | `Conv(input, output, spatial)` | Transform channels and spatial extents by the stated stride/padding/dilation rules. Preserve all unrelated axes. |
 | `cross_entropy(target, class)` | Consume the named class axis; target axes must exactly match the remaining axes. Return their unreduced losses; integer targets have no gradient. |

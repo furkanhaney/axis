@@ -22,13 +22,20 @@ unexercised surface area.
 
 ## Current surface
 
-Axis already has `Linear`, `PopulationLinear`, `Conv2d`, `Conv3d`, named-axis
+Axis already has `Linear` (bias on by default; `.bias(false)` before `build`
+omits the bias parameter entirely, so `named_parameters` then has only
+`weight`), `PopulationLinear` (bias always present; not yet given the same
+option), `Conv2d`, `Conv3d`, named-axis
 `LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, one-hot
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
 `GELU`, `ExactGELU`, `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
 `Sequential`, with tensor-level losses, sine, differentiable central
 differences, softmax, causal masking, attention
 composition, named reductions, data regimes, metrics, trainers, and optimizers.
+`SGD`, `Adam`, and `AdamW` take a per-step learning rate through
+`set_learning_rate`, driven by the pure `cosine_annealing_lr` and
+`one_cycle_lr` schedule functions (`optim.rs`); there is still no gradient
+clipping or mixed precision.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
 

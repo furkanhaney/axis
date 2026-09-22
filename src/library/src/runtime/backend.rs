@@ -156,6 +156,23 @@ impl Device {
             .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    /// `-gradient * numerator / denominator^2`: the divisor's gradient in `a / b`.
+    pub(crate) fn divide_backward_denominator(
+        &self,
+        gradient: &Buffer,
+        numerator: &Buffer,
+        denominator: &Buffer,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(denominator.shape()[0] as usize)?;
+        kernels::divide_backward_denominator(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            numerator.as_ref(),
+            denominator.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn mask_gradient(&self, gradient: &Buffer, winners: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(gradient.shape()[0] as usize)?;
         kernels::mask_gradient(
@@ -353,6 +370,40 @@ impl Device {
             gradient.as_ref(),
             logits.as_ref(),
             targets.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn binary_cross_entropy_weighted(
+        &self,
+        logits: &Buffer,
+        targets: &Buffer,
+        pos_weight: &Buffer,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(logits.shape()[0] as usize)?;
+        kernels::binary_cross_entropy_weighted(
+            (&mut out).partition([128]),
+            logits.as_ref(),
+            targets.as_ref(),
+            pos_weight.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn binary_cross_entropy_weighted_backward(
+        &self,
+        gradient: &Buffer,
+        logits: &Buffer,
+        targets: &Buffer,
+        pos_weight: &Buffer,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(logits.shape()[0] as usize)?;
+        kernels::binary_cross_entropy_weighted_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            logits.as_ref(),
+            targets.as_ref(),
+            pos_weight.as_ref(),
         )
         .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
@@ -1798,6 +1849,48 @@ mod kernels {
         let probability = select(gt_tile(z, zero), one / (one + e), e / (one + e));
         out.store(gradient.load_like(out) * (probability - y));
     }
+    // Weighted binary cross-entropy: -[p*y*log(sigma(x)) + (1-y)*log(1-sigma(x))], which
+    // expands (see `binary_cross_entropy_with_logits_weighted`'s derivation) to
+    // `log_weight * softplus_stable(x) - p*y*x` with `log_weight = 1 + (p-1)*y`; reduces to
+    // the unweighted kernel above at `p == 1`, where `log_weight == 1`.
+    #[cutile::entry()]
+    fn binary_cross_entropy_weighted(
+        out: &mut Tensor<f32, { [128] }>,
+        logits: &Tensor<f32, { [-1] }>,
+        targets: &Tensor<f32, { [-1] }>,
+        pos_weight: &Tensor<f32, { [-1] }>,
+    ) {
+        let z = logits.load_like(out);
+        let y = targets.load_like(out);
+        let p = pos_weight.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let magnitude = max_tile(z, zero - z);
+        let softplus = max_tile(z, zero) + log(one + exp(zero - magnitude));
+        let log_weight = one + (p - one) * y;
+        out.store(log_weight * softplus - p * y * z);
+    }
+    // d/dx of the weighted loss above is `log_weight * sigma(x) - p*y`; reduces to the
+    // unweighted backward kernel above at `p == 1`.
+    #[cutile::entry()]
+    fn binary_cross_entropy_weighted_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        logits: &Tensor<f32, { [-1] }>,
+        targets: &Tensor<f32, { [-1] }>,
+        pos_weight: &Tensor<f32, { [-1] }>,
+    ) {
+        let z = logits.load_like(out);
+        let y = targets.load_like(out);
+        let p = pos_weight.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let magnitude = max_tile(z, zero - z);
+        let e = exp(zero - magnitude);
+        let probability = select(gt_tile(z, zero), one / (one + e), e / (one + e));
+        let log_weight = one + (p - one) * y;
+        out.store(gradient.load_like(out) * (log_weight * probability - p * y));
+    }
     #[cutile::entry()]
     fn categorical_cross_entropy(
         out: &mut Tensor<f32, { [1] }>,
@@ -1974,8 +2067,10 @@ mod kernels {
             out.store(x + y);
         } else if OP == 1 {
             out.store(x - y);
-        } else {
+        } else if OP == 2 {
             out.store(x * y);
+        } else {
+            out.store(x / y);
         }
     }
     #[cutile::entry()]
@@ -2281,5 +2376,20 @@ mod kernels {
         let one = constant(1.0f32, shape![1]);
         let zero = constant(0.0f32, shape![1]);
         out.store(select(eq_tile(winner, input), one, zero));
+    }
+
+    /// `-gradient * numerator / denominator^2`, the divisor's gradient in `a / b`.
+    #[cutile::entry()]
+    fn divide_backward_denominator(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        numerator: &Tensor<f32, { [-1] }>,
+        denominator: &Tensor<f32, { [-1] }>,
+    ) {
+        let g = gradient.load_like(out);
+        let a = numerator.load_like(out);
+        let b = denominator.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        out.store((zero - g) * a / (b * b));
     }
 }

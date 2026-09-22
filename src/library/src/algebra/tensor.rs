@@ -88,6 +88,11 @@ enum Rule {
     Zero(usize),
     Scale(f32),
     Multiply(Buffer),
+    Divide(Buffer),
+    DivideDenominator {
+        numerator: Buffer,
+        denominator: Buffer,
+    },
     Relu(Buffer),
     Sigmoid(Buffer),
     Silu(Buffer),
@@ -106,6 +111,11 @@ enum Rule {
     BinaryCrossEntropy {
         logits: Buffer,
         targets: Buffer,
+    },
+    BinaryCrossEntropyWeighted {
+        logits: Buffer,
+        targets: Buffer,
+        pos_weight: Buffer,
     },
     CategoricalCrossEntropy {
         probability: Buffer,
@@ -570,9 +580,16 @@ impl Tensor {
         let rules = match op {
             0 => (Rule::Identity, Rule::Identity),
             1 => (Rule::Identity, Rule::Scale(-1.0)),
-            _ => (
+            2 => (
                 Rule::Multiply(b.0.value.clone()),
                 Rule::Multiply(a.0.value.clone()),
+            ),
+            _ => (
+                Rule::Divide(b.0.value.clone()),
+                Rule::DivideDenominator {
+                    numerator: a.0.value.clone(),
+                    denominator: b.0.value.clone(),
+                },
             ),
         };
         Ok(Self::node(
@@ -593,6 +610,13 @@ impl Tensor {
     }
     pub fn mul(&self, rhs: &Self) -> Result<Self> {
         self.binary(rhs, 2)
+    }
+    /// Elementwise `self / rhs`. Same shape-agreement contract as [`Tensor::mul`]:
+    /// identical axis sets, no implicit alignment. Division by zero follows IEEE
+    /// float semantics (produces `inf`/`nan`, as in PyTorch); callers that need a
+    /// safe denominator must clamp it themselves before dividing.
+    pub fn div(&self, rhs: &Self) -> Result<Self> {
+        self.binary(rhs, 3)
     }
     pub fn squared_error(&self, rhs: &Self) -> Result<Self> {
         if self.shape().rank() != rhs.shape().rank()
@@ -638,6 +662,78 @@ impl Tensor {
                 Rule::BinaryCrossEntropy {
                     logits: logits.0.value.clone(),
                     targets: targets.0.value.clone(),
+                },
+            )],
+            false,
+            None,
+        ))
+    }
+    /// Stable elementwise binary cross-entropy with an explicit positive-class weight,
+    /// matching `torch.nn.BCEWithLogitsLoss(pos_weight=...)`: the positive term of each
+    /// element's loss is scaled by `pos_weight` before the negative term is added, so
+    /// `pos_weight` changes the loss value itself and is not reachable by scaling the
+    /// unweighted loss afterward. `pos_weight` may be a scalar or may broadcast over any
+    /// subset of `self`'s axes (for example one weight per class, broadcasting over batch
+    /// and spatial axes); it follows the same subset-axis broadcasting as elementwise
+    /// `add`/`mul`, never an implicit outer product. Targets and `pos_weight` are
+    /// constants in reverse mode.
+    pub fn binary_cross_entropy_with_logits_weighted(
+        &self,
+        targets: &Self,
+        pos_weight: &Self,
+    ) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("binary cross-entropy targets cannot require gradients".into());
+        }
+        if pos_weight.requires_grad() {
+            return Err("binary cross-entropy pos_weight cannot require gradients".into());
+        }
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err(
+                "binary_cross_entropy_with_logits_weighted requires identical axis sets for logits and targets"
+                    .into(),
+            );
+        }
+        if pos_weight
+            .shape()
+            .axes()
+            .iter()
+            .any(|&axis| !self.shape().contains(axis))
+        {
+            return Err(
+                "binary_cross_entropy_with_logits_weighted pos_weight axes must be a subset of the logits axes"
+                    .into(),
+            );
+        }
+        self.compatible_device(targets)?;
+        self.compatible_device(pos_weight)?;
+        self.shared_extents(targets)?;
+        self.shared_extents(pos_weight)?;
+        let logits = self.align(self.shape())?;
+        let targets = targets.align(self.shape())?;
+        let pos_weight = pos_weight.align(self.shape())?;
+        let value = self.device().binary_cross_entropy_weighted(
+            &logits.0.value,
+            &targets.0.value,
+            &pos_weight.0.value,
+        )?;
+        Ok(Self::node(
+            self.shape().clone(),
+            Layout::contiguous(self.shape()),
+            value,
+            self.device(),
+            vec![Edge::new(
+                &logits,
+                Rule::BinaryCrossEntropyWeighted {
+                    logits: logits.0.value.clone(),
+                    targets: targets.0.value.clone(),
+                    pos_weight: pos_weight.0.value.clone(),
                 },
             )],
             false,
@@ -1937,6 +2033,56 @@ impl Tensor {
             None,
         ))
     }
+    /// Concatenate two or more tensors along a named axis they already share,
+    /// extending that axis's extent by the sum of each operand's extent. Every
+    /// other axis must match exactly across operands (same identity, same
+    /// extent); the output's axis order follows the first operand's. This is
+    /// the wave-1-proven composition of `pad_zeros` and `add`: each operand is
+    /// zero-padded into its own slice of the concatenated axis, then the
+    /// padded tensors are summed, so backward automatically narrows the
+    /// incoming gradient back to each operand's slice with no dedicated rule.
+    pub fn concat(values: &[Self], axis: Axis) -> Result<Self> {
+        let first = values
+            .first()
+            .ok_or("concat requires at least one tensor")?;
+        first.shape().index(axis)?;
+        let mut total = 0usize;
+        for value in values {
+            first.compatible_device(value)?;
+            if value.shape().rank() != first.shape().rank()
+                || first
+                    .shape()
+                    .axes()
+                    .iter()
+                    .any(|candidate| !value.shape().contains(*candidate))
+            {
+                return Err("concat requires identical input axis sets".into());
+            }
+            for dim in first.shape().dims() {
+                if dim.axis != axis && value.extent(dim.axis)? != dim.extent {
+                    return Err(
+                        format!("concat requires matching extent for {:?}", dim.axis).into(),
+                    );
+                }
+            }
+            total = total
+                .checked_add(value.extent(axis)?)
+                .ok_or("concat extent overflow")?;
+        }
+        let mut offset = 0usize;
+        let mut result: Option<Self> = None;
+        for value in values {
+            let extent = value.extent(axis)?;
+            let after = total - offset - extent;
+            let padded = value.pad_zeros(axis, offset, after)?;
+            result = Some(match result {
+                Some(accumulated) => accumulated.add(&padded)?,
+                None => padded,
+            });
+            offset += extent;
+        }
+        Ok(result.expect("validated at least one tensor above"))
+    }
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
         let started = Instant::now();
@@ -2106,6 +2252,15 @@ impl Tensor {
                         Rule::Zero(len) => self.device().zeros_buffer(*len)?,
                         Rule::Scale(f) => self.device().scale(&gradient, *f)?,
                         Rule::Multiply(rhs) => self.device().binary(&gradient, rhs, 2)?,
+                        Rule::Divide(rhs) => self.device().binary(&gradient, rhs, 3)?,
+                        Rule::DivideDenominator {
+                            numerator,
+                            denominator,
+                        } => self.device().divide_backward_denominator(
+                            &gradient,
+                            numerator,
+                            denominator,
+                        )?,
                         Rule::Relu(x) => self.device().relu_backward(&gradient, x)?,
                         Rule::Sigmoid(probability) => {
                             self.device().sigmoid_backward(&gradient, probability)?
@@ -2128,6 +2283,13 @@ impl Tensor {
                         Rule::BinaryCrossEntropy { logits, targets } => self
                             .device()
                             .binary_cross_entropy_backward(&gradient, logits, targets)?,
+                        Rule::BinaryCrossEntropyWeighted {
+                            logits,
+                            targets,
+                            pos_weight,
+                        } => self.device().binary_cross_entropy_weighted_backward(
+                            &gradient, logits, targets, pos_weight,
+                        )?,
                         Rule::CategoricalCrossEntropy {
                             probability,
                             targets,
