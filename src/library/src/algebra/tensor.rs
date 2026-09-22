@@ -211,6 +211,7 @@ enum Rule {
         winners: Buffer,
     },
     Unfold(Rc<UnfoldSpec>),
+    Fold(Rc<UnfoldSpec>),
     Select(Rc<SelectSpec>),
     Window(Rc<WindowSpec>),
     StackSlice {
@@ -2608,7 +2609,23 @@ impl Tensor {
         patch: Dim,
         kernel: [usize; 2],
     ) -> Result<Self> {
-        self.unfold_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0], 0.0)
+        self.unfold_ungrouped(channels, spatial, patch, kernel, [1, 1], [0, 0])
+    }
+
+    /// Ungrouped `unfold` (im2col) with configurable stride and zero padding: the channel axis
+    /// is replaced in place by `patch`, spatial axes shrink to their windowed count. Backs the
+    /// `Unfold` module; [`Self::unfold2d`] is its fixed-stride-one, no-padding special case.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn unfold_ungrouped<const N: usize>(
+        &self,
+        channels: Axis,
+        spatial: [Axis; N],
+        patch: Dim,
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
+    ) -> Result<Self> {
+        self.unfold_configured(channels, spatial, None, patch, kernel, stride, padding, 0.0)
     }
 
     /// Lower a configured 2D or 3D convolution or pooling op to grouped patches. The group
@@ -2641,24 +2658,82 @@ impl Tensor {
         )
     }
 
+    /// `fold` (col2im), ungrouped: the adjoint of [`Self::unfold_ungrouped`]. `self` holds
+    /// `patch` in place of a channel axis, at the spatial extents `unfold` would have produced;
+    /// `image_shape` names the reconstructed channel and spatial axes at their full (pre-unfold)
+    /// extents. Backs the `Fold` module.
     #[allow(clippy::too_many_arguments)]
-    fn unfold_configured<const N: usize>(
+    pub(crate) fn fold_ungrouped<const N: usize>(
         &self,
+        image_shape: &Shape,
         channels: Axis,
         spatial: [Axis; N],
-        group: Option<Dim>,
         patch: Dim,
         kernel: [usize; N],
         stride: [usize; N],
         padding: [usize; N],
-        fill: f32,
     ) -> Result<Self> {
-        let name = format!("unfold{N}d");
-        if !fill.is_finite() && fill != f32::NEG_INFINITY {
-            return Err(format!("{name} fill must be finite or negative infinity").into());
-        }
+        self.fold_configured(
+            image_shape,
+            channels,
+            spatial,
+            None,
+            patch,
+            kernel,
+            stride,
+            padding,
+        )
+    }
+
+    /// `fold` (col2im), grouped: the adjoint of [`Self::unfold_grouped`]. Backs
+    /// `ConvTranspose1d`/`2d`/`3d`, whose forward is a contraction (expanding `input_in_group`
+    /// into `patch` against the weight) followed by this scatter-sum into the larger output.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fold_grouped<const N: usize>(
+        &self,
+        image_shape: &Shape,
+        channels: Axis,
+        spatial: [Axis; N],
+        group: Dim,
+        patch: Dim,
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
+    ) -> Result<Self> {
+        self.fold_configured(
+            image_shape,
+            channels,
+            spatial,
+            Some(group),
+            patch,
+            kernel,
+            stride,
+            padding,
+        )
+    }
+
+    /// Pure geometry shared by `unfold`/`fold` and their `Module::output_shape` queries: given a
+    /// channel+spatial "image" shape, the window geometry, and an optional group axis, the
+    /// resulting patches shape (spatial axes replaced by their windowed count; the channel axis
+    /// is replaced in place by `patch` when ungrouped, or removed with `[group, patch]` appended
+    /// when grouped), the patch extent that geometry implies (`channels_per_group * kernel
+    /// volume`), the input/output spatial extents, and `channels_per_group` itself. Builds no
+    /// layout or plan and never touches the device or the plan cache, so a `Module` can call it
+    /// from `output_shape`/`build` with no tensor in hand.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn unfold_shape<const N: usize>(
+        name: &str,
+        image_shape: &Shape,
+        channels: Axis,
+        spatial: [Axis; N],
+        group: Option<Dim>,
+        patch: Axis,
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
+    ) -> Result<(Shape, usize, [usize; N], [usize; N], usize)> {
         if !(N == 2 || N == 3) {
-            return Err("Axis unfold supports exactly two or three spatial axes".into());
+            return Err(format!("Axis {name} supports exactly two or three spatial axes").into());
         }
         for (index, &axis) in spatial.iter().enumerate() {
             if axis == channels || spatial[..index].contains(&axis) {
@@ -2671,10 +2746,10 @@ impl Tensor {
         if stride.contains(&0) {
             return Err(format!("{name} stride extents must be positive").into());
         }
-        let channel_extent = self.extent(channels)?;
+        let channel_extent = image_shape.extent(channels)?;
         let mut input_spatial = [0; N];
         for index in 0..N {
-            input_spatial[index] = self.extent(spatial[index])?;
+            input_spatial[index] = image_shape.extent(spatial[index])?;
         }
         let groups = group.map_or(1, |dim| dim.extent);
         if groups == 0 {
@@ -2710,18 +2785,12 @@ impl Tensor {
             });
         let expected_patch =
             expected_patch.ok_or_else(|| format!("{name} patch extent overflow"))?;
-        if patch.extent != expected_patch {
-            return Err(format!(
-                "{name} patch extent must equal channels per group * kernel volume"
-            )
-            .into());
-        }
 
-        let mut dims = Vec::with_capacity(self.shape().rank() + usize::from(group.is_some()));
-        for dim in self.shape().dims() {
+        let mut dims = Vec::with_capacity(image_shape.rank() + usize::from(group.is_some()));
+        for dim in image_shape.dims() {
             if dim.axis == channels {
                 if group.is_none() {
-                    dims.push(patch);
+                    dims.push(patch.of(expected_patch));
                 }
             } else if let Some(index) = spatial.iter().position(|&axis| axis == dim.axis) {
                 dims.push(dim.axis.of(output_spatial[index]));
@@ -2730,9 +2799,59 @@ impl Tensor {
             }
         }
         if let Some(group) = group {
-            dims.extend([group, patch]);
+            dims.extend([group, patch.of(expected_patch)]);
         }
         let shape = Shape::new(dims)?;
+        Ok((
+            shape,
+            expected_patch,
+            input_spatial,
+            output_spatial,
+            channels_per_group,
+        ))
+    }
+
+    /// Spec-building shared by `unfold_configured` (a real gather) and `fold_configured` (a real
+    /// scatter/col2im, the adjoint of the same geometry): geometry via [`Self::unfold_shape`],
+    /// the patches layout `unfold`'s output (and `fold`'s input) must physically match, and the
+    /// cached [`UnfoldSpec`] describing both directions. Keyed identically regardless of which
+    /// direction calls it, so a convolution and a transposed convolution sharing geometry share
+    /// one compiled plan.
+    #[allow(clippy::too_many_arguments)]
+    fn unfold_spec<const N: usize>(
+        name: &str,
+        image_shape: &Shape,
+        image_layout: &Layout,
+        channels: Axis,
+        spatial: [Axis; N],
+        group: Option<Dim>,
+        patch: Dim,
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
+        fill: f32,
+    ) -> Result<(Shape, Layout, Vec<Axis>, UnfoldPlans)> {
+        if !fill.is_finite() && fill != f32::NEG_INFINITY {
+            return Err(format!("{name} fill must be finite or negative infinity").into());
+        }
+        let (shape, expected_patch, input_spatial, output_spatial, channels_per_group) =
+            Self::unfold_shape(
+                name,
+                image_shape,
+                channels,
+                spatial,
+                group,
+                patch.axis,
+                kernel,
+                stride,
+                padding,
+            )?;
+        if patch.extent != expected_patch {
+            return Err(format!(
+                "{name} patch extent must equal channels per group * kernel volume"
+            )
+            .into());
+        }
         let mut spatial_key = [None; 3];
         let mut kernel_key = [1; 3];
         let mut stride_key = [1; 3];
@@ -2744,8 +2863,8 @@ impl Tensor {
             padding_key[index] = padding[index];
         }
         let key = UnfoldPlanKey {
-            input_shape: self.shape().clone(),
-            input_layout: self.0.layout.clone(),
+            input_shape: image_shape.clone(),
+            input_layout: image_layout.clone(),
             output_shape: shape.clone(),
             channels,
             spatial_rank: N,
@@ -2769,7 +2888,7 @@ impl Tensor {
         output_order.push(patch.axis);
         let output_layout = Layout::new(&shape, &output_order)?;
         const TILE_TAIL: usize = 127;
-        if self.shape().len() > i32::MAX as usize - TILE_TAIL
+        if image_shape.len() > i32::MAX as usize - TILE_TAIL
             || shape.len() > i32::MAX as usize - TILE_TAIL
         {
             return Err(
@@ -2777,10 +2896,7 @@ impl Tensor {
             );
         }
         if let Some(plans) = UNFOLD_PLANS.with(|cache| cache.borrow().get(&key).cloned()) {
-            return match plans {
-                UnfoldPlans::Implicit(spec) => self.unfolded_with_spec(shape, output_layout, spec),
-                UnfoldPlans::Zero => self.zero_gathered(shape, output_layout),
-            };
+            return Ok((shape, output_layout, output_order, plans));
         }
 
         let has_input = (0..N).all(|dimension| {
@@ -2793,13 +2909,12 @@ impl Tensor {
             })
         });
         if !has_input {
-            let result = self.zero_gathered(shape, output_layout)?;
             UNFOLD_PLANS.with(|cache| {
                 cache.borrow_mut().insert(key, UnfoldPlans::Zero);
             });
             #[cfg(test)]
             UNFOLD_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
-            return Ok(result);
+            return Ok((shape, output_layout, output_order, UnfoldPlans::Zero));
         }
 
         let to_i32 = |value: usize| -> Result<i32> { Ok(i32::try_from(value)?) };
@@ -2813,8 +2928,8 @@ impl Tensor {
                 } else if dim.axis == patch.axis {
                     (0, to_i32(N + 2)?)
                 } else {
-                    let input_index = self.shape().index(dim.axis)?;
-                    (to_i32(self.0.layout.strides[input_index])?, 0)
+                    let input_index = image_shape.index(dim.axis)?;
+                    (to_i32(image_layout.strides[input_index])?, 0)
                 };
             forward_metadata.extend([
                 to_i32(dim.extent)?,
@@ -2823,8 +2938,8 @@ impl Tensor {
                 role,
             ]);
         }
-        let mut backward_metadata = Vec::with_capacity(self.shape().rank() * 4);
-        for (index, dim) in self.shape().dims().iter().enumerate() {
+        let mut backward_metadata = Vec::with_capacity(image_shape.rank() * 4);
+        for (index, dim) in image_shape.dims().iter().enumerate() {
             let (output_stride, role) = if dim.axis == channels {
                 (0, 1)
             } else if let Some(spatial_index) = spatial.iter().position(|&axis| axis == dim.axis) {
@@ -2835,13 +2950,13 @@ impl Tensor {
             };
             backward_metadata.extend([
                 to_i32(dim.extent)?,
-                to_i32(self.0.layout.strides[index])?,
+                to_i32(image_layout.strides[index])?,
                 output_stride,
                 role,
             ]);
         }
         let input_stride =
-            |axis| -> Result<i32> { to_i32(self.0.layout.strides[self.shape().index(axis)?]) };
+            |axis| -> Result<i32> { to_i32(image_layout.strides[image_shape.index(axis)?]) };
         let output_stride =
             |axis| -> Result<i32> { to_i32(output_layout.strides[shape.index(axis)?]) };
         let mut kernel_spec = [1; 3];
@@ -2865,9 +2980,9 @@ impl Tensor {
         output_special_strides[4] = output_stride(patch.axis)?;
         let spec = Rc::new(UnfoldSpec {
             spatial_rank: to_i32(N)?,
-            input_len: self.shape().len(),
+            input_len: image_shape.len(),
             output_len: shape.len(),
-            input_rank: to_i32(self.shape().rank())?,
+            input_rank: to_i32(image_shape.rank())?,
             output_rank: to_i32(shape.rank())?,
             forward_metadata,
             backward_metadata,
@@ -2881,7 +2996,6 @@ impl Tensor {
             input_special_strides,
             output_special_strides,
         });
-        let result = self.unfolded_with_spec(shape, output_layout, spec.clone())?;
         UNFOLD_PLANS.with(|cache| {
             cache
                 .borrow_mut()
@@ -2893,7 +3007,115 @@ impl Tensor {
             UNFOLD_PLAN_METADATA_MAX
                 .with(|maximum| maximum.set(maximum.get().max(spec.metadata_len())));
         }
-        Ok(result)
+        Ok((
+            shape,
+            output_layout,
+            output_order,
+            UnfoldPlans::Implicit(spec),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unfold_configured<const N: usize>(
+        &self,
+        channels: Axis,
+        spatial: [Axis; N],
+        group: Option<Dim>,
+        patch: Dim,
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
+        fill: f32,
+    ) -> Result<Self> {
+        let name = format!("unfold{N}d");
+        let (shape, layout, _order, plan) = Self::unfold_spec(
+            &name,
+            self.shape(),
+            &self.0.layout,
+            channels,
+            spatial,
+            group,
+            patch,
+            kernel,
+            stride,
+            padding,
+            fill,
+        )?;
+        match plan {
+            UnfoldPlans::Implicit(spec) => self.unfolded_with_spec(shape, layout, spec),
+            UnfoldPlans::Zero => self.zero_gathered(shape, layout),
+        }
+    }
+
+    /// `self` holds `patch` in place of a channel axis (`fold`'s own input, e.g. a prior
+    /// `unfold` or a transposed convolution's expanded weight contraction); `image_shape` is the
+    /// full-extent channel+spatial shape to scatter-sum it into. Rejects a `self` whose extents
+    /// do not match the geometry `image_shape`/`kernel`/`stride`/`padding` implies, before any
+    /// device call.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_configured<const N: usize>(
+        &self,
+        image_shape: &Shape,
+        channels: Axis,
+        spatial: [Axis; N],
+        group: Option<Dim>,
+        patch: Dim,
+        kernel: [usize; N],
+        stride: [usize; N],
+        padding: [usize; N],
+    ) -> Result<Self> {
+        let name = format!("fold{N}d");
+        let image_layout = Layout::contiguous(image_shape);
+        // `fold`'s own forward never reads outside `image_shape` (it only ever scatters into
+        // it), so the `fill` value only matters for `fold`'s *backward* (an `unfold` gather over
+        // the incoming image gradient): `0.0` there is exactly the correct adjoint, since a
+        // patches position that this geometry never scatters must receive exactly zero gradient.
+        let (patches_shape, _patches_layout, output_order, plan) = Self::unfold_spec(
+            &name,
+            image_shape,
+            &image_layout,
+            channels,
+            spatial,
+            group,
+            patch,
+            kernel,
+            stride,
+            padding,
+            0.0,
+        )?;
+        if self.shape().rank() != patches_shape.rank() {
+            return Err(format!("{name} input has the wrong rank for this geometry").into());
+        }
+        for dim in patches_shape.dims() {
+            if self.extent(dim.axis)? != dim.extent {
+                return Err(format!(
+                    "{name} input extent for {:?} does not match the geometry implied by image_shape, kernel, stride and padding",
+                    dim.axis
+                )
+                .into());
+            }
+        }
+        match plan {
+            UnfoldPlans::Zero => self.zero_gathered(image_shape.clone(), image_layout),
+            UnfoldPlans::Implicit(spec) => {
+                let ordered = self.with_layout(output_order)?;
+                let value = self
+                    .device()
+                    .unfold_backward(&ordered.0.value, spec.as_ref())?;
+                let edges = ordered
+                    .requires_grad()
+                    .then(|| Edge::new(&ordered, Rule::Fold(spec)));
+                Ok(Self::node(
+                    image_shape.clone(),
+                    image_layout,
+                    value,
+                    self.device(),
+                    edges.into_iter().collect(),
+                    false,
+                    None,
+                ))
+            }
+        }
     }
     /// Sum the named shared axes; align remaining shared axes, retain distinct ones.
     pub fn contract(&self, rhs: &Self, axes: impl IntoAxes) -> Result<Self> {
@@ -4395,6 +4617,11 @@ impl Tensor {
                         Rule::Unfold(spec) => {
                             self.device().unfold_backward(&gradient, spec.as_ref())?
                         }
+                        // `fold`'s own gradient is `unfold`'s own forward gather applied to the
+                        // incoming image gradient: exactly the adjoint of the scatter/col2im
+                        // `fold_configured` runs forward, reusing the same spec and the same
+                        // device kernel `Rule::Unfold`'s own backward calls in the other order.
+                        Rule::Fold(spec) => self.device().unfold(&gradient, spec.as_ref())?,
                         Rule::Select(spec) => self
                             .device()
                             .select_axis_backward(&gradient, spec.as_ref())?,

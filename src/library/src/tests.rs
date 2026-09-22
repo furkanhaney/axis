@@ -11500,3 +11500,714 @@ fn adaptive_avg_pool2d_global_head_composes_with_linear() -> Result<()> {
     assert!(input.grad().is_some());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn conv1d_matches_scalar_oracle_and_reuses_conv2d_exactly() -> Result<()> {
+    // groups=1, asymmetric stride/padding relative to kernel, under reordered storage: proves
+    // the unit-spatial-axis composition over Conv2d is exact, not merely close.
+    const CHANNELS: usize = 3;
+    const LEN: usize = 5;
+    const OUT_CHANNELS: usize = 4;
+    const KERNEL: usize = 3;
+    const STRIDE: usize = 2;
+    const PADDING: usize = 1;
+    const OUT_LEN: usize = 3;
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, length, output) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("length"),
+        Axis::new("output"),
+    );
+    let inputs: Vec<_> = (0..CHANNELS * LEN)
+        .map(|i| (i as f32 - 7.0) / 5.0)
+        .collect();
+    let weights: Vec<_> = (0..CHANNELS * KERNEL * OUT_CHANNELS)
+        .map(|i| ((i * 5 % 23) as f32 - 11.0) / 13.0)
+        .collect();
+    let biases: Vec<_> = (0..OUT_CHANNELS).map(|i| (i as f32 - 1.5) / 7.0).collect();
+    let input = Tensor::from_slice(
+        &inputs,
+        [batch.of(1), channel.of(CHANNELS), length.of(LEN)],
+        &device,
+    )?
+    .with_layout([length, channel, batch])?
+    .with_grad();
+    let mut conv = Conv1d::new(channel, output.of(OUT_CHANNELS), length, KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING);
+    assert_eq!(
+        conv.build(input.shape(), &device, 11)?,
+        Shape::new([batch.of(1), length.of(OUT_LEN), output.of(OUT_CHANNELS)])?
+    );
+    conv.parameter("weight")?.set_values(&weights)?;
+    conv.parameter("bias")?.set_values(&biases)?;
+
+    let mut expected = vec![0.0_f64; OUT_LEN * OUT_CHANNELS];
+    let mut input_gradient = vec![0.0_f64; inputs.len()];
+    let mut weight_gradient = vec![0.0_f64; weights.len()];
+    let mut bias_gradient = vec![0.0_f64; biases.len()];
+    let upstream = 1.0 / expected.len() as f64;
+    for o in 0..OUT_LEN {
+        for oc in 0..OUT_CHANNELS {
+            let mut value = f64::from(biases[oc]);
+            bias_gradient[oc] += upstream;
+            for ic in 0..CHANNELS {
+                for k in 0..KERNEL {
+                    let padded = o * STRIDE + k;
+                    let Some(i) = padded.checked_sub(PADDING) else {
+                        continue;
+                    };
+                    if i >= LEN {
+                        continue;
+                    }
+                    let input_index = ic * LEN + i;
+                    let patch = ic * KERNEL + k;
+                    let weight_index = patch * OUT_CHANNELS + oc;
+                    value += f64::from(inputs[input_index]) * f64::from(weights[weight_index]);
+                    input_gradient[input_index] += upstream * f64::from(weights[weight_index]);
+                    weight_gradient[weight_index] += upstream * f64::from(inputs[input_index]);
+                }
+            }
+            expected[o * OUT_CHANNELS + oc] = value;
+        }
+    }
+
+    let actual = conv.forward(&input)?;
+    close("Conv1d forward", &actual.to_vec()?, &expected);
+    actual.mean([batch, length, output])?.backward()?;
+    close(
+        "Conv1d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &input_gradient,
+    );
+    close(
+        "Conv1d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &weight_gradient,
+    );
+    close(
+        "Conv1d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &bias_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn conv_transpose2d_matches_scalar_forward_and_all_gradients_under_reordered_storage() -> Result<()>
+{
+    // Groups, asymmetric stride/padding/output_padding, and storage reordered relative to its
+    // declared axis order: exercises the split -> contract -> fold_grouped -> pad_zeros -> add
+    // composition end to end, including Rule::Fold's own backward (a forward unfold gather).
+    const IN_CHANNELS: usize = 4;
+    const IN_H: usize = 3;
+    const IN_W: usize = 3;
+    const OUT_CHANNELS: usize = 6;
+    const GROUPS: usize = 2;
+    const KERNEL: [usize; 2] = [2, 2];
+    const STRIDE: [usize; 2] = [2, 2];
+    const PADDING: [usize; 2] = [1, 1];
+    const OUTPUT_PADDING: [usize; 2] = [1, 0];
+    const IN_PER_GROUP: usize = IN_CHANNELS / GROUPS;
+    const OUT_PER_GROUP: usize = OUT_CHANNELS / GROUPS;
+    const PATCH: usize = OUT_PER_GROUP * KERNEL[0] * KERNEL[1];
+    const CORE_H: usize = (IN_H - 1) * STRIDE[0] + KERNEL[0] - 2 * PADDING[0];
+    const CORE_W: usize = (IN_W - 1) * STRIDE[1] + KERNEL[1] - 2 * PADDING[1];
+    const OUT_H: usize = CORE_H + OUTPUT_PADDING[0];
+    const OUT_W: usize = CORE_W + OUTPUT_PADDING[1];
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, height, width, output) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let inputs: Vec<_> = (0..IN_CHANNELS * IN_H * IN_W)
+        .map(|i| (i as f32 - 17.0) / 11.0)
+        .collect();
+    let weights: Vec<_> = (0..GROUPS * PATCH * IN_PER_GROUP)
+        .map(|i| ((i * 7 % 23) as f32 - 11.0) / 13.0)
+        .collect();
+    let biases: Vec<_> = (0..OUT_CHANNELS).map(|i| (i as f32 - 2.5) / 9.0).collect();
+    let input = Tensor::from_slice(
+        &inputs,
+        [
+            batch.of(1),
+            channel.of(IN_CHANNELS),
+            height.of(IN_H),
+            width.of(IN_W),
+        ],
+        &device,
+    )?
+    .with_layout([width, batch, channel, height])?
+    .with_grad();
+    let mut conv = ConvTranspose2d::new(channel, output.of(OUT_CHANNELS), [height, width], KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING)
+        .output_padding(OUTPUT_PADDING)
+        .groups(GROUPS);
+    assert_eq!(
+        conv.build(input.shape(), &device, 29)?,
+        Shape::new([
+            batch.of(1),
+            height.of(OUT_H),
+            width.of(OUT_W),
+            output.of(OUT_CHANNELS),
+        ])?
+    );
+    conv.parameter("weight")?.set_values(&weights)?;
+    conv.parameter("bias")?.set_values(&biases)?;
+
+    let mut expected = vec![0.0_f64; OUT_H * OUT_W * OUT_CHANNELS];
+    let mut input_gradient = vec![0.0_f64; inputs.len()];
+    let mut weight_gradient = vec![0.0_f64; weights.len()];
+    let mut bias_gradient = vec![0.0_f64; biases.len()];
+    // Bias applies over the whole (including output-padding) output, matching PyTorch's own
+    // `output = conv_transpose_no_bias + bias`.
+    let element_count = expected.len() as f64;
+    let upstream = 1.0 / element_count;
+    for gradient in bias_gradient.iter_mut() {
+        *gradient += upstream * (OUT_H * OUT_W) as f64;
+    }
+    for group in 0..GROUPS {
+        for ic_in_group in 0..IN_PER_GROUP {
+            let ic = group * IN_PER_GROUP + ic_in_group;
+            for iy in 0..IN_H {
+                for ix in 0..IN_W {
+                    let input_index = (ic * IN_H + iy) * IN_W + ix;
+                    for ky in 0..KERNEL[0] {
+                        for kx in 0..KERNEL[1] {
+                            let Some(oy) = (iy * STRIDE[0] + ky).checked_sub(PADDING[0]) else {
+                                continue;
+                            };
+                            let Some(ox) = (ix * STRIDE[1] + kx).checked_sub(PADDING[1]) else {
+                                continue;
+                            };
+                            if oy >= CORE_H || ox >= CORE_W {
+                                continue;
+                            }
+                            for oc_in_group in 0..OUT_PER_GROUP {
+                                let oc = group * OUT_PER_GROUP + oc_in_group;
+                                let patch_index =
+                                    oc_in_group * (KERNEL[0] * KERNEL[1]) + ky * KERNEL[1] + kx;
+                                let weight_index =
+                                    (group * PATCH + patch_index) * IN_PER_GROUP + ic_in_group;
+                                let output_index = (oy * OUT_W + ox) * OUT_CHANNELS + oc;
+                                expected[output_index] += f64::from(inputs[input_index])
+                                    * f64::from(weights[weight_index]);
+                                input_gradient[input_index] +=
+                                    upstream * f64::from(weights[weight_index]);
+                                weight_gradient[weight_index] +=
+                                    upstream * f64::from(inputs[input_index]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for oy in 0..OUT_H {
+        for ox in 0..OUT_W {
+            for oc in 0..OUT_CHANNELS {
+                expected[(oy * OUT_W + ox) * OUT_CHANNELS + oc] += f64::from(biases[oc]);
+            }
+        }
+    }
+
+    let actual = conv.forward(&input)?;
+    close(
+        "ConvTranspose2d forward under reordered storage",
+        &actual.to_vec()?,
+        &expected,
+    );
+    actual.mean([batch, height, width, output])?.backward()?;
+    close(
+        "ConvTranspose2d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &input_gradient,
+    );
+    close(
+        "ConvTranspose2d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &weight_gradient,
+    );
+    close(
+        "ConvTranspose2d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &bias_gradient,
+    );
+
+    let error = ConvTranspose2d::new(channel, output.of(OUT_CHANNELS), [height, width], KERNEL)
+        .output_padding([STRIDE[0], 0])
+        .build(input.shape(), &device, 5)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("output_padding"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn conv_transpose1d_matches_scalar_oracle_and_reuses_conv_transpose2d_exactly() -> Result<()> {
+    const IN_CHANNELS: usize = 2;
+    const LEN: usize = 3;
+    const OUT_CHANNELS: usize = 3;
+    const KERNEL: usize = 2;
+    const STRIDE: usize = 2;
+    const PADDING: usize = 0;
+    const OUTPUT_PADDING: usize = 1;
+    const PATCH: usize = OUT_CHANNELS * KERNEL;
+    const CORE_LEN: usize = (LEN - 1) * STRIDE + KERNEL - 2 * PADDING;
+    const OUT_LEN: usize = CORE_LEN + OUTPUT_PADDING;
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, length, output) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("length"),
+        Axis::new("output"),
+    );
+    let inputs: Vec<_> = (0..IN_CHANNELS * LEN)
+        .map(|i| (i as f32 - 2.5) / 3.0)
+        .collect();
+    let weights: Vec<_> = (0..PATCH * IN_CHANNELS)
+        .map(|i| ((i * 3 % 17) as f32 - 8.0) / 9.0)
+        .collect();
+    let biases: Vec<_> = (0..OUT_CHANNELS).map(|i| (i as f32 - 1.0) / 5.0).collect();
+    let input = Tensor::from_slice(
+        &inputs,
+        [batch.of(1), channel.of(IN_CHANNELS), length.of(LEN)],
+        &device,
+    )?
+    .with_grad();
+    let mut conv = ConvTranspose1d::new(channel, output.of(OUT_CHANNELS), length, KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING)
+        .output_padding(OUTPUT_PADDING);
+    assert_eq!(
+        conv.build(input.shape(), &device, 41)?,
+        Shape::new([batch.of(1), length.of(OUT_LEN), output.of(OUT_CHANNELS)])?
+    );
+    conv.parameter("weight")?.set_values(&weights)?;
+    conv.parameter("bias")?.set_values(&biases)?;
+
+    let mut expected = vec![0.0_f64; OUT_LEN * OUT_CHANNELS];
+    for o in 0..OUT_LEN {
+        for oc in 0..OUT_CHANNELS {
+            expected[o * OUT_CHANNELS + oc] = f64::from(biases[oc]);
+        }
+    }
+    let mut input_gradient = vec![0.0_f64; inputs.len()];
+    let mut weight_gradient = vec![0.0_f64; weights.len()];
+    let mut bias_gradient = vec![0.0_f64; biases.len()];
+    let upstream = 1.0 / expected.len() as f64;
+    for gradient in bias_gradient.iter_mut() {
+        *gradient += upstream * OUT_LEN as f64;
+    }
+    for ic in 0..IN_CHANNELS {
+        for i in 0..LEN {
+            let input_index = ic * LEN + i;
+            for k in 0..KERNEL {
+                let Some(o) = (i * STRIDE + k).checked_sub(PADDING) else {
+                    continue;
+                };
+                if o >= CORE_LEN {
+                    continue;
+                }
+                for oc in 0..OUT_CHANNELS {
+                    let patch_index = oc * KERNEL + k;
+                    let weight_index = patch_index * IN_CHANNELS + ic;
+                    let output_index = o * OUT_CHANNELS + oc;
+                    expected[output_index] +=
+                        f64::from(inputs[input_index]) * f64::from(weights[weight_index]);
+                    input_gradient[input_index] += upstream * f64::from(weights[weight_index]);
+                    weight_gradient[weight_index] += upstream * f64::from(inputs[input_index]);
+                }
+            }
+        }
+    }
+
+    let actual = conv.forward(&input)?;
+    close("ConvTranspose1d forward", &actual.to_vec()?, &expected);
+    actual.mean([batch, length, output])?.backward()?;
+    close(
+        "ConvTranspose1d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &input_gradient,
+    );
+    close(
+        "ConvTranspose1d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &weight_gradient,
+    );
+    close(
+        "ConvTranspose1d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &bias_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn conv_transpose3d_matches_scalar_forward_and_all_gradients() -> Result<()> {
+    const IN_CHANNELS: usize = 2;
+    const DEPTH: usize = 2;
+    const HEIGHT: usize = 2;
+    const WIDTH: usize = 2;
+    const OUT_CHANNELS: usize = 3;
+    const KERNEL: [usize; 3] = [2, 2, 2];
+    const STRIDE: [usize; 3] = [2, 2, 2];
+    const PADDING: [usize; 3] = [0, 0, 0];
+    const PATCH: usize = OUT_CHANNELS * KERNEL[0] * KERNEL[1] * KERNEL[2];
+    const OUT_D: usize = (DEPTH - 1) * STRIDE[0] + KERNEL[0];
+    const OUT_H: usize = (HEIGHT - 1) * STRIDE[1] + KERNEL[1];
+    const OUT_W: usize = (WIDTH - 1) * STRIDE[2] + KERNEL[2];
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, depth, height, width, output) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("output"),
+    );
+    let inputs: Vec<_> = (0..IN_CHANNELS * DEPTH * HEIGHT * WIDTH)
+        .map(|i| (i as f32 - 7.0) / 6.0)
+        .collect();
+    let weights: Vec<_> = (0..PATCH * IN_CHANNELS)
+        .map(|i| ((i * 5 % 19) as f32 - 9.0) / 11.0)
+        .collect();
+    let biases: Vec<_> = (0..OUT_CHANNELS).map(|i| (i as f32 - 1.0) / 4.0).collect();
+    let input = Tensor::from_slice(
+        &inputs,
+        [
+            batch.of(1),
+            channel.of(IN_CHANNELS),
+            depth.of(DEPTH),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+        ],
+        &device,
+    )?
+    .with_grad();
+    let mut conv = ConvTranspose3d::new(
+        channel,
+        output.of(OUT_CHANNELS),
+        [depth, height, width],
+        KERNEL,
+    )
+    .stride(STRIDE)
+    .padding(PADDING);
+    assert_eq!(
+        conv.build(input.shape(), &device, 53)?,
+        Shape::new([
+            batch.of(1),
+            depth.of(OUT_D),
+            height.of(OUT_H),
+            width.of(OUT_W),
+            output.of(OUT_CHANNELS),
+        ])?
+    );
+    conv.parameter("weight")?.set_values(&weights)?;
+    conv.parameter("bias")?.set_values(&biases)?;
+
+    let mut expected = vec![0.0_f64; OUT_D * OUT_H * OUT_W * OUT_CHANNELS];
+    let mut input_gradient = vec![0.0_f64; inputs.len()];
+    let mut weight_gradient = vec![0.0_f64; weights.len()];
+    let mut bias_gradient = vec![0.0_f64; biases.len()];
+    let upstream = 1.0 / (OUT_D * OUT_H * OUT_W * OUT_CHANNELS) as f64;
+    for od in 0..OUT_D {
+        for oh in 0..OUT_H {
+            for ow in 0..OUT_W {
+                for oc in 0..OUT_CHANNELS {
+                    bias_gradient[oc] += upstream;
+                    expected[((od * OUT_H + oh) * OUT_W + ow) * OUT_CHANNELS + oc] +=
+                        f64::from(biases[oc]);
+                }
+            }
+        }
+    }
+    for ic in 0..IN_CHANNELS {
+        for id in 0..DEPTH {
+            for ih in 0..HEIGHT {
+                for iw in 0..WIDTH {
+                    let input_index = ((ic * DEPTH + id) * HEIGHT + ih) * WIDTH + iw;
+                    for kd in 0..KERNEL[0] {
+                        for kh in 0..KERNEL[1] {
+                            for kw in 0..KERNEL[2] {
+                                let od = id * STRIDE[0] + kd;
+                                let oh = ih * STRIDE[1] + kh;
+                                let ow = iw * STRIDE[2] + kw;
+                                for oc in 0..OUT_CHANNELS {
+                                    let patch_index = oc * (KERNEL[0] * KERNEL[1] * KERNEL[2])
+                                        + (kd * KERNEL[1] + kh) * KERNEL[2]
+                                        + kw;
+                                    let weight_index = patch_index * IN_CHANNELS + ic;
+                                    let output_index =
+                                        ((od * OUT_H + oh) * OUT_W + ow) * OUT_CHANNELS + oc;
+                                    expected[output_index] += f64::from(inputs[input_index])
+                                        * f64::from(weights[weight_index]);
+                                    input_gradient[input_index] +=
+                                        upstream * f64::from(weights[weight_index]);
+                                    weight_gradient[weight_index] +=
+                                        upstream * f64::from(inputs[input_index]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let actual = conv.forward(&input)?;
+    close("ConvTranspose3d forward", &actual.to_vec()?, &expected);
+    actual
+        .mean([batch, depth, height, width, output])?
+        .backward()?;
+    close(
+        "ConvTranspose3d input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &input_gradient,
+    );
+    close(
+        "ConvTranspose3d weight gradient",
+        &conv.parameter("weight")?.grad().unwrap().to_vec()?,
+        &weight_gradient,
+    );
+    close(
+        "ConvTranspose3d bias gradient",
+        &conv.parameter("bias")?.grad().unwrap().to_vec()?,
+        &bias_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn unfold_module_matches_scalar_patches_and_gradient_under_reordered_storage() -> Result<()> {
+    const CHANNELS: usize = 2;
+    const HEIGHT: usize = 3;
+    const WIDTH: usize = 4;
+    const KERNEL: [usize; 2] = [2, 2];
+    const STRIDE: [usize; 2] = [1, 2];
+    const PADDING: [usize; 2] = [1, 0];
+    const OUT_H: usize = (HEIGHT + 2 * PADDING[0] - KERNEL[0]) / STRIDE[0] + 1;
+    const OUT_W: usize = (WIDTH + 2 * PADDING[1] - KERNEL[1]) / STRIDE[1] + 1;
+    const PATCH: usize = CHANNELS * KERNEL[0] * KERNEL[1];
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, height, width, patch) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("patch"),
+    );
+    let inputs: Vec<_> = (0..CHANNELS * HEIGHT * WIDTH)
+        .map(|i| (i as f32 - 11.0) / 7.0)
+        .collect();
+    let input = Tensor::from_slice(
+        &inputs,
+        [
+            batch.of(1),
+            channel.of(CHANNELS),
+            height.of(HEIGHT),
+            width.of(WIDTH),
+        ],
+        &device,
+    )?
+    .with_layout([width, batch, channel, height])?
+    .with_grad();
+    let unfold = Unfold::new(channel, [height, width], patch, KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING);
+    assert_eq!(
+        unfold.output_shape(input.shape())?,
+        Shape::new([
+            batch.of(1),
+            patch.of(PATCH),
+            height.of(OUT_H),
+            width.of(OUT_W)
+        ])?
+    );
+
+    let mut expected = vec![0.0_f64; OUT_H * OUT_W * PATCH];
+    let mut input_gradient = vec![0.0_f64; inputs.len()];
+    let upstream = 1.0 / expected.len() as f64;
+    for oy in 0..OUT_H {
+        for ox in 0..OUT_W {
+            for c in 0..CHANNELS {
+                for ky in 0..KERNEL[0] {
+                    for kx in 0..KERNEL[1] {
+                        let patch_index = (c * KERNEL[0] + ky) * KERNEL[1] + kx;
+                        let output_index = (patch_index * OUT_H + oy) * OUT_W + ox;
+                        let padded_y = oy * STRIDE[0] + ky;
+                        let padded_x = ox * STRIDE[1] + kx;
+                        let (Some(iy), Some(ix)) = (
+                            padded_y.checked_sub(PADDING[0]),
+                            padded_x.checked_sub(PADDING[1]),
+                        ) else {
+                            continue;
+                        };
+                        if iy >= HEIGHT || ix >= WIDTH {
+                            continue;
+                        }
+                        let input_index = (c * HEIGHT + iy) * WIDTH + ix;
+                        expected[output_index] = f64::from(inputs[input_index]);
+                        input_gradient[input_index] += upstream;
+                    }
+                }
+            }
+        }
+    }
+
+    let actual = unfold.forward(&input)?;
+    close(
+        "Unfold forward under reordered storage",
+        &actual.to_vec()?,
+        &expected,
+    );
+    actual.mean([batch, height, width, patch])?.backward()?;
+    close(
+        "Unfold input gradient under reordered storage",
+        &input.grad().unwrap().to_vec()?,
+        &input_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
+    const CHANNELS: usize = 2;
+    const OUT_H: usize = 4;
+    const OUT_W: usize = 4;
+    const KERNEL: [usize; 2] = [2, 2];
+    const STRIDE: [usize; 2] = [2, 2];
+    const PADDING: [usize; 2] = [0, 0];
+    const IN_H: usize = (OUT_H - KERNEL[0]) / STRIDE[0] + 1;
+    const IN_W: usize = (OUT_W - KERNEL[1]) / STRIDE[1] + 1;
+    const PATCH: usize = CHANNELS * KERNEL[0] * KERNEL[1];
+
+    let device = Device::cuda(0)?;
+    let (batch, channel, height, width, patch) = (
+        Axis::new("batch"),
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("patch"),
+    );
+
+    // Non-overlapping windows (stride == kernel): a real image folds and unfolds back to
+    // itself exactly, the representative composition that motivates `Fold`/`Unfold` as a pair.
+    let image_values: Vec<_> = (0..CHANNELS * OUT_H * OUT_W)
+        .map(|i| (i as f32 - 15.0) / 9.0)
+        .collect();
+    let image = Tensor::from_slice(
+        &image_values,
+        [
+            batch.of(1),
+            channel.of(CHANNELS),
+            height.of(OUT_H),
+            width.of(OUT_W),
+        ],
+        &device,
+    )?;
+    let unfold = Unfold::new(channel, [height, width], patch, KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING);
+    let patches = unfold.forward(&image)?.with_grad();
+    let fold = Fold::new(channel, [height, width], [OUT_H, OUT_W], patch, KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING);
+    assert_eq!(
+        fold.output_shape(patches.shape())?,
+        Shape::new([
+            batch.of(1),
+            channel.of(CHANNELS),
+            height.of(OUT_H),
+            width.of(OUT_W),
+        ])?
+    );
+    let folded = fold.forward(&patches)?;
+    close(
+        "Fold(Unfold(x)) reconstructs x exactly under non-overlapping windows",
+        &folded.to_vec()?,
+        &image_values
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    // An independent scalar oracle for Fold's own forward (col2im: sum overlapping patch
+    // contributions into the image) and its gradient (the adjoint: a plain `unfold` gather of
+    // the incoming image gradient, `Rule::Fold`'s own backward path).
+    let patch_values: Vec<_> = (0..IN_H * IN_W * PATCH)
+        .map(|i| (i as f32 - 20.0) / 13.0)
+        .collect();
+    let patches_input = Tensor::from_slice(
+        &patch_values,
+        [
+            batch.of(1),
+            height.of(IN_H),
+            width.of(IN_W),
+            patch.of(PATCH),
+        ],
+        &device,
+    )?
+    .with_grad();
+    let mut expected = vec![0.0_f64; CHANNELS * OUT_H * OUT_W];
+    let mut patches_gradient = vec![0.0_f64; patch_values.len()];
+    let element_count = (CHANNELS * OUT_H * OUT_W) as f64;
+    for iy in 0..IN_H {
+        for ix in 0..IN_W {
+            for c in 0..CHANNELS {
+                for ky in 0..KERNEL[0] {
+                    for kx in 0..KERNEL[1] {
+                        let oy = iy * STRIDE[0] + ky;
+                        let ox = ix * STRIDE[1] + kx;
+                        let patch_index = (c * KERNEL[0] + ky) * KERNEL[1] + kx;
+                        let patches_index = (iy * IN_W + ix) * PATCH + patch_index;
+                        let output_index = (c * OUT_H + oy) * OUT_W + ox;
+                        expected[output_index] += f64::from(patch_values[patches_index]);
+                        // upstream = mean over the image, so d(mean)/d(this image element) is
+                        // 1/element_count; col2im sums exactly one contribution per (iy,ix,ky,kx)
+                        // into a non-overlapping window here, so the adjoint gather is exact.
+                        patches_gradient[patches_index] = 1.0 / element_count;
+                    }
+                }
+            }
+        }
+    }
+    let folded = fold.forward(&patches_input)?;
+    close("Fold forward scalar oracle", &folded.to_vec()?, &expected);
+    folded.mean([batch, channel, height, width])?.backward()?;
+    close(
+        "Fold input gradient scalar oracle",
+        &patches_input.grad().unwrap().to_vec()?,
+        &patches_gradient,
+    );
+
+    let mismatched = Tensor::from_slice(
+        &[0.0; PATCH],
+        [batch.of(1), height.of(1), width.of(1), patch.of(PATCH)],
+        &device,
+    )?;
+    let error = Fold::new(channel, [height, width], [OUT_H, OUT_W], patch, KERNEL)
+        .stride(STRIDE)
+        .padding(PADDING)
+        .output_shape(mismatched.shape())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not match"), "{error}");
+    Ok(())
+}

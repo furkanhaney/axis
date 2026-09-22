@@ -15,8 +15,9 @@ The crate currently provides:
   slicing, compact device copies for layout, merge, and alignment, and
   integer-factor nearest and half-pixel bilinear resampling along a named
   axis;
-- `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
-  grouped/depthwise channels, `MaxPool2d`/`MaxPool3d` and
+- `Linear`, `Conv1d`/`Conv2d`/`Conv3d`, `ConvTranspose1d`/`2d`/`3d`, and
+  named-axis `Unfold`/`Fold`, all with stride, symmetric padding, and
+  grouped/depthwise channels where they apply, `MaxPool2d`/`MaxPool3d` and
   `Tensor::adaptive_avg_pool3d`, named-axis `LayerNorm`, `RmsNorm`,
   `GroupNorm`, and stateless `InstanceNorm`, one-hot `Embedding` and
   `PositionEmbedding`, explicit-state `LstmCell`/`Lstm`, activations,
