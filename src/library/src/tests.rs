@@ -6443,17 +6443,18 @@ fn containers_have_no_single_forward_and_reject_duplicate_module_keys() -> Resul
     assert_eq!(list.iter().count(), 3);
     assert!(list.get(5).is_none());
 
-    let entries: Vec<(String, Box<dyn Module>)> = vec![
-        ("a".into(), Box::new(ReLU)),
-        ("b".into(), Box::new(Tanh)),
-    ];
+    let entries: Vec<(String, Box<dyn Module>)> =
+        vec![("a".into(), Box::new(ReLU)), ("b".into(), Box::new(Tanh))];
     let mut dict = ModuleDict::new(entries)?;
     assert_eq!(dict.len(), 2);
     assert!(dict.output_shape(&shape).is_err());
     assert_eq!(dict.get("a").unwrap().output_shape(&shape)?, shape);
     assert!(
-        ModuleDict::new(vec![("dup".into(), Box::new(ReLU)), ("dup".into(), Box::new(Tanh))])
-            .is_err()
+        ModuleDict::new(vec![
+            ("dup".into(), Box::new(ReLU)),
+            ("dup".into(), Box::new(Tanh))
+        ])
+        .is_err()
     );
     assert!(dict.insert("a", Box::new(SiLU)).is_err());
     dict.insert("c", Box::new(SiLU))?;
@@ -6479,9 +6480,21 @@ fn flatten_and_unflatten_shapes_invert_and_reject_bad_configuration() -> Result<
         flatten.output_shape(&input)?,
         Shape::new([sample.of(2), merged.of(6)])?
     );
-    assert!(Flatten::new(Vec::<Axis>::new(), merged).output_shape(&input).is_err());
-    assert!(Flatten::new([col, bogus], merged).output_shape(&input).is_err());
-    assert!(Flatten::new([col, col], merged).output_shape(&input).is_err());
+    assert!(
+        Flatten::new(Vec::<Axis>::new(), merged)
+            .output_shape(&input)
+            .is_err()
+    );
+    assert!(
+        Flatten::new([col, bogus], merged)
+            .output_shape(&input)
+            .is_err()
+    );
+    assert!(
+        Flatten::new([col, col], merged)
+            .output_shape(&input)
+            .is_err()
+    );
 
     let packed = Shape::new([sample.of(2), merged.of(6)])?;
     let unflatten = Unflatten::new(merged, [col.of(3), row.of(2)]);
@@ -6494,7 +6507,11 @@ fn flatten_and_unflatten_shapes_invert_and_reject_bad_configuration() -> Result<
             .output_shape(&packed)
             .is_err()
     );
-    assert!(Unflatten::new(bogus, [col.of(3), row.of(2)]).output_shape(&packed).is_err());
+    assert!(
+        Unflatten::new(bogus, [col.of(3), row.of(2)])
+            .output_shape(&packed)
+            .is_err()
+    );
 
     assert_eq!(Identity.output_shape(&input)?, input);
     Ok(())
@@ -6531,8 +6548,16 @@ fn bilinear_and_local_response_norm_reject_invalid_configuration_before_allocati
     let signal = Shape::new([channel.of(4)])?;
     assert_eq!(norm.output_shape(&signal)?, signal);
     assert!(LocalResponseNorm::new(channel, 4)?.alpha(f32::NAN).is_err());
-    assert!(LocalResponseNorm::new(channel, 4)?.beta(f32::INFINITY).is_err());
-    assert!(LocalResponseNorm::new(channel, 4)?.k(f32::NEG_INFINITY).is_err());
+    assert!(
+        LocalResponseNorm::new(channel, 4)?
+            .beta(f32::INFINITY)
+            .is_err()
+    );
+    assert!(
+        LocalResponseNorm::new(channel, 4)?
+            .k(f32::NEG_INFINITY)
+            .is_err()
+    );
     norm = norm.alpha(0.5)?.beta(0.5)?.k(1.0)?;
     assert_eq!(norm.output_shape(&signal)?, signal);
     Ok(())
@@ -6554,8 +6579,8 @@ fn flatten_and_unflatten_match_tensor_merge_and_split_forward_and_gradient() -> 
     let values = [
         0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 100.0, 101.0, 102.0, 110.0, 111.0, 112.0,
     ];
-    let input = Tensor::from_slice(&values, [sample.of(2), row.of(2), col.of(3)], &device)?
-        .with_grad();
+    let input =
+        Tensor::from_slice(&values, [sample.of(2), row.of(2), col.of(3)], &device)?.with_grad();
     let mut flatten = Flatten::new([col, row], merged);
     let expected_shape = Shape::new([sample.of(2), merged.of(6)])?;
     assert_eq!(flatten.build(input.shape(), &device, 0)?, expected_shape);
@@ -6569,11 +6594,16 @@ fn flatten_and_unflatten_match_tensor_merge_and_split_forward_and_gradient() -> 
     );
 
     let weights = Tensor::from_slice(
-        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
         [sample.of(2), merged.of(6)],
         &device,
     )?;
-    flattened.mul(&weights)?.mean([sample, merged])?.backward()?;
+    flattened
+        .mul(&weights)?
+        .mean([sample, merged])?
+        .backward()?;
     close(
         "Flatten gradient under a reversed merge order",
         &input.grad().unwrap().to_vec()?,
@@ -6593,9 +6623,11 @@ fn flatten_and_unflatten_match_tensor_merge_and_split_forward_and_gradient() -> 
         ],
     );
 
-    let merged_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
-    let packed = Tensor::from_slice(&merged_values, [sample.of(2), merged.of(6)], &device)?
-        .with_grad();
+    let merged_values = [
+        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+    ];
+    let packed =
+        Tensor::from_slice(&merged_values, [sample.of(2), merged.of(6)], &device)?.with_grad();
     let mut unflatten = Unflatten::new(merged, [col.of(3), row.of(2)]);
     let split_shape = Shape::new([sample.of(2), col.of(3), row.of(2)])?;
     assert_eq!(unflatten.build(packed.shape(), &device, 0)?, split_shape);
@@ -6603,7 +6635,10 @@ fn flatten_and_unflatten_match_tensor_merge_and_split_forward_and_gradient() -> 
     close(
         "Unflatten forward is a pure reshape (identical physical values)",
         &split.to_vec()?,
-        &merged_values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+        &merged_values
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
     );
 
     let split_weights = Tensor::from_slice(
@@ -6671,14 +6706,17 @@ fn bilinear_matches_hand_computed_quadratic_form_forward_and_every_gradient() ->
         Axis::new("in2"),
         Axis::new("output"),
     );
-    let x1 = Tensor::from_slice(&[1.0, 2.0, 3.0, -1.0], [batch.of(2), in1.of(2)], &device)?
-        .with_grad();
-    let x2 = Tensor::from_slice(&[0.5, -2.0, 1.0, 2.0], [batch.of(2), in2.of(2)], &device)?
-        .with_grad();
+    let x1 =
+        Tensor::from_slice(&[1.0, 2.0, 3.0, -1.0], [batch.of(2), in1.of(2)], &device)?.with_grad();
+    let x2 =
+        Tensor::from_slice(&[0.5, -2.0, 1.0, 2.0], [batch.of(2), in2.of(2)], &device)?.with_grad();
 
     let mut bilinear = Bilinear::new(in1, in2, output.of(2));
     let expected_shape = Shape::new([batch.of(2), output.of(2)])?;
-    assert_eq!(bilinear.build(x1.shape(), x2.shape(), &device, 0)?, expected_shape);
+    assert_eq!(
+        bilinear.build(x1.shape(), x2.shape(), &device, 0)?,
+        expected_shape
+    );
     bilinear
         .named_parameters()
         .iter()
@@ -6695,29 +6733,24 @@ fn bilinear_matches_hand_computed_quadratic_form_forward_and_every_gradient() ->
         .set_values(&[0.1, -0.2])?;
 
     let y = bilinear.forward(&x1, &x2)?;
-    close(
-        "Bilinear forward",
-        &y.to_vec()?,
-        &[-28.4, -33.2, 2.1, 7.8],
-    );
+    close("Bilinear forward", &y.to_vec()?, &[-28.4, -33.2, 2.1, 7.8]);
 
     // Reordered physical storage for both operands must not change the forward value: same
     // logical [batch, in*] shapes and values as `x1`/`x2`, transposed in physical storage.
-    let x1_reordered = Tensor::from_slice(&[1.0, 2.0, 3.0, -1.0], [batch.of(2), in1.of(2)], &device)?
-        .with_layout([in1, batch])?;
-    let x2_reordered = Tensor::from_slice(&[0.5, -2.0, 1.0, 2.0], [batch.of(2), in2.of(2)], &device)?
-        .with_layout([in2, batch])?;
+    let x1_reordered =
+        Tensor::from_slice(&[1.0, 2.0, 3.0, -1.0], [batch.of(2), in1.of(2)], &device)?
+            .with_layout([in1, batch])?;
+    let x2_reordered =
+        Tensor::from_slice(&[0.5, -2.0, 1.0, 2.0], [batch.of(2), in2.of(2)], &device)?
+            .with_layout([in2, batch])?;
     close(
         "Bilinear forward is unaffected by reordered operand storage",
         &bilinear.forward(&x1_reordered, &x2_reordered)?.to_vec()?,
         &[-28.4, -33.2, 2.1, 7.8],
     );
 
-    let weight_tensor = Tensor::from_slice(
-        &[1.0, 2.0, 3.0, 4.0],
-        [batch.of(2), output.of(2)],
-        &device,
-    )?;
+    let weight_tensor =
+        Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], [batch.of(2), output.of(2)], &device)?;
     y.mul(&weight_tensor)?.mean([batch, output])?.backward()?;
     close(
         "Bilinear bias gradient",
@@ -6756,7 +6789,11 @@ fn bilinear_matches_hand_computed_quadratic_form_forward_and_every_gradient() ->
         &[9.75, 14.25, -1.5, 5.5],
     );
 
-    assert!(Bilinear::new(in1, in2, output.of(2)).forward(&x1, &x2).is_err());
+    assert!(
+        Bilinear::new(in1, in2, output.of(2))
+            .forward(&x1, &x2)
+            .is_err()
+    );
     Ok(())
 }
 
@@ -6925,8 +6962,14 @@ fn local_response_norm_matches_hand_computed_oracle_under_asymmetric_window() ->
         &device,
     )?
     .with_grad();
-    let mut norm = LocalResponseNorm::new(channel, 4)?.alpha(0.5)?.beta(0.5)?.k(1.0)?;
-    assert_eq!(norm.build(input.shape(), &device, 0)?, input.shape().clone());
+    let mut norm = LocalResponseNorm::new(channel, 4)?
+        .alpha(0.5)?
+        .beta(0.5)?
+        .k(1.0)?;
+    assert_eq!(
+        norm.build(input.shape(), &device, 0)?,
+        input.shape().clone()
+    );
     let output = norm.forward(&input)?;
     close(
         "LocalResponseNorm forward under an asymmetric window",
@@ -7036,12 +7079,24 @@ fn module_list_and_module_dict_named_parameters_stay_addressable_like_sequential
     sum.mean([output])?.backward()?;
     close(
         "ModuleList branch 0 weight gradient",
-        &list.get(0).unwrap().parameter("weight")?.grad().unwrap().to_vec()?,
+        &list
+            .get(0)
+            .unwrap()
+            .parameter("weight")?
+            .grad()
+            .unwrap()
+            .to_vec()?,
         &[1.5, 1.5, 2.5, 2.5],
     );
     close(
         "ModuleList branch 1 weight gradient",
-        &list.get(1).unwrap().parameter("weight")?.grad().unwrap().to_vec()?,
+        &list
+            .get(1)
+            .unwrap()
+            .parameter("weight")?
+            .grad()
+            .unwrap()
+            .to_vec()?,
         &[1.5, 1.5, 2.5, 2.5],
     );
 
@@ -7055,8 +7110,12 @@ fn module_list_and_module_dict_named_parameters_stay_addressable_like_sequential
             Box::new(Linear::new(input, output.of(2)).bias(false)) as Box<dyn Module>,
         ),
     ])?;
-    dict.get_mut("even").unwrap().build(&input_shape, &device, 0)?;
-    dict.get_mut("odd").unwrap().build(&input_shape, &device, 0)?;
+    dict.get_mut("even")
+        .unwrap()
+        .build(&input_shape, &device, 0)?;
+    dict.get_mut("odd")
+        .unwrap()
+        .build(&input_shape, &device, 0)?;
     let dict_paths: Vec<_> = dict
         .named_parameters()
         .into_iter()
@@ -7092,8 +7151,16 @@ fn parameter_list_and_parameter_dict_named_parameters_stay_addressable() -> Resu
 
     let residual = p0.tensor().add(&p1.tensor())?;
     residual.mean([feature])?.backward()?;
-    close("ParameterList p0 gradient", &p0.grad().unwrap().to_vec()?, &[0.5, 0.5]);
-    close("ParameterList p1 gradient", &p1.grad().unwrap().to_vec()?, &[0.5, 0.5]);
+    close(
+        "ParameterList p0 gradient",
+        &p0.grad().unwrap().to_vec()?,
+        &[0.5, 0.5],
+    );
+    close(
+        "ParameterList p1 gradient",
+        &p1.grad().unwrap().to_vec()?,
+        &[0.5, 0.5],
+    );
 
     let mut dict = ParameterDict::new(vec![("a".to_string(), p0.clone())])?;
     assert!(dict.insert("a", p1.clone()).is_err());
@@ -7102,8 +7169,11 @@ fn parameter_list_and_parameter_dict_named_parameters_stay_addressable() -> Resu
     assert_eq!(dict.get("b").unwrap().id(), p1.id());
     assert!(dict.get("missing").is_none());
     assert!(
-        ParameterDict::new(vec![("dup".to_string(), p0.clone()), ("dup".to_string(), p1.clone())])
-            .is_err()
+        ParameterDict::new(vec![
+            ("dup".to_string(), p0.clone()),
+            ("dup".to_string(), p1.clone())
+        ])
+        .is_err()
     );
     Ok(())
 }

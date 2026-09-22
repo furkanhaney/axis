@@ -581,9 +581,11 @@ impl Module for LocalResponseNorm {
             window = window.add(&padded.narrow(self.channel, offset, extent)?)?;
         }
         let mean_square = window.scale(1.0 / self.size as f32)?;
-        let base = mean_square
-            .scale(self.alpha)?
-            .add(&Tensor::from_slice(&[self.k], [], input.device())?)?;
+        let base = mean_square.scale(self.alpha)?.add(&Tensor::from_slice(
+            &[self.k],
+            [],
+            input.device(),
+        )?)?;
         let denominator = base.ln()?.scale(self.beta)?.exp()?;
         input.div(&denominator)
     }

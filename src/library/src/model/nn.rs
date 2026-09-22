@@ -705,8 +705,10 @@ impl ModuleList {
 }
 impl Module for ModuleList {
     fn output_shape(&self, _input: &Shape) -> Result<Shape> {
-        Err("ModuleList has no forward of its own; call output_shape on a held module directly"
-            .into())
+        Err(
+            "ModuleList has no forward of its own; call output_shape on a held module directly"
+                .into(),
+        )
     }
     fn build(&mut self, _input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
         Err("ModuleList has no forward of its own; build each held module directly".into())
@@ -772,8 +774,10 @@ impl ModuleDict {
 }
 impl Module for ModuleDict {
     fn output_shape(&self, _input: &Shape) -> Result<Shape> {
-        Err("ModuleDict has no forward of its own; call output_shape on a held module directly"
-            .into())
+        Err(
+            "ModuleDict has no forward of its own; call output_shape on a held module directly"
+                .into(),
+        )
     }
     fn build(&mut self, _input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
         Err("ModuleDict has no forward of its own; build each held module directly".into())
@@ -1053,8 +1057,7 @@ impl Bilinear {
         let extent1 = x1.extent(self.in1)?;
         let extent2 = x2.extent(self.in2)?;
         for dim in x1.dims() {
-            if dim.axis != self.in1 && x2.contains(dim.axis) && x2.extent(dim.axis)? != dim.extent
-            {
+            if dim.axis != self.in1 && x2.contains(dim.axis) && x2.extent(dim.axis)? != dim.extent {
                 return Err(format!("Bilinear shared axis {:?} extent mismatch", dim.axis).into());
             }
         }
@@ -1255,13 +1258,11 @@ impl EmbeddingBag {
             .tensor()
             .gather(self.vocabulary.axis, index, self.position_role)?;
         match self.mode {
-            EmbeddingBagMode::Sum => {
-                rows.scatter_add(self.position_role, &bag, output, bag_count)
-            }
+            EmbeddingBagMode::Sum => rows.scatter_add(self.position_role, &bag, output, bag_count),
             EmbeddingBagMode::Mean => {
                 let summed = rows.scatter_add(self.position_role, &bag, output, bag_count)?;
-                let counts = Tensor::bincount(&bag, output, bag_count, &device)?
-                    .clamp(Some(1.0), None)?;
+                let counts =
+                    Tensor::bincount(&bag, output, bag_count, &device)?.clamp(Some(1.0), None)?;
                 summed.div(&counts)
             }
             EmbeddingBagMode::Max => {
