@@ -4854,3 +4854,204 @@ fn seeded_uniform_and_normal_tensors_build_named_axis_tensors_with_no_gradient_e
     println!("seeded uniform/normal tensor construction PASS");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn exp_forward_and_gradient_match_independent_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    // Hand-computed literals: exp(0) = 1, exp(1) = e, plus exp(-2)/exp(-1)/exp(2).
+    let values = [-2.0_f32, -1.0, 0.0, 1.0, 2.0];
+    let expected = [
+        0.1353352832366127,
+        0.36787944117144233,
+        1.0,
+        std::f64::consts::E,
+        7.38905609893065,
+    ];
+    let leaf = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let output = leaf.exp()?;
+    close("exp forward", &output.to_vec()?, &expected);
+    output.mean(sample)?.backward()?;
+    // Backward is `g * exp(x)`; mean seeds `g = 1 / len`, so the expected gradient is
+    // just the forward oracle scaled the same way.
+    let expected_gradient: Vec<f64> = expected.iter().map(|&y| y / values.len() as f64).collect();
+    close(
+        "exp derivative (g * exp(x))",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    // Reordered-storage CUDA case: physical order different from logical order.
+    let (row, col) = (Axis::new("exp_row"), Axis::new("exp_col"));
+    let wide_values: Vec<f32> = (0..201).map(|i| (i as f32 - 100.0) / 25.0).collect();
+    let wide_leaf = Tensor::from_slice(&wide_values, [row.of(3), col.of(67)], &device)?.with_grad();
+    let wide_output = wide_leaf.with_layout([col, row])?.exp()?;
+    let wide_expected: Vec<f64> = wide_values.iter().map(|&x| f64::from(x).exp()).collect();
+    close(
+        "exp forward (reordered storage)",
+        &wide_output.to_vec()?,
+        &wide_expected,
+    );
+    wide_output.mean([row, col])?.backward()?;
+    let wide_expected_gradient: Vec<f64> = wide_expected
+        .iter()
+        .map(|&y| y / wide_values.len() as f64)
+        .collect();
+    close(
+        "exp derivative (reordered storage)",
+        &wide_leaf.grad().unwrap().to_vec()?,
+        &wide_expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn ln_forward_and_gradient_match_independent_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    // Hand-computed literals: ln(1) = 0, ln(e) = 1, plus ln(0.25) = -ln(4).
+    let values = [0.25_f32, 1.0, std::f32::consts::E, 4.0];
+    let expected = [-1.3862943611198906, 0.0, 1.0, 1.3862943611198906];
+    let leaf = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let output = leaf.ln()?;
+    close("ln forward", &output.to_vec()?, &expected);
+    output.mean(sample)?.backward()?;
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| 1.0 / f64::from(x) / values.len() as f64)
+        .collect();
+    close(
+        "ln derivative (g / x)",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    // IEEE behaviour at and below zero: no clamping, matching f32::ln/torch.log.
+    let boundary = Tensor::from_slice(&[0.0_f32, -1.0], [sample.of(2)], &device)?;
+    let boundary_output = boundary.ln()?.to_vec()?;
+    assert!(
+        boundary_output[0].is_infinite() && boundary_output[0].is_sign_negative(),
+        "ln(0) must be -inf, got {}",
+        boundary_output[0]
+    );
+    assert!(
+        boundary_output[1].is_nan(),
+        "ln(-1) must be NaN, got {}",
+        boundary_output[1]
+    );
+
+    // Reordered-storage CUDA case: physical order different from logical order.
+    let (row, col) = (Axis::new("ln_row"), Axis::new("ln_col"));
+    let wide_values: Vec<f32> = (0..201).map(|i| (i as f32 + 1.0) / 25.0).collect();
+    let wide_leaf = Tensor::from_slice(&wide_values, [row.of(3), col.of(67)], &device)?.with_grad();
+    let wide_output = wide_leaf.with_layout([col, row])?.ln()?;
+    let wide_expected: Vec<f64> = wide_values.iter().map(|&x| f64::from(x).ln()).collect();
+    close(
+        "ln forward (reordered storage)",
+        &wide_output.to_vec()?,
+        &wide_expected,
+    );
+    wide_output.mean([row, col])?.backward()?;
+    let wide_expected_gradient: Vec<f64> = wide_values
+        .iter()
+        .map(|&x| 1.0 / f64::from(x) / wide_values.len() as f64)
+        .collect();
+    close(
+        "ln derivative (reordered storage)",
+        &wide_leaf.grad().unwrap().to_vec()?,
+        &wide_expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn softplus_forward_and_gradient_match_pytorch_beta1_threshold40_oracle() -> Result<()> {
+    // `world/energy-output`'s exact consumer configuration (every `fit_*.py`'s
+    // nonlinearity): `torch.nn.Softplus(beta=1, threshold=40)`.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let (beta, threshold) = (1.0_f32, 40.0_f32);
+    // Hand-computed literals: softplus(0) = ln(2); x = 41 clears beta*x > 40, so the
+    // linear branch returns x itself with gradient exactly 1; x = -41 is deep in the
+    // logarithmic branch, where softplus(x) is negligible.
+    let values = [0.0_f32, 41.0, -41.0, -2.0, 2.0];
+    let expected = [
+        std::f64::consts::LN_2,
+        41.0,
+        1.5628821893349888e-18,
+        0.1269280110429725,
+        2.1269280110429727,
+    ];
+    let leaf = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let output = leaf.softplus(beta, threshold)?;
+    close("softplus forward", &output.to_vec()?, &expected);
+    output.mean(sample)?.backward()?;
+    let n = values.len() as f64;
+    let expected_gradient = [
+        0.5 / n,
+        1.0 / n,
+        1.5628821893349888e-18 / n,
+        0.11920292202211755 / n,
+        0.8807970779778823 / n,
+    ];
+    close(
+        "softplus derivative (sigmoid(beta*x), 1 past the threshold)",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    assert!(leaf.softplus(0.0, threshold).is_err());
+    assert!(leaf.softplus(-1.0, threshold).is_err());
+    assert!(leaf.softplus(f32::NAN, threshold).is_err());
+    assert!(leaf.softplus(beta, f32::NAN).is_err());
+    assert!(leaf.softplus(beta, f32::INFINITY).is_err());
+
+    // Reordered-storage CUDA case spanning both branches (|x| up to 50 crosses
+    // beta * x > 40 on both signs of the permuted tensor).
+    let (row, col) = (Axis::new("softplus_row"), Axis::new("softplus_col"));
+    let wide_values: Vec<f32> = (0..201).map(|i| (i as f32 - 100.0) / 2.0).collect();
+    let wide_leaf = Tensor::from_slice(&wide_values, [row.of(3), col.of(67)], &device)?.with_grad();
+    let wide_output = wide_leaf
+        .with_layout([col, row])?
+        .softplus(beta, threshold)?;
+    let wide_expected: Vec<f64> = wide_values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            let scaled = f64::from(beta) * x;
+            if scaled > f64::from(threshold) {
+                x
+            } else {
+                (1.0 + scaled.exp()).ln() / f64::from(beta)
+            }
+        })
+        .collect();
+    close(
+        "softplus forward (reordered storage)",
+        &wide_output.to_vec()?,
+        &wide_expected,
+    );
+    wide_output.mean([row, col])?.backward()?;
+    let wide_expected_gradient: Vec<f64> = wide_values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            let scaled = f64::from(beta) * x;
+            let derivative = if scaled > f64::from(threshold) {
+                1.0
+            } else {
+                1.0 / (1.0 + (-scaled).exp())
+            };
+            derivative / wide_values.len() as f64
+        })
+        .collect();
+    close(
+        "softplus derivative (reordered storage)",
+        &wide_leaf.grad().unwrap().to_vec()?,
+        &wide_expected_gradient,
+    );
+    Ok(())
+}
