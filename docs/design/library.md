@@ -1156,3 +1156,46 @@ existing device kernels with no new one. `Fold` rejects an input whose
 extents are inconsistent with its `output_size`/kernel/stride/padding before
 any device call, the same "before launch" contract every other row in this
 family holds.
+
+### Norm orders and signed alpha
+
+Four gap-closes on wave 1's PR #125/#123 distance, margin-loss and signed-linear-unit rows;
+`docs/nn/catalog.md` records the row-level verdicts.
+
+- **`Tensor::pairwise_distance`/`Tensor::triplet_margin_loss` now take a `p`.** Both were
+  Euclidean-only (`p=2`, hardcoded). `p` is now any positive real or `f32::INFINITY`, matching
+  PyTorch's own `p`-norm domain. `p == 2.0` still runs the original
+  `((diff)^2).sum(axis).sqrt()` composition bit-exact (no other row's recorded output moves);
+  `p == 1.0` is `abs(diff).sum(axis)`; `p == f32::INFINITY` is `abs(diff).max(axis)` (PyTorch's
+  documented `p -> inf` limit); every other `p` is the general `(sum(abs(diff)^p))^(1/p)`,
+  composed from `ln`/`exp` (`x^p = exp(p * ln(x))`) since there is no dedicated elementwise
+  power op -- `ln(0) = -inf` and `exp(-inf) = 0` give the mathematically correct zero
+  contribution at an exactly-zero coordinate. `eps` (PyTorch default `1e-6`) is unchanged: added
+  to the raw difference BEFORE the norm, exactly where PyTorch's own `F.pairwise_distance` adds
+  it (`aten/src/ATen/native/Distance.cpp`), never as a denominator floor.
+- **`Tensor::multi_margin_loss` now takes a `p` and an optional `weight`.** `p` (PyTorch
+  default `1.0`) must be exactly `1.0` or `2.0`, PyTorch's own documented domain; `p == 2.0`
+  squares the per-class hinge term before summing. `weight` (PyTorch default `None`) is an
+  optional length-`class.extent()` tensor indexed by `class` alone: when given, the WHOLE
+  per-sample hinge sum is multiplied by `weight[target]` -- the true class's own weight,
+  gathered once per sample as `target.mul(weight).sum(class)` -- never a per-competing-class
+  lookup or an average over all classes, matching `aten/src/ATen/native/LossMulti.h`.
+- **`Tensor::cosine_similarity`'s clamp changed shape (semantic fix).** Wave 1 clamped
+  `||x1||` and `||x2||` to `eps` INDIVIDUALLY before multiplying them; PyTorch's own kernel
+  (`aten/src/ATen/native/Distance.cpp`) instead clamps the PRODUCT of the two squared norms to
+  `eps^2` before one shared square root: `x1.x2 / sqrt(clamp_min(||x1||^2 * ||x2||^2, eps^2))`.
+  The two formulas agree whenever both norms sit above `eps`; they diverge whenever exactly one
+  operand's real norm sits below `eps` (the joint form still lets that operand's real, sub-`eps`
+  norm shrink the denominator, since only the PRODUCT is floored -- the individually-clamped
+  form floors it at `eps` regardless of the OTHER operand's norm). Axis now matches the joint
+  form exactly, forward and gradient.
+- **`ELU`/`CELU` accept any finite, nonzero `alpha`**, PyTorch's own documented domain
+  (`torch.nn.CELU`'s docs read "valid for alpha != 0"; `torch.nn.ELU`'s give no sign
+  restriction at all). Both keep their existing two-branch composition (`x` where `x > 0`,
+  otherwise the exponential branch) unchanged -- for `CELU`, `alpha * (exp(x / alpha) - 1)`
+  already equals PyTorch's `max(0, x) + min(0, alpha * (exp(x / alpha) - 1))` for every nonzero
+  `alpha`, not only positive ones, because the sign of `alpha * (exp(x / alpha) - 1)` always
+  lands on the side the `max`/`min` wrapper would have selected anyway; the same argument, with
+  `celu`'s `exp(x / alpha)` collapsing to `exp(x)`, holds for `ELU`. The positive branch never
+  reads `alpha`, so every already-recorded `alpha > 0` output and gradient stays bit-exact; only
+  the validation guard widens from "positive" to "nonzero".
