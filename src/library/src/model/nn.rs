@@ -597,6 +597,569 @@ impl Module for SignStraightThrough {
     }
 }
 
+/// Every padded axis and its `(before, after)` extents, shared by all five
+/// padding modes below. PyTorch's `nn.*Pad1d/2d/3d` classes take one flat
+/// tuple ordered *last-dim-first* (`ZeroPad2d((left, right, top, bottom))`
+/// pads width before height); Axis instead takes one `(Axis, before, after)`
+/// entry per padded axis, in any order, since axis identity -- not tuple
+/// position -- selects which dimension moves. A `ZeroPad2d((left, right,
+/// top, bottom))` call becomes `ZeroPad::new([(height, top, bottom),
+/// (width, left, right)])`; the "1d"/"2d"/"3d" split in PyTorch's names is
+/// purely how many entries the list has (one, two, or three), not a
+/// different type or contract here. Every axis not listed is preserved
+/// unchanged, matching how `Conv2d`/`MaxPool2d` append or resize only their
+/// own named axes.
+fn validate_pad_list(name: &str, pads: &[(Axis, usize, usize)]) -> Result<()> {
+    if pads.is_empty() {
+        return Err(format!("{name} requires at least one padded axis").into());
+    }
+    for (index, &(axis, _, _)) in pads.iter().enumerate() {
+        if pads[..index].iter().any(|&(other, _, _)| other == axis) {
+            return Err(format!("{name} lists axis {axis:?} more than once").into());
+        }
+    }
+    Ok(())
+}
+
+/// Add `before + after` to each listed axis's extent, checked for overflow, and
+/// preserve every other axis in place. Shared shape math for all five padding
+/// modes: they differ only in what forward writes into the new coordinates.
+fn padded_shape(name: &str, input: &Shape, pads: &[(Axis, usize, usize)]) -> Result<Shape> {
+    let mut dims = input.dims().to_vec();
+    for &(axis, before, after) in pads {
+        let slot = dims
+            .iter_mut()
+            .find(|dim| dim.axis == axis)
+            .ok_or_else(|| format!("{name} axis {axis:?} is not in the input shape"))?;
+        let extent = slot
+            .extent
+            .checked_add(before)
+            .and_then(|extent| extent.checked_add(after))
+            .ok_or_else(|| format!("{name} padded extent overflow"))?;
+        *slot = axis.of(extent);
+    }
+    Shape::new(dims)
+}
+
+/// Exact zero padding, covering `ZeroPad1d`/`ZeroPad2d`/`ZeroPad3d` (see the
+/// tuple-to-axis mapping above `validate_pad_list`). Composed entirely from
+/// repeated [`Tensor::pad_zeros`], one call per listed axis; backward is
+/// `pad_zeros`'s own exact crop, so a source element's gradient is unaffected
+/// by padding.
+pub struct ZeroPad {
+    pads: Vec<(Axis, usize, usize)>,
+}
+impl ZeroPad {
+    pub fn new(pads: impl IntoIterator<Item = (Axis, usize, usize)>) -> Result<Self> {
+        let pads: Vec<_> = pads.into_iter().collect();
+        validate_pad_list("ZeroPad", &pads)?;
+        Ok(Self { pads })
+    }
+}
+impl Module for ZeroPad {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        padded_shape("ZeroPad", input, &self.pads)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.pads
+            .iter()
+            .try_fold(input.clone(), |value, &(axis, before, after)| {
+                value.pad_zeros(axis, before, after)
+            })
+    }
+}
+
+/// Padding at an arbitrary constant value, covering `ConstantPad1d/2d/3d`.
+/// `ZeroPad`'s own zero-padded tensor already has the correct interior
+/// (`pad_zeros` never touches it) and exact zeros in the border; a second,
+/// independent zero-padding of a constant ones mask (`Tensor::zeros(..).ge(0.0)`,
+/// which carries no gradient edge of its own) turns into an interior/border
+/// indicator, and its `logical_not` -- exactly zero inside, exactly one in the
+/// border -- scaled by `value` and added supplies the constant. Backward is
+/// therefore identical to `ZeroPad`'s: the border term is a detached constant
+/// and contributes no gradient.
+pub struct ConstantPad {
+    pads: Vec<(Axis, usize, usize)>,
+    value: f32,
+}
+impl ConstantPad {
+    pub fn new(pads: impl IntoIterator<Item = (Axis, usize, usize)>, value: f32) -> Result<Self> {
+        let pads: Vec<_> = pads.into_iter().collect();
+        validate_pad_list("ConstantPad", &pads)?;
+        if !value.is_finite() {
+            return Err("ConstantPad value must be finite".into());
+        }
+        Ok(Self { pads, value })
+    }
+}
+impl Module for ConstantPad {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        padded_shape("ConstantPad", input, &self.pads)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let interior = Tensor::zeros(input.shape().dims().to_vec(), input.device())?.ge(0.0)?;
+        let (zero_padded, interior_padded) = self.pads.iter().try_fold(
+            (input.clone(), interior),
+            |(value, mask), &(axis, before, after)| -> Result<_> {
+                Ok((
+                    value.pad_zeros(axis, before, after)?,
+                    mask.pad_zeros(axis, before, after)?,
+                ))
+            },
+        )?;
+        let border = interior_padded.logical_not()?.scale(self.value)?;
+        zero_padded.add(&border)
+    }
+}
+
+/// A source coordinate function for [`edge_pad`]: maps an extended-domain
+/// coordinate (which may be negative or `>= extent`) back into `[0, extent)`.
+type EdgeSource = fn(usize, isize) -> usize;
+
+/// PyTorch's whole-sample reflection: mirror around each edge coordinate
+/// without repeating it (`-1` reflects to `1`, not `0`). Only ever called
+/// with `before < extent` and `after < extent` (enforced before launch), so
+/// one bounce off each edge always lands back inside `[0, extent)`; a larger
+/// pad would need a second bounce, which is exactly PyTorch's own
+/// restriction on `ReflectionPad*`.
+fn reflect_source(extent: usize, coordinate: isize) -> usize {
+    if coordinate < 0 {
+        (-coordinate) as usize
+    } else if coordinate as usize >= extent {
+        2 * (extent - 1) - coordinate as usize
+    } else {
+        coordinate as usize
+    }
+}
+
+/// PyTorch's edge replication: clamp into `[0, extent)`. Valid for any pad
+/// size, since clamping never leaves the axis.
+fn replicate_source(extent: usize, coordinate: isize) -> usize {
+    coordinate.clamp(0, extent as isize - 1) as usize
+}
+
+/// Pad one named axis by building a host-side source index for every output
+/// coordinate and reading it back with [`Tensor::gather`]. Gather's backward
+/// is an exact scatter-add over repeated indices (`Plan::gather`/`Plan::reverse`),
+/// which is exactly the gradient reflection and replication padding need: an
+/// edge-adjacent source element that feeds more than one output coordinate
+/// accumulates every contribution instead of losing all but one.
+fn edge_pad(
+    value: &Tensor,
+    axis: Axis,
+    before: usize,
+    after: usize,
+    source: EdgeSource,
+) -> Result<Tensor> {
+    if before == 0 && after == 0 {
+        return Ok(value.clone());
+    }
+    let extent = value.extent(axis)?;
+    let out_len = extent
+        .checked_add(before)
+        .and_then(|extent| extent.checked_add(after))
+        .ok_or("edge padding extent overflow")?;
+    let index: Vec<usize> = (0..out_len)
+        .map(|position| source(extent, position as isize - before as isize))
+        .collect();
+    let role = axis.role("edge_pad");
+    value.gather(axis, &index, role)?.rename(role, axis)
+}
+
+/// Reflection padding, covering `ReflectionPad1d/2d/3d`. Matches PyTorch's
+/// own constraint that each side's padding be strictly less than the axis's
+/// extent (checked before launch, in [`reflect_source`]'s doc); see
+/// [`edge_pad`] for the composition and its exact gradient.
+pub struct ReflectionPad {
+    pads: Vec<(Axis, usize, usize)>,
+}
+impl ReflectionPad {
+    pub fn new(pads: impl IntoIterator<Item = (Axis, usize, usize)>) -> Result<Self> {
+        let pads: Vec<_> = pads.into_iter().collect();
+        validate_pad_list("ReflectionPad", &pads)?;
+        Ok(Self { pads })
+    }
+}
+impl Module for ReflectionPad {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        for &(axis, before, after) in &self.pads {
+            let extent = input.extent(axis)?;
+            if before >= extent || after >= extent {
+                return Err(format!(
+                    "ReflectionPad padding on axis {axis:?} must be less than its extent {extent}, matching PyTorch's own constraint"
+                )
+                .into());
+            }
+        }
+        padded_shape("ReflectionPad", input, &self.pads)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.pads
+            .iter()
+            .try_fold(input.clone(), |value, &(axis, before, after)| {
+                edge_pad(&value, axis, before, after, reflect_source)
+            })
+    }
+}
+
+/// Edge replication padding, covering `ReplicationPad1d/2d/3d`. No pad-size
+/// constraint beyond the shared overflow check: see [`edge_pad`] for the
+/// composition and its exact gradient.
+pub struct ReplicationPad {
+    pads: Vec<(Axis, usize, usize)>,
+}
+impl ReplicationPad {
+    pub fn new(pads: impl IntoIterator<Item = (Axis, usize, usize)>) -> Result<Self> {
+        let pads: Vec<_> = pads.into_iter().collect();
+        validate_pad_list("ReplicationPad", &pads)?;
+        Ok(Self { pads })
+    }
+}
+impl Module for ReplicationPad {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        padded_shape("ReplicationPad", input, &self.pads)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.pads
+            .iter()
+            .try_fold(input.clone(), |value, &(axis, before, after)| {
+                edge_pad(&value, axis, before, after, replicate_source)
+            })
+    }
+}
+
+/// Pad one named axis by wrapping values from its opposite edge: the
+/// composition `roll` itself uses (`narrow` the wrap-around slice, `concat`
+/// it onto the un-narrowed original). Backward needs no dedicated rule:
+/// `concat`'s backward narrows the upstream gradient back to each operand's
+/// own output slice, and `narrow`'s backward zero-scatters that slice into
+/// the source axis, so a source element used by both the wrapped copy and
+/// the interior copy (whenever `before` or `after` is positive) accumulates
+/// gradient from both through ordinary multi-use accumulation.
+fn circular_pad_axis(value: &Tensor, axis: Axis, before: usize, after: usize) -> Result<Tensor> {
+    if before == 0 && after == 0 {
+        return Ok(value.clone());
+    }
+    let extent = value.extent(axis)?;
+    let mut parts = Vec::with_capacity(3);
+    if before > 0 {
+        parts.push(value.narrow(axis, extent - before, before)?);
+    }
+    parts.push(value.clone());
+    if after > 0 {
+        parts.push(value.narrow(axis, 0, after)?);
+    }
+    Tensor::concat(&parts, axis)
+}
+
+/// Circular (wrap-around) padding, covering `CircularPad1d/2d/3d`. Matches
+/// PyTorch's own constraint that each side's padding be at most the axis's
+/// extent (a full wrap is allowed, unlike reflection's strict `<`); see
+/// [`circular_pad_axis`] for the composition and its exact gradient.
+pub struct CircularPad {
+    pads: Vec<(Axis, usize, usize)>,
+}
+impl CircularPad {
+    pub fn new(pads: impl IntoIterator<Item = (Axis, usize, usize)>) -> Result<Self> {
+        let pads: Vec<_> = pads.into_iter().collect();
+        validate_pad_list("CircularPad", &pads)?;
+        Ok(Self { pads })
+    }
+}
+impl Module for CircularPad {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        for &(axis, before, after) in &self.pads {
+            let extent = input.extent(axis)?;
+            if before > extent || after > extent {
+                return Err(format!(
+                    "CircularPad padding on axis {axis:?} must be at most its extent {extent}, matching PyTorch's own constraint"
+                )
+                .into());
+            }
+        }
+        padded_shape("CircularPad", input, &self.pads)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.pads
+            .iter()
+            .try_fold(input.clone(), |value, &(axis, before, after)| {
+                circular_pad_axis(&value, axis, before, after)
+            })
+    }
+}
+
+/// Sub-pixel upscaling: rearrange `channel` (extent `C * factor^2`) into
+/// `factor` blocks along each of the two named `spatial` axes, expanding
+/// each by `factor` and shrinking `channel` to `C`. PyTorch's own
+/// `pixel_shuffle` decomposition -- reshape the channel axis to
+/// `(C, factor, factor)`, permute to interleave each `factor` axis with its
+/// spatial axis, then flatten -- is exactly [`Tensor::split`] (channel into
+/// `[out_channel, row_factor, col_factor]`, outermost first) followed by two
+/// [`Tensor::merge`] calls (`[height, row_factor]`, `[width, col_factor]`,
+/// spatial axis outermost so it varies slower than its own sub-pixel
+/// offset). No dedicated kernel or backward rule: `split`/`merge` are both
+/// already differentiable.
+pub struct PixelShuffle {
+    channel: Axis,
+    spatial: [Axis; 2],
+    factor: usize,
+}
+impl PixelShuffle {
+    pub fn new(channel: Axis, spatial: [Axis; 2], factor: usize) -> Result<Self> {
+        if factor == 0 {
+            return Err("PixelShuffle upscale_factor must be at least 1".into());
+        }
+        if spatial[0] == spatial[1] || spatial.contains(&channel) {
+            return Err("PixelShuffle requires distinct channel and spatial axes".into());
+        }
+        Ok(Self {
+            channel,
+            spatial,
+            factor,
+        })
+    }
+}
+impl Module for PixelShuffle {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let square = self
+            .factor
+            .checked_mul(self.factor)
+            .ok_or("PixelShuffle upscale_factor squared overflow")?;
+        let channel_extent = input.extent(self.channel)?;
+        if channel_extent % square != 0 {
+            return Err(format!(
+                "PixelShuffle channel axis {:?} extent {channel_extent} is not divisible by upscale_factor^2 ({square})",
+                self.channel
+            )
+            .into());
+        }
+        let out_channel = channel_extent / square;
+        let [height, width] = self.spatial;
+        let new_height = input
+            .extent(height)?
+            .checked_mul(self.factor)
+            .ok_or("PixelShuffle height overflow")?;
+        let new_width = input
+            .extent(width)?
+            .checked_mul(self.factor)
+            .ok_or("PixelShuffle width overflow")?;
+        let dims = input.dims().iter().map(|dim| {
+            if dim.axis == self.channel {
+                self.channel.of(out_channel)
+            } else if dim.axis == height {
+                height.of(new_height)
+            } else if dim.axis == width {
+                width.of(new_width)
+            } else {
+                *dim
+            }
+        });
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let channel_extent = input.extent(self.channel)?;
+        let out_channel = channel_extent / (self.factor * self.factor);
+        let (out_channel_axis, row_factor, col_factor) = (
+            self.channel.role("pixel_shuffle_channel"),
+            self.channel.role("pixel_shuffle_row_factor"),
+            self.channel.role("pixel_shuffle_col_factor"),
+        );
+        let [height, width] = self.spatial;
+        let (new_height, new_width) = (
+            height.role("pixel_shuffle_height"),
+            width.role("pixel_shuffle_width"),
+        );
+        let split = input.split(
+            self.channel,
+            [
+                out_channel_axis.of(out_channel),
+                row_factor.of(self.factor),
+                col_factor.of(self.factor),
+            ],
+        )?;
+        let merged = split
+            .merge([height, row_factor], new_height)?
+            .merge([width, col_factor], new_width)?;
+        merged
+            .rename(out_channel_axis, self.channel)?
+            .rename(new_height, height)?
+            .rename(new_width, width)
+    }
+}
+
+/// The exact inverse of [`PixelShuffle`]: shrink `channel`'s two named
+/// `spatial` axes by `factor` each and grow `channel` by `factor^2`.
+/// Composed as [`Tensor::split`] on each spatial axis (`[outer, sub_pixel]`,
+/// spatial axis outermost, undoing `PixelShuffle`'s merge order exactly)
+/// followed by one [`Tensor::merge`] of `[channel, row_factor, col_factor]`
+/// into the new channel axis (undoing `PixelShuffle`'s split order exactly).
+pub struct PixelUnshuffle {
+    channel: Axis,
+    spatial: [Axis; 2],
+    factor: usize,
+}
+impl PixelUnshuffle {
+    pub fn new(channel: Axis, spatial: [Axis; 2], factor: usize) -> Result<Self> {
+        if factor == 0 {
+            return Err("PixelUnshuffle downscale_factor must be at least 1".into());
+        }
+        if spatial[0] == spatial[1] || spatial.contains(&channel) {
+            return Err("PixelUnshuffle requires distinct channel and spatial axes".into());
+        }
+        Ok(Self {
+            channel,
+            spatial,
+            factor,
+        })
+    }
+}
+impl Module for PixelUnshuffle {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let [height, width] = self.spatial;
+        let height_extent = input.extent(height)?;
+        let width_extent = input.extent(width)?;
+        if height_extent % self.factor != 0 || width_extent % self.factor != 0 {
+            return Err(format!(
+                "PixelUnshuffle spatial extents ({height_extent}, {width_extent}) must both be divisible by downscale_factor {}",
+                self.factor
+            )
+            .into());
+        }
+        let square = self
+            .factor
+            .checked_mul(self.factor)
+            .ok_or("PixelUnshuffle downscale_factor squared overflow")?;
+        let channel_extent = input.extent(self.channel)?;
+        let new_channel = channel_extent
+            .checked_mul(square)
+            .ok_or("PixelUnshuffle channel overflow")?;
+        let dims = input.dims().iter().map(|dim| {
+            if dim.axis == self.channel {
+                self.channel.of(new_channel)
+            } else if dim.axis == height {
+                height.of(height_extent / self.factor)
+            } else if dim.axis == width {
+                width.of(width_extent / self.factor)
+            } else {
+                *dim
+            }
+        });
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let [height, width] = self.spatial;
+        let (height_outer, row_factor) = (
+            height.role("pixel_unshuffle_height"),
+            height.role("pixel_unshuffle_row_factor"),
+        );
+        let (width_outer, col_factor) = (
+            width.role("pixel_unshuffle_width"),
+            width.role("pixel_unshuffle_col_factor"),
+        );
+        let height_extent = input.extent(height)?;
+        let width_extent = input.extent(width)?;
+        let split = input
+            .split(
+                height,
+                [
+                    height_outer.of(height_extent / self.factor),
+                    row_factor.of(self.factor),
+                ],
+            )?
+            .split(
+                width,
+                [
+                    width_outer.of(width_extent / self.factor),
+                    col_factor.of(self.factor),
+                ],
+            )?;
+        let new_channel = self.channel.role("pixel_unshuffle_channel");
+        let merged = split.merge([self.channel, row_factor, col_factor], new_channel)?;
+        merged
+            .rename(new_channel, self.channel)?
+            .rename(height_outer, height)?
+            .rename(width_outer, width)
+    }
+}
+
+/// `torch.nn.ChannelShuffle(groups)`: split `channel` (extent `C`) into
+/// `[group (groups), within (C / groups)]` -- PyTorch's actual internal
+/// reshape order, `(N, groups, C/groups, *)`, which is the reverse of its
+/// own prose ("divides ... into g groups as (N, C/g, g, *)"), verified
+/// against a real `channel_shuffle` run rather than trusted from the text
+/// -- then merge back in swapped order `[within, group]`, reproducing its
+/// documented transpose-and-flatten exactly (`[ch0, ch1, ch2, ch3]` at
+/// `groups=2` becomes `[ch0, ch2, ch1, ch3]`, matching the PyTorch docs'
+/// own example; the two group/within orderings only coincide when
+/// `groups == C / groups`, which is why that example alone cannot
+/// distinguish them). Every other axis is untouched, so this works on any
+/// `(N, C, *)` shape without naming the trailing axes. No dedicated kernel
+/// or backward rule: `split` and `merge` are both already differentiable.
+pub struct ChannelShuffle {
+    channel: Axis,
+    groups: usize,
+}
+impl ChannelShuffle {
+    pub fn new(channel: Axis, groups: usize) -> Result<Self> {
+        if groups == 0 {
+            return Err("ChannelShuffle groups must be at least 1".into());
+        }
+        Ok(Self { channel, groups })
+    }
+}
+impl Module for ChannelShuffle {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let extent = input.extent(self.channel)?;
+        if extent % self.groups != 0 {
+            return Err(format!(
+                "ChannelShuffle channel axis {:?} extent {extent} is not divisible by groups {}",
+                self.channel, self.groups
+            )
+            .into());
+        }
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let extent = input.extent(self.channel)?;
+        let within_extent = extent / self.groups;
+        let (group, within) = (
+            self.channel.role("channel_shuffle_group"),
+            self.channel.role("channel_shuffle_within"),
+        );
+        let split = input.split(
+            self.channel,
+            [group.of(self.groups), within.of(within_extent)],
+        )?;
+        let new_channel = self.channel.role("channel_shuffle_merged");
+        let merged = split.merge([within, group], new_channel)?;
+        merged.rename(new_channel, self.channel)
+    }
+}
+
 pub trait IntoLayers {
     fn into_layers(self) -> Vec<Box<dyn Module>>;
 }

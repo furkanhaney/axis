@@ -65,8 +65,10 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    Embedding, ExactGELU, GELU, IntoLayers, LeakyReLU, Linear, Module, ParamId, Parameter,
-    PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU, SignStraightThrough, Tanh,
+    ChannelShuffle, CircularPad, ConstantPad, Embedding, ExactGELU, GELU, IntoLayers, LeakyReLU,
+    Linear, Module, ParamId, Parameter, PixelShuffle, PixelUnshuffle, PopulationLinear,
+    PositionEmbedding, ReLU, ReflectionPad, ReplicationPad, Sequential, SiLU, SignStraightThrough,
+    Tanh, ZeroPad,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{
@@ -107,18 +109,20 @@ mod window_tests;
 pub mod prelude {
     pub use crate::{
         Adam, AdamW, AdditionDataset, AdditionSample, Axis, Batch, CategoricalAccuracy,
-        CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
-        Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
-        EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
-        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
-        Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
-        LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
-        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
-        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear,
-        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot,
-        ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD,
-        Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh,
-        Tensor, TrainStep, Trainer, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        CentralDifference, ChannelShuffle, CircularPad, ConstantPad, Conv2d, Conv3d, DataLoader,
+        DataRegimeReceipt, DataSource, Device, Dim, Disjointness, DisjointnessEvidence,
+        DisjointnessReceipt, Embedding, EmpiricalMonotonicity, EmpiricalMonotonicityReceipt,
+        EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU, FinitePasses, FinitePassesLoader,
+        FinitePassesReceipt, GELU, GroupNorm, IdentityScheme, Idr, IdrLimits, IdrReceipt,
+        InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm, LeakyReLU, LearningDirection,
+        LearningEvidence, LearningLimits, LearningObservation, LearningProgress,
+        LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState, MaxPool2d, MaxPool3d,
+        Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
+        MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PixelShuffle, PixelUnshuffle,
+        PopulationLinear, PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding,
+        ReLU, ReflectionPad, RegimeSnapshot, ReplicationPad, ResidualClaim, ResidualEvidence,
+        ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential, Shape, SiLU,
+        SignStraightThrough, SinglePass, Standardizer, Tanh, Tensor, TrainStep, Trainer, ZeroPad,
+        clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
     };
 }
