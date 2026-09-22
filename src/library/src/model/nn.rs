@@ -1,4 +1,4 @@
-use crate::{Axis, Device, Dim, Result, Shape, Tensor};
+use crate::{Axis, Device, Dim, Result, Shape, Tensor, TrainingPass};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -81,7 +81,23 @@ pub trait Module {
     /// Infer extents, validate contracts, allocate and initialize parameters; never run forward.
     /// Rebuilding with compatible extents/device preserves parameters and ignores the new seed.
     fn build(&mut self, input: &Shape, device: &Device, seed: u64) -> Result<Shape>;
+    /// Evaluation semantics: no mode flag on `self`, no randomness beyond what
+    /// `forward` itself already defines. This never changes with the arrival
+    /// of `forward_training`.
     fn forward(&self, input: &Tensor) -> Result<Tensor>;
+    /// Training-mode forward pass, driven by an explicit [`TrainingPass`]
+    /// rather than a flag on `self`. The default implementation ignores
+    /// `pass` and calls [`Module::forward`], which is exactly today's
+    /// behavior for every module without a train/eval distinction. Override
+    /// this (never `forward`, which must stay evaluation semantics) to add
+    /// explicit randomness or a train/eval difference, such as [`Dropout`].
+    /// A container that holds child modules (`Sequential`, or any future
+    /// one) overrides this to thread the same `pass` through every child in
+    /// order, so their draws stay distinct within one step.
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let _ = pass;
+        self.forward(input)
+    }
     /// Structural paths identify slots; ParamId identifies shared storage within this process.
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
         vec![]
@@ -597,6 +613,64 @@ impl Module for SignStraightThrough {
     }
 }
 
+/// Parameter-free inverted dropout (PyTorch's `nn.Dropout`). `forward`
+/// (evaluation) is the identity: it returns the same tensor unchanged, never
+/// a copy scaled by 1. `forward_training` consumes exactly one
+/// `pass.next_seed()` draw per call, regardless of `p`, so a downstream
+/// random consumer's draw sequence does not shift when `p` changes; that
+/// seed only feeds an actual `Tensor::uniform` draw when `0 < p < 1`. It
+/// keeps each element whose `Tensor::uniform(shape, seed, 0.0, 1.0, device)`
+/// draw is `>= p`, zeroes the rest, and rescales the kept elements by
+/// `1 / (1 - p)` (PyTorch's inverted dropout), so the output's expectation
+/// matches the input. `p == 0` returns the input unchanged; `p == 1` returns
+/// exact zeros with exactly zero gradient (PyTorch's own `p == 1` behavior),
+/// since `1 / (1 - p)` is undefined there. Elsewhere the gradient is
+/// `mask / (1 - p)` by construction -- a constant `{0, 1}` mask times a
+/// scalar -- so no dedicated backward rule is needed.
+#[derive(Clone, Copy)]
+pub struct Dropout {
+    p: f32,
+}
+impl Dropout {
+    pub fn new(p: f32) -> Result<Self> {
+        if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            return Err(
+                format!("Dropout probability must be finite and in [0, 1], got {p}").into(),
+            );
+        }
+        Ok(Self { p })
+    }
+}
+impl Module for Dropout {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        Ok(input.clone())
+    }
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let seed = pass.next_seed();
+        if self.p == 0.0 {
+            return Ok(input.clone());
+        }
+        if self.p == 1.0 {
+            return input.scale(0.0);
+        }
+        let draw = Tensor::uniform(
+            input.shape().dims().iter().copied(),
+            seed,
+            0.0,
+            1.0,
+            input.device(),
+        )?;
+        let mask = draw.ge(self.p)?;
+        input.mul(&mask)?.scale(1.0 / (1.0 - self.p))
+    }
+}
+
 pub trait IntoLayers {
     fn into_layers(self) -> Vec<Box<dyn Module>>;
 }
@@ -648,6 +722,12 @@ impl Module for Sequential {
         self.layers
             .iter()
             .try_fold(input.clone(), |value, layer| layer.forward(&value))
+    }
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        self.layers.iter().try_fold(input.clone(), |value, layer| {
+            layer.forward_training(&value, &mut *pass)
+        })
     }
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
         self.layers
