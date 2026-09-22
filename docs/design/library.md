@@ -607,3 +607,112 @@ an accidental public restriction.
 Success is the existing training behavior expressed through short programs
 with these contracts enforced. The four golden programs remain acceptance
 targets, and each capability gains its status from a running witness.
+
+### Regression and likelihood losses
+
+`HuberLoss`, `SmoothL1Loss`, `NLLLoss`, `BCELoss` (probability form),
+`KLDivLoss`, `PoissonNLLLoss`, `GaussianNLLLoss`, `SoftMarginLoss`, and
+`MultiLabelSoftMarginLoss` join `squared_error`/`absolute_error`
+(`MSELoss`/`L1Loss`) and `binary_cross_entropy_with_logits`/
+`categorical_cross_entropy_with_logits` (`BCEWithLogitsLoss`/
+`CrossEntropyLoss`) in the same shape: an unreduced, elementwise loss (or, for
+the two that reduce a named class axis, unreduced over every other axis) with
+the caller naming its own `mean(axes)`/`sum(axes)` reduction, matching
+PyTorch's `reduction='none'`. Every new op composes entirely from existing
+tensor primitives (`sub`, `abs`, `clamp`, `ln`, `exp`, `mul`, `add`, `div`,
+`scale`, `softplus`, `sum`, `mean`, `eq`, `logical_not`, and
+`binary_cross_entropy_with_logits`/`squared_error` themselves); none adds a
+backend kernel or a `Rule` variant, so their gradients are the ordinary chain
+rule through those existing, already-tested rules.
+
+`Tensor::huber_loss(rhs, delta)` (PyTorch default `delta = 1.0`) is
+`0.5 * min(|d|, delta)^2 + delta * relu(|d| - delta)` with `d = self - rhs`,
+an exact algebraic identity with PyTorch's two-branch definition; its
+gradient is `clamp(d, -delta, delta)`. `Tensor::smooth_l1_loss(rhs, beta)`
+(PyTorch default `beta = 1.0`) is exactly `huber_loss(rhs, beta) / beta`,
+another exact identity (`SmoothL1Loss(beta) == HuberLoss(delta=beta) / beta`),
+so it composes `huber_loss` rather than repeating its formula. morpheus's
+RBC/WBC radius and offset regression heads across
+`research/src/vision/morpheus/mobilesam/scale10` call
+`F.smooth_l1_loss(..., beta=.02)` throughout (for example
+`train_click_rbc.py:558`), the consumer for that non-default `beta`.
+
+`Tensor::nll_loss(targets, class)` generalizes `NLLLoss` to constant one-hot
+or probability targets over a named class axis exactly the way
+`categorical_cross_entropy_with_logits` generalizes `CrossEntropyLoss` --
+the same target-representation decision, mirrored here rather than reinvented.
+`self` must already hold log-probabilities; unlike
+`categorical_cross_entropy_with_logits`, this op folds in no softmax. Loss is
+`-sum(class, target * self)`, so backward is exactly `-target`. morpheus's
+partition classifier calls
+`F.nll_loss(q[full].log(), lab[full].long(), weight=ce_weight)`
+(`train_partition5.py:291`); Axis has no per-class `weight` yet.
+
+`Tensor::binary_cross_entropy(targets)` (`BCELoss`) takes probabilities
+directly (`self` already squashed by the caller, typically `.sigmoid()`),
+unlike the existing logits-fused `binary_cross_entropy_with_logits`. PyTorch
+floors the log at `-100` so a prediction of exactly `0` or `1` stays finite;
+Axis floors the *input* probability at `f32::MIN_POSITIVE` before `ln`
+instead, because both literal transcriptions of PyTorch's stated floor break
+backward in `f32`: clamping `ln`'s *output* to `-100` still lets `ln`'s own
+`g / x` backward see `x == 0` (`0 / 0 -> NaN`, since `clamp`'s zero multiplier
+cannot retroactively fix a numerator that was already NaN), and flooring the
+input at PyTorch's own `exp(-100)` rounds to an `f32` subnormal so small that
+`ln`'s backward `1 / x` overflows to infinity, which then hits the input
+clamp's own zeroing multiplier as `inf * 0 -> NaN` right back. Flooring at
+the smallest *normal* `f32` keeps `1 / x` finite while still reaching
+`ln(f32::MIN_POSITIVE) ~ -87.3`, the closest approach to PyTorch's `-100`
+this backward can support without a dedicated kernel. Away from the floor the
+gradient matches PyTorch's own `(x - y) / (x * (1 - x))`; at a saturated,
+wrong-side prediction where the active log term is floored, it is exactly `0`
+rather than PyTorch's own large finite value.
+
+`Tensor::kl_div_loss(targets)` (`KLDivLoss`, PyTorch default
+`log_target = false`) takes `self` as log-probabilities and `targets` as
+probabilities: `target * (log(target) - self)`. It matches PyTorch's `xlogy`
+convention at `target == 0` (contributes exactly `0`, never `NaN` from
+`0 * -inf`) by substituting `1.0` for `log`'s input only where
+`target == 0`, a substitution whose own `target` factor of `0` cancels either
+way. `log_target = true` is not implemented. morpheus's distillation heads
+call
+`F.kl_div(F.log_softmax(logits / t, -1), F.softmax(teacher_logits / t, -1), ...)`
+(`microtier/runs/wbc-edgepath-slice4m/train.py:124`), the consumer for this
+exact `log_target = false` shape.
+
+`Tensor::poisson_nll_loss(targets)` (`PoissonNLLLoss`, PyTorch default
+`log_input = true, full = false`) is `exp(self) - target * self`; the
+Stirling `full = true` term and the `log_input = false`/`eps` branch are not
+implemented. `Tensor::gaussian_nll_loss(targets, var, eps)`
+(`GaussianNLLLoss`, PyTorch default `full = false`) treats `var` as a second,
+differentiable model output (unlike `targets`, a constant), and computes
+`0.5 * (ln(max(var, eps)) + (self - target)^2 / max(var, eps))`, reusing
+`squared_error` for the `(self - target)^2` term; the constant
+`0.5 * log(2*pi)` term `full = true` would add is not implemented. `var` must
+be elementwise nonnegative before clamping, matching PyTorch's own check.
+Unlike PyTorch, which clamps `var` inside `no_grad` so its gradient passes
+straight through the clamp using the clamped value, Axis composes this from
+the ordinary `clamp`, whose boundary rule zeroes `var`'s own gradient at
+elements the clamp actually moved (`var < eps`); `self`'s gradient is
+unaffected either way.
+
+`Tensor::soft_margin_loss(targets)` (`SoftMarginLoss`, `target` in
+`{-1, +1}`) is `(-target * self).softplus(1.0, 20.0)` -- PyTorch's own
+default `Softplus` threshold, reused purely for the numerically stable linear
+seam, not as a knob callers choose.
+`Tensor::multilabel_soft_margin_loss(targets, class)`
+(`MultiLabelSoftMarginLoss`, PyTorch default, no per-class `weight`) is the
+mean, over the named class axis, of `binary_cross_entropy_with_logits`:
+PyTorch's own formula
+`-1/C * sum_c [y_c*log(sigmoid(x_c)) + (1-y_c)*log(1-sigmoid(x_c))]` is
+exactly that mean, since `binary_cross_entropy_with_logits` already computes
+the summand elementwise. Unlike Axis's other losses here, PyTorch's own
+unreduced (`reduction='none'`) form for this one already reduces the class
+axis, so the class axis is gone from the result before any caller reduction.
+
+All nine ops require targets to be constants in reverse mode (rejecting
+`targets.requires_grad()` before any device work), matching the existing
+`binary_cross_entropy_with_logits`/`categorical_cross_entropy_with_logits`
+convention; `huber_loss`/`smooth_l1_loss` are the exception, following
+`squared_error`/`absolute_error`'s own convention of allowing gradients on
+both operands, since both are direct generalizations of those two regression
+losses rather than classifier-vs-label losses.
