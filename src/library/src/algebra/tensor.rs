@@ -2558,6 +2558,160 @@ impl Tensor {
         ))
     }
 
+    /// Host-side index of the first logical coordinate achieving the minimum along one named
+    /// `axis`, per remaining position, in the same order [`Self::min`] itself removes that axis.
+    ///
+    /// This is a discrete evaluation-path primitive: it names *which* coordinate won a
+    /// reduction, so unlike [`Self::min`] it carries no gradient of its own and stays entirely
+    /// host-side. It never invents a second comparator: it reads back [`Self::min`]'s own
+    /// device-computed minimum for each remaining position alongside this tensor's raw storage,
+    /// then rescans each group in ascending coordinate order for the first element bit-equal to
+    /// that minimum -- exactly `min`'s own tie rule (`backend.rs`'s `grouped_minimum` keeps the
+    /// earlier candidate on a strict `<` comparison, so the first logical coordinate wins any
+    /// tie) and its own finite-only comparison (a non-finite candidate never matches). A group
+    /// with no finite candidate is an error: there is no coordinate a NaN result could name.
+    pub fn argmin(&self, axis: Axis) -> Result<Vec<usize>> {
+        let started = Instant::now();
+        let reduced_index = self.shape().index(axis)?;
+        let extent = self.extent(axis)?;
+        let output = Shape::new(
+            self.shape()
+                .dims()
+                .iter()
+                .copied()
+                .filter(|d| d.axis != axis),
+        )?;
+        let minimum = self.min(axis)?.to_vec()?;
+        let values = self.device().read(&self.0.value)?;
+        let mut indices = Vec::with_capacity(output.len());
+        for (output_index, &target) in minimum.iter().enumerate() {
+            let output_coords = output.coords(output_index);
+            let mut winner = None;
+            for coordinate in 0..extent {
+                let mut input_coords = output_coords.clone();
+                input_coords.insert(reduced_index, coordinate);
+                let physical = self.0.layout.offset(&input_coords);
+                let value = values[physical];
+                if value.is_finite() && value == target {
+                    winner = Some(coordinate);
+                    break;
+                }
+            }
+            indices.push(winner.ok_or_else(|| {
+                format!(
+                    "argmin found no finite candidate along {axis:?} at output position {output_index}"
+                )
+            })?);
+        }
+        profile("argmin", started);
+        Ok(indices)
+    }
+
+    /// Sum values into buckets named by a host-side integer label per position of `axis`,
+    /// replacing `axis` with a new `bucket` axis of extent `bucket_count`. `index[i]` names the
+    /// bucket position `i` of `axis` contributes to; every other axis carries through unchanged,
+    /// and a bucket no position names is an exact zero, not an error, matching PyTorch's
+    /// `Tensor.index_add_`.
+    ///
+    /// This is the exact transpose of [`Self::gather`]: gather's forward picks one source row
+    /// per output position, and its backward scatter-adds the upstream gradient back into every
+    /// row that picked it. `scatter_add`'s forward *is* that scatter-add, built from the same
+    /// host index array; its own backward is exactly gather's forward pick over the identical
+    /// index (reading each source position's own bucket back out of the upstream gradient). The
+    /// pairing needs no new backend kernel: it reuses `Plan::gather`/`Plan::reverse`'s CSR
+    /// machinery the other way around from `gather`, keyed by this tensor's own physical
+    /// storage so reordered layouts read correctly. `index` is checked against `axis`'s extent
+    /// and `bucket_count` before any device work, and shares `Plan`'s 16,777,216-contribution
+    /// limit, counted against this tensor's own size.
+    pub fn scatter_add(
+        &self,
+        axis: Axis,
+        index: &[usize],
+        bucket: Axis,
+        bucket_count: usize,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let dimension = self.shape().index(axis)?;
+        let extent = self.shape().dims()[dimension].extent;
+        if bucket_count == 0 {
+            return Err("scatter_add requires a positive bucket count".into());
+        }
+        if index.len() != extent {
+            return Err(format!(
+                "scatter_add index length {} does not match {axis:?} extent {extent}",
+                index.len()
+            )
+            .into());
+        }
+        for (position, &target) in index.iter().enumerate() {
+            if target >= bucket_count {
+                return Err(format!(
+                    "scatter_add bucket {target} at position {position} is outside bucket count {bucket_count}"
+                )
+                .into());
+            }
+        }
+        let mut dims = self.shape().dims().to_vec();
+        dims[dimension] = bucket.of(bucket_count);
+        let output_shape = Shape::new(dims)?;
+        let output_layout = Layout::contiguous(&output_shape);
+        // One entry per physical position of `self`: `map[physical] = output_physical` reads
+        // through `self.0.layout` (so reordered storage is handled the same way `gather` reads
+        // it), and writes to the freshly allocated, always-contiguous output.
+        let mut map = vec![0usize; self.shape().len()];
+        for source_position in 0..self.shape().len() {
+            let mut coords = self.shape().coords(source_position);
+            let physical = self.0.layout.offset(&coords);
+            coords[dimension] = index[coords[dimension]];
+            map[physical] = output_layout.offset(&coords);
+        }
+        // Forward groups source positions by their target bucket and sums them (the transpose
+        // of gather's own `Plan::gather` pick); backward picks each source position's bucket
+        // straight out of the upstream gradient (the transpose of gather's own `Plan::reverse`
+        // scatter-add) -- the same `map`, read the other way around in each direction.
+        let forward_plan = Rc::new(Plan::reverse(&map, output_shape.len())?);
+        let backward_plan = Rc::new(Plan::gather(&map)?);
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, forward_plan.as_ref(), 1.0)?;
+        let result = Self::node(
+            output_shape,
+            output_layout,
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Group {
+                    plan: backward_plan,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )],
+            false,
+            None,
+        );
+        profile("scatter_add", started);
+        Ok(result)
+    }
+
+    /// Per-bucket counts of a host-side bucket-index array: the constant-ones case of
+    /// [`Self::scatter_add`], so `hard_eval`'s `torch.bincount(lab, minlength=k)` has a direct
+    /// spelling. Adds no backend machinery of its own; a caller that already has a values tensor
+    /// to scatter can divide its own `scatter_add` sum by this count instead of calling both.
+    pub fn bincount(
+        index: &[usize],
+        bucket: Axis,
+        bucket_count: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        if index.is_empty() {
+            return Err("bincount requires a nonempty index".into());
+        }
+        let source = Axis::new("bincount_source");
+        let ones = Self::from_slice(&vec![1.0f32; index.len()], [source.of(index.len())], device)?;
+        ones.scatter_add(source, index, bucket, bucket_count)
+    }
+
     /// Gather rows of a named axis by an arbitrary host-computed integer index,
     /// replacing that axis with a new named axis laid out along the index.
     ///

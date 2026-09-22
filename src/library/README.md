@@ -91,6 +91,14 @@ contraction, so it stays affordable at table sizes a one-hot vector could
 never reach; backward scatter-adds the upstream gradient into the picked
 rows, so a repeated index accumulates deterministically.
 
+`tensor.argmin(axis)` returns a host-side index of `min`'s own winning
+coordinate per remaining position, with no gradient of its own.
+`tensor.scatter_add(axis, index, bucket, bucket_count)` is `gather`'s exact
+transpose: it sums values into host-index-named buckets with an exact
+gradient, and its constant-ones case `Tensor::bincount` gives per-bucket
+counts. Together they turn a discrete nearest-neighbour assignment into
+per-bucket sums and counts without leaving the tensor graph.
+
 `Embedding` looks a one-hot `vocabulary` axis up in a learned
 `[vocabulary, feature]` table, so a token is a coordinate rather than an integer
 index; `PositionEmbedding` adds a learned `[position, feature]` table.
