@@ -1976,6 +1976,74 @@ impl Tensor {
         ))
     }
 
+    /// Gather rows of a named axis by an arbitrary host-computed integer index,
+    /// replacing that axis with a new named axis laid out along the index.
+    ///
+    /// `index[i]` selects one logical coordinate of `axis` for output position
+    /// `i` of `output`; every other axis carries through unchanged and every
+    /// coordinate is checked against `axis`'s extent before any device work.
+    /// This is a row copy, not `Embedding`'s dense one-hot contraction, so it
+    /// stays affordable at table sizes a one-hot vector could never reach: the
+    /// index lives on the host as plain integers, never as device-side
+    /// vocabulary weight. Backward scatter-adds the upstream gradient into the
+    /// picked rows using the same host-built, CSR-grouped reduction plan
+    /// `mean` and `min` already use for their own broadcast and reduction
+    /// gradients (`Plan::gather`/`Plan::reverse` in `runtime::backend`), so a
+    /// repeated index accumulates every contribution deterministically and a
+    /// row that is never picked gets an exact zero gradient. It shares that
+    /// plan's 16,777,216-contribution limit, counted against the gathered
+    /// output's size (`index.len()` times the extent of every other axis),
+    /// never against the table's own row count.
+    pub fn gather(&self, axis: Axis, index: &[usize], output: Axis) -> Result<Self> {
+        let started = Instant::now();
+        let dimension = self.shape().index(axis)?;
+        let extent = self.shape().dims()[dimension].extent;
+        if index.is_empty() {
+            return Err("gather requires a nonempty index".into());
+        }
+        for (position, &row) in index.iter().enumerate() {
+            if row >= extent {
+                return Err(format!(
+                    "gather index {row} at position {position} is outside {axis:?} extent {extent}"
+                )
+                .into());
+            }
+        }
+        let mut dims = self.shape().dims().to_vec();
+        dims[dimension] = output.of(index.len());
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape);
+        let mut map = vec![0usize; shape.len()];
+        for (output_position, slot) in map.iter_mut().enumerate() {
+            let mut coords = shape.coords(output_position);
+            coords[dimension] = index[coords[dimension]];
+            *slot = self.0.layout.offset(&coords);
+        }
+        let forward_plan = Rc::new(Plan::gather(&map)?);
+        let reverse_plan = Rc::new(Plan::reverse(&map, self.shape().len())?);
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, forward_plan.as_ref(), 1.0)?;
+        let result = Self::node(
+            shape,
+            layout,
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Group {
+                    plan: reverse_plan,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )],
+            false,
+            None,
+        );
+        profile("gather", started);
+        Ok(result)
+    }
+
     /// Stack equal named shapes, inserting a new logical axis at `position`.
     /// Physical storage is stack-major so each source remains one contiguous copy.
     pub fn stack(values: &[Self], axis: Axis, position: usize) -> Result<Self> {

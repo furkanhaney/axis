@@ -3849,3 +3849,93 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     println!("concat values, gradients, and composed-path cross-check PASS");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gather_scatter_add_matches_hand_computed_oracle_on_repeated_index() -> Result<()> {
+    // render's hash_grid.py picks HashGrid table rows by a computed integer
+    // hash; upscale_eval's SwinIR picks relative_position_bias_table rows by
+    // a precomputed geometry index. Both need forward row copies AND a
+    // gradient that ACCUMULATES into a row picked more than once — the case
+    // a one-hot-matmul implementation gets wrong silently (correct forward,
+    // dropped accumulated gradient) unless backward is a real scatter-add.
+    let device = Device::cuda(0)?;
+    let (row, feature, pick) = (Axis::new("row"), Axis::new("feature"), Axis::new("pick"));
+    let table_values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    let table = Tensor::from_slice(&table_values, [row.of(5), feature.of(2)], &device)?.with_grad();
+
+    // Non-monotonic order; row 2 is picked twice, at positions 1 and 3.
+    let index = [0usize, 2, 4, 2, 1];
+    let gathered = table.gather(row, &index, pick)?;
+    assert_eq!(gathered.shape(), &Shape::new([pick.of(5), feature.of(2)])?);
+    close(
+        "gather forward",
+        &gathered.to_vec()?,
+        &[1.0, 2.0, 5.0, 6.0, 9.0, 10.0, 5.0, 6.0, 3.0, 4.0],
+    );
+
+    gathered.mean([pick, feature])?.backward()?;
+    close(
+        "gather scatter-add gradient",
+        &table.grad().expect("table gradient").to_vec()?,
+        &[0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.0, 0.0, 0.1, 0.1],
+    );
+
+    // Rejected before any device work: empty index, an index outside the
+    // row extent, and an axis the table does not have.
+    assert!(table.gather(row, &[], pick).is_err());
+    assert!(table.gather(row, &[0, 5], pick).is_err());
+    assert!(table.gather(Axis::new("missing"), &[0], pick).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gather_matches_hand_computed_oracle_under_reordered_table_storage() -> Result<()> {
+    // Same accumulation contract as the test above, this time with the
+    // table's PHYSICAL storage transposed relative to its logical
+    // [row, feature] order (mirroring a table copied through `with_layout`,
+    // or one whose default construction stride order differs from a
+    // gather's own row-major assumption): gather must read through the
+    // permuted strides in `self.0.layout`, not assume row-major storage.
+    let device = Device::cuda(0)?;
+    let (row, feature, pick) = (Axis::new("row"), Axis::new("feature"), Axis::new("pick"));
+    let table_values = [
+        1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+    ];
+    let table = Tensor::from_slice(&table_values, [row.of(4), feature.of(3)], &device)?
+        .with_layout([feature, row])?
+        .with_grad();
+
+    // Non-monotonic order; row 3 is picked twice, at positions 0 and 2.
+    let index = [3usize, 0, 3, 1];
+    let gathered = table.gather(row, &index, pick)?;
+    close(
+        "reordered gather forward",
+        &gathered.to_vec()?,
+        &[
+            10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 4.0, 5.0, 6.0,
+        ],
+    );
+
+    gathered.mean([pick, feature])?.backward()?;
+    close(
+        "reordered gather scatter-add gradient",
+        &table.grad().expect("table gradient").to_vec()?,
+        &[
+            1.0 / 12.0,
+            1.0 / 12.0,
+            1.0 / 12.0,
+            1.0 / 12.0,
+            1.0 / 12.0,
+            1.0 / 12.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0 / 6.0,
+            1.0 / 6.0,
+            1.0 / 6.0,
+        ],
+    );
+    Ok(())
+}
