@@ -62,6 +62,15 @@ shared xorshift stream that initializes parameters, then uploaded, with no
 gradient edge, since a random draw is a constant, not a parameter.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
+`Tensor::broadcast_to(shape)` explicitly broadcasts a tensor onto a target
+shape carrying every one of its axes (at its own extent) plus any axes it
+lacks entirely; it is the outer-broadcast primitive elementwise
+add/sub/mul/div deliberately refuse (they only ever align one operand's axis
+set onto the other's when it is already a subset), so two operands with
+genuinely disjoint axis sets -- `vision/image-encode`'s pixel-indexed and
+site-indexed tensors in its `torch.cdist`-style pairwise distance -- compose
+an outer op from `broadcast_to` and an ordinary elementwise op instead of a
+dedicated outer-product method.
 
 ## Ordered backlog
 
