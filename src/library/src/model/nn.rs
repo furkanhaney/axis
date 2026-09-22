@@ -114,14 +114,18 @@ pub trait Module {
 }
 
 /// Contract `input`, introduce `output`, and preserve all unrelated axes.
-/// Cloning a built Linear explicitly ties its parameters.
+/// Cloning a built Linear explicitly ties its parameters. Carries a learned
+/// `[output]` bias by default; `.bias(false)` before `build` omits it
+/// entirely, so `named_parameters` then has only `weight` and no zero-filled
+/// bias tensor is ever allocated.
 #[derive(Clone)]
 pub struct Linear {
     input: Axis,
     output: Dim,
     input_role: Axis,
     output_role: Axis,
-    bound: Option<(usize, Parameter, Parameter)>,
+    bias: bool,
+    bound: Option<(usize, Parameter, Option<Parameter>)>,
 }
 impl Linear {
     pub fn new(input: Axis, output: Dim) -> Self {
@@ -130,8 +134,15 @@ impl Linear {
             output,
             input_role: input.role("linear_input"),
             output_role: output.axis.role("linear_output"),
+            bias: true,
             bound: None,
         }
+    }
+    /// Disable the learned bias term. Has no effect once `build` has already
+    /// allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.bias = bias;
+        self
     }
 }
 impl Module for Linear {
@@ -171,11 +182,15 @@ impl Module for Linear {
             weight_shape.dims().iter().copied(),
             device,
         )?);
-        let bias = Parameter::new(Tensor::from_slice(
-            &vec![0.0; self.output.extent],
-            [self.output_role.of(self.output.extent)],
-            device,
-        )?);
+        let bias = if self.bias {
+            Some(Parameter::new(Tensor::from_slice(
+                &vec![0.0; self.output.extent],
+                [self.output_role.of(self.output.extent)],
+                device,
+            )?))
+        } else {
+            None
+        };
         self.bound = Some((extent, weight, bias));
         Ok(shape)
     }
@@ -185,16 +200,25 @@ impl Module for Linear {
             .bound
             .as_ref()
             .ok_or("Linear must be built before forward")?;
-        input
+        let projected = input
             .rename(self.input, self.input_role)?
-            .contract(&weight.tensor(), self.input_role)?
-            .add(&bias.tensor())?
-            .rename(self.output_role, self.output.axis)
+            .contract(&weight.tensor(), self.input_role)?;
+        let projected = match bias {
+            Some(bias) => projected.add(&bias.tensor())?,
+            None => projected,
+        };
+        projected.rename(self.output_role, self.output.axis)
     }
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
         self.bound
             .as_ref()
-            .map(|(_, w, b)| vec![("weight".into(), w.clone()), ("bias".into(), b.clone())])
+            .map(|(_, weight, bias)| {
+                let mut params = vec![("weight".into(), weight.clone())];
+                if let Some(bias) = bias {
+                    params.push(("bias".into(), bias.clone()));
+                }
+                params
+            })
             .unwrap_or_default()
     }
 }
