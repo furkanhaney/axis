@@ -1795,6 +1795,25 @@ impl Tensor {
         profile("max", started);
         Ok(result)
     }
+    /// Numerically stable log-sum-exp reduction over one named axis: `ln(sum(exp(x)))`
+    /// computed as `m + ln(sum(exp(x - m)))` with `m = self.max(axis)`, matching
+    /// `torch.logsumexp`. `m` is [`Self::detach`]ed before the subtraction, so no gradient
+    /// flows back through it; differentiating the remaining composition by hand collapses
+    /// to exactly `softmax(x)` along `axis` (`exp(x - m) / sum(exp(x - m))`), independent of
+    /// `m`'s own derivative -- the standard stabilizing-shift trick. Composed entirely from
+    /// [`Self::max`], [`Self::sub`], [`Self::exp`], [`Self::sum`], [`Self::ln`], and
+    /// [`Self::add`] -- no dedicated kernel or backward rule -- so even a row whose entries
+    /// sit near a large shared magnitude (e.g. near 1000) never exponentiates anything
+    /// larger than zero and cannot overflow. Shares `max`'s axis-removal contract and its
+    /// no-finite-candidate convention: a group with every entry non-finite gives `m = NaN`,
+    /// so `logsumexp` returns `NaN` there too, unlike PyTorch's `torch.logsumexp`, which
+    /// returns `-infinity` for an all-`-infinity` group. Unlike `max`, this composition has
+    /// no dedicated backward rule to zero that group's gradient, so `NaN` also propagates
+    /// through it ordinarily, rather than landing on zero.
+    pub fn logsumexp(&self, axis: Axis) -> Result<Self> {
+        let shift = self.max(axis)?.detach();
+        self.sub(&shift)?.exp()?.sum(axis)?.ln()?.add(&shift)
+    }
     /// Reduce a tensor to the mean of elements selected by a constant binary mask.
     /// The mask must have the same named axes, and every axis must be reduced.
     pub fn masked_mean(&self, mask: &Self) -> Result<Self> {

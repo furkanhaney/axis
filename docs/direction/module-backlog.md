@@ -38,7 +38,10 @@ option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
 `Sequential`, with tensor-level losses (including `abs`/`absolute_error`, PyTorch's
 unreduced `F.l1_loss`, zero gradient at exactly zero matching its `abs` backward
 convention), sine, elementwise `exp`/`ln`, a PyTorch-exact
-`Tensor::softplus(beta, threshold)`, differentiable central
+`Tensor::softplus(beta, threshold)`, a numerically stable named-axis
+`Tensor::logsumexp(axis)` (`m + ln(sum(exp(x - m)))` with the shift `m = max(axis)`
+detached, so the gradient is exactly `softmax`; an all-non-finite group inherits `max`'s
+`NaN` rather than PyTorch's `-infinity`), differentiable central
 differences, softmax, causal masking, named-axis nearest and bilinear
 resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
 composition, named reductions, an arbitrary-index `gather` (a host-side integer
