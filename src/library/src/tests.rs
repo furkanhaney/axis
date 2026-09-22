@@ -4107,3 +4107,46 @@ fn max_pool3d_matches_gastric_kernel_and_sums_overlapping_gradients_per_channel(
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_avg_pool3d_matches_hand_computed_uneven_bins_and_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (depth, height, width) = (Axis::new("depth"), Axis::new("height"), Axis::new("width"));
+    // depth 2 -> 1 and width 1 -> 1 are trivial single-bin axes; height 5 -> 2 is PyTorch's own
+    // textbook uneven case: bin 0 = [0, 3), bin 1 = [2, 5), sharing input index 2.
+    #[rustfmt::skip]
+    let inputs: [f32; 10] = [
+        1.0, 2.0, 3.0, 4.0, 5.0,
+        10.0, 20.0, 30.0, 40.0, 50.0,
+    ];
+    let input = Tensor::from_slice(&inputs, [depth.of(2), height.of(5), width.of(1)], &device)?
+        .with_layout([width, height, depth])?
+        .with_grad();
+
+    let actual = input.adaptive_avg_pool3d([depth, height, width], [1, 2, 1])?;
+    assert_eq!(
+        actual.shape(),
+        &Shape::new([depth.of(1), height.of(2), width.of(1)])?
+    );
+    close(
+        "AdaptiveAvgPool3d forward with an uneven bin",
+        &actual.to_vec()?,
+        &[11.0, 22.0],
+    );
+
+    actual.mean([depth, height, width])?.backward()?;
+    // Height index 2 falls in both bins (depth-averaged over both bins' 1/6 weight each);
+    // every other height index falls in exactly one bin.
+    #[rustfmt::skip]
+    let expected_gradient: [f64; 10] = [
+        1.0 / 12.0, 1.0 / 12.0, 1.0 / 6.0, 1.0 / 12.0, 1.0 / 12.0,
+        1.0 / 12.0, 1.0 / 12.0, 1.0 / 6.0, 1.0 / 12.0, 1.0 / 12.0,
+    ];
+    close(
+        "AdaptiveAvgPool3d gradient (the shared boundary element is averaged into both bins)",
+        &input.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}

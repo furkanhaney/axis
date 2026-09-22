@@ -14,10 +14,12 @@ The crate currently provides:
   deterministic finite minimum reductions, asymmetric zero-padding, contiguous
   slicing, and compact device copies for layout, merge, and alignment;
 - `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
-  grouped/depthwise channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
-  and stateless `InstanceNorm`, one-hot `Embedding` and `PositionEmbedding`,
-  explicit-state `LstmCell`/`Lstm`, activations, attention primitives with
-  causal and prefix-causal masks, and sequential composition;
+  grouped/depthwise channels, `MaxPool2d`/`MaxPool3d` and
+  `Tensor::adaptive_avg_pool3d`, named-axis `LayerNorm`, `RmsNorm`,
+  `GroupNorm`, and stateless `InstanceNorm`, one-hot `Embedding` and
+  `PositionEmbedding`, explicit-state `LstmCell`/`Lstm`, activations,
+  attention primitives with causal and prefix-causal masks, and sequential
+  composition;
 - device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
   exact AdamW remainder;
 - generated and finite data loaders with executable single-pass, finite-pass,
