@@ -76,7 +76,7 @@ pub use nn::{
     ModuleList, PReLU, ParamId, Parameter, ParameterDict, ParameterList, PixelShuffle,
     PixelUnshuffle, PopulationLinear, PositionEmbedding, ReLU, ReLU6, ReflectionPad,
     ReplicationPad, SELU, Sequential, SiLU, SignStraightThrough, Softmax2d, Softmin, Softplus,
-    Softshrink, Softsign, Tanh, Tanhshrink, Threshold, Unflatten, ZeroPad,
+    Softshrink, Softsign, Tanh, Tanhshrink, Threshold, Unflatten, Upsample, UpsampleMode, ZeroPad,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, LocalResponseNorm, RmsNorm};
 pub use optim::{
@@ -94,7 +94,7 @@ pub use residual::{
     EmpiricalResidual, EmpiricalResidualReceipt, LawIdentity, ResidualClaim, ResidualEvidence,
     ResidualLimits, ResidualScope,
 };
-pub use tensor::Tensor;
+pub use tensor::{LinearCrossEntropyOptions, Tensor};
 pub use train::{Optimizer, TrainStep, Trainer};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -130,16 +130,17 @@ pub mod prelude {
         Hardswish, Hardtanh, Identity, IdentityScheme, Idr, IdrLimits, IdrReceipt, InMemoryDataset,
         InstanceNorm, LPPool1d, LPPool2d, LPPool3d, LawIdentity, LayerNorm, LeakyReLU,
         LearningDirection, LearningEvidence, LearningLimits, LearningObservation, LearningProgress,
-        LearningProgressReceipt, Linear, LocalResponseNorm, LogSigmoid, LogSoftmax, Lstm, LstmCell,
-        LstmRun, LstmState, MaxPool1d, MaxPool2d, MaxPool3d, Mish, Module, ModuleDict, ModuleList,
-        MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
-        MuonWithAuxAdamW, Optimizer, PReLU, ParamId, Parameter, ParameterDict, ParameterList,
-        PixelShuffle, PixelUnshuffle, PopulationLinear, PopulationMode, PopulationReceipt,
-        PopulationSpec, PositionEmbedding, ReLU, ReLU6, ReflectionPad, RegimeSnapshot,
-        ReplicationPad, ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result,
-        RmsNorm, Rnn, RnnCell, RnnNonlinearity, RnnRun, SELU, SGD, Sample, Sequential, Shape, SiLU,
-        SignStraightThrough, SinglePass, Softmax2d, Softmin, Softplus, Softshrink, Softsign,
-        Standardizer, Tanh, Tanhshrink, Tensor, Threshold, TrainStep, Trainer, Unflatten, Unfold,
-        ZeroPad, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        LearningProgressReceipt, Linear, LinearCrossEntropyOptions, LocalResponseNorm, LogSigmoid,
+        LogSoftmax, Lstm, LstmCell, LstmRun, LstmState, MaxPool1d, MaxPool2d, MaxPool3d, Mish,
+        Module, ModuleDict, ModuleList, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
+        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, PReLU, ParamId, Parameter,
+        ParameterDict, ParameterList, PixelShuffle, PixelUnshuffle, PopulationLinear,
+        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, ReLU6,
+        ReflectionPad, RegimeSnapshot, ReplicationPad, ResidualClaim, ResidualEvidence,
+        ResidualLimits, ResidualScope, Result, RmsNorm, Rnn, RnnCell, RnnNonlinearity, RnnRun,
+        SELU, SGD, Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Softmax2d,
+        Softmin, Softplus, Softshrink, Softsign, Standardizer, Tanh, Tanhshrink, Tensor, Threshold,
+        TrainStep, Trainer, Unflatten, Unfold, Upsample, UpsampleMode, ZeroPad, clip_grad_norm,
+        cosine_annealing_lr, one_cycle_lr,
     };
 }

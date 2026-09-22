@@ -12211,3 +12211,445 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
     assert!(error.contains("does not match"), "{error}");
     Ok(())
 }
+
+// --- nn-climb-misc: Upsample bicubic/scale_factor, LinearCrossEntropyLoss,
+// AdaptiveLogSoftmaxWithLoss, CTCLoss -------------------------------------
+
+#[test]
+#[ignore = "requires CUDA"]
+fn resample_bicubic_matches_independent_oracle_forward_and_gradient() -> Result<()> {
+    // Independent oracle: a from-scratch Python reimplementation of PyTorch's
+    // documented `a = -0.75` separable bicubic kernel and
+    // `align_corners=False` half-pixel source formula (never calling this
+    // crate), forward-mode for the values and central differences for the
+    // gradient. Storage is reordered (`with_layout([length, batch])`, an
+    // unrelated `batch` axis preserved through the resample) for the CUDA
+    // non-trivial-layout coverage the base order requires.
+    let device = Device::cuda(0)?;
+    let (batch, length) = (Axis::new("batch"), Axis::new("length"));
+    let x = Tensor::from_slice(
+        &[0.0, 1.0, 2.0, 3.0, 10.0, 7.0, 3.0, -2.0],
+        [batch.of(2), length.of(4)],
+        &device,
+    )?
+    .with_layout([length, batch])?
+    .with_grad();
+
+    let out = x.resample_bicubic(length, 7)?;
+    assert_eq!(out.shape(), &Shape::new([batch.of(2), length.of(7)])?);
+    close(
+        "bicubic upsample values",
+        &out.to_vec()?,
+        &[
+            -0.099216, 0.279246, 0.896593, 1.5, 2.103407, 2.720754, 3.099216, 10.297649, 9.223761,
+            7.356414, 5.1875, 2.529155, -0.542274, -2.496082,
+        ],
+    );
+    let weight: Vec<f32> = (1..=14).map(|v| v as f32).collect();
+    let weight = Tensor::from_slice(&weight, [batch.of(2), length.of(7)], &device)?;
+    out.mul(&weight)?.mean([batch, length])?.backward()?;
+    close(
+        "bicubic upsample gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            0.15817, 0.389089, 0.626946, 0.825795, 1.019139, 1.27812, 1.515976, 1.686765,
+        ],
+    );
+
+    assert!(x.resample_bicubic(length, 0).is_err());
+    assert!(
+        Tensor::from_slice(&[0.0_f32], [length.of(1)], &device)?
+            .resample_bicubic(length, 2)
+            .is_err()
+    );
+    println!("bicubic upsample values, gradient, and rejections PASS");
+    Ok(())
+}
+
+#[test]
+fn upsample_module_rejects_invalid_configurations_before_launch() -> Result<()> {
+    let (height, width, depth) = (Axis::new("height"), Axis::new("width"), Axis::new("depth"));
+    assert!(Upsample::size(vec![height], UpsampleMode::Bilinear, vec![8]).is_err());
+    assert!(Upsample::size(vec![height, width], UpsampleMode::Trilinear, vec![8, 8]).is_err());
+    assert!(Upsample::size(vec![height, height], UpsampleMode::Bicubic, vec![8, 8]).is_err());
+    assert!(Upsample::size(vec![height], UpsampleMode::Nearest, vec![]).is_err());
+    assert!(Upsample::scale_factor(vec![height], UpsampleMode::Nearest, vec![-1.0]).is_err());
+
+    let shape = Shape::new([height.of(3), width.of(3)])?;
+    let odd_ratio = Upsample::size(vec![height, width], UpsampleMode::Bilinear, vec![7, 5])?
+        .output_shape(&shape);
+    assert!(odd_ratio.is_ok()); // bilinear tolerates a non-integer ratio
+    let odd_nearest = Upsample::size(vec![height, width], UpsampleMode::Nearest, vec![7, 6])?
+        .output_shape(&shape);
+    assert!(
+        odd_nearest.is_err(),
+        "nearest must reject a non-integer output ratio before forward runs a kernel"
+    );
+
+    let _ = depth; // exercised in the CUDA trilinear/bicubic module tests below
+    println!("Upsample rejects bad configurations before launch PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn upsample_module_nearest_scale_factor_and_bilinear_size_match_the_composed_primitives()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, height, width) = (Axis::new("batch"), Axis::new("height"), Axis::new("width"));
+    let values: Vec<f32> = (0..2 * 3 * 4).map(|v| v as f32).collect();
+    let x = Tensor::from_slice(&values, [batch.of(2), height.of(3), width.of(4)], &device)?;
+
+    let nearest =
+        Upsample::scale_factor(vec![height, width], UpsampleMode::Nearest, vec![2.0, 2.0])?;
+    let via_module = nearest.forward(&x)?;
+    let via_primitive = x.upsample_nearest(height, 2)?.upsample_nearest(width, 2)?;
+    assert_eq!(
+        via_module.shape(),
+        &Shape::new([batch.of(2), height.of(6), width.of(8)])?
+    );
+    close(
+        "Upsample nearest module matches composed upsample_nearest",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    let bilinear = Upsample::size(vec![height, width], UpsampleMode::Bilinear, vec![5, 6])?;
+    let via_module = bilinear.forward(&x)?;
+    let via_primitive = x
+        .resample_bilinear(height, 5)?
+        .resample_bilinear(width, 6)?;
+    assert_eq!(
+        via_module.shape(),
+        &Shape::new([batch.of(2), height.of(5), width.of(6)])?
+    );
+    close(
+        "Upsample bilinear module matches composed resample_bilinear",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+    println!("Upsample nearest and bilinear module composition PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn upsample_module_bicubic_and_trilinear_match_the_composed_primitives() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, height, width, depth) = (
+        Axis::new("batch"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("depth"),
+    );
+    let values: Vec<f32> = (0..2 * 4 * 5).map(|v| v as f32 / 3.0).collect();
+    let x = Tensor::from_slice(&values, [batch.of(2), height.of(4), width.of(5)], &device)?;
+    let bicubic =
+        Upsample::scale_factor(vec![height, width], UpsampleMode::Bicubic, vec![1.75, 1.4])?;
+    let via_module = bicubic.forward(&x)?;
+    let via_primitive = x.resample_bicubic(height, 7)?.resample_bicubic(width, 7)?;
+    assert_eq!(via_module.shape(), via_primitive.shape());
+    close(
+        "Upsample bicubic module matches composed resample_bicubic",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    let cube_values: Vec<f32> = (0..2 * 2 * 3).map(|v| v as f32).collect();
+    let cube = Tensor::from_slice(
+        &cube_values,
+        [depth.of(2), height.of(2), width.of(3)],
+        &device,
+    )?;
+    let trilinear = Upsample::size(
+        vec![depth, height, width],
+        UpsampleMode::Trilinear,
+        vec![4, 3, 5],
+    )?;
+    let via_module = trilinear.forward(&cube)?;
+    let via_primitive = cube
+        .resample_bilinear(depth, 4)?
+        .resample_bilinear(height, 3)?
+        .resample_bilinear(width, 5)?;
+    assert_eq!(
+        via_module.shape(),
+        &Shape::new([depth.of(4), height.of(3), width.of(5)])?
+    );
+    close(
+        "Upsample trilinear module matches composed resample_bilinear",
+        &via_module.to_vec()?,
+        &via_primitive
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+    println!("Upsample bicubic and trilinear module composition PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn linear_cross_entropy_with_logits_matches_independent_oracle_and_label_smoothing() -> Result<()> {
+    // Independent oracle: a from-scratch Python reimplementation (linear
+    // projection + log-softmax + one-hot NLL, never calling this crate),
+    // forward-mode for the values, central differences for the gradient.
+    let device = Device::cuda(0)?;
+    let (batch, feature, class) = (Axis::new("batch"), Axis::new("feature"), Axis::new("class"));
+    let x = Tensor::from_slice(
+        &[1.0, -1.0, 0.5, 2.0],
+        [batch.of(2), feature.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let weight = Tensor::from_slice(
+        &[0.3, -0.2, 0.1, 0.5, 0.4, -0.3],
+        [feature.of(2), class.of(3)],
+        &device,
+    )?;
+    let bias = Tensor::from_slice(&[0.1, -0.1, 0.05], [class.of(3)], &device)?;
+    let targets = Tensor::from_slice(
+        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [batch.of(2), class.of(3)],
+        &device,
+    )?;
+
+    let loss = x.linear_cross_entropy_with_logits(
+        &weight,
+        Some(&bias),
+        feature,
+        &targets,
+        class,
+        LinearCrossEntropyOptions::default(),
+    )?;
+    assert_eq!(loss.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "linear_cross_entropy forward",
+        &loss.to_vec()?,
+        &[1.1884726920355417, 2.278166234674651],
+    );
+    loss.sum(batch)?.backward()?;
+    close(
+        "linear_cross_entropy gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            -0.1892273575054837,
+            -0.43920023821808485,
+            0.02558424485377131,
+            0.6872381714573272,
+        ],
+    );
+
+    let smoothed = x.linear_cross_entropy_with_logits(
+        &weight,
+        Some(&bias),
+        feature,
+        &targets,
+        class,
+        LinearCrossEntropyOptions {
+            label_smoothing: 0.1,
+        },
+    )?;
+    close(
+        "linear_cross_entropy label_smoothing=0.1 forward",
+        &smoothed.to_vec()?,
+        &[1.1901393587022084, 2.183166234674651],
+    );
+
+    let bad_options = x.linear_cross_entropy_with_logits(
+        &weight,
+        Some(&bias),
+        feature,
+        &targets,
+        class,
+        LinearCrossEntropyOptions {
+            label_smoothing: 1.0,
+        },
+    );
+    assert!(bad_options.is_err());
+    println!("linear_cross_entropy forward, gradient, smoothing, and rejection PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_log_softmax_with_loss_matches_independent_oracle_and_gradient() -> Result<()> {
+    // Independent oracle: a from-scratch Python reimplementation of the
+    // documented head/tail-cluster algorithm (Grave et al., never calling
+    // this crate), forward-mode for the loss, central differences on the
+    // input for the gradient.
+    let device = Device::cuda(0)?;
+    let (batch, feature, head, hidden, tail) = (
+        Axis::new("batch"),
+        Axis::new("feature"),
+        Axis::new("head"),
+        Axis::new("hidden"),
+        Axis::new("tail"),
+    );
+    let x = Tensor::from_slice(
+        &[1.0, -1.0, 0.5, 2.0],
+        [batch.of(2), feature.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let head_weight = Tensor::from_slice(
+        &[0.3, -0.2, 0.1, 0.5, 0.4, -0.3],
+        [feature.of(2), head.of(3)],
+        &device,
+    )?;
+    let down = Tensor::from_slice(&[0.7, -0.6], [feature.of(2), hidden.of(1)], &device)?;
+    let up = Tensor::from_slice(&[0.2, -0.4], [hidden.of(1), tail.of(2)], &device)?;
+
+    let loss = x.adaptive_log_softmax_with_loss(
+        feature,
+        &[0, 3],
+        &head_weight,
+        None,
+        &[(down, up)],
+        &[2],
+        4,
+        4.0,
+    )?;
+    assert_eq!(loss.shape(), &Shape::new([])?);
+    close(
+        "adaptive_log_softmax_with_loss forward",
+        &loss.to_vec()?,
+        &[2.009960678433578],
+    );
+    loss.backward()?;
+    close(
+        "adaptive_log_softmax_with_loss gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            -0.10015691238596247,
+            -0.2182897270275319,
+            0.08118351478625385,
+            0.27480755728337414,
+        ],
+    );
+
+    let bad_cutoffs =
+        x.adaptive_log_softmax_with_loss(feature, &[0, 3], &head_weight, None, &[], &[2], 4, 4.0);
+    assert!(bad_cutoffs.is_err());
+    let bad_target = x.adaptive_log_softmax_with_loss(
+        feature,
+        &[0, 9],
+        &head_weight,
+        None,
+        &[(
+            Tensor::from_slice(&[0.7, -0.6], [feature.of(2), hidden.of(1)], &device)?,
+            Tensor::from_slice(&[0.2, -0.4], [hidden.of(1), tail.of(2)], &device)?,
+        )],
+        &[2],
+        4,
+        4.0,
+    );
+    assert!(bad_target.is_err());
+    println!("adaptive_log_softmax_with_loss forward, gradient, and rejections PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn ctc_loss_matches_a_brute_force_alignment_enumeration_oracle_and_gradient() -> Result<()> {
+    // Independent oracle: a from-scratch Python brute-force enumeration of
+    // every length-5 alignment over {blank, 1, 2} for each row, summing the
+    // probability of every alignment that collapses (remove repeats, then
+    // blanks) to that row's target, never calling this crate's recursion;
+    // central differences on `log_probs` for the gradient.
+    let device = Device::cuda(0)?;
+    let (time, batch, class) = (Axis::new("time"), Axis::new("batch"), Axis::new("class"));
+    let values: Vec<f32> = vec![
+        -1.3567911512332076,
+        -0.4795070079818505,
+        -2.092115175194454,
+        -0.4882880325997338,
+        -1.7619240228532507,
+        -1.5389340289290703,
+        -0.6963311961508857,
+        -1.5333381110534465,
+        -1.25254900844565,
+        -2.0853854816278377,
+        -0.6334774907643611,
+        -1.0642170816754177,
+        -1.4931444438837849,
+        -0.5757504700251607,
+        -1.5462182182986792,
+        -0.8887169921392661,
+        -1.5276293766062397,
+        -0.9894867982063107,
+        -1.6313126948565788,
+        -1.5135964953251788,
+        -0.5374938309487728,
+        -1.8816041714184617,
+        -1.4720397385272714,
+        -0.4809472877880643,
+        -0.7197947915682178,
+        -1.1935292973487241,
+        -1.560655467800923,
+        -1.7564195054443232,
+        -1.9888978959848111,
+        -0.37035108710279974,
+    ];
+    let log_probs =
+        Tensor::from_slice(&values, [time.of(5), batch.of(2), class.of(3)], &device)?.with_grad();
+    let loss = Tensor::ctc_loss(&log_probs, time, class, &[vec![1, 2], vec![2, 1]], 0)?;
+    assert_eq!(loss.shape(), &Shape::new([])?);
+    close("ctc_loss forward", &loss.to_vec()?, &[1.1402979907802995]);
+    loss.backward()?;
+    close(
+        "ctc_loss gradient",
+        &log_probs.grad().expect("log_probs gradient").to_vec()?,
+        &[
+            -0.07417302928414138,
+            -0.17582697071527598,
+            0.0,
+            -0.1755447176254865,
+            0.0,
+            -0.07445528237504107,
+            -0.11717402560451617,
+            -0.10649235196114049,
+            -0.026333622485941177,
+            -0.0476135484672735,
+            -0.01877553388540676,
+            -0.18361091767449267,
+            -0.0640173126764676,
+            -0.10229759407009986,
+            -0.08368509334055751,
+            -0.08095412294295556,
+            -0.04647759982767674,
+            -0.12256827730316999,
+            -0.03408435491514261,
+            -0.011108473186860479,
+            -0.20480717191073694,
+            -0.04722226968456589,
+            -0.13032839455751066,
+            -0.07244933583061552,
+            -0.16334511960813813,
+            0.0,
+            -0.08665488039127922,
+            -0.09162478264657103,
+            -0.15837521735284632,
+            0.0,
+        ],
+    );
+
+    let mismatched_lengths = Tensor::ctc_loss(&log_probs, time, class, &[vec![1, 2], vec![2]], 0);
+    assert!(mismatched_lengths.is_err());
+    let blank_in_target = Tensor::ctc_loss(&log_probs, time, class, &[vec![0, 1], vec![1, 2]], 0);
+    assert!(blank_in_target.is_err());
+    println!("ctc_loss forward, gradient, and rejections PASS");
+    Ok(())
+}

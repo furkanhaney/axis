@@ -1703,6 +1703,172 @@ impl Module for ChannelShuffle {
     }
 }
 
+/// `torch.nn.Upsample`'s interpolation mode (`mode=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpsampleMode {
+    Nearest,
+    Bilinear,
+    Bicubic,
+    Trilinear,
+}
+
+/// `torch.nn.Upsample(size=None, scale_factor=None, mode='nearest',
+/// align_corners=None)` over a fixed, ordered list of named spatial axes
+/// (PyTorch infers 1D/2D/3D from the input's trailing dims; here the axes
+/// are named explicitly instead, so any rank works). Build with
+/// [`Upsample::size`] (a literal per-axis output extent, PyTorch's `size=`)
+/// or [`Upsample::scale_factor`] (a per-axis multiplier, PyTorch's
+/// `scale_factor=`) -- exactly one form, matching PyTorch's own mutual
+/// exclusivity.
+///
+/// `Nearest` composes [`Tensor::upsample_nearest`] once per axis, so every
+/// axis's output/input ratio must be a positive integer (an exact ratio;
+/// caught in `output_shape`/`build`, before `forward` ever runs a kernel) --
+/// the same restriction `upsample_nearest` itself already carries. `Bilinear`
+/// (exactly 2 axes) and `Trilinear` (exactly 3 axes) both compose
+/// [`Tensor::resample_bilinear`] once per axis: exact because linear
+/// interpolation is separable (`world/fluid`'s U-Net calls the 2D form on
+/// `height` then `width`; `trilinear_upsample_matches_composed_bilinear_
+/// against_independent_oracle` in `tests.rs` proves the 3-axis composition
+/// against a real PyTorch `F.interpolate(mode="trilinear")` oracle).
+/// `Bicubic` (any axis count) composes the new
+/// [`Tensor::resample_bicubic`] once per axis, also separable. All four
+/// modes use PyTorch's `align_corners=False` default; `align_corners=True`
+/// is not implemented for any mode (out of scope for the gap this closes:
+/// `docs/nn/catalog.md` named bicubic, trilinear and `scale_factor=`, not
+/// `align_corners`).
+///
+/// `scale_factor` output extents use PyTorch's own `floor(in_extent *
+/// scale_factor)` (its documented behavior once `recompute_scale_factor`,
+/// deprecated since PyTorch 1.6 and removed by 2.14, no longer applies).
+pub struct Upsample {
+    axes: Vec<Axis>,
+    mode: UpsampleMode,
+    size: Option<Vec<usize>>,
+    scale_factor: Option<Vec<f64>>,
+}
+impl Upsample {
+    pub fn size(axes: Vec<Axis>, mode: UpsampleMode, size: Vec<usize>) -> Result<Self> {
+        if axes.len() != size.len() {
+            return Err("Upsample size must give exactly one output extent per axis".into());
+        }
+        Self::new(axes, mode, Some(size), None)
+    }
+    pub fn scale_factor(
+        axes: Vec<Axis>,
+        mode: UpsampleMode,
+        scale_factor: Vec<f64>,
+    ) -> Result<Self> {
+        if axes.len() != scale_factor.len() {
+            return Err("Upsample scale_factor must give exactly one factor per axis".into());
+        }
+        for &factor in &scale_factor {
+            if !(factor > 0.0) {
+                return Err("Upsample scale_factor values must be positive".into());
+            }
+        }
+        Self::new(axes, mode, None, Some(scale_factor))
+    }
+    fn new(
+        axes: Vec<Axis>,
+        mode: UpsampleMode,
+        size: Option<Vec<usize>>,
+        scale_factor: Option<Vec<f64>>,
+    ) -> Result<Self> {
+        if axes.is_empty() {
+            return Err("Upsample requires at least one spatial axis".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !axes.iter().all(|axis| seen.insert(*axis)) {
+            return Err("Upsample spatial axes must be distinct".into());
+        }
+        match mode {
+            UpsampleMode::Bilinear if axes.len() != 2 => {
+                return Err("Upsample bilinear requires exactly 2 spatial axes".into());
+            }
+            UpsampleMode::Trilinear if axes.len() != 3 => {
+                return Err("Upsample trilinear requires exactly 3 spatial axes".into());
+            }
+            _ => {}
+        }
+        Ok(Self {
+            axes,
+            mode,
+            size,
+            scale_factor,
+        })
+    }
+    fn output_extents(&self, input: &Shape) -> Result<Vec<usize>> {
+        if let Some(size) = &self.size {
+            for &extent in size {
+                if extent == 0 {
+                    return Err("Upsample size extents must be at least 1".into());
+                }
+            }
+            Ok(size.clone())
+        } else if let Some(factors) = &self.scale_factor {
+            self.axes
+                .iter()
+                .zip(factors)
+                .map(|(&axis, &factor)| {
+                    let extent = input.extent(axis)?;
+                    let out = ((extent as f64) * factor).floor() as usize;
+                    if out == 0 {
+                        return Err("Upsample scale_factor produced a zero output extent".into());
+                    }
+                    Ok(out)
+                })
+                .collect()
+        } else {
+            Err("Upsample requires either size or scale_factor".into())
+        }
+    }
+}
+impl Module for Upsample {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let extents = self.output_extents(input)?;
+        if self.mode == UpsampleMode::Nearest {
+            for (&axis, &out_extent) in self.axes.iter().zip(extents.iter()) {
+                let in_extent = input.extent(axis)?;
+                if out_extent % in_extent != 0 {
+                    return Err(format!(
+                        "Upsample nearest output extent {out_extent} is not an exact integer multiple of {axis:?}'s input extent {in_extent}"
+                    )
+                    .into());
+                }
+            }
+        }
+        let dims = input.dims().iter().copied().map(|dim| {
+            match self.axes.iter().position(|&axis| axis == dim.axis) {
+                Some(position) => dim.axis.of(extents[position]),
+                None => dim,
+            }
+        });
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        let extents = self.output_extents(input.shape())?;
+        let mut output = input.clone();
+        for (&axis, &out_extent) in self.axes.iter().zip(extents.iter()) {
+            output = match self.mode {
+                UpsampleMode::Nearest => {
+                    let in_extent = output.extent(axis)?;
+                    output.upsample_nearest(axis, out_extent / in_extent)?
+                }
+                UpsampleMode::Bilinear | UpsampleMode::Trilinear => {
+                    output.resample_bilinear(axis, out_extent)?
+                }
+                UpsampleMode::Bicubic => output.resample_bicubic(axis, out_extent)?,
+            };
+        }
+        Ok(output)
+    }
+}
+
 pub trait IntoLayers {
     fn into_layers(self) -> Vec<Box<dyn Module>>;
 }
