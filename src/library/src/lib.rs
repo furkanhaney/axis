@@ -90,6 +90,9 @@ compile_error!(
 );
 
 #[cfg(test)]
+#[path = "algebra/layout_tests.rs"]
+mod layout_tests;
+#[cfg(test)]
 #[path = "model/recurrent_tests.rs"]
 mod recurrent_tests;
 #[cfg(test)]
