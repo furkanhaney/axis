@@ -867,6 +867,158 @@ fn binary_cross_entropy_is_stable_and_differentiable() -> Result<()> {
     Ok(())
 }
 
+// Independent derivation for `binary_cross_entropy_with_logits_weighted`, matching
+// `torch.nn.BCEWithLogitsLoss(pos_weight=p)`:
+//   loss = -[p*y*log(sigma(x)) + (1-y)*log(1-sigma(x))]
+// Using log(sigma(x)) = x - softplus(x) and log(1-sigma(x)) = -softplus(x):
+//   loss = -p*y*x + softplus(x)*(p*y + 1 - y) = log_weight*softplus(x) - p*y*x
+// where log_weight = 1 + (p-1)*y and softplus(x) is the same stable
+// max(x,0) + log(1+exp(-|x|)) form the unweighted kernel already uses (log_weight == 1
+// at p == 1, recovering the unweighted formula exactly — the shared oracle case).
+//   d(loss)/dx = log_weight*sigma(x) - p*y
+#[test]
+#[ignore = "requires CUDA"]
+fn binary_cross_entropy_weighted_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let values = [-1000.0_f32, -2.0, 0.0, 2.0, 1000.0];
+    let target_values = [0.0_f32, 1.0, 0.0, 1.0, 1.0];
+    let logits = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let targets = Tensor::from_slice(&target_values, [feature.of(target_values.len())], &device)?;
+    // gastric's AxialMIL sets one scalar `pos_weight` per fold from its class balance
+    // (`train_axial_mil.py:336`); a nontrivial scalar (!= 1) is this test's scalar case.
+    let pos_weight = Tensor::from_slice(&[3.0_f32], [], &device)?;
+
+    let losses = logits.binary_cross_entropy_with_logits_weighted(&targets, &pos_weight)?;
+    // Hand-computed at p = 3, from the derivation above:
+    //   x=-1000, y=0: log_weight=1, softplus=0                 -> loss=0
+    //   x=-2,    y=1: log_weight=3, softplus=0.12692801104297  -> loss=3*0.12692801104297 - 3*1*(-2) = 6.38078403312892
+    //   x=0,     y=0: log_weight=1, softplus=ln(2)=0.69314718056 -> loss=0.69314718056
+    //   x=2,     y=1: log_weight=3, softplus=2.12692801104297  -> loss=3*2.12692801104297 - 3*1*2 = 0.38078403312892
+    //   x=1000,  y=1: log_weight=3, softplus=1000               -> loss=3*1000 - 3*1*1000 = 0
+    let expected = [
+        0.0,
+        6.380_784_033_128_92,
+        std::f64::consts::LN_2, // x=0, y=0: loss = softplus(0) - 0 = ln(1 + e^0) = ln(2) exactly
+        0.380_784_033_128_92,
+        0.0,
+    ];
+    close(
+        "weighted binary cross-entropy",
+        &losses.to_vec()?,
+        &expected,
+    );
+
+    losses.mean(feature)?.backward()?;
+    // d(loss)/dx above, divided by the 5-element mean:
+    //   x=-1000: 1*0 - 3*0 = 0                     -> 0
+    //   x=-2:    3*0.11920292202212 - 3*1 = -2.64239123393365 -> /5 = -0.52847824678673
+    //   x=0:     1*0.5 - 3*0 = 0.5                  -> /5 = 0.1
+    //   x=2:     3*0.88079707797788 - 3*1 = -0.35760876606635 -> /5 = -0.07152175321327
+    //   x=1000:  3*1 - 3*1 = 0                      -> 0
+    let expected_gradient = [0.0, -0.528_478_246_786_73, 0.1, -0.071_521_753_213_27, 0.0];
+    close(
+        "weighted binary cross-entropy gradient",
+        &logits.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits_weighted(&targets, &pos_weight.with_grad())
+            .is_err()
+    );
+    let other = Axis::new("other");
+    let wrong_axes = Tensor::from_slice(&target_values, [other.of(5)], &device)?;
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits_weighted(&targets, &wrong_axes)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn binary_cross_entropy_weighted_broadcasts_a_per_class_tensor_over_reordered_storage() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let (batch, class) = (
+        Axis::new("weighted_bce_batch"),
+        Axis::new("weighted_bce_class"),
+    );
+    // morpheus's objectness head weights `F.binary_cross_entropy_with_logits` by a
+    // per-class tensor broadcast over batch and spatial axes
+    // (`train_sup.py:156-157`, `pos_weight=pw[None,:,None,None]`); batch/class stand in
+    // for that broadcast shape here. `with_layout` keeps the tensor's own logical
+    // [class, batch] axis order (so `to_vec()`'s coordinate walk stays class-major) but
+    // requests batch-major physical strides, forcing the op to read a genuinely permuted,
+    // non-contiguous buffer rather than one that already matches its own shape order --
+    // the CUDA non-trivial-layout case.
+    let logit_values = [0.5_f32, -0.25, -1.5, 1.0, 2.0, -2.0]; // [class, batch]: c0b0,c0b1,c1b0,c1b1,c2b0,c2b1
+    let target_values = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0];
+    let pos_weight_values = [2.0_f32, 0.5, 4.0]; // per class, matches pw[None,:,None,None]
+
+    let logits = Tensor::from_slice(&logit_values, [class.of(3), batch.of(2)], &device)?
+        .with_layout([batch, class])?
+        .with_grad();
+    let targets = Tensor::from_slice(&target_values, [class.of(3), batch.of(2)], &device)?
+        .with_layout([batch, class])?;
+    let pos_weight = Tensor::from_slice(&pos_weight_values, [class.of(3)], &device)?;
+
+    let losses = logits.binary_cross_entropy_with_logits_weighted(&targets, &pos_weight)?;
+
+    // (x, y, p) in [class, batch] row-major order -- the tensors' own logical shape,
+    // unchanged by `with_layout` -- matching `to_vec()`'s coordinate walk.
+    let logical = [
+        (0.5_f64, 1.0_f64, 2.0_f64), // class0, batch0
+        (-0.25, 0.0, 2.0),           // class0, batch1
+        (-1.5, 0.0, 0.5),            // class1, batch0
+        (1.0, 1.0, 0.5),             // class1, batch1
+        (2.0, 1.0, 4.0),             // class2, batch0
+        (-2.0, 0.0, 4.0),            // class2, batch1
+    ];
+    let softplus = |x: f64| x.max(0.0) + (-x.abs()).exp().ln_1p();
+    let expected_loss: Vec<f64> = logical
+        .iter()
+        .map(|&(x, y, p)| {
+            let log_weight = 1.0 + (p - 1.0) * y;
+            log_weight * softplus(x) - p * y * x
+        })
+        .collect();
+    close(
+        "weighted binary cross-entropy (per-class broadcast, reordered storage)",
+        &losses.to_vec()?,
+        &expected_loss,
+    );
+
+    losses.mean([batch, class])?.backward()?;
+    let expected_gradient: Vec<f64> = logical
+        .iter()
+        .map(|&(x, y, p)| {
+            let log_weight = 1.0 + (p - 1.0) * y;
+            let sigma = 1.0 / (1.0 + (-x).exp());
+            (log_weight * sigma - p * y) / logical.len() as f64
+        })
+        .collect();
+    close(
+        "weighted binary cross-entropy gradient (per-class broadcast, reordered storage)",
+        &logits.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    let wrong_extent = Tensor::from_slice(&[1.0_f32, 2.0], [class.of(2)], &device)?;
+    assert!(
+        logits
+            .detach()
+            .binary_cross_entropy_with_logits_weighted(&targets, &wrong_extent)
+            .is_err()
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires CUDA"]
 fn causal_softmax_masks_values_and_gradients() -> Result<()> {

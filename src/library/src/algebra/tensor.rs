@@ -107,6 +107,11 @@ enum Rule {
         logits: Buffer,
         targets: Buffer,
     },
+    BinaryCrossEntropyWeighted {
+        logits: Buffer,
+        targets: Buffer,
+        pos_weight: Buffer,
+    },
     CategoricalCrossEntropy {
         probability: Buffer,
         targets: Buffer,
@@ -638,6 +643,78 @@ impl Tensor {
                 Rule::BinaryCrossEntropy {
                     logits: logits.0.value.clone(),
                     targets: targets.0.value.clone(),
+                },
+            )],
+            false,
+            None,
+        ))
+    }
+    /// Stable elementwise binary cross-entropy with an explicit positive-class weight,
+    /// matching `torch.nn.BCEWithLogitsLoss(pos_weight=...)`: the positive term of each
+    /// element's loss is scaled by `pos_weight` before the negative term is added, so
+    /// `pos_weight` changes the loss value itself and is not reachable by scaling the
+    /// unweighted loss afterward. `pos_weight` may be a scalar or may broadcast over any
+    /// subset of `self`'s axes (for example one weight per class, broadcasting over batch
+    /// and spatial axes); it follows the same subset-axis broadcasting as elementwise
+    /// `add`/`mul`, never an implicit outer product. Targets and `pos_weight` are
+    /// constants in reverse mode.
+    pub fn binary_cross_entropy_with_logits_weighted(
+        &self,
+        targets: &Self,
+        pos_weight: &Self,
+    ) -> Result<Self> {
+        if targets.requires_grad() {
+            return Err("binary cross-entropy targets cannot require gradients".into());
+        }
+        if pos_weight.requires_grad() {
+            return Err("binary cross-entropy pos_weight cannot require gradients".into());
+        }
+        if self.shape().rank() != targets.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&axis| !targets.shape().contains(axis))
+        {
+            return Err(
+                "binary_cross_entropy_with_logits_weighted requires identical axis sets for logits and targets"
+                    .into(),
+            );
+        }
+        if pos_weight
+            .shape()
+            .axes()
+            .iter()
+            .any(|&axis| !self.shape().contains(axis))
+        {
+            return Err(
+                "binary_cross_entropy_with_logits_weighted pos_weight axes must be a subset of the logits axes"
+                    .into(),
+            );
+        }
+        self.compatible_device(targets)?;
+        self.compatible_device(pos_weight)?;
+        self.shared_extents(targets)?;
+        self.shared_extents(pos_weight)?;
+        let logits = self.align(self.shape())?;
+        let targets = targets.align(self.shape())?;
+        let pos_weight = pos_weight.align(self.shape())?;
+        let value = self.device().binary_cross_entropy_weighted(
+            &logits.0.value,
+            &targets.0.value,
+            &pos_weight.0.value,
+        )?;
+        Ok(Self::node(
+            self.shape().clone(),
+            Layout::contiguous(self.shape()),
+            value,
+            self.device(),
+            vec![Edge::new(
+                &logits,
+                Rule::BinaryCrossEntropyWeighted {
+                    logits: logits.0.value.clone(),
+                    targets: targets.0.value.clone(),
+                    pos_weight: pos_weight.0.value.clone(),
                 },
             )],
             false,
@@ -2106,6 +2183,13 @@ impl Tensor {
                         Rule::BinaryCrossEntropy { logits, targets } => self
                             .device()
                             .binary_cross_entropy_backward(&gradient, logits, targets)?,
+                        Rule::BinaryCrossEntropyWeighted {
+                            logits,
+                            targets,
+                            pos_weight,
+                        } => self.device().binary_cross_entropy_weighted_backward(
+                            &gradient, logits, targets, pos_weight,
+                        )?,
                         Rule::CategoricalCrossEntropy {
                             probability,
                             targets,
