@@ -1156,3 +1156,51 @@ existing device kernels with no new one. `Fold` rejects an input whose
 extents are inconsistent with its `output_size`/kernel/stride/padding before
 any device call, the same "before launch" contract every other row in this
 family holds.
+
+### Pooling options and unpooling
+
+The fixed-kernel pooling family now carries PyTorch 2.14's remaining options,
+all validated before launch and all composed from the existing
+`unfold_grouped` patch path, so no kernel was added.
+
+| Module | Option | Default | Semantics |
+| --- | --- | --- | --- |
+| `AvgPool1d/2d/3d` | `ceil_mode` | `false` | window count `ceil((L + 2p - k) / s) + 1`, minus one if that last window would start at or past `L + p` |
+| `AvgPool1d/2d/3d` | `count_include_pad` | `true` | divisor = window clipped to the padded input (full `k` except a `ceil_mode` overhang); `false` counts real positions only |
+| `AvgPool1d/2d/3d` | `divisor_override` | unset | every window's sum divided by this positive constant |
+| `LPPool1d/2d/3d` | `p` | (required) | any finite positive real; `(sum x^p)^(1/p)`, no averaging |
+| `LPPool1d/2d/3d` | `ceil_mode` | `false` | as above; a clipped window is `(sum * k / clipped)^(1/p)`, PyTorch's `avg_pool(x^p) * k` |
+| `MaxPool1d/2d/3d` | `forward_with_indices` | | PyTorch's `return_indices=True` |
+| `MaxUnpool1d/2d/3d` | `stride`, `padding`, output size | `kernel`, `0`, `(in - 1) s - 2p + k` | explicit size must lie strictly within one stride of the default |
+
+A `ceil_mode` window that overhangs the right padding reads zeros appended
+past the input. For a sum those zeros behave exactly like padding, and the
+divisor comes from host-side window counts, never from the zeros. When every
+window counts the full kernel volume, average and LP pooling keep their
+earlier reduction, so the default configuration's bits do not change.
+Integer `p` keeps its repeated-product path. A real `p` computes
+`exp(p ln x)` with `0^p = 0` and a zero gradient. A negative input is NaN,
+as `x.pow(p)` is in PyTorch. One difference from PyTorch remains on purpose:
+with an odd integer `p` and a negative window sum, Axis returns the real
+signed root where PyTorch returns NaN.
+
+Max-pool indices are host-side `usize` values, one per output element, in
+the output's logical order. Each is the row-major offset of the winning
+input position within its spatial volume, taking the axes in the supplied
+spatial order with the last one fastest. This is PyTorch's flattened
+`(D*)H*W` index. The winner is the first maximum in window scan order, which
+is also the element the gradient reaches. `Tensor::max_unpool{1,2,3}d`
+merges the input onto one axis and scatter-adds it into a zero output, so
+the gradient is a gather of the upstream gradient by the same indices, and
+the indices take no gradient. When two elements name the same position, the
+last one written is kept, as PyTorch's CPU kernel keeps it. The overwritten
+element adds `x - detach(x)`: zero in the forward pass, but it still
+receives the gradient that PyTorch's gather gives it.
+
+`adaptive_max_pool` now merges its per-axis gathered windows into a single
+window axis before one `max`. That axis walks every bin in PyTorch's
+adaptive-max scan order (last spatial axis innermost, first strict maximum
+kept). A tie between two positions on different axes therefore routes the
+gradient to PyTorch's element. The earlier axis-by-axis reduction resolved
+such ties by the axis reduced last. That is the only output that changed,
+and only for exact ties that span more than one axis.
