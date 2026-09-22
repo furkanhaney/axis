@@ -103,11 +103,14 @@ contracts and evidence bar.
 The byte autoencoder (`research/src/learning/bae`) is the next outside consumer: 125 bytes
 to a 256-bit sign code to an autoregressive byte decoder over memory tokens,
 with prefix (nested) dropout on the code. Its first slice landed `Embedding`,
-`PositionEmbedding`, and `prefix_causal_mask` with scalar oracles. The
-remaining pull, in the order it bites: a sign with straight-through gradient,
-prefix dropout as a named-axis module with a horizon-weighted loss, Bernoulli
-input dropout, and therefore explicit random-state and train/evaluation
-semantics recorded in the receipt. Its held-out residual tables
+`PositionEmbedding`, and `prefix_causal_mask` with scalar oracles. Its second
+slice landed `Tensor::sign_straight_through` and the `SignStraightThrough`
+module: forward `+1` where `x > 0` else `-1` (so `x == 0` maps to `-1`,
+reproducing `bitae.quantize`'s `torch.where(z > 0, 1.0, -1.0)` rather than
+`torch.sign`), backward the identity, matching `z + (hard - z).detach()`. The
+remaining pull, in the order it bites: prefix dropout as a named-axis module
+with a horizon-weighted loss, Bernoulli input dropout, and therefore explicit
+random-state and train/evaluation semantics recorded in the receipt. Its held-out residual tables
 (`bae/docs/NESTED.md`) are the replication oracle. A related finding: the
 shared xorshift initializer emits exactly `-scale` as its first sample for any
 seed below 2^40, so every module's first entry sits at the boundary; changing

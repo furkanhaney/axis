@@ -168,6 +168,16 @@ tokens in front of an autoregressive sequence. `causal_mask` is the
 `prefix == 0` case. Both remain square, zero-offset, logical dense masks;
 cached decoding and padding masks still need their own contracts.
 
+`Tensor::sign_straight_through` and the `SignStraightThrough` module quantize
+to `{-1, +1}`: `+1` where `x > 0`, otherwise `-1`, so `x == 0` maps to `-1`.
+This reproduces the byte autoencoder's `bitae.quantize` two-level branch,
+`torch.where(z > 0, 1.0, -1.0)`, deliberately rather than `torch.sign`, which
+gives exactly `0` at `x == 0`. The backward is the identity: bae's
+`z + (hard - z).detach()` stops the hard threshold's own gradient, so the
+whole local Jacobian is the straight-through pass-through, `Rule::Identity`.
+Axis leaves any squashing (bae applies `tanh` first) to the caller rather than
+folding it into this op, matching bae's own composition of the two steps.
+
 `DataLoader` batches any `DataSource` and checks its regime before releasing a
 batch. Finite `InMemoryDataset` sources report corpus size; generated sources
 such as `AdditionDataset` do not invent one. Each guarded batch carries a
