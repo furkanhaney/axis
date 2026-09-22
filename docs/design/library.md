@@ -1156,3 +1156,45 @@ existing device kernels with no new one. `Fold` rejects an input whose
 extents are inconsistent with its `output_size`/kernel/stride/padding before
 any device call, the same "before launch" contract every other row in this
 family holds.
+
+### Recurrent layers: depth, direction and bias
+
+`Rnn`, `Gru` and `Lstm` each stack `RecurrentConfig::num_layers` eager
+per-step transitions (`RnnCell`, `GruCell`, `LstmCell` respectively), and
+optionally run a second, reversed-time transition per layer
+(`RecurrentConfig::bidirectional`), matching PyTorch's `RNN`/`GRU`/`LSTM`
+depth and direction semantics over one named time axis:
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `num_layers` | how many transitions are stacked; layer `i`'s (possibly two-direction) hidden output feeds layer `i + 1` verbatim | `1` |
+| `bidirectional` | run a second transition per layer over the reversed time order and concatenate `[forward; backward]` on the hidden axis (PyTorch's order) | `false` |
+| `bias` | allocate each transition's combined bias parameter (`LstmCell`'s convention: one bias, not PyTorch's separate `bias_ih`/`bias_hh`) | `true` |
+
+`RecurrentConfig` is a plain struct, not a shared base type: PyTorch's
+`RNNBase` also owns shared weight storage and flattening behavior that these
+three families do not share (each keeps its own gate layout and init
+convention already), so Axis stops at the config fields the three
+constructors actually have in common, rather than inventing a class
+hierarchy to also claim the `RNNBase` row.
+
+Every layer after the first reads a hidden extent of `hidden * 2` when
+`bidirectional`, since it consumes the previous layer's concatenated output.
+`run`/`run_from` take and return `num_layers * num_directions` states,
+ordered `layer * directions + direction` (direction `0` = forward, `1` =
+backward), matching PyTorch's `(num_layers * num_directions, batch, hidden)`
+stacking order; each entry carries only that one layer/direction's own
+hidden (and, for `Lstm`, cell) state, never a doubled extent. The default
+configuration (one layer, unidirectional, `bias = true`) is bit-exact with
+this family before `num_layers`/`bidirectional`/`bias` existed, and keeps its
+original unprefixed parameter names (`input_weight`, `recurrent_weight`,
+`bias`); any other configuration prefixes every name with its layer and
+direction (`layer0_forward_input_weight`, ...), since it then owns more than
+one of each.
+
+`RnnCell`/`GruCell`/`LstmCell` themselves stay single-layer, single-direction
+primitives -- `bias(false)` toggles their own bias parameter, and `Rnn`,
+`Gru` and `Lstm` build one (or two, when bidirectional) per layer from
+`RecurrentConfig`'s `bias` field. `RnnCell`'s `nonlinearity` (`Tanh` default,
+`Relu` matching `nonlinearity="relu"`) applies identically to every layer and
+direction of the `Rnn` that owns it.
