@@ -218,7 +218,7 @@ fn lstm_matches_independent_f64_forward_and_all_central_differences() -> Result<
         .with_layout([hidden, batch])?
         .with_grad(),
     )?;
-    let run = model.run_from(&x, &[initial.clone()])?;
+    let run = model.run_from(&x, std::slice::from_ref(&initial))?;
     assert_eq!(
         run.sequence.shape(),
         &Shape::new([batch.of(B), time.of(T), hidden.of(H)])?
@@ -560,7 +560,7 @@ fn lstm_causality_streaming_layout_and_state_contracts() -> Result<()> {
             &device,
         )?,
     )?;
-    let full = model.run_from(&base, &[initial.clone()])?;
+    let full = model.run_from(&base, std::slice::from_ref(&initial))?;
     let first_values = chunk_values(&case.input, 0, 2);
     let second_values = chunk_values(&case.input, 2, 3);
     let first = Tensor::from_slice(
@@ -573,7 +573,7 @@ fn lstm_causality_streaming_layout_and_state_contracts() -> Result<()> {
         [batch.of(B), time.of(1), input.of(I)],
         &device,
     )?;
-    let first_run = model.run_from(&first, &[initial.clone()])?;
+    let first_run = model.run_from(&first, std::slice::from_ref(&initial))?;
     let second_run = model.run_from(&second, &[first_run.state[0].clone()])?;
     close(
         "streamed sequence",
@@ -633,7 +633,7 @@ fn lstm_causality_streaming_layout_and_state_contracts() -> Result<()> {
         )?
         .with_grad(),
     )?;
-    let full_run = model.run_from(&full_input, &[full_initial.clone()])?;
+    let full_run = model.run_from(&full_input, std::slice::from_ref(&full_initial))?;
     terminal_loss(&full_run.state[0].clone(), batch, hidden)?.backward()?;
     let full_input_gradient = full_input.grad().unwrap().to_vec()?;
     let full_hidden_gradient = full_initial.hidden.grad().unwrap().to_vec()?;
@@ -671,7 +671,7 @@ fn lstm_causality_streaming_layout_and_state_contracts() -> Result<()> {
         )?
         .with_grad(),
     )?;
-    let first_run = model.run_from(&first_input, &[streamed_initial.clone()])?;
+    let first_run = model.run_from(&first_input, std::slice::from_ref(&streamed_initial))?;
     let second_run = model.run_from(&second_input, &[first_run.state[0].clone()])?;
     terminal_loss(&second_run.state[0], batch, hidden)?.backward()?;
     close(
@@ -738,7 +738,7 @@ fn lstm_causality_streaming_layout_and_state_contracts() -> Result<()> {
     )?
     .with_grad();
     let detached_initial = LstmState::new(initial.hidden.with_grad(), initial.cell.with_grad())?;
-    let first_run = model.run_from(&detached_first, &[detached_initial.clone()])?;
+    let first_run = model.run_from(&detached_first, std::slice::from_ref(&detached_initial))?;
     let detached_state = first_run.state[0].detach();
     let detached_run = model.run_from(&detached_second, &[detached_state])?;
     close(
@@ -939,7 +939,7 @@ fn rnn_matches_independent_f64_forward_and_all_central_differences() -> Result<(
     )?
     .with_layout([hidden, batch])?
     .with_grad();
-    let run = model.run_from(&x, &[initial.clone()])?;
+    let run = model.run_from(&x, std::slice::from_ref(&initial))?;
     assert_eq!(
         run.sequence.shape(),
         &Shape::new([batch.of(B), time.of(T), hidden.of(H)])?
@@ -1271,7 +1271,7 @@ fn gru_matches_independent_f64_forward_and_all_central_differences() -> Result<(
     )?
     .with_layout([hidden, batch])?
     .with_grad();
-    let run = model.run_from(&x, &[initial.clone()])?;
+    let run = model.run_from(&x, std::slice::from_ref(&initial))?;
     assert_eq!(
         run.sequence.shape(),
         &Shape::new([batch.of(B), time.of(T), hidden.of(H)])?
@@ -1953,6 +1953,9 @@ fn bi_stack(gate_multiple: usize, seed: u64) -> BiStack {
     }
 }
 
+/// Selects one parameter vector of a [`BiCase`] for a central difference.
+type BiField = fn(&mut BiCase) -> &mut Vec<f64>;
+
 #[derive(Clone)]
 struct BiCase {
     input: Vec<f64>,
@@ -2006,7 +2009,7 @@ where
         finals_cell[slot] = vec![0.0; B * H];
     }
     for batch in 0..B {
-        let mut layer0_seq = vec![0.0; T * 2 * H];
+        let mut layer0_seq = [0.0; T * 2 * H];
         let mut h = case.initial[0][batch * H..(batch + 1) * H].to_vec();
         let mut c = case.initial_cell[0][batch * H..(batch + 1) * H].to_vec();
         for t in 0..T {
@@ -2039,7 +2042,7 @@ where
         finals_hidden[1][batch * H..(batch + 1) * H].copy_from_slice(&h);
         finals_cell[1][batch * H..(batch + 1) * H].copy_from_slice(&c);
 
-        let mut layer1_seq = vec![0.0; T * 2 * H];
+        let mut layer1_seq = [0.0; T * 2 * H];
         let mut h = case.initial[2][batch * H..(batch + 1) * H].to_vec();
         let mut c = case.initial_cell[2][batch * H..(batch + 1) * H].to_vec();
         for t in 0..T {
@@ -2240,15 +2243,15 @@ fn rnn_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         &bi_finite_difference(&case, step, |case| &mut case.input),
         3e-3,
     );
-    for slot in 0..4 {
+    for (slot, state) in initial.iter().enumerate() {
         close(
             &format!("2-layer bidirectional RNN initial state gradient {slot}"),
-            &initial[slot].grad().unwrap().to_vec()?,
+            &state.grad().unwrap().to_vec()?,
             &bi_finite_difference(&case, step, |case| &mut case.initial[slot]),
             3e-3,
         );
     }
-    let weight_fields: [(&str, fn(&mut BiCase) -> &mut Vec<f64>); 12] = [
+    let weight_fields: [(&str, BiField); 12] = [
         ("layer0_forward_input_weight", |c| {
             &mut c.stack.layer0_forward.input_weight
         }),
@@ -2383,15 +2386,15 @@ fn gru_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         &bi_finite_difference(&case, step, |case| &mut case.input),
         3e-3,
     );
-    for slot in 0..4 {
+    for (slot, state) in initial.iter().enumerate() {
         close(
             &format!("2-layer bidirectional GRU initial state gradient {slot}"),
-            &initial[slot].grad().unwrap().to_vec()?,
+            &state.grad().unwrap().to_vec()?,
             &bi_finite_difference(&case, step, |case| &mut case.initial[slot]),
             3e-3,
         );
     }
-    let weight_fields: [(&str, fn(&mut BiCase) -> &mut Vec<f64>); 12] = [
+    let weight_fields: [(&str, BiField); 12] = [
         ("layer0_forward_input_weight", |c| {
             &mut c.stack.layer0_forward.input_weight
         }),
@@ -2557,21 +2560,21 @@ fn lstm_two_layer_bidirectional_matches_independent_f64_oracle() -> Result<()> {
         &bi_finite_difference(&case, step, |case| &mut case.input),
         3e-3,
     );
-    for slot in 0..4 {
+    for (slot, state) in initial.iter().enumerate() {
         close(
             &format!("2-layer bidirectional LSTM initial hidden gradient {slot}"),
-            &initial[slot].hidden.grad().unwrap().to_vec()?,
+            &state.hidden.grad().unwrap().to_vec()?,
             &bi_finite_difference(&case, step, |case| &mut case.initial[slot]),
             3e-3,
         );
         close(
             &format!("2-layer bidirectional LSTM initial cell gradient {slot}"),
-            &initial[slot].cell.grad().unwrap().to_vec()?,
+            &state.cell.grad().unwrap().to_vec()?,
             &bi_finite_difference(&case, step, |case| &mut case.initial_cell[slot]),
             3e-3,
         );
     }
-    let weight_fields: [(&str, fn(&mut BiCase) -> &mut Vec<f64>); 12] = [
+    let weight_fields: [(&str, BiField); 12] = [
         ("layer0_forward_input_weight", |c| {
             &mut c.stack.layer0_forward.input_weight
         }),
