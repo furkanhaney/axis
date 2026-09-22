@@ -98,6 +98,7 @@ struct UnfoldPlanKey {
     stride: [usize; 3],
     padding: [usize; 3],
     group: Option<Dim>,
+    fill_bits: u32,
 }
 
 thread_local! {
@@ -1115,6 +1116,10 @@ impl Tensor {
         ))
     }
     /// Tanh-approximated GELU, matching the common transformer formulation.
+    ///
+    /// This is PyTorch's `F.gelu(x, approximate="tanh")`, NOT its default. A model ported
+    /// from an un-annotated `F.gelu(x)` or `nn.GELU()` wants [`Self::gelu_exact`]; using this
+    /// form instead gives plausible numbers that differ by about `1e-3` in the tails.
     pub fn gelu(&self) -> Result<Self> {
         let value = self.device().gelu(&self.0.value)?;
         Ok(Self::node(
@@ -1131,7 +1136,8 @@ impl Tensor {
     ///
     /// The CUDA backend numerically evaluates the normal CDF in FP32 (not bitwise
     /// identical to a particular libm). Backward uses `Phi(x) + x * phi(x)`.
-    /// This distinction matters when importing pretrained exact-GELU models.
+    /// This distinction matters when importing pretrained exact-GELU models: this is
+    /// PyTorch's default `F.gelu`/`nn.GELU` (`approximate="none"`).
     pub fn gelu_exact(&self) -> Result<Self> {
         let value = self.device().gelu_exact(&self.0.value)?;
         Ok(Self::node(
@@ -1516,6 +1522,123 @@ impl Tensor {
         profile("min", started);
         Ok(result)
     }
+    /// Reduce three named spatial axes to a fixed target extent each, using PyTorch's adaptive
+    /// average-pooling bin formula per axis: `start = floor(i * input / output)`,
+    /// `end = ceil((i + 1) * input / output)`. Every other axis (such as batch or channel) is
+    /// preserved. When an axis's input extent does not divide evenly by its target extent,
+    /// adjacent bins can share one boundary element; that element is averaged, at full weight,
+    /// into each bin it falls in, exactly as `F.adaptive_avg_pool3d` computes it. Unlike a fixed
+    /// kernel/stride pool, bins have no padding: every bin is a nonempty range of real input
+    /// coordinates.
+    pub fn adaptive_avg_pool3d(&self, spatial: [Axis; 3], target: [usize; 3]) -> Result<Self> {
+        self.adaptive_avg_pool(spatial, target)
+    }
+    fn adaptive_avg_pool<const N: usize>(
+        &self,
+        spatial: [Axis; N],
+        target: [usize; N],
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let name = format!("adaptive_avg_pool{N}d");
+        if !(N == 2 || N == 3) {
+            return Err(
+                "Axis adaptive average pooling supports exactly two or three spatial axes".into(),
+            );
+        }
+        for (index, &axis) in spatial.iter().enumerate() {
+            if spatial[..index].contains(&axis) {
+                return Err(format!("{name} requires distinct spatial axes").into());
+            }
+        }
+        if target.contains(&0) {
+            return Err(format!("{name} target extents must be positive").into());
+        }
+        let mut bins: [Vec<(usize, usize)>; N] = std::array::from_fn(|_| Vec::new());
+        for index in 0..N {
+            let input_extent = self.extent(spatial[index])?;
+            let out_extent = target[index];
+            let mut axis_bins = Vec::with_capacity(out_extent);
+            for i in 0..out_extent {
+                let start = i * input_extent / out_extent;
+                let end = ((i + 1) * input_extent).div_ceil(out_extent);
+                axis_bins.push((start, end));
+            }
+            bins[index] = axis_bins;
+        }
+        let dims: Vec<_> = self
+            .shape()
+            .dims()
+            .iter()
+            .map(|dim| {
+                spatial
+                    .iter()
+                    .position(|&axis| axis == dim.axis)
+                    .map_or(*dim, |index| dim.axis.of(target[index]))
+            })
+            .collect();
+        let output = Shape::new(dims)?;
+        let layout = Layout::contiguous(&output);
+        let mut spatial_positions = [0usize; N];
+        for index in 0..N {
+            spatial_positions[index] = self.shape().index(spatial[index])?;
+        }
+        let mut forward_groups: Vec<Vec<(usize, usize)>> = Vec::with_capacity(output.len());
+        let mut reverse_groups: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.shape().len()];
+        let mut weights = Vec::with_capacity(output.len());
+        for output_index in 0..output.len() {
+            let output_coords = output.coords(output_index);
+            let mut ranges = [(0usize, 0usize); N];
+            let mut extents = [0usize; N];
+            for index in 0..N {
+                ranges[index] = bins[index][output_coords[spatial_positions[index]]];
+                extents[index] = ranges[index].1 - ranges[index].0;
+            }
+            let window_len: usize = extents.iter().product();
+            let mut group = Vec::with_capacity(window_len);
+            for w in 0..window_len {
+                let mut remainder = w;
+                let mut offsets = [0usize; N];
+                for index in (0..N).rev() {
+                    offsets[index] = remainder % extents[index];
+                    remainder /= extents[index];
+                }
+                let mut input_coords = output_coords.clone();
+                for index in 0..N {
+                    input_coords[spatial_positions[index]] = ranges[index].0 + offsets[index];
+                }
+                let physical = self.0.layout.offset(&input_coords);
+                group.push((physical, output_index));
+                reverse_groups[physical].push((output_index, output_index));
+            }
+            weights.push(1.0 / window_len as f32);
+            forward_groups.push(group);
+        }
+        let weight_axis = Axis::new("adaptive_avg_pool_weight");
+        let weights = Self::from_slice(&weights, [weight_axis.of(output.len())], self.device())?;
+        let forward_plan = Plan::groups(forward_groups, true)?;
+        let reverse_plan = Rc::new(Plan::groups(reverse_groups, true)?);
+        let value =
+            self.device()
+                .grouped(&self.0.value, Some(&weights.0.value), &forward_plan, 1.0)?;
+        let result = Self::node(
+            output,
+            layout,
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Group {
+                    plan: reverse_plan,
+                    rhs: Some(weights.0.value.clone()),
+                    factor: 1.0,
+                },
+            )],
+            false,
+            None,
+        );
+        profile(&name, started);
+        Ok(result)
+    }
     /// Reduce one named axis to its maximum finite value.
     ///
     /// Non-finite candidates are ignored. A group without a finite candidate returns NaN and
@@ -1691,12 +1814,15 @@ impl Tensor {
         patch: Dim,
         kernel: [usize; 2],
     ) -> Result<Self> {
-        self.unfold_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0])
+        self.unfold_configured(channels, spatial, None, patch, kernel, [1, 1], [0, 0], 0.0)
     }
 
-    /// Lower a configured 2D or 3D convolution to grouped patches. The group
+    /// Lower a configured 2D or 3D convolution or pooling op to grouped patches. The group
     /// and patch axes are appended so merging grouped output channels restores
     /// convolution's public rule that output channels are the final logical axis.
+    /// `fill` is written at every patch position outside the input (padding); convolution
+    /// passes `0.0`, and windowed max pooling passes `f32::NEG_INFINITY` so a padded position
+    /// can never win the reduction.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn unfold_grouped<const N: usize>(
         &self,
@@ -1707,6 +1833,7 @@ impl Tensor {
         kernel: [usize; N],
         stride: [usize; N],
         padding: [usize; N],
+        fill: f32,
     ) -> Result<Self> {
         self.unfold_configured(
             channels,
@@ -1716,6 +1843,7 @@ impl Tensor {
             kernel,
             stride,
             padding,
+            fill,
         )
     }
 
@@ -1729,8 +1857,12 @@ impl Tensor {
         kernel: [usize; N],
         stride: [usize; N],
         padding: [usize; N],
+        fill: f32,
     ) -> Result<Self> {
         let name = format!("unfold{N}d");
+        if !fill.is_finite() && fill != f32::NEG_INFINITY {
+            return Err(format!("{name} fill must be finite or negative infinity").into());
+        }
         if !(N == 2 || N == 3) {
             return Err("Axis unfold supports exactly two or three spatial axes".into());
         }
@@ -1828,6 +1960,7 @@ impl Tensor {
             stride: stride_key,
             padding: padding_key,
             group,
+            fill_bits: fill.to_bits(),
         };
         let mut output_order = vec![];
         if let Some(group) = group {
@@ -1945,6 +2078,7 @@ impl Tensor {
             forward_metadata,
             backward_metadata,
             channels_per_group: to_i32(channels_per_group)?,
+            fill,
             kernel: kernel_spec,
             stride: stride_spec,
             padding: padding_spec,
