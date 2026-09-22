@@ -61,6 +61,22 @@ impl Parameter {
     }
 }
 
+/// Deterministic uniform values in `[-scale, scale)` from a xorshift stream.
+/// Every parameter initializer shares this generator so a seed is reproducible.
+/// A seed below 2^40 has no high bits yet, so the first sample is exactly
+/// `-scale`; the stream is well mixed from the second sample on.
+fn uniform_values(seed: u64, count: usize, scale: f32) -> Vec<f32> {
+    let mut rng = seed.max(1);
+    (0..count)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (((rng >> 40) as f32 / (1_u32 << 24) as f32) * 2.0 - 1.0) * scale
+        })
+        .collect()
+}
+
 pub trait Module {
     fn output_shape(&self, input: &Shape) -> Result<Shape>;
     /// Infer extents, validate contracts, allocate and initialize parameters; never run forward.
@@ -148,16 +164,8 @@ impl Module for Linear {
             self.input_role.of(extent),
             self.output_role.of(self.output.extent),
         ])?;
-        let mut rng = seed.max(1);
         let scale = (6.0 / (extent + self.output.extent) as f32).sqrt();
-        let values: Vec<_> = (0..weight_shape.len())
-            .map(|_| {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                (((rng >> 40) as f32 / (1_u32 << 24) as f32) * 2.0 - 1.0) * scale
-            })
-            .collect();
+        let values = uniform_values(seed, weight_shape.len(), scale);
         let weight = Parameter::new(Tensor::from_slice(
             &values,
             weight_shape.dims().iter().copied(),
@@ -187,6 +195,155 @@ impl Module for Linear {
         self.bound
             .as_ref()
             .map(|(_, w, b)| vec![("weight".into(), w.clone()), ("bias".into(), b.clone())])
+            .unwrap_or_default()
+    }
+}
+
+/// Look up one learned feature vector per vocabulary entry.
+///
+/// Axis tensors are floating point, so a token is spelled as a one-hot
+/// coordinate on the named `vocabulary` axis rather than as an integer index.
+/// The lookup contracts that axis with a `[vocabulary, feature]` table, which
+/// has the same value and derivative as an index gather. The input is not
+/// checked to be one-hot on the device; a soft input is a weighted mixture.
+/// Entries start uniform in `[-0.02, 0.02)`.
+#[derive(Clone)]
+pub struct Embedding {
+    vocabulary: Axis,
+    feature: Dim,
+    vocabulary_role: Axis,
+    feature_role: Axis,
+    bound: Option<(usize, Parameter)>,
+}
+impl Embedding {
+    pub fn new(vocabulary: Axis, feature: Dim) -> Self {
+        Self {
+            vocabulary,
+            feature,
+            vocabulary_role: vocabulary.role("embedding_vocabulary"),
+            feature_role: feature.axis.role("embedding_feature"),
+            bound: None,
+        }
+    }
+}
+impl Module for Embedding {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let extent = input.extent(self.vocabulary)?;
+        if let Some((bound, _)) = &self.bound
+            && *bound != extent
+        {
+            return Err("Embedding vocabulary extent differs from its built extent".into());
+        }
+        let mut dims: Vec<_> = input
+            .dims()
+            .iter()
+            .copied()
+            .filter(|dim| dim.axis != self.vocabulary)
+            .collect();
+        dims.push(self.feature);
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, device: &Device, seed: u64) -> Result<Shape> {
+        let shape = self.output_shape(input)?;
+        if let Some((_, table)) = &self.bound {
+            if !table.tensor().device().same(device) {
+                return Err("Embedding is already built on a different Device".into());
+            }
+            return Ok(shape);
+        }
+        let extent = input.extent(self.vocabulary)?;
+        let table_shape = Shape::new([
+            self.vocabulary_role.of(extent),
+            self.feature_role.of(self.feature.extent),
+        ])?;
+        let table = Parameter::new(Tensor::from_slice(
+            &uniform_values(seed, table_shape.len(), 0.02),
+            table_shape.dims().iter().copied(),
+            device,
+        )?);
+        self.bound = Some((extent, table));
+        Ok(shape)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        let (_, table) = self
+            .bound
+            .as_ref()
+            .ok_or("Embedding must be built before forward")?;
+        input
+            .rename(self.vocabulary, self.vocabulary_role)?
+            .contract(&table.tensor(), self.vocabulary_role)?
+            .rename(self.feature_role, self.feature.axis)
+    }
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.bound
+            .as_ref()
+            .map(|(_, table)| vec![("table".into(), table.clone())])
+            .unwrap_or_default()
+    }
+}
+
+/// Add one learned vector per position: a `[position, feature]` table whose
+/// extents are read from the input at build and broadcast over every other
+/// axis. The output shape equals the input shape. Entries start uniform in
+/// `[-0.02, 0.02)`.
+#[derive(Clone)]
+pub struct PositionEmbedding {
+    position: Axis,
+    feature: Axis,
+    bound: Option<(usize, usize, Parameter)>,
+}
+impl PositionEmbedding {
+    pub fn new(position: Axis, feature: Axis) -> Self {
+        Self {
+            position,
+            feature,
+            bound: None,
+        }
+    }
+}
+impl Module for PositionEmbedding {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        if self.position == self.feature {
+            return Err("PositionEmbedding requires distinct position and feature axes".into());
+        }
+        let extents = (input.extent(self.position)?, input.extent(self.feature)?);
+        if let Some((positions, features, _)) = &self.bound
+            && (*positions, *features) != extents
+        {
+            return Err("PositionEmbedding input extents differ from its built extents".into());
+        }
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, device: &Device, seed: u64) -> Result<Shape> {
+        let shape = self.output_shape(input)?;
+        if let Some((_, _, table)) = &self.bound {
+            if !table.tensor().device().same(device) {
+                return Err("PositionEmbedding is already built on a different Device".into());
+            }
+            return Ok(shape);
+        }
+        let (positions, features) = (input.extent(self.position)?, input.extent(self.feature)?);
+        let table = Parameter::new(Tensor::from_slice(
+            &uniform_values(seed, positions * features, 0.02),
+            [self.position.of(positions), self.feature.of(features)],
+            device,
+        )?);
+        self.bound = Some((positions, features, table));
+        Ok(shape)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        let (_, _, table) = self
+            .bound
+            .as_ref()
+            .ok_or("PositionEmbedding must be built before forward")?;
+        input.add(&table.tensor())
+    }
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.bound
+            .as_ref()
+            .map(|(_, _, table)| vec![("table".into(), table.clone())])
             .unwrap_or_default()
     }
 }
@@ -256,16 +413,8 @@ impl Module for PopulationLinear {
             self.input_role.of(extent),
             self.output_role.of(self.output.extent),
         ])?;
-        let mut rng = seed.max(1);
         let scale = (6.0 / (extent + self.output.extent) as f32).sqrt();
-        let values: Vec<_> = (0..weight_shape.len())
-            .map(|_| {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                (((rng >> 40) as f32 / (1_u32 << 24) as f32) * 2.0 - 1.0) * scale
-            })
-            .collect();
+        let values = uniform_values(seed, weight_shape.len(), scale);
         let weight = Parameter::new(Tensor::from_slice(
             &values,
             weight_shape.dims().iter().copied(),

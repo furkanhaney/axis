@@ -1193,8 +1193,18 @@ impl Tensor {
     /// Mask key positions greater than query positions with -infinity.
     /// This is square, zero-offset self-attention; cached/offset attention is not supported.
     pub fn causal_mask(&self, query: Axis, key: Axis) -> Result<Self> {
+        self.prefix_causal_mask(query, key, 0)
+    }
+    /// Causal mask whose first `prefix` key positions stay visible to every query.
+    /// A block of memory or code tokens placed before the sequence is attended
+    /// freely, and the remaining positions are strictly causal. This is a
+    /// logical dense mask, not a sparse kernel; `prefix == 0` is `causal_mask`.
+    pub fn prefix_causal_mask(&self, query: Axis, key: Axis, prefix: usize) -> Result<Self> {
         if query == key || self.extent(query)? != self.extent(key)? {
             return Err("causal_mask requires distinct query/key axes of equal extent".into());
+        }
+        if prefix > self.extent(key)? {
+            return Err("prefix_causal_mask prefix exceeds the key extent".into());
         }
         let q = self.shape().index(query)?;
         let k = self.shape().index(key)?;
@@ -1202,7 +1212,8 @@ impl Tensor {
         let mut keep = vec![0.0; self.shape().len()];
         for i in 0..self.shape().len() {
             let coords = self.shape().coords(i);
-            keep[self.0.layout.offset(&coords)] = f32::from(coords[k] <= coords[q]);
+            keep[self.0.layout.offset(&coords)] =
+                f32::from(coords[k] <= coords[q] || coords[k] < prefix);
         }
         let keep = self.device().upload(keep)?;
         let value = self.device().mask(&self.0.value, &keep)?;
