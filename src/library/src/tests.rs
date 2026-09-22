@@ -5554,3 +5554,109 @@ fn softplus_forward_and_gradient_match_pytorch_beta1_threshold40_oracle() -> Res
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clamp_matches_hand_computed_values_below_inside_above_at_bound_and_nan() -> Result<()> {
+    // vision/image-encode's stage_a.py:72, `sites.clamp_(0, 1)`, keeps site positions inside
+    // the unit square after each Adam step -- both bounds given, matching torch.clamp(x, 0, 1).
+    // Cover below-both-bounds, exactly-at-min, strictly-inside, exactly-at-max,
+    // above-both-bounds, and a NaN element (Axis tensors are dense f32, so a real caller can
+    // hand clamp() one).
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let values = [-2.0f32, -0.5, 0.0, 0.3, 0.7, 1.0, 1.5, 2.0, f32::NAN];
+    let x = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+
+    let clamped = x.clamp(Some(0.0), Some(1.0))?;
+    assert_eq!(clamped.shape(), x.shape());
+    let actual = clamped.to_vec()?;
+    assert!(
+        actual[8].is_nan(),
+        "a NaN input must propagate unclamped, got {}",
+        actual[8]
+    );
+    close(
+        "clamp(0, 1) forward, below/at-min/inside/at-max/above",
+        &actual[..8],
+        &[0.0, 0.0, 0.0, 0.3, 0.7, 1.0, 1.0, 1.0],
+    );
+
+    clamped.mean(sample)?.backward()?;
+    // PyTorch's clamp gradient: 1 where min <= x <= max (inclusive of both bounds), 0
+    // elsewhere -- including NaN, since `x >= min` is itself false for NaN.
+    let n = values.len() as f64;
+    close(
+        "clamp(0, 1) gradient, below/at-min/inside/at-max/above/nan",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[0.0, 0.0, 1.0 / n, 1.0 / n, 1.0 / n, 1.0 / n, 0.0, 0.0, 0.0],
+    );
+
+    // Rejections before any device launch.
+    assert!(
+        x.clamp(Some(2.0), Some(1.0)).is_err(),
+        "min > max must be rejected"
+    );
+    assert!(
+        x.clamp(Some(f32::NAN), None).is_err(),
+        "a NaN min must be rejected"
+    );
+    assert!(
+        x.clamp(None, Some(f32::NAN)).is_err(),
+        "a NaN max must be rejected"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clamp_with_only_a_min_bound_matches_energy_output_denominator_floor() -> Result<()> {
+    // world/energy-output's fit_reconstruction.py:100-101, `counts.clamp(min=1)`, floors a
+    // per-feature observed count before it becomes a division denominator -- only `min` is
+    // given, so `max` stays unbounded (`None`), matching torch.clamp(counts, min=1).
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let values = [0.0f32, 0.5, 1.0, 3.0];
+    let counts = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+
+    let floored = counts.clamp(Some(1.0), None)?;
+    close(
+        "clamp(min=1) forward",
+        &floored.to_vec()?,
+        &[1.0, 1.0, 1.0, 3.0],
+    );
+
+    floored.mean(feature)?.backward()?;
+    close(
+        "clamp(min=1) gradient: zero below the floor, one at and above it",
+        &counts.grad().expect("counts gradient").to_vec()?,
+        &[0.0, 0.0, 0.25, 0.25],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clamp_matches_logical_order_under_reordered_cuda_storage() -> Result<()> {
+    // Elementwise ops read the raw physical buffer and keep the tensor's existing Layout
+    // unchanged (`with_layout` only ever changes physical strides), so clamp on a
+    // reordered-storage tensor must still read out in the tensor's own logical Shape order
+    // via `to_vec()`, exactly like `sign`, `sin`, or the scalar comparisons.
+    let device = Device::cuda(0)?;
+    let (batch, time) = (Axis::new("batch"), Axis::new("time"));
+    let values: Vec<f32> = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+    let x = Tensor::from_slice(&values, [batch.of(2), time.of(3)], &device)?
+        .with_layout([time, batch])?;
+    let clamped = x.clamp(Some(-1.0), Some(1.0))?;
+    assert_eq!(clamped.shape(), x.shape());
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&v| f64::from(v.clamp(-1.0, 1.0)))
+        .collect();
+    close(
+        "reordered-storage clamp(-1, 1)",
+        &clamped.to_vec()?,
+        &expected,
+    );
+    Ok(())
+}

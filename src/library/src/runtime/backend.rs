@@ -412,6 +412,33 @@ impl Device {
             .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    /// `min`/`max` are already-resolved bounds: [`Tensor::clamp`] maps an omitted side to
+    /// `f32::NEG_INFINITY`/`f32::INFINITY` before calling here, so the kernel only ever sees
+    /// two concrete scalars, the same resolved-parameter shape as [`Self::leaky_relu`].
+    pub(crate) fn clamp(&self, a: &Buffer, min: f32, max: f32) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::clamp((&mut out).partition([128]), a.as_ref(), min, max)
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn clamp_backward(
+        &self,
+        gradient: &Buffer,
+        a: &Buffer,
+        min: f32,
+        max: f32,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::clamp_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            a.as_ref(),
+            min,
+            max,
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn inverse_sqrt_backward(
         &self,
         gradient: &Buffer,
@@ -2520,6 +2547,38 @@ mod kernels {
             eq_tile(x, s)
         };
         out.store(select(condition, one, zero));
+    }
+    /// Clamp low then high, mirroring `sign`'s comparison-then-`select` shape. A `NaN`
+    /// input satisfies neither `lt_tile` nor `gt_tile` (every ordered IEEE comparison
+    /// against `NaN` is false), so it falls through both selects unclamped and the stored
+    /// output stays `NaN`.
+    #[cutile::entry()]
+    fn clamp(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>, min: f32, max: f32) {
+        let x = a.load_like(out);
+        let lo = broadcast_scalar(min, shape![128]);
+        let hi = broadcast_scalar(max, shape![128]);
+        let after_low = select(lt_tile(x, lo), lo, x);
+        out.store(select(gt_tile(after_low, hi), hi, after_low));
+    }
+    /// Gradient matches PyTorch's `clamp`: passes through where `min <= x && x <= max`,
+    /// including exactly at either bound, and is zero elsewhere -- including a `NaN` input,
+    /// since `ge_tile`/`le_tile` against `NaN` are both false.
+    #[cutile::entry()]
+    fn clamp_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        min: f32,
+        max: f32,
+    ) {
+        let x = a.load_like(out);
+        let lo = broadcast_scalar(min, shape![128]);
+        let hi = broadcast_scalar(max, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let zero = constant(0.0f32, shape![128]);
+        let within_high = select(le_tile(x, hi), one, zero);
+        let mask = select(ge_tile(x, lo), within_high, zero);
+        out.store(gradient.load_like(out) * mask);
     }
     #[cutile::entry()]
     fn grouped<const PRODUCT: i32>(
