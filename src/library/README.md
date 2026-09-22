@@ -11,11 +11,13 @@ axis because both happen to have the same extent.
 The crate currently provides:
 
 - named-axis tensor algebra and reverse-mode differentiation, including
-  deterministic finite minimum reductions;
+  deterministic finite minimum reductions, asymmetric zero-padding, contiguous
+  slicing, and compact device copies for layout, merge, and alignment;
 - `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
   grouped/depthwise channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
-  and stateless `InstanceNorm`, explicit-state `LstmCell`/`Lstm`, activations,
-  attention primitives, and sequential composition;
+  and stateless `InstanceNorm`, one-hot `Embedding` and `PositionEmbedding`,
+  explicit-state `LstmCell`/`Lstm`, activations, attention primitives with
+  causal and prefix-causal masks, and sequential composition;
 - device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
   exact AdamW remainder;
 - generated and finite data loaders with executable single-pass, finite-pass,
@@ -57,7 +59,8 @@ change as real training programs expose better defaults and abstractions.
 parity; `Tensor::gelu()` and `GELU` retain their tanh formulation. `SiLU` and
 configurable `LeakyReLU` compose existing differentiable tensor primitives.
 The exact-form operation uses FP32 normal-CDF evaluation and its analytic
-derivative, not bitwise libm equivalence. This addition is not in release 0.7.0.
+derivative, not bitwise libm equivalence. `gelu` is the tanh form; a model
+ported from PyTorch's default `nn.GELU` wants `gelu_exact`.
 
 The Muon implementation's pinned upstream revision and MIT attribution are in
 [THIRD_PARTY.md](THIRD_PARTY.md), which is included in every published crate.
@@ -71,11 +74,17 @@ asymmetric convolution padding are not implemented. Both paths materialize FP32 
 contraction; 3D kernel volumes can make that intermediate large, while later
 generic layout and broadcast operations retain their index-plan limits.
 
-The development API adds `tensor.pad_zeros(axis, before, after)` and
-`tensor.narrow(axis, start, length)` for asymmetric zero-padding and contiguous
-nonempty slicing. Both preserve named axes, keep values and gradients on-device,
-and use rank-sized metadata instead of element-sized index tables. Identity
-operations share storage. These APIs are not in the published 0.9.0 release.
+`tensor.pad_zeros(axis, before, after)` and `tensor.narrow(axis, start, length)`
+give asymmetric zero-padding and contiguous nonempty slicing. Both preserve
+named axes, keep values and gradients on-device, and use rank-sized metadata
+instead of element-sized index tables; padding, slicing, layout changes, merge,
+and alignment run as compact device copies. Identity operations share storage.
+
+`Embedding` looks a one-hot `vocabulary` axis up in a learned
+`[vocabulary, feature]` table, so a token is a coordinate rather than an integer
+index; `PositionEmbedding` adds a learned `[position, feature]` table.
+`Tensor::prefix_causal_mask` masks attention so a prefix attends freely and the
+remainder attends causally.
 
 `Lstm` names its time, input, and hidden axes and preserves every unrelated
 stream axis. `run` starts from device-resident zero state; `run_from` accepts an
@@ -91,8 +100,13 @@ cargo add axis@0.10.0
 ```
 
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
-CNN, attention, generated-data, paired Muon, MNIST, and research-script migrations with
-independent numerical oracles. Contributions from humans and agents are both
+CNN, attention, generated-data, paired Muon, MNIST, and research-script
+migrations with independent numerical oracles. Outside consumers pin the
+published crate: a generated-data Sudoku transformer, a game-disjoint chess
+policy-and-value transformer, an in-process cell-segmentation click in the Atlas
+labeler, and a set of research studies each carrying a small Axis port checked
+against a PyTorch oracle. What those consumers still lack is tracked as issues
+and in `docs/direction/next.md`. Contributions from humans and agents are both
 welcome under the repository's contribution contract. The project name and
 branding are covered by its
 [trademark policy](https://github.com/furkanhaney/axis/blob/main/TRADEMARK.md).
