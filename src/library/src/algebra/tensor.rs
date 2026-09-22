@@ -1069,49 +1069,73 @@ impl Tensor {
             None,
         ))
     }
-    pub fn mean(&self, axes: impl IntoAxes) -> Result<Self> {
-        let started = Instant::now();
-        let axes = self.shape().select_axes(axes)?;
-        let key = (0, self.shape().clone(), self.0.layout.clone(), axes.clone());
+    /// Shared plan for the group-sum kernel behind [`Tensor::mean`] and [`Tensor::sum`]:
+    /// remove exactly `axes`, keep every other axis, and scale the summed contributions by
+    /// `factor` (computed from the output/input element counts so callers can pick `1.0` for
+    /// an exact sum or `output/input` for a mean). `discriminant` keeps the two ops' cached
+    /// plans apart, since they share a shape/layout/axes key but not a factor.
+    fn reduction_plans(
+        &self,
+        discriminant: u8,
+        axes: &[Axis],
+        factor: fn(usize, usize) -> f32,
+    ) -> Result<ReductionPlans> {
+        let key = (
+            discriminant,
+            self.shape().clone(),
+            self.0.layout.clone(),
+            axes.to_vec(),
+        );
         let cached = REDUCTION_PLANS.with(|cache| cache.borrow().get(&key).cloned());
-        let plans = match cached {
-            Some(plans) => plans,
-            None => {
-                let output = Shape::new(
-                    self.shape()
-                        .dims()
-                        .iter()
-                        .copied()
-                        .filter(|d| !axes.contains(&d.axis)),
-                )?;
-                let layout = Layout::contiguous(&output);
-                let factor = output.len() as f32 / self.shape().len() as f32;
-                let mut map = vec![0; self.shape().len()];
-                for i in 0..self.shape().len() {
-                    let coords = self.shape().coords(i);
-                    let retained: Vec<_> = self
-                        .shape()
-                        .dims()
-                        .iter()
-                        .zip(&coords)
-                        .filter(|(d, _)| !axes.contains(&d.axis))
-                        .map(|(_, &coordinate)| coordinate)
-                        .collect();
-                    map[self.0.layout.offset(&coords)] = layout.offset(&retained);
-                }
-                let plans = ReductionPlans {
-                    output: output.clone(),
-                    layout,
-                    factor,
-                    forward: Rc::new(Plan::reverse(&map, output.len())?),
-                    reverse: Rc::new(Plan::gather(&map)?),
-                };
-                REDUCTION_PLANS.with(|cache| {
-                    cache.borrow_mut().insert(key, plans.clone());
-                });
-                plans
-            }
+        if let Some(plans) = cached {
+            return Ok(plans);
+        }
+        let output = Shape::new(
+            self.shape()
+                .dims()
+                .iter()
+                .copied()
+                .filter(|d| !axes.contains(&d.axis)),
+        )?;
+        let layout = Layout::contiguous(&output);
+        let factor = factor(output.len(), self.shape().len());
+        let mut map = vec![0; self.shape().len()];
+        for i in 0..self.shape().len() {
+            let coords = self.shape().coords(i);
+            let retained: Vec<_> = self
+                .shape()
+                .dims()
+                .iter()
+                .zip(&coords)
+                .filter(|(d, _)| !axes.contains(&d.axis))
+                .map(|(_, &coordinate)| coordinate)
+                .collect();
+            map[self.0.layout.offset(&coords)] = layout.offset(&retained);
+        }
+        let plans = ReductionPlans {
+            output: output.clone(),
+            layout,
+            factor,
+            forward: Rc::new(Plan::reverse(&map, output.len())?),
+            reverse: Rc::new(Plan::gather(&map)?),
         };
+        REDUCTION_PLANS.with(|cache| {
+            cache.borrow_mut().insert(key, plans.clone());
+        });
+        Ok(plans)
+    }
+    /// Run the group-sum kernel for a [`reduction_plans`](Self::reduction_plans) plan and wrap
+    /// the result in a graph node whose backward broadcasts the upstream gradient back across
+    /// the reduced axes, scaled by the same `factor`.
+    fn reduce_grouped(
+        &self,
+        discriminant: u8,
+        axes: Vec<Axis>,
+        factor: fn(usize, usize) -> f32,
+        label: &str,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let plans = self.reduction_plans(discriminant, &axes, factor)?;
         let value =
             self.device()
                 .grouped(&self.0.value, None, plans.forward.as_ref(), plans.factor)?;
@@ -1129,8 +1153,26 @@ impl Tensor {
             false,
             None,
         );
-        profile("mean", started);
+        profile(label, started);
         Ok(result)
+    }
+    pub fn mean(&self, axes: impl IntoAxes) -> Result<Self> {
+        let axes = self.shape().select_axes(axes)?;
+        self.reduce_grouped(
+            0,
+            axes,
+            |output, input| output as f32 / input as f32,
+            "mean",
+        )
+    }
+    /// Reduce precisely the named `axes` to their sum; every other axis is preserved
+    /// unchanged. Backward broadcasts the upstream gradient across the reduced axes without
+    /// scaling it, since each contributing element has unit local derivative. This runs the
+    /// same group-sum kernel `mean` uses, with the constant scale `1.0` in place of `mean`'s
+    /// `1 / extent` — the two are the same primitive, not a division after the fact.
+    pub fn sum(&self, axes: impl IntoAxes) -> Result<Self> {
+        let axes = self.shape().select_axes(axes)?;
+        self.reduce_grouped(2, axes, |_, _| 1.0, "sum")
     }
     /// Population mean and variance over exactly the declared named axes.
     pub fn moments(&self, axes: impl IntoAxes) -> Result<(Self, Self)> {
