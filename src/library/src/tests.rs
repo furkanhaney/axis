@@ -2293,13 +2293,7 @@ fn silu_and_leaky_relu_modules_match_independent_oracles() -> Result<()> {
     let expected_leaky_gradient = values
         .iter()
         .map(|&x| {
-            let derivative = if x > 0.0 {
-                1.0
-            } else if x < 0.0 {
-                0.125
-            } else {
-                0.0
-            };
+            let derivative = if x > 0.0 { 1.0 } else { 0.125 };
             derivative / values.len() as f64
         })
         .collect::<Vec<_>>();
@@ -2312,6 +2306,191 @@ fn silu_and_leaky_relu_modules_match_independent_oracles() -> Result<()> {
     assert!(LeakyReLU::new(-0.1).is_err());
     assert!(LeakyReLU::new(f32::NAN).is_err());
     assert!(input.leaky_relu(f32::INFINITY).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA and AXIS_PYTHON with PyTorch"]
+fn pytorch_activation_forward_and_gradient_parity() -> Result<()> {
+    let Ok(python) = std::env::var("AXIS_PYTHON") else {
+        println!("SKIP: set AXIS_PYTHON to a Python interpreter with PyTorch");
+        return Ok(());
+    };
+    let script = r#"
+import torch
+import torch.nn.functional as F
+
+values = [-8.0, -3.0, -1.0, -0.0, 0.0, 0.5, 2.0, 8.0]
+operations = (
+    ("exact_gelu", lambda x: F.gelu(x, approximate="none")),
+    ("silu", F.silu),
+    ("leaky_relu", lambda x: F.leaky_relu(x, negative_slope=0.125)),
+)
+for name, operation in operations:
+    x = torch.tensor(values, dtype=torch.float32, requires_grad=True)
+    y = operation(x)
+    y.mean().backward()
+    print(name + ":forward " + " ".join(format(float(v), ".9g") for v in y))
+    print(name + ":gradient " + " ".join(format(float(v), ".9g") for v in x.grad))
+"#;
+    let output = std::process::Command::new(&python)
+        .args(["-c", script])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "PyTorch oracle failed via {python}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let oracle = String::from_utf8(output.stdout)?;
+    let mut lines = oracle.lines();
+    let mut expected = |label: &str| -> Result<Vec<f64>> {
+        let line = lines
+            .next()
+            .ok_or_else(|| format!("PyTorch oracle omitted {label}"))?;
+        let (observed_label, values) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed PyTorch oracle line: {line}"))?;
+        if observed_label != label {
+            return Err(
+                format!("PyTorch oracle emitted {observed_label}, expected {label}").into(),
+            );
+        }
+        values
+            .split_whitespace()
+            .map(|value| value.parse::<f64>().map_err(Into::into))
+            .collect()
+    };
+
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("pytorch_parity_feature");
+    let values = [-8.0, -3.0, -1.0, -0.0, 0.0, 0.5, 2.0, 8.0];
+    for (name, module) in [
+        ("exact_gelu", &ExactGELU as &dyn Module),
+        ("silu", &SiLU as &dyn Module),
+        ("leaky_relu", &LeakyReLU::new(0.125)? as &dyn Module),
+    ] {
+        let input = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+        let output = module.forward(&input)?;
+        close(
+            &format!("PyTorch {name} forward"),
+            &output.to_vec()?,
+            &expected(&format!("{name}:forward"))?,
+        );
+        output.mean(feature)?.backward()?;
+        close(
+            &format!("PyTorch {name} gradient"),
+            &input.grad().unwrap().to_vec()?,
+            &expected(&format!("{name}:gradient"))?,
+        );
+    }
+    assert!(
+        lines.next().is_none(),
+        "PyTorch oracle emitted extra output"
+    );
+    println!("PyTorch activation parity PASS via {python}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA and AXIS_PYTHON with CUDA PyTorch"]
+fn pytorch_activation_forward_performance() -> Result<()> {
+    let Ok(python) = std::env::var("AXIS_PYTHON") else {
+        println!("SKIP: set AXIS_PYTHON to a Python interpreter with CUDA PyTorch");
+        return Ok(());
+    };
+    const ELEMENTS: usize = 1_048_576;
+    const WARMUPS: usize = 8;
+    const ITERATIONS: usize = 40;
+    let script = format!(
+        r#"
+import time
+import torch
+import torch.nn.functional as F
+
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA PyTorch is required")
+x = torch.linspace(-8.0, 8.0, {ELEMENTS}, dtype=torch.float32, device="cuda")
+operations = (
+    ("exact_gelu", lambda value: F.gelu(value, approximate="none")),
+    ("silu", F.silu),
+    ("leaky_relu", lambda value: F.leaky_relu(value, negative_slope=0.125)),
+)
+with torch.inference_mode():
+    for name, operation in operations:
+        for _ in range({WARMUPS}):
+            operation(x)
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        for _ in range({ITERATIONS}):
+            operation(x)
+        torch.cuda.synchronize()
+        print(name + " " + format((time.perf_counter() - started) / {ITERATIONS}, ".12g"))
+"#
+    );
+    let output = std::process::Command::new(&python)
+        .args(["-c", &script])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "PyTorch benchmark failed via {python}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let pytorch = String::from_utf8(output.stdout)?;
+    let mut pytorch_lines = pytorch.lines();
+
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("pytorch_performance_feature");
+    let values = (0..ELEMENTS)
+        .map(|index| -8.0 + 16.0 * index as f32 / (ELEMENTS - 1) as f32)
+        .collect::<Vec<_>>();
+    let input = Tensor::from_slice(&values, [feature.of(ELEMENTS)], &device)?;
+    for (name, module) in [
+        ("exact_gelu", &ExactGELU as &dyn Module),
+        ("silu", &SiLU as &dyn Module),
+        ("leaky_relu", &LeakyReLU::new(0.125)? as &dyn Module),
+    ] {
+        for _ in 0..WARMUPS {
+            std::hint::black_box(module.forward(&input)?);
+        }
+        device.synchronize()?;
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(module.forward(&input)?);
+        }
+        device.synchronize()?;
+        let axis_seconds = started.elapsed().as_secs_f64() / ITERATIONS as f64;
+
+        let line = pytorch_lines
+            .next()
+            .ok_or_else(|| format!("PyTorch benchmark omitted {name}"))?;
+        let (observed_name, seconds) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed PyTorch benchmark line: {line}"))?;
+        if observed_name != name {
+            return Err(
+                format!("PyTorch benchmark emitted {observed_name}, expected {name}").into(),
+            );
+        }
+        let pytorch_seconds = seconds.parse::<f64>()?;
+        let ratio = axis_seconds / pytorch_seconds;
+        assert!(
+            axis_seconds.is_finite() && pytorch_seconds.is_finite() && pytorch_seconds > 0.0,
+            "invalid benchmark timing for {name}"
+        );
+        println!(
+            "performance {name}: Axis={:.3} ms PyTorch={:.3} ms ratio={ratio:.2}x elements={ELEMENTS}",
+            axis_seconds * 1e3,
+            pytorch_seconds * 1e3,
+        );
+    }
+    assert!(
+        pytorch_lines.next().is_none(),
+        "PyTorch benchmark emitted extra output"
+    );
     Ok(())
 }
 

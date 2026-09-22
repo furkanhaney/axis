@@ -94,12 +94,34 @@ forward error below 2e-6 and derivative error below 5e-7 over 8,193 inputs spann
 kernel tiles. Nonfinite inputs and bitwise cross-backend parity are not certified.
 The existing tanh-GELU regression remains unchanged.
 
-`SiLU` composes sigmoid and multiplication, while `LeakyReLU::new(slope)?`
-composes the established ReLU primitives. Leaky-ReLU slopes must be finite and
-non-negative; the derivative at exactly zero is zero. The independent f64 oracle
+`SiLU` and `LeakyReLU::new(slope)?` each lower to one cuTile kernel in forward
+and reverse mode. Leaky-ReLU slopes must be finite and non-negative; the
+derivative at exactly zero is the negative slope, matching PyTorch. The
+independent f64 oracle
 covers 2,051 values, reordered storage, odd partial tiles, both forward paths and
-both reverse-mode derivatives. These are correctness paths rather than fused
-activation kernels.
+both reverse-mode derivatives.
+
+An additional ignored parity test can compare those three activations directly
+with an installed PyTorch at runtime. Run it with
+`AXIS_PYTHON=/path/to/python bash scripts/cargo.sh test -p axis pytorch_activation_forward_and_gradient_parity -- --ignored --nocapture`.
+This dynamic comparison supplements the independent scalar oracles; it does not
+replace them or make PyTorch a build dependency.
+The adjacent `pytorch_activation_forward_performance` test also emits a warmed,
+synchronized forward-latency receipt for one million elements. It is a local
+regression signal rather than a framework-wide throughput claim.
+
+The matched fragments use each framework's direct public spelling:
+
+| Operation | PyTorch | Axis |
+| --- | --- | --- |
+| exact GELU | `F.gelu(x, approximate="none")` | `x.gelu_exact()?` |
+| SiLU | `F.silu(x)` | `x.silu()?` |
+| leaky ReLU | `F.leaky_relu(x, negative_slope=0.125)` | `x.leaky_relu(0.125)?` |
+
+Parity cases must hold dtype, device, input, reduction, and differentiation
+semantics constant. Axis should improve the spelling or the executable
+guarantees and should meet or beat the measured PyTorch path before documentation
+calls it faster.
 
 Normalization follows the named axes that define the statistic rather than a
 rank suffix. `LayerNorm::new(feature)?` remains the ordinary single-axis form;

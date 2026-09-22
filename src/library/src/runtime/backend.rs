@@ -218,6 +218,39 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn silu(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::silu((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn silu_backward(&self, gradient: &Buffer, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::silu_backward((&mut out).partition([128]), gradient.as_ref(), a.as_ref())
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn leaky_relu(&self, a: &Buffer, negative_slope: f32) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::leaky_relu((&mut out).partition([128]), a.as_ref(), negative_slope)
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn leaky_relu_backward(
+        &self,
+        gradient: &Buffer,
+        a: &Buffer,
+        negative_slope: f32,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::leaky_relu_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            a.as_ref(),
+            negative_slope,
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn tanh(&self, a: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(a.shape()[0] as usize)?;
         kernels::tanh_forward((&mut out).partition([128]), a.as_ref())
@@ -1994,6 +2027,52 @@ mod kernels {
         let p = probability.load_like(out);
         let one = constant(1.0f32, shape![128]);
         out.store(gradient.load_like(out) * p * (one - p));
+    }
+    fn sigmoid_tile(x: Tile<f32, { [128] }>) -> Tile<f32, { [128] }> {
+        let zero = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let e = exp(zero - max_tile(x, zero - x));
+        select(gt_tile(x, zero), one / (one + e), e / (one + e))
+    }
+    #[cutile::entry()]
+    fn silu(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        let x = a.load_like(out);
+        out.store(x * sigmoid_tile(x));
+    }
+    #[cutile::entry()]
+    fn silu_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+    ) {
+        let x = a.load_like(out);
+        let p = sigmoid_tile(x);
+        let one = constant(1.0f32, shape![128]);
+        out.store(gradient.load_like(out) * (p + x * p * (one - p)));
+    }
+    #[cutile::entry()]
+    fn leaky_relu(
+        out: &mut Tensor<f32, { [128] }>,
+        a: &Tensor<f32, { [-1] }>,
+        negative_slope: f32,
+    ) {
+        let x = a.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        let slope = broadcast_scalar(negative_slope, shape![128]);
+        out.store(select(gt_tile(x, zero), x, slope * x));
+    }
+    #[cutile::entry()]
+    fn leaky_relu_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        negative_slope: f32,
+    ) {
+        let x = a.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let slope = broadcast_scalar(negative_slope, shape![128]);
+        out.store(gradient.load_like(out) * select(gt_tile(x, zero), one, slope));
     }
     #[cutile::entry()]
     fn tanh_forward(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
