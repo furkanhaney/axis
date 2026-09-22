@@ -502,6 +502,76 @@ fn odd_features_short_batch_unrelated_axes_and_storage_order() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn bias_disabled_linear_has_only_a_weight_parameter_and_matches_a_hand_computed_oracle()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature, output) = (
+        Axis::new("batch"),
+        Axis::new("feature"),
+        Axis::new("output"),
+    );
+    let values = [1.0, -2.0, 0.5, 3.0, -0.25, 1.5]; // [batch=3, feature=2]
+    let weights = [0.5, -1.0, 2.0, 0.25]; // [feature=2, output=2]
+    let x = Tensor::from_slice(&values, [batch.of(3), feature.of(2)], &device)?.with_grad();
+    let mut model = Linear::new(feature, output.of(2)).bias(false);
+    model.build(&Shape::new([batch.of(3), feature.of(2)])?, &device, 3)?;
+
+    let named = model.named_parameters();
+    assert_eq!(
+        named.len(),
+        1,
+        "a bias-disabled Linear must expose only its weight"
+    );
+    assert_eq!(named[0].0, "weight");
+    let weight = model.parameters()[0].clone();
+    assert_eq!(
+        weight.tensor().shape().len(),
+        2 * 2,
+        "parameter count must be exactly in * out, with no + out for a bias"
+    );
+    weight.set_values(&weights)?;
+
+    let prediction = model.forward(&x)?;
+    let mut expected = vec![0.0_f64; 3 * 2];
+    for r in 0..3 {
+        for j in 0..2 {
+            expected[r * 2 + j] = (0..2)
+                .map(|i| f64::from(values[r * 2 + i]) * f64::from(weights[i * 2 + j]))
+                .sum();
+        }
+    }
+    close("bias-disabled forward", &prediction.to_vec()?, &expected);
+
+    prediction
+        .mul(&prediction)?
+        .mean([batch, output])?
+        .backward()?;
+    let mut dx = vec![0.0_f64; values.len()];
+    let mut dw = vec![0.0_f64; weights.len()];
+    for r in 0..3 {
+        for j in 0..2 {
+            let dy = 2.0 * expected[r * 2 + j] / 6.0;
+            for i in 0..2 {
+                dx[r * 2 + i] += dy * f64::from(weights[i * 2 + j]);
+                dw[i * 2 + j] += dy * f64::from(values[r * 2 + i]);
+            }
+        }
+    }
+    close(
+        "bias-disabled input gradients",
+        &x.grad().unwrap().to_vec()?,
+        &dx,
+    );
+    close(
+        "bias-disabled weight gradients",
+        &weight.grad().unwrap().to_vec()?,
+        &dw,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn shared_axes_contract_and_both_input_derivatives() -> Result<()> {
     let device = Device::cuda(0)?;
     let (b, h, f, time) = (

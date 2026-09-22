@@ -349,7 +349,7 @@ provenance contract; reading a file is not itself a research guarantee.
 
 | Operation | Contract |
 |---|---|
-| `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. |
+| `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. Carries a learned `[output]` bias by default; `.bias(false)` before `build` omits it entirely, so `named_parameters` has only `weight`. |
 | `x.squared_error(y)` | Align identical axis sets by identity, require equal extents, preserve the unreduced shape. |
 | `x.mean(axes)` | Remove precisely those axes; backward broadcasts and divides by their extent product. Scalar `.backward()` requires all loss axes to have been reduced. |
 | `x.moments(axes)` / `x.mean_square(axes)` | Require at least one named axis and return population statistics with precisely those axes removed. Gradients broadcast through the original logical axes. |

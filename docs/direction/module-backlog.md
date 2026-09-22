@@ -22,7 +22,10 @@ unexercised surface area.
 
 ## Current surface
 
-Axis already has `Linear`, `PopulationLinear`, `Conv2d`, `Conv3d`, named-axis
+Axis already has `Linear` (bias on by default; `.bias(false)` before `build`
+omits the bias parameter entirely, so `named_parameters` then has only
+`weight`), `PopulationLinear` (bias always present; not yet given the same
+option), `Conv2d`, `Conv3d`, named-axis
 `LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, one-hot
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
 `GELU`, `ExactGELU`, `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
