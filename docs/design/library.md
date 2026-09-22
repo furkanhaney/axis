@@ -978,3 +978,77 @@ to three axes, verified bit-close against a real `F.interpolate(mode=
 a composition of the existing linear one) and a literal `scale_factor=`
 spelling (every real consumer of `resample_bilinear` already computes the
 target extent itself) remain open.
+
+### Containers and utility layers
+
+`ModuleList`, `ModuleDict`, `ParameterList`, and `ParameterDict` (`model/nn.rs`)
+register children for traversal without defining any composition order of
+their own, matching PyTorch's own `nn.Module.forward` raising
+`NotImplementedError` on each of them: `output_shape`/`build`/`forward` all
+return an explicit error, and a caller builds and runs a held module directly
+through `ModuleList::get`/`get_mut`/`iter` (or `ModuleDict`'s equivalents by
+key). `named_parameters` still aggregates every held module's or parameter's
+own parameters under `Sequential`'s own slot-path convention -- `"{index}.{name}"`
+for the two list containers, `"{key}.{name}"` for the two dict containers, so
+paths such as `"0.weight"` or `"encoder.bias"` stay addressable through
+`model.parameter(path)`. `ModuleDict`/`ParameterDict` reject a duplicate key
+before any module is built. `ParameterList`/`ParameterDict` hold standalone
+`Parameter`s directly (not modules), for a caller that composes them by hand.
+
+`Flatten`/`Unflatten` are thin `Module` wrappers over `Tensor::merge`/`split`:
+`Flatten::new(axes, output)` merges the named `axes`, in the given order, into
+one `output` axis (PyTorch's `nn.Flatten` expressed over identities instead of
+a positional `start_dim`/`end_dim` range); `Unflatten::new(axis, dims)` splits
+one named `axis` into the ordered `dims` list whose extents must multiply back
+to it. Both inherit their wrapped primitive's exact validation and physical-
+layout contract, including which position the resulting axis is inserted at.
+
+`Identity` is a parameter-free passthrough, `nn.Identity`.
+
+`Bilinear::new(in1, in2, output)` computes PyTorch's `nn.Bilinear` form,
+`y = x1^T A x2 + b`, from two `Tensor::contract` calls -- `x1` contracted
+against `weight` over `in1`, then that intermediate contracted against `x2`
+over `in2` -- the same contraction `Linear` already uses, applied twice, so it
+needs no dedicated kernel. It does not implement `Module`, which only threads
+a single input tensor through `forward`: call `Bilinear::build` then
+`Bilinear::forward` directly with both operands. Weight has logical shape
+`[in1, in2, output]` and starts uniform in `[-scale, scale)` with
+`scale = sqrt(6 / (in1_extent + in2_extent + output_extent))`, the same
+Xavier-style rule `Linear` uses generalized over both inputs (Axis does not
+reproduce PyTorch's own default `reset_parameters`, matching `Linear`'s own
+departure from it); the bias is zero-initialized like `Linear`'s and can be
+disabled with `.bias(false)` before `build`.
+
+`EmbeddingBag::new(vocabulary, feature, mode)` pools one learned feature
+vector per vocabulary entry per bag: PyTorch's `nn.EmbeddingBag`. Unlike
+`Embedding`'s dense one-hot contraction, the input is a host-side flat
+row-index array together with `offsets` (bag `b` covers positions
+`offsets[b]..offsets[b + 1]`, or `..index.len()` for the last bag, exactly
+`torch.nn.EmbeddingBag.forward`'s own `input`/`offsets` pair), so it scales to
+a large table the same way `Tensor::gather` itself does. It does not
+implement `Module` either, for the same host-side-argument reason as
+`Bilinear`. `forward` gathers one table row per position (`Tensor::gather`),
+then pools rows sharing a bag: `Sum` and `Mean` reuse `Tensor::scatter_add`
+directly (`Mean` divides by each bag's own item count from `Tensor::bincount`,
+clamped to at least one so an empty bag reads back as an exact zero row rather
+than `0 / 0`); `Max` broadcasts the gathered rows onto an explicit
+`[bag, position, feature]` cube, adds a host-built additive offset that is
+exactly `f32::NEG_INFINITY` at every `(bag, position)` pair whose position is
+not in that bag, and reduces with `Tensor::max`, which already ignores
+non-finite candidates and documents the "no finite candidate" case as `NaN`
+with zero gradient -- so an empty bag's `Max` row is honestly `NaN`, a
+deliberate divergence from PyTorch's zero-filled empty bag for that one mode.
+No mode needs a new kernel.
+
+`LocalResponseNorm::new(channel, size)` (`model/normalization.rs`) matches
+PyTorch's `nn.LocalResponseNorm`: each element divides by
+`(k + alpha / size * sum(a_c'^2))^beta`, the sum running over a `size`-channel
+window around `c`, zero-padded at the channel-axis boundary with PyTorch's own
+asymmetric `size / 2` / `(size - 1) / 2` before/after split for an even
+`size`. Defaults are `alpha = 1e-4`, `beta = 0.75`, `k = 1.0`, overridable with
+`.alpha`/`.beta`/`.k`. It is composed entirely from existing ops -- `mul`
+(square), `pad_zeros`, `size - 1` pairs of `narrow`/`add` for the sliding sum,
+`scale` for the mean and the `alpha` factor, and `exp(beta * ln(x))` for the
+fractional power -- so it needs no dedicated kernel, and it has no learned
+parameters, matching PyTorch's own stateless module. The power composition
+inherits `Tensor::ln`'s ordinary IEEE domain rather than a clamp.
