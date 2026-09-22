@@ -61,19 +61,15 @@ impl Parameter {
     }
 }
 
-/// Deterministic uniform values in `[-scale, scale)` from a xorshift stream.
+/// Deterministic uniform values in `[-scale, scale)` from the shared xorshift stream
+/// (`crate::tensor::xorshift_unit_stream`, also used by `Tensor::uniform`/`Tensor::normal`).
 /// Every parameter initializer shares this generator so a seed is reproducible.
 /// A seed below 2^40 has no high bits yet, so the first sample is exactly
 /// `-scale`; the stream is well mixed from the second sample on.
 fn uniform_values(seed: u64, count: usize, scale: f32) -> Vec<f32> {
-    let mut rng = seed.max(1);
-    (0..count)
-        .map(|_| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            (((rng >> 40) as f32 / (1_u32 << 24) as f32) * 2.0 - 1.0) * scale
-        })
+    crate::tensor::xorshift_unit_stream(seed, count)
+        .into_iter()
+        .map(|raw| (raw * 2.0 - 1.0) * scale)
         .collect()
 }
 

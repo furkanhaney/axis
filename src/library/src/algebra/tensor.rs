@@ -20,6 +20,56 @@ fn profile(label: &str, started: Instant) {
     }
 }
 
+/// Deterministic raw stream in `[0, 1)` from a xorshift64 generator, seeded `seed.max(1)`.
+/// Parameter initialization (`model::nn::uniform_values`) and `Tensor::uniform`/`Tensor::normal`
+/// all draw from this one stream, so a seed reproduces bit-exact values everywhere it is used.
+/// A seed below 2^40 has no high bits set yet, so the first raw sample is exactly `0.0`; the
+/// stream is well mixed from the second sample on. This quirk is not fixed here: recorded
+/// initialization baselines depend on it.
+pub(crate) fn xorshift_unit_stream(seed: u64, count: usize) -> Vec<f32> {
+    let mut rng = seed.max(1);
+    (0..count)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 40) as f32 / (1_u32 << 24) as f32
+        })
+        .collect()
+}
+
+/// Host-side values for [`Tensor::uniform`]: each raw `[0, 1)` sample rescaled to `[low, high)`.
+/// Kept as a pure function so its exact sequence is checkable against an independent oracle
+/// without a device.
+pub(crate) fn uniform_host_values(seed: u64, count: usize, low: f32, high: f32) -> Vec<f32> {
+    xorshift_unit_stream(seed, count)
+        .into_iter()
+        .map(|raw| low + raw * (high - low))
+        .collect()
+}
+
+/// Host-side values for [`Tensor::normal`]: consecutive raw `[0, 1)` pairs `(u1, u2)` become one
+/// Box-Muller pair of independent standard-normal values, `z0 = sqrt(-2 * ln(1 - u1)) *
+/// cos(2*pi*u2)` and `z1 = sqrt(-2 * ln(1 - u1)) * sin(2*pi*u2)`, each scaled to `mean + std *
+/// z`. Using `1 - u1` rather than `u1` keeps the logarithm's argument in `(0, 1]` even on the
+/// shared stream's documented first-sample-exactly-zero seeds (where it collapses the first
+/// pair to exactly `mean`), so no draw ever requires discarding or resampling. An odd element
+/// count drops the unused second value of the final pair. Kept as a pure function for the same
+/// reason as [`uniform_host_values`].
+pub(crate) fn normal_host_values(seed: u64, count: usize, mean: f32, std: f32) -> Vec<f32> {
+    let raw = xorshift_unit_stream(seed, count.div_ceil(2) * 2);
+    let mut values = Vec::with_capacity(count);
+    for pair in raw.chunks_exact(2) {
+        let radius = (-2.0 * (1.0 - pair[0]).ln()).sqrt();
+        let angle = 2.0 * std::f32::consts::PI * pair[1];
+        values.push(mean + std * (radius * angle.cos()));
+        if values.len() < count {
+            values.push(mean + std * (radius * angle.sin()));
+        }
+    }
+    values
+}
+
 #[derive(Clone)]
 enum UnfoldPlans {
     Implicit(Rc<UnfoldSpec>),
@@ -228,6 +278,50 @@ impl Tensor {
             false,
             None,
         ))
+    }
+    /// Deterministic uniform draw in `[low, high)` from the shared xorshift stream that
+    /// initializes parameters (see [`xorshift_unit_stream`]), generated host-side then
+    /// uploaded like [`Tensor::from_slice`]. A random draw has no upstream input, so the
+    /// result carries no gradient edge; it is a constant, not a parameter. The same seed,
+    /// shape and range reproduce identical values on any run or machine; distinct seeds
+    /// diverge. Inherits the shared stream's documented quirk: a seed below 2^40 draws
+    /// exactly `low` first.
+    pub fn uniform(
+        dims: impl IntoIterator<Item = Dim>,
+        seed: u64,
+        low: f32,
+        high: f32,
+        device: &Device,
+    ) -> Result<Self> {
+        if !(low.is_finite() && high.is_finite() && low < high) {
+            return Err(
+                format!("uniform requires finite low < high, got low={low} high={high}").into(),
+            );
+        }
+        let shape = Shape::new(dims)?;
+        let values = uniform_host_values(seed, shape.len(), low, high);
+        Self::from_slice(&values, shape.dims().iter().copied(), device)
+    }
+    /// Deterministic normal draw with the given `mean` and standard deviation `std`, from the
+    /// same shared xorshift stream as [`Tensor::uniform`] via the Box-Muller transform (see
+    /// [`normal_host_values`] for the exact formula). Generated host-side then uploaded, with
+    /// no gradient edge, exactly like [`Tensor::uniform`].
+    pub fn normal(
+        dims: impl IntoIterator<Item = Dim>,
+        seed: u64,
+        mean: f32,
+        std: f32,
+        device: &Device,
+    ) -> Result<Self> {
+        if !(mean.is_finite() && std.is_finite() && std >= 0.0) {
+            return Err(format!(
+                "normal requires finite mean and non-negative std, got mean={mean} std={std}"
+            )
+            .into());
+        }
+        let shape = Shape::new(dims)?;
+        let values = normal_host_values(seed, shape.len(), mean, std);
+        Self::from_slice(&values, shape.dims().iter().copied(), device)
     }
     pub fn shape(&self) -> &Shape {
         &self.0.shape
