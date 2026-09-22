@@ -3849,3 +3849,209 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     println!("concat values, gradients, and composed-path cross-check PASS");
     Ok(())
 }
+
+#[test]
+fn seeded_uniform_and_normal_host_values_match_an_independent_xorshift_oracle() {
+    // Independent Rust reimplementation of the xorshift64 stream (mirrors, but does not call,
+    // `crate::tensor::xorshift_unit_stream`), used only to hand-derive the literals below via a
+    // one-off script; not part of the crate under test. The generator: rng = seed.max(1); each
+    // draw does rng ^= rng<<13; rng ^= rng>>7; rng ^= rng<<17; raw = (rng>>40) as f64 / 2f64^24.
+    // uniform(seed, count, low, high) maps raw -> low + raw*(high-low). normal(seed, count, mean,
+    // std) consumes raw pairs (u1, u2) via Box-Muller: z0 = sqrt(-2*ln(1-u1))*cos(2*pi*u2), z1 =
+    // sqrt(-2*ln(1-u1))*sin(2*pi*u2), each scaled to mean + std*z; an odd count drops the final
+    // z1. energy-output (world/energy-output) needs the uniform sequence to threshold into a
+    // reproducible Bernoulli mask; fluid (world/fluid) needs the normal sequence as additive
+    // noise — both need the WHOLE multi-draw sequence for one seed to match, not just one value.
+    //
+    // world/energy-output shape: a fresh 30% mask drawn every epoch from one seed (`seed+37`).
+    // seed=7 is far below 2^40, so the shared stream's documented quirk (first raw sample
+    // exactly 0) makes the very first uniform draw land exactly on `low`.
+    close(
+        "uniform seed=7 low=-1 high=1 (six successive draws)",
+        &crate::tensor::uniform_host_values(7, 6, -1.0, 1.0),
+        &[
+            -1.0,
+            -0.1249457597732544,
+            0.5105017423629761,
+            -0.056897759437561035,
+            -0.08123886585235596,
+            0.4238666296005249,
+        ],
+    );
+    // Same seed, different range: a second, independent call reproduces the SAME raw stream
+    // (determinism), rescaled to [0, 1) instead of [-1, 1).
+    close(
+        "uniform seed=7 low=0 high=1, second call (determinism across calls)",
+        &crate::tensor::uniform_host_values(7, 6, 0.0, 1.0),
+        &[
+            0.0,
+            0.4375271201133728,
+            0.755250871181488,
+            0.4715511202812195,
+            0.459380567073822,
+            0.7119333148002625,
+        ],
+    );
+    // A distinct seed diverges from the first draw on.
+    close(
+        "uniform seed=12345 low=-3 high=5 (distinct seed diverges)",
+        &crate::tensor::uniform_host_values(12345, 4, -3.0, 5.0),
+        &[
+            -2.9999942779541016,
+            1.8767971992492676,
+            2.067387104034424,
+            -1.9700355529785156,
+        ],
+    );
+    for &(seed, low, high) in &[(7u64, -1.0f32, 1.0f32), (12345, -3.0, 5.0), (1, -1.0, 1.0)] {
+        for &value in &crate::tensor::uniform_host_values(seed, 64, low, high) {
+            assert!(
+                value >= low && value < high,
+                "uniform seed={seed}: {value} outside [{low}, {high})"
+            );
+        }
+    }
+
+    // world/fluid shape: `torch.randn_like(xb)` additive noise, needed as a normal draw, not
+    // just uniform. seed=99 is also below 2^40, so the shared stream's quirk collapses the
+    // FIRST PAIR of normal draws (both z0 and z1) to exactly `mean`, since raw=0 forces
+    // radius=0 for the whole pair, not just one value.
+    close(
+        "normal seed=99 mean=0 std=1 (six successive draws, two full pairs plus one)",
+        &crate::tensor::normal_host_values(99, 6, 0.0, 1.0),
+        &[
+            0.0,
+            0.0,
+            -0.04610706669773621,
+            0.15413647086258625,
+            1.160083365411145,
+            -1.2878684354641539,
+        ],
+    );
+    // Odd count: the trailing unpaired z1 is dropped, not returned.
+    close(
+        "normal seed=99 mean=2 std=0.5, odd count drops the final pair's second value",
+        &crate::tensor::normal_host_values(99, 5, 2.0, 0.5),
+        &[
+            2.0,
+            2.0,
+            1.9769464666511318,
+            2.0770682354312933,
+            2.5800416827055725,
+        ],
+    );
+    // Mean/std sanity over a modest sample: 2,000 draws from one seed land within a generous
+    // tolerance of the requested mean and standard deviation (this is a statistical sanity
+    // check, not a bit-exact oracle).
+    let sample = crate::tensor::normal_host_values(4242, 2000, 1.0, 2.0);
+    let sample_mean = sample.iter().map(|&v| f64::from(v)).sum::<f64>() / sample.len() as f64;
+    let sample_variance = sample
+        .iter()
+        .map(|&v| (f64::from(v) - sample_mean).powi(2))
+        .sum::<f64>()
+        / sample.len() as f64;
+    assert!(
+        (sample_mean - 1.0).abs() < 0.1,
+        "normal sample mean {sample_mean} too far from 1.0"
+    );
+    assert!(
+        (sample_variance.sqrt() - 2.0).abs() < 0.1,
+        "normal sample std {} too far from 2.0",
+        sample_variance.sqrt()
+    );
+    println!("seeded uniform/normal host values PASS");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn seeded_uniform_and_normal_tensors_build_named_axis_tensors_with_no_gradient_edge() -> Result<()>
+{
+    // world/energy-output composes a fresh seeded uniform draw into a Bernoulli mask every
+    // epoch (`torch.rand(z.shape, generator=rng) < MASK_RATE`); world/fluid adds a fresh
+    // seeded normal draw as training noise (`xb + torch.randn_like(xb) * 0.5 * mask`). Both
+    // need `Tensor::uniform`/`Tensor::normal` to build an ordinary named-axis device tensor
+    // whose values are usable directly in later elementwise composition.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let feature = Axis::new("feature");
+
+    let mask_source = Tensor::uniform([sample.of(2), feature.of(3)], 7, 0.0, 1.0, &device)?;
+    close(
+        "uniform tensor values match the host oracle",
+        &mask_source.to_vec()?,
+        &[
+            0.0,
+            0.4375271201133728,
+            0.755250871181488,
+            0.4715511202812195,
+            0.459380567073822,
+            0.7119333148002625,
+        ],
+    );
+    assert!(
+        !mask_source.requires_grad(),
+        "a random draw is a constant, not a differentiable leaf"
+    );
+
+    let noise = Tensor::normal([sample.of(2), feature.of(3)], 99, 0.0, 1.0, &device)?;
+    close(
+        "normal tensor values match the host oracle",
+        &noise.to_vec()?,
+        &[
+            0.0,
+            0.0,
+            -0.04610706669773621,
+            0.15413647086258625,
+            1.160083365411145,
+            -1.2878684354641539,
+        ],
+    );
+    assert!(!noise.requires_grad());
+
+    // fluid's actual composition: additive noise into an existing input tensor, exercising the
+    // random tensor as an ordinary operand of `mul`/`add` alongside a tensor with reordered
+    // physical storage (the input built with a permuted layout).
+    let input_values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let input = Tensor::from_slice(&input_values, [sample.of(2), feature.of(3)], &device)?
+        .with_layout([feature, sample])?
+        .with_grad();
+    let scaled_noise = noise.scale(0.5)?;
+    let noisy = input.add(&scaled_noise)?;
+    let noise_values = noise.to_vec()?;
+    let out_shape = noisy.shape().clone();
+    let mut expected = Vec::with_capacity(6);
+    for index in 0..out_shape.len() {
+        let coords = out_shape.coords(index);
+        let (s, f) = (
+            coords[out_shape.index(sample)?],
+            coords[out_shape.index(feature)?],
+        );
+        expected
+            .push(f64::from(input_values[s * 3 + f]) + f64::from(noise_values[s * 3 + f]) * 0.5);
+    }
+    close(
+        "input plus scaled seeded noise",
+        &noisy.to_vec()?,
+        &expected,
+    );
+    noisy.mean([sample, feature])?.backward()?;
+    close(
+        "gradient flows through the non-random operand only",
+        &input.grad().expect("input gradient").to_vec()?,
+        &[1.0 / 6.0; 6],
+    );
+
+    // A second, independent seed produces different values from both constructors (distinct
+    // seeds diverge, not just distinct calls).
+    let other_seed_uniform = Tensor::uniform([sample.of(2), feature.of(3)], 8, 0.0, 1.0, &device)?;
+    assert_ne!(mask_source.to_vec()?, other_seed_uniform.to_vec()?);
+    let other_seed_normal = Tensor::normal([sample.of(2), feature.of(3)], 100, 0.0, 1.0, &device)?;
+    assert_ne!(noise.to_vec()?, other_seed_normal.to_vec()?);
+
+    // Rejections: low must be strictly less than high, and std must be non-negative.
+    assert!(Tensor::uniform([sample.of(2)], 1, 1.0, 1.0, &device).is_err());
+    assert!(Tensor::uniform([sample.of(2)], 1, 1.0, -1.0, &device).is_err());
+    assert!(Tensor::normal([sample.of(2)], 1, 0.0, -1.0, &device).is_err());
+    println!("seeded uniform/normal tensor construction PASS");
+    Ok(())
+}
