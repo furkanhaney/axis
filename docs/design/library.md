@@ -607,3 +607,74 @@ an accidental public restriction.
 Success is the existing training behavior expressed through short programs
 with these contracts enforced. The four golden programs remain acceptance
 targets, and each capability gains its status from a running witness.
+
+### Padding and pixel rearrangement
+
+Five padding modes (`ZeroPad`, `ConstantPad`, `ReflectionPad`, `ReplicationPad`,
+`CircularPad`) each take one list of `(Axis, before, after)` entries instead of
+PyTorch's `1d`/`2d`/`3d` type split. PyTorch's `nn.*PadNd` classes take one flat
+tuple ordered *last-dim-first* (`nn.ZeroPad2d((left, right, top, bottom))` pads
+width before height); Axis takes one entry per padded axis, in any order, since
+axis identity selects the dimension rather than tuple position. That call
+becomes `ZeroPad::new([(height, top, bottom), (width, left, right)])`. What
+PyTorch spells as three different classes (`1d`/`2d`/`3d`) is here one type
+with one, two, or three list entries -- consistent with the rest of the crate
+expressing dimensionality through how many named axes a call lists, not
+through a suffixed type. Every axis not listed is preserved unchanged.
+
+| Mode | Composition | Defaults matched |
+|---|---|---|
+| `ZeroPad` | Repeated `Tensor::pad_zeros`, one call per listed axis. | Exact zeros, PyTorch's `ZeroPad*d`. |
+| `ConstantPad` | `ZeroPad`'s own zero-padded tensor, plus `value` added only in the border: a constant ones mask (`Tensor::zeros(..).ge(0.0)`, no gradient edge) is zero-padded the same way, `logical_not`-ed into a border indicator, scaled by `value`, and added. | PyTorch's `ConstantPad*d`; backward is identical to `ZeroPad`'s since the border term is detached. |
+| `ReflectionPad` | A host-side per-output-coordinate index (whole-sample reflection, never repeating the edge element) read back with `Tensor::gather`. | PyTorch's `ReflectionPad*d`, including its `before < extent` / `after < extent` constraint (checked before launch). |
+| `ReplicationPad` | Same `gather` composition with a clamped index. | PyTorch's `ReplicationPad*d`; no upper bound on padding size. |
+| `CircularPad` | `narrow` the wrap-around slice(s) from the opposite edge and `concat` them onto the unmodified original -- the same two primitives `roll` itself composes from. | PyTorch's `CircularPad*d`, including its `before <= extent` / `after <= extent` constraint (a full wrap is allowed, unlike reflection's strict `<`). |
+
+`ReflectionPad` and `ReplicationPad` both land on `Tensor::gather` rather than a
+dedicated kernel because gather's existing backward is an exact scatter-add
+over repeated indices (`Plan::gather`/`Plan::reverse`): an edge-adjacent source
+element that several output coordinates read back from accumulates every one
+of their gradients, which is exactly what both modes' true gradient requires.
+`CircularPad`'s composition gets the same accumulation for free a different
+way -- a source element used by both the wrapped copy and the interior copy
+is simply used twice in the graph, and ordinary multi-use gradient
+accumulation (`concat`'s backward narrows each operand its own output slice,
+`narrow`'s backward zero-scatters that slice back) sums both contributions.
+
+`PixelShuffle`/`PixelUnshuffle` (no `1d`/`2d`/`3d` split in PyTorch's own
+catalog either -- sub-pixel convolution is inherently a two-spatial-axis
+operation) rearrange one named `channel` axis against two named `spatial`
+axes at an integer `factor`. PyTorch's own decomposition -- reshape the
+channel axis to `(C, factor, factor)`, permute each `factor` axis next to its
+spatial axis, flatten -- is exactly `Tensor::split` (channel into
+`[out_channel, row_factor, col_factor]`, outermost first) followed by two
+`Tensor::merge` calls (`[height, row_factor]`, `[width, col_factor]`, each
+spatial axis outermost so it varies slower than its own sub-pixel offset).
+`PixelUnshuffle` is the exact inverse composition. Neither needs a dedicated
+kernel or backward rule, since `split`/`merge` are both already
+differentiable; wave 1 of the research migration first proved this exact
+composition against a real `pixel_shuffle` oracle.
+
+`ChannelShuffle(groups)` splits `channel` into `[group (groups), within
+(C / groups)]` -- verified against a real `channel_shuffle` run to be
+PyTorch's actual internal reshape order, `(N, groups, C/groups, *)`, which is
+the *reverse* of its own prose ("divides ... into g groups as (N, C/g, g,
+*)") -- then merges back in swapped order `[within, group]`, reproducing its
+documented transpose-and-flatten. The two possible group/within orderings
+only coincide when `groups == C / groups`, which is why PyTorch's own
+`[ch0,ch1,ch2,ch3]`-at-`groups=2` doc example cannot by itself distinguish
+them; a `groups=3` case with unequal group sizes was needed to catch the
+first (wrong) ordering during this implementation. `ChannelShuffle` names
+only the channel axis, so it works on any `(N, C, *)` shape without naming
+the trailing axes.
+
+`Upsample`'s "partial" gap (`docs/nn/catalog.md`: "nearest and bilinear only;
+no trilinear or bicubic, no scale-factor form") narrows by one item without
+new code: 2D/3D linear interpolation is separable, so calling the existing
+`Tensor::resample_bilinear` once per spatial axis -- already the documented
+pattern for 2D bilinear -- composes exact trilinear interpolation when applied
+to three axes, verified bit-close against a real `F.interpolate(mode=
+"trilinear")` oracle. Bicubic (a genuinely different interpolation kernel, not
+a composition of the existing linear one) and a literal `scale_factor=`
+spelling (every real consumer of `resample_bilinear` already computes the
+target extent itself) remain open.
