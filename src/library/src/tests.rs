@@ -5660,3 +5660,116 @@ fn clamp_matches_logical_order_under_reordered_cuda_storage() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_axis_roll_matches_hand_computed_values_gradients_and_wrap_around() -> Result<()> {
+    // SwinIR's shifted-window attention (network_swinir.py:251,271): a
+    // [height, width] feature map, `torch.roll(x, shifts=(-s, -s), dims=(1, 2))`
+    // done as two independent single-axis calls. Values 0..12 in
+    // [height(4), width(3)] row-major order:
+    //   row0 [0,1,2]  row1 [3,4,5]  row2 [6,7,8]  row3 [9,10,11]
+    let device = Device::cuda(0)?;
+    let (height, width, missing) = (
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("missing"),
+    );
+    let values: Vec<f32> = (0..12).map(|v| v as f32).collect();
+    let a = Tensor::from_slice(&values, [height.of(4), width.of(3)], &device)?;
+
+    // Positive shift: torch.roll's convention moves element i to i+shift, so
+    // output row j holds input row (j - shift) mod 4. shift=1 -> row0 <- row3,
+    // row1 <- row0, row2 <- row1, row3 <- row2.
+    close(
+        "roll height by +1",
+        &a.roll(height, 1)?.to_vec()?,
+        &[9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    );
+    // Negative shift is the exact inverse: row j holds input row (j + 1) mod 4.
+    close(
+        "roll height by -1",
+        &a.roll(height, -1)?.to_vec()?,
+        &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0],
+    );
+    // Wrap-around: a shift outside [-extent, extent] reduces mod the axis
+    // extent (4), so +5 and -5 reproduce the +1 and -1 results above exactly.
+    close(
+        "roll height by +5 (wraps to +1)",
+        &a.roll(height, 5)?.to_vec()?,
+        &[9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    );
+    close(
+        "roll height by -5 (wraps to -1)",
+        &a.roll(height, -5)?.to_vec()?,
+        &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0],
+    );
+    // Shift 0 and shift = a multiple of the extent are the identity.
+    let identity: Vec<f64> = values.iter().map(|&v| f64::from(v)).collect();
+    close(
+        "roll height by 0 is identity",
+        &a.roll(height, 0)?.to_vec()?,
+        &identity,
+    );
+    close(
+        "roll height by extent (4) is identity",
+        &a.roll(height, 4)?.to_vec()?,
+        &identity,
+    );
+
+    // Rolling the OTHER named axis leaves height untouched: shift width by +1
+    // rotates each row's 3 columns independently (col0 <- col2 within the row).
+    close(
+        "roll width by +1 (independent axis)",
+        &a.roll(width, 1)?.to_vec()?,
+        &[2.0, 0.0, 1.0, 5.0, 3.0, 4.0, 8.0, 6.0, 7.0, 11.0, 9.0, 10.0],
+    );
+
+    // Gradient: y = roll(x, height, +1), loss = mean(y * w) over w = 1..12
+    // (same [height, width] layout). dLoss/dy = w / 12. The chosen composition
+    // (concat of two narrow slices) makes backward exactly the inverse roll,
+    // dLoss/dx = roll(dLoss/dy, -1): row j of dx holds row (j + 1) mod 4 of
+    // w/12 -- computed here from the mathematical definition of roll, not by
+    // calling the op under test.
+    let x = Tensor::from_slice(&values, [height.of(4), width.of(3)], &device)?.with_grad();
+    let weights: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let w = Tensor::from_slice(&weights, [height.of(4), width.of(3)], &device)?;
+    x.roll(height, 1)?
+        .mul(&w)?
+        .mean([height, width])?
+        .backward()?;
+    close(
+        "roll height by +1 gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            4.0 / 12.0,
+            5.0 / 12.0,
+            6.0 / 12.0,
+            7.0 / 12.0,
+            8.0 / 12.0,
+            9.0 / 12.0,
+            10.0 / 12.0,
+            11.0 / 12.0,
+            12.0 / 12.0,
+            1.0 / 12.0,
+            2.0 / 12.0,
+            3.0 / 12.0,
+        ],
+    );
+
+    // Reordered-storage CUDA case: the same logical tensor built with a
+    // transposed physical layout must roll to the identical logical values
+    // (`to_vec` follows `Shape.dims()` order, not physical strides).
+    let permuted = Tensor::from_slice(&values, [height.of(4), width.of(3)], &device)?
+        .with_layout([width, height])?;
+    close(
+        "roll height by +1 over reordered storage",
+        &permuted.roll(height, 1)?.to_vec()?,
+        &[9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    );
+
+    // A missing axis is rejected before any device work.
+    assert!(a.roll(missing, 1).is_err());
+    println!("named-axis roll values, gradients, and reordered-storage PASS");
+    Ok(())
+}

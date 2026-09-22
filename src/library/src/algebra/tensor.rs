@@ -2733,6 +2733,34 @@ impl Tensor {
         }
         Ok(result.expect("validated at least one tensor above"))
     }
+    /// Cyclically shift one named axis's values by `shift`, wrapping values
+    /// that run off one end onto the other. PyTorch's `torch.roll` sign
+    /// convention: the element at logical index `i` moves to
+    /// `(i + shift).rem_euclid(extent)`, so a positive shift moves values
+    /// toward higher indices and a negative shift moves them toward lower
+    /// indices. Shifting by 0 or by any multiple of the axis's extent is the
+    /// identity. Rolling one axis at a time composes exactly with PyTorch's
+    /// multi-axis `dims=`: `torch.roll(x, shifts=(-s, -s), dims=(1, 2))` is
+    /// two calls, one per axis (SwinIR's shifted-window attention,
+    /// `network_swinir.py:251,271`).
+    ///
+    /// Implemented as `concat` of two `narrow` slices -- the wrapped tail
+    /// moved ahead of the untouched head -- rather than a dedicated backend
+    /// rule: both primitives already carry exact device kernels and exact
+    /// gradients, so backward falls out for free as the inverse roll (the
+    /// same call with `shift` negated), with no new `Rule` variant to
+    /// maintain.
+    pub fn roll(&self, axis: Axis, shift: isize) -> Result<Self> {
+        let extent = self.extent(axis)?;
+        let offset = shift.rem_euclid(isize::try_from(extent)?);
+        if offset == 0 {
+            return Ok(self.clone());
+        }
+        let split = extent - usize::try_from(offset)?;
+        let head = self.narrow(axis, 0, split)?;
+        let tail = self.narrow(axis, split, extent - split)?;
+        Self::concat(&[tail, head], axis)
+    }
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
         let started = Instant::now();
