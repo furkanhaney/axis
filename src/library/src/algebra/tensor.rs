@@ -1108,6 +1108,10 @@ impl Tensor {
         ))
     }
     /// Tanh-approximated GELU, matching the common transformer formulation.
+    ///
+    /// This is PyTorch's `F.gelu(x, approximate="tanh")`, NOT its default. A model ported
+    /// from an un-annotated `F.gelu(x)` or `nn.GELU()` wants [`Self::gelu_exact`]; using this
+    /// form instead gives plausible numbers that differ by about `1e-3` in the tails.
     pub fn gelu(&self) -> Result<Self> {
         let value = self.device().gelu(&self.0.value)?;
         Ok(Self::node(
@@ -1124,7 +1128,8 @@ impl Tensor {
     ///
     /// The CUDA backend numerically evaluates the normal CDF in FP32 (not bitwise
     /// identical to a particular libm). Backward uses `Phi(x) + x * phi(x)`.
-    /// This distinction matters when importing pretrained exact-GELU models.
+    /// This distinction matters when importing pretrained exact-GELU models: this is
+    /// PyTorch's default `F.gelu`/`nn.GELU` (`approximate="none"`).
     pub fn gelu_exact(&self) -> Result<Self> {
         let value = self.device().gelu_exact(&self.0.value)?;
         Ok(Self::node(
