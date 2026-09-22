@@ -243,7 +243,7 @@ still enters cuTile and reports a missing toolkit, and a no-default-features
 build outside docs.rs is rejected. CI runs this contract on an ordinary Ubuntu
 runner without installing CUDA.
 
-Convolution dilation, asymmetric padding, and a full Transformer remain future
+Convolution dilation, built-in asymmetric convolution padding, and a full Transformer remain future
 slices. The single-layer forward LSTM is an eager correctness path with explicit
 state; it is not a fused recurrent kernel or a sequence-throughput result.
 
@@ -326,6 +326,8 @@ provenance contract; reading a file is not itself a research guarantee.
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
 | `select(axis, coordinate)` | Remove one named axis at a checked logical coordinate. Compute offsets from compact rank-sized geometry and scatter its derivative back into the original physical layout. |
+| `pad_zeros(axis, before, after)` | Preserve logical axis order and add exact zero-valued coordinates independently on each side. Backward crops to the original extent and layout. Zero/zero padding shares storage. |
+| `narrow(axis, start, length)` | Preserve the named axis and select a checked nonempty contiguous interval. Backward inserts exact zeros outside the interval. A full-axis interval shares storage. |
 | `Tensor::stack(values, axis, position)` | Require identical named input shapes and devices; insert the new logical axis at the declared position. Store sources contiguously under a stack-major physical layout and slice each derivative back to its source. |
 | `causal_mask(query, key)` | Require distinct axes with equal extents; replace key positions greater than query positions with negative infinity and give them zero derivative. Square, zero-offset self-attention only. |
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
@@ -356,7 +358,8 @@ with the flattened patch ordered by input channel, kernel y, then kernel x.
 Depthwise convolution is the grouped case where `g` equals the input channel
 count (and commonly the output channel count). Reconfiguring a built layer to
 a different group geometry is rejected before execution. Dilation and
-asymmetric padding are not yet supported.
+asymmetric padding are not yet built into convolution. Explicit `pad_zeros`
+can supply asymmetric input padding before a convolution with zero built-in padding.
 
 `Conv3d::new` applies the same contract to three supplied spatial axes,
 conventionally `[depth, height, width]`. Its kernel, stride, and padding arrays

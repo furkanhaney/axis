@@ -1,7 +1,7 @@
 use crate::{
     Axis, Device, Dim, IntoAxes, Result, Shape,
     axis::Layout,
-    backend::{Buffer, Plan, SelectSpec, UnfoldSpec},
+    backend::{Buffer, Plan, SelectSpec, UnfoldSpec, WindowSpec},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -152,6 +152,7 @@ enum Rule {
     },
     Unfold(Rc<UnfoldSpec>),
     Select(Rc<SelectSpec>),
+    Window(Rc<WindowSpec>),
     StackSlice {
         offset: usize,
         len: usize,
@@ -1763,6 +1764,88 @@ impl Tensor {
             None,
         ))
     }
+    /// Add exact zeros before and after one named axis, preserving logical axis order.
+    /// Zero padding on both sides shares the original storage. Otherwise the result
+    /// is materialized on-device using rank-sized geometry, including for backward.
+    pub fn pad_zeros(&self, axis: Axis, before: usize, after: usize) -> Result<Self> {
+        let extent = self.extent(axis)?;
+        let padded = extent
+            .checked_add(before)
+            .and_then(|n| n.checked_add(after))
+            .ok_or("padding extent overflow")?;
+        self.window(axis, padded, -i32::try_from(before)?)
+    }
+
+    /// Keep a contiguous, nonempty interval of one named axis without removing it.
+    /// Reject out-of-range or overflowing intervals. A full-axis interval shares
+    /// storage; other intervals use device-side copies and zero-scattered gradients.
+    pub fn narrow(&self, axis: Axis, start: usize, length: usize) -> Result<Self> {
+        let extent = self.extent(axis)?;
+        let end = start
+            .checked_add(length)
+            .ok_or("narrow interval overflow")?;
+        if length == 0 || end > extent {
+            return Err("narrow requires a nonempty interval inside the named axis".into());
+        }
+        self.window(axis, length, i32::try_from(start)?)
+    }
+
+    fn window(&self, axis: Axis, extent: usize, shift: i32) -> Result<Self> {
+        let dimension = self.shape().index(axis)?;
+        if extent == self.extent(axis)? && shift == 0 {
+            return Ok(self.clone());
+        }
+        let mut dims = self.shape().dims().to_vec();
+        dims[dimension] = axis.of(extent);
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape);
+        // (destination extent, destination stride, source extent, source stride,
+        // source coordinate - destination coordinate), per logical dimension.
+        let mut forward = Vec::with_capacity(shape.rank() * 5);
+        let mut reverse = Vec::with_capacity(shape.rank() * 5);
+        for (index, dim) in shape.dims().iter().enumerate() {
+            let output_extent = i32::try_from(dim.extent)?;
+            let output_stride = i32::try_from(layout.strides[index])?;
+            let input_extent = i32::try_from(self.shape().dims()[index].extent)?;
+            let input_stride = i32::try_from(self.0.layout.strides[index])?;
+            let offset = if index == dimension { shift } else { 0 };
+            forward.extend([
+                output_extent,
+                output_stride,
+                input_extent,
+                input_stride,
+                offset,
+            ]);
+            reverse.extend([
+                input_extent,
+                input_stride,
+                output_extent,
+                output_stride,
+                -offset,
+            ]);
+        }
+        let spec = WindowSpec {
+            output_len: shape.len(),
+            rank: i32::try_from(shape.rank())?,
+            metadata: forward,
+        };
+        let reverse = Rc::new(WindowSpec {
+            output_len: self.shape().len(),
+            rank: spec.rank,
+            metadata: reverse,
+        });
+        let value = self.device().copy_window(&self.0.value, &spec)?;
+        Ok(Self::node(
+            shape,
+            layout,
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Window(reverse))],
+            false,
+            None,
+        ))
+    }
+
     /// Select one logical coordinate of a named axis and remove that axis.
     ///
     /// The compact backend computes offsets from rank-sized metadata rather
@@ -2191,6 +2274,9 @@ impl Tensor {
                         Rule::Select(spec) => self
                             .device()
                             .select_axis_backward(&gradient, spec.as_ref())?,
+                        Rule::Window(spec) => {
+                            self.device().copy_window(&gradient, spec.as_ref())?
+                        }
                         Rule::StackSlice { offset, len } => {
                             self.device().contiguous_slice(&gradient, *offset, *len)?
                         }

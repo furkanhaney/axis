@@ -751,6 +751,22 @@ impl Device {
         Ok(self.track(out))
     }
 
+    pub(crate) fn copy_window(&self, input: &Buffer, spec: &WindowSpec) -> Result<Buffer> {
+        let metadata = self.upload_i32(&spec.metadata)?;
+        let mut out = self.zeros(spec.output_len)?;
+        unsafe {
+            kernels::copy_window(
+                (&mut out).partition([128]),
+                input.as_ref().device_pointer(),
+                metadata.as_ref(),
+                i32::try_from(spec.output_len)?,
+                spec.rank,
+            )
+        }
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+
     pub(crate) fn select_axis(&self, input: &Buffer, spec: &SelectSpec) -> Result<Buffer> {
         let metadata = self.upload_i32(&spec.metadata)?;
         let mut out = self.zeros(spec.output_len)?;
@@ -938,6 +954,14 @@ pub(crate) struct UnfoldSpec {
     pub output_spatial: [i32; 3],
     pub input_special_strides: [i32; 4],
     pub output_special_strides: [i32; 5],
+}
+
+/// Rank-sized destination-to-source translation used by padding, cropping and
+/// their inverse derivatives. Each dimension stores five signed coordinates.
+pub(crate) struct WindowSpec {
+    pub output_len: usize,
+    pub rank: i32,
+    pub metadata: Vec<i32>,
 }
 
 /// Compact metadata for selecting one coordinate of one named axis.
@@ -1438,6 +1462,55 @@ mod kernels {
             }
         }
         out.store(sum);
+    }
+
+    #[cutile::entry()]
+    unsafe fn copy_window(
+        out: &mut Tensor<f32, { [128] }>,
+        input: *const f32,
+        metadata: &Tensor<i32, { [-1] }>,
+        output_len: i32,
+        rank: i32,
+    ) {
+        let output_index: Tile<i32, { [128] }> =
+            iota(shape![128]) + broadcast_scalar(get_tile_block_id().0 * 128i32, shape![128]);
+        let mut live = lt_tile(output_index, broadcast_scalar(output_len, shape![128]));
+        let mp = metadata.partition(shape![1]);
+        let mut input_index = constant(0i32, shape![128]);
+        let zero = constant(0i32, shape![128]);
+        for dimension in 0i32..rank {
+            let base = dimension * 5i32;
+            let output_extent: i32 = tile_to_scalar(mp.load([base]).reshape(shape![]));
+            let output_stride: i32 = tile_to_scalar(mp.load([base + 1i32]).reshape(shape![]));
+            let input_extent: i32 = tile_to_scalar(mp.load([base + 2i32]).reshape(shape![]));
+            let input_stride: i32 = tile_to_scalar(mp.load([base + 3i32]).reshape(shape![]));
+            let shift: i32 = tile_to_scalar(mp.load([base + 4i32]).reshape(shape![]));
+            let coordinate = (output_index / broadcast_scalar(output_stride, shape![128]))
+                % broadcast_scalar(output_extent, shape![128])
+                + broadcast_scalar(shift, shape![128]);
+            let valid = ge_tile(coordinate, zero)
+                & lt_tile(coordinate, broadcast_scalar(input_extent, shape![128]));
+            live = live & valid;
+            // Invalid coordinates must not overflow intermediate address arithmetic.
+            input_index = input_index
+                + select(valid, coordinate, zero) * broadcast_scalar(input_stride, shape![128]);
+        }
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(input);
+        let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const f32, { [128] }> = base.broadcast(shape![128]);
+        let addresses = addptr_tile(base, select(live, input_index, zero));
+        let (values, _token): (Tile<f32, { [128] }>, Token) = unsafe {
+            load_ptr_tko(
+                addresses,
+                ordering::Relaxed,
+                Some(scope::Device),
+                Some(live),
+                Some(0.0f32),
+                None,
+                Latency::<0>,
+            )
+        };
+        out.store(values);
     }
 
     #[cutile::entry()]
