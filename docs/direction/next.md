@@ -100,7 +100,7 @@ contracts and evidence bar.
 
 ## Next useful implementation
 
-The byte autoencoder (`research/bae`) is the next outside consumer: 125 bytes
+The byte autoencoder (`research/src/learning/bae`) is the next outside consumer: 125 bytes
 to a 256-bit sign code to an autoregressive byte decoder over memory tokens,
 with prefix (nested) dropout on the code. Its first slice landed `Embedding`,
 `PositionEmbedding`, and `prefix_causal_mask` with scalar oracles. The
