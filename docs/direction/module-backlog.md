@@ -25,7 +25,8 @@ unexercised surface area.
 Axis already has `Linear` (bias on by default; `.bias(false)` before `build`
 omits the bias parameter entirely, so `named_parameters` then has only
 `weight`), `PopulationLinear` (bias always present; not yet given the same
-option), `Conv2d`, `Conv3d`, named-axis
+option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
+`Tensor::adaptive_avg_pool3d`, named-axis
 `LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, one-hot
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
 `GELU` and erf-form `ExactGELU` (PyTorch's default `nn.GELU` is the exact form), `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
@@ -56,9 +57,9 @@ and panel acceptances, but it is not yet a comfortable general module library.
 | Active | physics-informed residual consumers and independent numerical oracles | Central differences and empirical residual receipts now provide the first honest path; ODE and pendulum studies must establish defaults and expose missing composition. |
 | Recurrent foundation | `LstmCell` and `Lstm` correctness are implemented; fused recurrence, direction, and layer composition remain | Independent forward and complete gradient oracles protect the eager IFGO implementation before performance work. |
 | Stateful foundation | explicit training/evaluation mode and persistent non-parameter state, then named-axis `BatchNorm` | Running statistics cannot be represented honestly by the current stateless `Module` contract. |
-| Common composition | `Conv1d` or rank-general convolution, pooling, `ELU`, dropout, prefix (nested) dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. Exact GELU, `SiLU`, and `LeakyReLU` landed from Atlas and vision consumer pressure; `Embedding`, the prefix causal mask, and `SignStraightThrough` landed from the byte autoencoder migration, whose ordered binary code is also the consumer for prefix dropout. |
+| Common composition | `Conv1d` or rank-general convolution, `ELU`, dropout, prefix (nested) dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. Exact GELU, `SiLU`, and `LeakyReLU` landed from Atlas and vision consumer pressure; `Embedding`, the prefix causal mask, and `SignStraightThrough` landed from the byte autoencoder migration, whose ordered binary code is also the consumer for prefix dropout. `MaxPool2d`/`MaxPool3d` and `Tensor::adaptive_avg_pool3d` landed from `fluid`'s U-Net encoder, `morpheus`'s peak-NMS decode, and `gastric`'s interface-region pooler. |
 | Architecture families | recurrent variants, transpose convolution, reusable transformer encoder/decoder modules | Add them around measured consumers after the lower-level contracts settle. |
-| Specialized | sparse, quantized, distributed, adaptive and fractional pooling, lazy initialization | Each needs its own representation or execution contract; names alone would provide false parity. |
+| Specialized | sparse, quantized, distributed, fractional pooling, lazy initialization | Each needs its own representation or execution contract; names alone would provide false parity. |
 
 Dimensions are expressed by named axes rather than suffixing every concept with
 `1d`, `2d`, and `3d`. Axis may still expose a dimension-specific kernel where

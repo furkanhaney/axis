@@ -16,10 +16,12 @@ The crate currently provides:
   integer-factor nearest and half-pixel bilinear resampling along a named
   axis;
 - `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
-  grouped/depthwise channels, named-axis `LayerNorm`, `RmsNorm`, `GroupNorm`,
-  and stateless `InstanceNorm`, one-hot `Embedding` and `PositionEmbedding`,
-  explicit-state `LstmCell`/`Lstm`, activations, attention primitives with
-  causal and prefix-causal masks, and sequential composition;
+  grouped/depthwise channels, `MaxPool2d`/`MaxPool3d` and
+  `Tensor::adaptive_avg_pool3d`, named-axis `LayerNorm`, `RmsNorm`,
+  `GroupNorm`, and stateless `InstanceNorm`, one-hot `Embedding` and
+  `PositionEmbedding`, explicit-state `LstmCell`/`Lstm`, activations,
+  attention primitives with causal and prefix-causal masks, and sequential
+  composition;
 - device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
   exact AdamW remainder;
 - generated and finite data loaders with executable single-pass, finite-pass,
