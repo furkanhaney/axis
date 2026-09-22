@@ -74,7 +74,9 @@ pub use optim::{
     cosine_annealing_lr, one_cycle_lr,
 };
 pub use preprocess::Standardizer;
-pub use recurrent::{Lstm, LstmCell, LstmRun, LstmState};
+pub use recurrent::{
+    Gru, GruCell, GruRun, Lstm, LstmCell, LstmRun, LstmState, Rnn, RnnCell, RnnNonlinearity, RnnRun,
+};
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
 };
@@ -110,15 +112,16 @@ pub mod prelude {
         CentralDifference, Conv2d, Conv3d, DataLoader, DataRegimeReceipt, DataSource, Device, Dim,
         Disjointness, DisjointnessEvidence, DisjointnessReceipt, Embedding, EmpiricalMonotonicity,
         EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
-        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, IdentityScheme,
-        Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm, LawIdentity, LayerNorm,
-        LeakyReLU, LearningDirection, LearningEvidence, LearningLimits, LearningObservation,
-        LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell, LstmRun, LstmState,
-        MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix,
-        MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear,
-        PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot,
-        ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD,
-        Sample, Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh,
-        Tensor, TrainStep, Trainer, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        FinitePasses, FinitePassesLoader, FinitePassesReceipt, GELU, GroupNorm, Gru, GruCell,
+        GruRun, IdentityScheme, Idr, IdrLimits, IdrReceipt, InMemoryDataset, InstanceNorm,
+        LawIdentity, LayerNorm, LeakyReLU, LearningDirection, LearningEvidence, LearningLimits,
+        LearningObservation, LearningProgress, LearningProgressReceipt, Linear, Lstm, LstmCell,
+        LstmRun, LstmState, MaxPool2d, MaxPool3d, Module, MonotoneDirection, MonotonicityLimits,
+        Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, Optimizer, ParamId, Parameter,
+        PopulationLinear, PopulationMode, PopulationReceipt, PopulationSpec, PositionEmbedding,
+        ReLU, RegimeSnapshot, ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope,
+        Result, RmsNorm, Rnn, RnnCell, RnnNonlinearity, RnnRun, SGD, Sample, Sequential, Shape,
+        SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh, Tensor, TrainStep, Trainer,
+        clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
     };
 }
