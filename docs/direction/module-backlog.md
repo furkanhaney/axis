@@ -60,6 +60,15 @@ there is still no mixed precision. `Tensor::uniform` and `Tensor::normal` are th
 public, seeded random tensor constructors: generated host-side from the same
 shared xorshift stream that initializes parameters, then uploaded, with no
 gradient edge, since a random draw is a constant, not a parameter.
+`Module` now also has an explicit training/evaluation mode: `forward` stays
+evaluation semantics, and a provided `forward_training(input, pass: &mut
+TrainingPass)` defaults to calling `forward`, so every existing module is
+unchanged, while `Sequential` threads one `TrainingPass` through its children
+in order. `TrainingPass` and `Trainer::with_seed`/`step_training` make the
+per-step random-draw context and its seed explicit and recorded
+(`TrainStep::pass_seed`); `Dropout` is its first consumer, identity in
+`forward` and inverted dropout drawn from `pass.next_seed()` in
+`forward_training`.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
 `Tensor::broadcast_to(shape)` explicitly broadcasts a tensor onto a target
@@ -78,7 +87,7 @@ dedicated outer-product method.
 | --- | --- | --- |
 | Active | physics-informed residual consumers and independent numerical oracles | Central differences and empirical residual receipts now provide the first honest path; ODE and pendulum studies must establish defaults and expose missing composition. |
 | Recurrent foundation | `LstmCell` and `Lstm` correctness are implemented; fused recurrence, direction, and layer composition remain | Independent forward and complete gradient oracles protect the eager IFGO implementation before performance work. |
-| Stateful foundation | explicit training/evaluation mode and persistent non-parameter state, then named-axis `BatchNorm` | Running statistics cannot be represented honestly by the current stateless `Module` contract. |
+| Stateful foundation | persistent non-parameter state, then named-axis `BatchNorm` | Running statistics cannot be represented honestly until `Module` can hold and update them (#76). |
 | Common composition | `Conv1d` or rank-general convolution, `ELU`, dropout, prefix (nested) dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. Exact GELU, `SiLU`, and `LeakyReLU` landed from Atlas and vision consumer pressure; `Embedding`, the prefix causal mask, and `SignStraightThrough` landed from the byte autoencoder migration, whose ordered binary code is also the consumer for prefix dropout. `MaxPool2d`/`MaxPool3d` and `Tensor::adaptive_avg_pool3d` landed from `fluid`'s U-Net encoder, `morpheus`'s peak-NMS decode, and `gastric`'s interface-region pooler. |
 | Architecture families | recurrent variants, transpose convolution, reusable transformer encoder/decoder modules | Add them around measured consumers after the lower-level contracts settle. |
 | Specialized | sparse, quantized, distributed, fractional pooling, lazy initialization | Each needs its own representation or execution contract; names alone would provide false parity. |
