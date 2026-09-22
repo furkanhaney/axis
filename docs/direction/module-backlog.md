@@ -20,6 +20,11 @@ primitive and its reference test exercises a representative composition. More
 specialized abstractions should wait for a second use rather than enter as
 unexercised surface area.
 
+The catalog is also a number: [docs/nn/catalog.md](../nn/catalog.md) freezes
+every `torch.nn` class as a row with a verdict, and `scripts/checks/nn_gap.sh
+--check` holds the floor (1351 bp at the 2026-09-22 freeze). This file says in
+what order rows should flip; that table says which have.
+
 ## Current surface
 
 Axis already has `Linear` (bias on by default; `.bias(false)` before `build`

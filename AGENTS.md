@@ -22,7 +22,9 @@ run artifacts; distinguish mechanics witnesses from scientific results.
   the introductory shelf.
 - Other `src/studies/` families contain applied research ports whose
   task-specific architecture, metrics, and evidence do not belong in the library.
-- `docs/` explains contracts, design decisions, and measured limits.
+- `docs/` explains contracts, design decisions, and measured limits. `docs/nn/`
+  is the torch.nn spec: every PyTorch module class as a row with a verdict, a
+  number and a floor (`scripts/checks/nn_gap.sh --check`).
 - `scripts/` contains shell tooling. Axis contains no Python.
 - `tests/` contains repository and packaging gates.
 - Tracked data belongs only in `data/evidence/` or `data/runs/`.
