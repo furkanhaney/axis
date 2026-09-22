@@ -289,6 +289,30 @@ the cuTile kernels use signed 32-bit coordinates, every composite padded
 spatial extent must fit `i32`; larger geometry is rejected before a plan is
 cached or a patch output is allocated.
 
+`MaxPool2d`/`MaxPool3d` reduce each channel independently, materializing the
+same rank-tagged patch as convolution but with the patch fill set to negative
+infinity instead of zero, so a padded position can never win the window; the
+maximum is then `-min(-patch)`, reusing `Tensor::min`'s existing tie-break
+(the first logical coordinate) and finite-only comparison unchanged. Because
+patch materialization is itself a proper partition of the (larger) patch-space
+tensor, `min`'s ordinary bijective backward is exact there, and convolution's
+own col2im already sums overlapping window contributions back onto the shared
+source exactly, so no new backend kernel was needed for either padding or a
+stride smaller than the kernel. Padding must be at most half the kernel extent
+per axis, PyTorch's own `MaxPool` constraint, which also guarantees every
+window keeps at least one real element. The channel axis is appended after the
+(in-place, resized) spatial axes, exactly as `Conv2d`/`Conv3d` append their
+output-channel axis. `Tensor::adaptive_avg_pool3d` instead reduces each spatial
+axis to an explicit target extent using PyTorch's own start/end bin formula
+(`floor(i * in / out)`, `ceil((i + 1) * in / out)`); adjacent bins can share
+one boundary element when the input extent does not divide evenly, so unlike a
+fixed-kernel pool its reduction is not a strict partition. It is implemented as
+a single weighted grouped reduction (the same CSR product-sum kernel
+`contract` already exercises) built from both directions at once: forward sums
+each bin's members scaled by its own `1 / size`, and backward gathers, per
+input element, every bin that contains it, scaled the same way -- exact for
+overlap without a new kernel or a host round trip.
+
 `Device::cuda_bf16` is an explicit mixed-precision policy: matrix-product
 inputs are rounded to BF16 inside the kernel and accumulated into FP32. Stored
 parameters, activations outside matrix products, reductions, gradients, and
@@ -421,6 +445,8 @@ provenance contract; reading a file is not itself a research guarantee.
 | `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |
 | `Conv2d(input, output, spatial, kernel)` | Cross-correlate named spatial axes with configurable positive stride, finite symmetric zero-padding, and positive channel groups. Require both channel extents to divide evenly by groups; preserve unrelated axes and append the output-channel axis. |
 | `Conv3d(input, output, spatial, kernel)` | Apply the same contract to three ordered named spatial axes. Flatten patches by input channel, then the three kernel coordinates with the final coordinate fastest. |
+| `MaxPool2d(channels, spatial, kernel)` / `MaxPool3d` | Reduce each configured spatial window to its maximum, independently per channel; stride defaults to the kernel extent, padding to zero, and padding must be at most half the kernel extent per axis. A padded position never wins; ties route the gradient to the window's first logical coordinate. Preserve unrelated axes (spatial axes resized in place) and append the channel axis, matching `Conv2d`/`Conv3d`. |
+| `Tensor::adaptive_avg_pool3d(spatial, target)` | Reduce three named spatial axes to explicit target extents using PyTorch's own per-axis bin formula (`floor(i * in / out)`, `ceil((i + 1) * in / out)`); adjacent bins may share one boundary element, which is averaged into each bin it falls in. Preserve every other axis in place. |
 | Named normalization | Normalize only the declared axes. Layer/RMS affine parameters span the declared normalized shape; group/instance affine parameters span the channel axis. Preserve every input axis and reject changed built extents or group geometry. |
 | `Lstm(input, hidden, time)` | Apply a standard IFGO transition in logical time-coordinate order. Preserve unrelated stream axes, replace input with hidden, accept explicit hidden/cell state, and return both the complete sequence and connected terminal state. |
 | `binary_cross_entropy_with_logits(target)` | Return stable unreduced elementwise losses for identical axis sets. Targets are constants; the caller names every reduction axis. |
@@ -548,8 +574,10 @@ actual outside consumer.
 4. **Executable CNN slice (implemented semantics):** convolution with stride,
    symmetric padding and grouped/depthwise channels, ReLU, named global mean,
    Linear, and stable binary loss reproduce the concrete CNN and a compact
-   depthwise-separable block. Adaptive pooling, collapse, categorical
-   cross-entropy, dilation, and an optimized convolution kernel remain.
+   depthwise-separable block. `MaxPool2d`/`MaxPool3d` and
+   `Tensor::adaptive_avg_pool3d` (below) round out the pooling family. Collapse,
+   categorical cross-entropy, dilation, and an optimized convolution kernel
+   remain.
 5. **LSTM (implemented correctness slice):** stable sigmoid/tanh, compact named
    selection, stack, explicit connected or detached state, and an eager IFGO
    recurrence. Its independent f64 oracle covers every input, initial-state,
