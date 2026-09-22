@@ -153,11 +153,17 @@ enum Rule {
     },
     Tanh(Buffer),
     Sin(Buffer),
+    Abs(Buffer),
     Gelu(Buffer),
     GeluExact(Buffer),
     InverseSqrt {
         input: Buffer,
         epsilon: f32,
+    },
+    Clamp {
+        input: Buffer,
+        min: f32,
+        max: f32,
     },
     BinaryCrossEntropy {
         logits: Buffer,
@@ -210,6 +216,13 @@ enum Rule {
     StackSlice {
         offset: usize,
         len: usize,
+    },
+    Exp(Buffer),
+    Ln(Buffer),
+    Softplus {
+        input: Buffer,
+        beta: f32,
+        threshold: f32,
     },
 }
 impl Edge {
@@ -744,6 +757,37 @@ impl Tensor {
         let delta = self.sub(rhs)?;
         delta.mul(&delta)
     }
+    /// Elementwise absolute value. Backward is `gradient * sign(x)`, matching PyTorch's `abs`
+    /// backward: the gradient is exactly zero at `x == 0` (PyTorch's own subgradient choice
+    /// there, not `NaN` or either one-sided slope).
+    pub fn abs(&self) -> Result<Self> {
+        let value = self.device().abs(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Abs(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise mean absolute error (PyTorch's unreduced `F.l1_loss`): `(self -
+    /// rhs).abs()`. Same axis-agreement contract as [`Tensor::squared_error`] — identical axis
+    /// sets, equal extents, unreduced shape — leaving the reduction (typically `.mean(axes)`) to
+    /// the caller.
+    pub fn absolute_error(&self, rhs: &Self) -> Result<Self> {
+        if self.shape().rank() != rhs.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&a| !rhs.shape().contains(a))
+        {
+            return Err("absolute_error requires identical axis sets".into());
+        }
+        self.sub(rhs)?.abs()
+    }
     /// Stable elementwise binary cross-entropy. Targets are constants in reverse mode.
     pub fn binary_cross_entropy_with_logits(&self, targets: &Self) -> Result<Self> {
         if targets.requires_grad() {
@@ -1165,6 +1209,73 @@ impl Tensor {
             None,
         ))
     }
+    /// Elementwise exponential, `exp(x)`. Backward is `g * exp(x)`, computed from
+    /// the already-produced output rather than re-evaluating `exp` from the input,
+    /// the same trade [`Self::tanh`] makes. Output has the same [`Shape`] as the
+    /// input.
+    pub fn exp(&self) -> Result<Self> {
+        let value = self.device().exp(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value.clone(),
+            self.device(),
+            vec![Edge::new(self, Rule::Exp(value))],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise natural logarithm, `ln(x)`. IEEE behaviour, no clamping: `ln`
+    /// of a non-positive input is `-inf` at exactly `x == 0` and `NaN` for
+    /// `x < 0`, matching `f32::ln`/PyTorch's `torch.log` rather than any epsilon
+    /// or absolute-value guard. Backward is `g / x`, which inherits the same
+    /// non-finite behaviour at and below zero. Output has the same [`Shape`] as
+    /// the input.
+    pub fn ln(&self) -> Result<Self> {
+        let value = self.device().ln(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Ln(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// PyTorch-exact `Softplus`: `(1 / beta) * ln(1 + exp(beta * x))`, except
+    /// where `beta * x > threshold`, which returns `x` itself (the identity
+    /// function's large-`x` asymptote, computed exactly rather than through the
+    /// logarithm) to keep both branches finite and match
+    /// `torch.nn.functional.softplus(x, beta, threshold)` bit for bit at the seam.
+    /// Backward is `sigmoid(beta * x)` on the logarithmic branch and exactly `1`
+    /// on the linear branch, mirroring the forward's own branch selection.
+    /// `beta` must be finite and positive; `threshold` must be finite.
+    pub fn softplus(&self, beta: f32, threshold: f32) -> Result<Self> {
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err("softplus beta must be finite and positive".into());
+        }
+        if !threshold.is_finite() {
+            return Err("softplus threshold must be finite".into());
+        }
+        let value = self.device().softplus(&self.0.value, beta, threshold)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Softplus {
+                    input: self.0.value.clone(),
+                    beta,
+                    threshold,
+                },
+            )],
+            false,
+            None,
+        ))
+    }
     /// Shared body for the scalar comparison family below. `op` selects the cuTile
     /// comparison the same way [`Self::binary`]'s `op` selects add/sub/mul/div: 0
     /// (`>`), 1 (`>=`), 2 (`<`), 3 (`<=`), 4 (`==`). Output has the same [`Shape`]
@@ -1245,6 +1356,52 @@ impl Tensor {
                 Rule::InverseSqrt {
                     input: self.0.value.clone(),
                     epsilon,
+                },
+            )],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise clamp into `[min, max]`; either bound may be `None` to leave that side
+    /// unbounded, matching `torch.clamp`'s optional `min`/`max` keywords (`sites.clamp_(0,
+    /// 1)` in `vision/image-encode`'s Stage A and `counts.clamp(min=1)` in
+    /// `world/energy-output`'s reconstruction loss are the two consumers -- the second gives
+    /// only `min`). Rejects a `NaN` bound or `min > max` before any device launch. A `NaN`
+    /// element of `self` propagates unclamped: like [`Self::gt`] and its siblings, every
+    /// ordered comparison against `NaN` is `false`, so neither the low nor the high branch
+    /// ever fires for it.
+    ///
+    /// Gradient matches PyTorch's `clamp` convention, not "zero at the boundary too": the
+    /// upstream gradient passes through unchanged where `min <= x && x <= max` -- including
+    /// exactly at either bound -- and is zero everywhere `x` was actually moved by clamping.
+    /// A `NaN` input therefore also gets a zero gradient, since `x >= min` is itself `false`
+    /// for `NaN` under the same ordered-comparison rule.
+    pub fn clamp(&self, min: Option<f32>, max: Option<f32>) -> Result<Self> {
+        if min.is_some_and(f32::is_nan) {
+            return Err("clamp min must not be NaN".into());
+        }
+        if max.is_some_and(f32::is_nan) {
+            return Err("clamp max must not be NaN".into());
+        }
+        if let (Some(min), Some(max)) = (min, max)
+            && min > max
+        {
+            return Err(format!("clamp requires min <= max, got min={min} max={max}").into());
+        }
+        let lo = min.unwrap_or(f32::NEG_INFINITY);
+        let hi = max.unwrap_or(f32::INFINITY);
+        let value = self.device().clamp(&self.0.value, lo, hi)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Clamp {
+                    input: self.0.value.clone(),
+                    min: lo,
+                    max: hi,
                 },
             )],
             false,
@@ -2469,6 +2626,36 @@ impl Tensor {
         Ok(result)
     }
 
+    /// Broadcast `self` onto `shape`, an explicit target that must carry every one
+    /// of `self`'s axes at `self`'s own extent; `shape` may add axes `self` lacks
+    /// entirely (they read with stride zero) and may reorder `self`'s existing axes.
+    /// This is the outer-broadcast primitive: elementwise `add`/`sub`/`mul`/`div`
+    /// only ever align one operand's axis set onto the other's when it is already a
+    /// subset (`binary`, `algebra/tensor.rs`), and reject two operands that each have
+    /// an axis the other lacks as "cannot introduce an implicit outer product". A
+    /// caller with genuinely disjoint axis sets -- a `pixel`-indexed operand and a
+    /// `site`-indexed operand, say -- broadcasts each one explicitly onto a shared
+    /// `[pixel, site, ...]` shape first, then combines the results with an ordinary
+    /// elementwise op: `a.broadcast_to(&shape)?.sub(&b.broadcast_to(&shape)?)`
+    /// composes a `torch.cdist`-style outer pairwise difference from `broadcast_to`
+    /// and `sub` alone, with no dedicated outer-product op. Backward sums the
+    /// upstream gradient over every axis this call added, exactly as every other
+    /// broadcast in the crate reduces an introduced axis (elementwise add/mul/div,
+    /// `binary_cross_entropy_with_logits_weighted`'s `pos_weight`).
+    pub fn broadcast_to(&self, shape: &Shape) -> Result<Self> {
+        for dim in self.shape().dims() {
+            if !shape.contains(dim.axis) {
+                return Err(
+                    format!("broadcast_to target shape is missing axis {:?}", dim.axis).into(),
+                );
+            }
+            if shape.extent(dim.axis)? != dim.extent {
+                return Err(format!("broadcast_to extent mismatch for {:?}", dim.axis).into());
+            }
+        }
+        self.align(shape)
+    }
+
     /// Stack equal named shapes, inserting a new logical axis at `position`.
     /// Physical storage is stack-major so each source remains one contiguous copy.
     pub fn stack(values: &[Self], axis: Axis, position: usize) -> Result<Self> {
@@ -2575,6 +2762,34 @@ impl Tensor {
             offset += extent;
         }
         Ok(result.expect("validated at least one tensor above"))
+    }
+    /// Cyclically shift one named axis's values by `shift`, wrapping values
+    /// that run off one end onto the other. PyTorch's `torch.roll` sign
+    /// convention: the element at logical index `i` moves to
+    /// `(i + shift).rem_euclid(extent)`, so a positive shift moves values
+    /// toward higher indices and a negative shift moves them toward lower
+    /// indices. Shifting by 0 or by any multiple of the axis's extent is the
+    /// identity. Rolling one axis at a time composes exactly with PyTorch's
+    /// multi-axis `dims=`: `torch.roll(x, shifts=(-s, -s), dims=(1, 2))` is
+    /// two calls, one per axis (SwinIR's shifted-window attention,
+    /// `network_swinir.py:251,271`).
+    ///
+    /// Implemented as `concat` of two `narrow` slices -- the wrapped tail
+    /// moved ahead of the untouched head -- rather than a dedicated backend
+    /// rule: both primitives already carry exact device kernels and exact
+    /// gradients, so backward falls out for free as the inverse roll (the
+    /// same call with `shift` negated), with no new `Rule` variant to
+    /// maintain.
+    pub fn roll(&self, axis: Axis, shift: isize) -> Result<Self> {
+        let extent = self.extent(axis)?;
+        let offset = shift.rem_euclid(isize::try_from(extent)?);
+        if offset == 0 {
+            return Ok(self.clone());
+        }
+        let split = extent - usize::try_from(offset)?;
+        let head = self.narrow(axis, 0, split)?;
+        let tail = self.narrow(axis, split, extent - split)?;
+        Self::concat(&[tail, head], axis)
     }
     /// Materialize a storage order without changing logical axes or values.
     pub fn with_layout(&self, order: impl IntoAxes) -> Result<Self> {
@@ -2851,11 +3066,15 @@ impl Tensor {
                         }
                         Rule::Tanh(output) => self.device().tanh_backward(&gradient, output)?,
                         Rule::Sin(input) => self.device().sin_backward(&gradient, input)?,
+                        Rule::Abs(input) => self.device().abs_backward(&gradient, input)?,
                         Rule::Gelu(x) => self.device().gelu_backward(&gradient, x)?,
                         Rule::GeluExact(x) => self.device().gelu_exact_backward(&gradient, x)?,
                         Rule::InverseSqrt { input, epsilon } => self
                             .device()
                             .inverse_sqrt_backward(&gradient, input, *epsilon)?,
+                        Rule::Clamp { input, min, max } => {
+                            self.device().clamp_backward(&gradient, input, *min, *max)?
+                        }
                         Rule::BinaryCrossEntropy { logits, targets } => self
                             .device()
                             .binary_cross_entropy_backward(&gradient, logits, targets)?,
@@ -2921,6 +3140,15 @@ impl Tensor {
                         Rule::StackSlice { offset, len } => {
                             self.device().contiguous_slice(&gradient, *offset, *len)?
                         }
+                        Rule::Exp(output) => self.device().exp_backward(&gradient, output)?,
+                        Rule::Ln(input) => self.device().ln_backward(&gradient, input)?,
+                        Rule::Softplus {
+                            input,
+                            beta,
+                            threshold,
+                        } => self
+                            .device()
+                            .softplus_backward(&gradient, input, *beta, *threshold)?,
                     };
                     let id = edge.input.0.id;
                     let sum = if let Some(existing) = adjoints.remove(&id) {

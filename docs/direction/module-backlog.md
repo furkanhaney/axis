@@ -35,7 +35,10 @@ option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
 `LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, one-hot
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
 `GELU` and erf-form `ExactGELU` (PyTorch's default `nn.GELU` is the exact form), `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
-`Sequential`, with tensor-level losses, sine, differentiable central
+`Sequential`, with tensor-level losses (including `abs`/`absolute_error`, PyTorch's
+unreduced `F.l1_loss`, zero gradient at exactly zero matching its `abs` backward
+convention), sine, elementwise `exp`/`ln`, a PyTorch-exact
+`Tensor::softplus(beta, threshold)`, differentiable central
 differences, softmax, causal masking, named-axis nearest and bilinear
 resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
 composition, named reductions, an arbitrary-index `gather` (a host-side integer
@@ -44,6 +47,11 @@ index, not a one-hot contraction, so it scales to a large table where
 `gt`/`ge`/`lt`/`le`/`eq` compare a tensor against a scalar into a `{0.0, 1.0}`
 mask with no gradient of its own; `logical_and`/`logical_not` compose masks the
 same way PyTorch's `&`/`~` do on 0/1 tensors (`mul`, `1 - x`).
+`clamp(min, max)` bounds a tensor elementwise into `[min, max]` with either
+side an optional `f32` (`None` leaves it unbounded), propagating `NaN` inputs
+unclamped and passing the gradient through at either bound as well as
+strictly inside it, matching PyTorch's `clamp`, not a "zero at the boundary
+too" convention.
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
 `one_cycle_lr` schedule functions (`optim.rs`), and a global-norm
@@ -54,6 +62,15 @@ shared xorshift stream that initializes parameters, then uploaded, with no
 gradient edge, since a random draw is a constant, not a parameter.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
+`Tensor::broadcast_to(shape)` explicitly broadcasts a tensor onto a target
+shape carrying every one of its axes (at its own extent) plus any axes it
+lacks entirely; it is the outer-broadcast primitive elementwise
+add/sub/mul/div deliberately refuse (they only ever align one operand's axis
+set onto the other's when it is already a subset), so two operands with
+genuinely disjoint axis sets -- `vision/image-encode`'s pixel-indexed and
+site-indexed tensors in its `torch.cdist`-style pairwise distance -- compose
+an outer op from `broadcast_to` and an ordinary elementwise op instead of a
+dedicated outer-product method.
 
 ## Ordered backlog
 

@@ -173,6 +173,23 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    /// Elementwise absolute value.
+    pub(crate) fn abs(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::abs((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    /// `gradient * sign(input)`, zero at exactly `input == 0`.
+    pub(crate) fn abs_backward(&self, gradient: &Buffer, input: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(input.shape()[0] as usize)?;
+        kernels::abs_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            input.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn mask_gradient(&self, gradient: &Buffer, winners: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(gradient.shape()[0] as usize)?;
         kernels::mask_gradient(
@@ -332,6 +349,60 @@ impl Device {
         kernels::sign((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn exp(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::exp_forward((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn exp_backward(&self, gradient: &Buffer, output: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(output.shape()[0] as usize)?;
+        kernels::exp_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            output.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn ln(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::ln((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn ln_backward(&self, gradient: &Buffer, input: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(input.shape()[0] as usize)?;
+        kernels::ln_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            input.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn softplus(&self, a: &Buffer, beta: f32, threshold: f32) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::softplus((&mut out).partition([128]), a.as_ref(), beta, threshold)
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn softplus_backward(
+        &self,
+        gradient: &Buffer,
+        input: &Buffer,
+        beta: f32,
+        threshold: f32,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(input.shape()[0] as usize)?;
+        kernels::softplus_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            input.as_ref(),
+            beta,
+            threshold,
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     /// `op` selects the comparison the same way [`Self::binary`]'s `op` selects
     /// add/sub/mul/div: 0 (`>`), 1 (`>=`), 2 (`<`), 3 (`<=`), 4 (`==`).
     pub(crate) fn compare_scalar(&self, a: &Buffer, scalar: f32, op: i32) -> Result<Buffer> {
@@ -339,6 +410,33 @@ impl Device {
         kernels::compare_scalar((&mut out).partition([128]), a.as_ref(), scalar)
             .generics(vec![op.to_string()])
             .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    /// `min`/`max` are already-resolved bounds: [`Tensor::clamp`] maps an omitted side to
+    /// `f32::NEG_INFINITY`/`f32::INFINITY` before calling here, so the kernel only ever sees
+    /// two concrete scalars, the same resolved-parameter shape as [`Self::leaky_relu`].
+    pub(crate) fn clamp(&self, a: &Buffer, min: f32, max: f32) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::clamp((&mut out).partition([128]), a.as_ref(), min, max)
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    pub(crate) fn clamp_backward(
+        &self,
+        gradient: &Buffer,
+        a: &Buffer,
+        min: f32,
+        max: f32,
+    ) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::clamp_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            a.as_ref(),
+            min,
+            max,
+        )
+        .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
     pub(crate) fn inverse_sqrt_backward(
@@ -2345,6 +2443,83 @@ mod kernels {
         let negative_one = constant(-1.0f32, shape![128]);
         out.store(select(gt_tile(a.load_like(out), zero), one, negative_one));
     }
+    // Named `exp_forward`/`exp_backward` rather than bare `exp` because the body
+    // calls cutile's own `exp` primitive; a same-named entry point would shadow
+    // it and recurse into itself instead, the same reason `tanh`/`sin` above are
+    // `tanh_forward`/`sin_forward`.
+    #[cutile::entry()]
+    fn exp_forward(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        out.store(exp(a.load_like(out)));
+    }
+    #[cutile::entry()]
+    fn exp_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        output: &Tensor<f32, { [-1] }>,
+    ) {
+        out.store(gradient.load_like(out) * output.load_like(out));
+    }
+    // `ln` calls cutile's `log` primitive (a different name), so no `exp`-style
+    // shadowing renamed is needed here.
+    #[cutile::entry()]
+    fn ln(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        out.store(log(a.load_like(out)));
+    }
+    #[cutile::entry()]
+    fn ln_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        input: &Tensor<f32, { [-1] }>,
+    ) {
+        out.store(gradient.load_like(out) / input.load_like(out));
+    }
+    // PyTorch-exact `Softplus(beta, threshold)`: `(1/beta) * ln(1 + exp(beta*x))`
+    // on the logarithmic branch, `x` itself once `beta*x > threshold`. This
+    // mirrors PyTorch's own kernel, which evaluates the logarithmic branch
+    // directly (no `sign`-style magnitude subtraction) because the threshold
+    // already keeps `exp(beta*x)` finite before the branch matters; unlike
+    // `binary_cross_entropy`'s internal softplus, this one is user-facing with
+    // an unbounded `x`, so the linear branch -- not a stability trick -- is what
+    // keeps it finite past the threshold.
+    #[cutile::entry()]
+    fn softplus(
+        out: &mut Tensor<f32, { [128] }>,
+        a: &Tensor<f32, { [-1] }>,
+        beta: f32,
+        threshold: f32,
+    ) {
+        let x = a.load_like(out);
+        let beta_tile = broadcast_scalar(beta, shape![128]);
+        let threshold_tile = broadcast_scalar(threshold, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let scaled = beta_tile * x;
+        let value = log(one + exp(scaled)) / beta_tile;
+        out.store(select(gt_tile(scaled, threshold_tile), x, value));
+    }
+    // Backward is `sigmoid(beta*x)` on the logarithmic branch (computed the same
+    // stable way as `sigmoid`/`binary_cross_entropy_backward` above, since unlike
+    // the forward there is no threshold protecting this expression's exponent)
+    // and exactly `1` on the linear branch, since the linear branch's output is
+    // `x` itself.
+    #[cutile::entry()]
+    fn softplus_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        beta: f32,
+        threshold: f32,
+    ) {
+        let x = a.load_like(out);
+        let beta_tile = broadcast_scalar(beta, shape![128]);
+        let threshold_tile = broadcast_scalar(threshold, shape![128]);
+        let zero = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let scaled = beta_tile * x;
+        let magnitude = max_tile(scaled, zero - scaled);
+        let e = exp(zero - magnitude);
+        let sigmoid = select(gt_tile(scaled, zero), one / (one + e), e / (one + e));
+        out.store(gradient.load_like(out) * select(gt_tile(scaled, threshold_tile), one, sigmoid));
+    }
     /// One elementwise comparison kernel for the whole `gt`/`ge`/`lt`/`le`/`eq`
     /// family, mirroring `sign`'s `select`-of-a-comparison shape. `OP` picks the
     /// operator (0=`>`, 1=`>=`, 2=`<`, 3=`<=`, 4=`==`); each `gt_tile`/`ge_tile`/
@@ -2372,6 +2547,38 @@ mod kernels {
             eq_tile(x, s)
         };
         out.store(select(condition, one, zero));
+    }
+    /// Clamp low then high, mirroring `sign`'s comparison-then-`select` shape. A `NaN`
+    /// input satisfies neither `lt_tile` nor `gt_tile` (every ordered IEEE comparison
+    /// against `NaN` is false), so it falls through both selects unclamped and the stored
+    /// output stays `NaN`.
+    #[cutile::entry()]
+    fn clamp(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>, min: f32, max: f32) {
+        let x = a.load_like(out);
+        let lo = broadcast_scalar(min, shape![128]);
+        let hi = broadcast_scalar(max, shape![128]);
+        let after_low = select(lt_tile(x, lo), lo, x);
+        out.store(select(gt_tile(after_low, hi), hi, after_low));
+    }
+    /// Gradient matches PyTorch's `clamp`: passes through where `min <= x && x <= max`,
+    /// including exactly at either bound, and is zero elsewhere -- including a `NaN` input,
+    /// since `ge_tile`/`le_tile` against `NaN` are both false.
+    #[cutile::entry()]
+    fn clamp_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        min: f32,
+        max: f32,
+    ) {
+        let x = a.load_like(out);
+        let lo = broadcast_scalar(min, shape![128]);
+        let hi = broadcast_scalar(max, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let zero = constant(0.0f32, shape![128]);
+        let within_high = select(le_tile(x, hi), one, zero);
+        let mask = select(ge_tile(x, lo), within_high, zero);
+        out.store(gradient.load_like(out) * mask);
     }
     #[cutile::entry()]
     fn grouped<const PRODUCT: i32>(
@@ -2518,5 +2725,28 @@ mod kernels {
         let b = denominator.load_like(out);
         let zero = constant(0.0f32, shape![128]);
         out.store((zero - g) * a / (b * b));
+    }
+
+    #[cutile::entry()]
+    fn abs(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        out.store(absf(a.load_like(out)));
+    }
+
+    /// `gradient * sign(input)`; PyTorch's `abs` backward convention gives exactly zero at
+    /// `input == 0`, so neither branch of the select fires there.
+    #[cutile::entry()]
+    fn abs_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        input: &Tensor<f32, { [-1] }>,
+    ) {
+        let x = input.load_like(out);
+        let g = gradient.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        out.store(select(
+            gt_tile(x, zero),
+            g,
+            select(lt_tile(x, zero), zero - g, zero),
+        ));
     }
 }

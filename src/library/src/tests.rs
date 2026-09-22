@@ -5155,3 +5155,743 @@ fn seeded_uniform_and_normal_tensors_build_named_axis_tensors_with_no_gradient_e
     println!("seeded uniform/normal tensor construction PASS");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adamw_with_hyperparameters_matches_hand_computed_two_step_update() -> Result<()> {
+    // Independent scalar oracle for issue #82 (AdamW's public constructor could not express a
+    // non-default beta2, blocking upscale_eval's SwinIR trainer, which uses betas=(0.9, 0.99)).
+    // lr=0.1, weight_decay=0.1, beta1=0.8, beta2=0.9, epsilon=1e-8, theta0=1.0, constant
+    // gradient g=0.4 every step. epsilon's ~1e-8 contribution to each denominator is far below
+    // this test's tolerance and is omitted from the arithmetic below.
+    //
+    // step 1:
+    //   m1 = (1 - beta1) * g              = 0.2 * 0.4   = 0.08
+    //   v1 = (1 - beta2) * g^2            = 0.1 * 0.16  = 0.016
+    //   mhat1 = m1 / (1 - beta1^1)        = 0.08 / 0.2  = 0.4
+    //   vhat1 = v1 / (1 - beta2^1)        = 0.016 / 0.1 = 0.16
+    //   decayed0 = theta0 * (1 - lr*wd)   = 1.0 * 0.99  = 0.99
+    //   theta1 = decayed0 - lr*mhat1/sqrt(vhat1) = 0.99 - 0.1*(0.4/0.4) = 0.89
+    // step 2 (g=0.4 again):
+    //   m2 = beta1*m1 + (1-beta1)*g       = 0.8*0.08 + 0.2*0.4   = 0.144
+    //   v2 = beta2*v1 + (1-beta2)*g^2     = 0.9*0.016 + 0.1*0.16 = 0.0304
+    //   mhat2 = m2 / (1 - beta1^2)        = 0.144 / 0.36 = 0.4
+    //   vhat2 = v2 / (1 - beta2^2)        = 0.0304 / 0.19 = 0.16
+    //   decayed1 = theta1 * (1 - lr*wd)   = 0.89 * 0.99  = 0.8811
+    //   theta2 = decayed1 - lr*mhat2/sqrt(vhat2) = 0.8811 - 0.1*(0.4/0.4) = 0.7811
+    let device = Device::cuda(0)?;
+    let unit = Axis::new("unit");
+    let parameter = Parameter::new(Tensor::from_slice(&[1.0], [unit.of(1)], &device)?);
+    let coefficient = Tensor::from_slice(&[0.4], [unit.of(1)], &device)?;
+    let mut adamw = AdamW::with_hyperparameters(0.1, 0.1, 0.8, 0.9, 1e-8)?;
+    for expected in [0.89_f64, 0.7811_f64] {
+        parameter
+            .tensor()
+            .mul(&coefficient)?
+            .mean(unit)?
+            .backward()?;
+        adamw.step_parameters([parameter.clone()])?;
+        close(
+            "AdamW hand-computed non-default-beta update",
+            &parameter.tensor().to_vec()?,
+            &[expected],
+        );
+        parameter.zero_grad();
+    }
+    assert_eq!(adamw.completed_steps(), 2);
+
+    // Validation mirrors Adam::with_hyperparameters exactly (same finite/range checks, in the
+    // same argument order), plus AdamW's own weight-decay check.
+    assert!(AdamW::with_hyperparameters(0.0, 0.0, 0.9, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(f32::NAN, 0.0, 0.9, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 1.0, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 0.9, 1.0, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 0.9, 0.999, 0.0).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, -0.1, 0.9, 0.999, 1e-8).is_err());
+    assert!(AdamW::with_hyperparameters(0.1, 0.0, 0.9, 0.99, 1e-8).is_ok());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adamw_new_matches_with_hyperparameters_at_defaults_bit_exactly() -> Result<()> {
+    // AdamW::new(lr, weight_decay) must stay byte-identical to before #82: it now forwards to
+    // with_hyperparameters at Adam's own defaults (beta1=0.9, beta2=0.999, epsilon=1e-8), so the
+    // two must drive an identical parameter to the same bits, not merely within tolerance.
+    let device = Device::cuda(0)?;
+    let unit = Axis::new("unit");
+    let make_parameter = |value: f32| -> Result<Parameter> {
+        Ok(Parameter::new(Tensor::from_slice(
+            &[value],
+            [unit.of(1)],
+            &device,
+        )?))
+    };
+    let coefficient = Tensor::from_slice(&[0.3], [unit.of(1)], &device)?;
+    let default_parameter = make_parameter(1.0)?;
+    let explicit_parameter = make_parameter(1.0)?;
+    let mut default_adamw = AdamW::new(0.05, 0.02)?;
+    let mut explicit_adamw = AdamW::with_hyperparameters(0.05, 0.02, 0.9, 0.999, 1e-8)?;
+
+    for _ in 0..3 {
+        for parameter in [&default_parameter, &explicit_parameter] {
+            parameter
+                .tensor()
+                .mul(&coefficient)?
+                .mean(unit)?
+                .backward()?;
+        }
+        default_adamw.step_parameters([default_parameter.clone()])?;
+        explicit_adamw.step_parameters([explicit_parameter.clone()])?;
+        assert_eq!(
+            default_parameter.tensor().to_vec()?,
+            explicit_parameter.tensor().to_vec()?,
+            "AdamW::new must stay bit-exact with AdamW::with_hyperparameters at its own defaults"
+        );
+        default_parameter.zero_grad();
+        explicit_parameter.zero_grad();
+    }
+    assert_eq!(
+        default_adamw.completed_steps(),
+        explicit_adamw.completed_steps()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn abs_and_absolute_error_match_hand_computed_forward_and_gradient_oracles() -> Result<()> {
+    // morpheus's ctr/scl/rad heads train with masked `F.l1_loss` (mean absolute error over
+    // positive-class slots only); it composes as `(pred - target).abs()` then a caller-side
+    // masked mean, exactly like `squared_error`'s own unreduced-then-`.mean()` convention
+    // (research/src/vision/morpheus/docs/axis-issues.md "Elementwise L1 loss (abs)",
+    // axis#89). `sign(0) == 0` below matches PyTorch's own `abs` backward subgradient choice
+    // at exactly zero, not `NaN` or either one-sided slope.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let values = [-3.0f32, -1.0, 0.0, 2.0, 5.0];
+    let x = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let absolute = x.abs()?;
+    close(
+        "abs forward",
+        &absolute.to_vec()?,
+        &values
+            .iter()
+            .map(|&v| f64::from(v).abs())
+            .collect::<Vec<_>>(),
+    );
+    absolute.mean(sample)?.backward()?;
+    close(
+        "abs gradient, zero exactly at x == 0",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[-0.2, -0.2, 0.0, 0.2, 0.2],
+    );
+
+    let target_values = [-1.0f32, 2.0, 0.0, 2.0, 1.0];
+    let pred = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let target =
+        Tensor::from_slice(&target_values, [sample.of(values.len())], &device)?.with_grad();
+    let loss = pred.absolute_error(&target)?;
+    close(
+        "absolute_error forward (unreduced |pred - target|)",
+        &loss.to_vec()?,
+        &[2.0, 3.0, 0.0, 0.0, 4.0],
+    );
+    loss.mean(sample)?.backward()?;
+    close(
+        "absolute_error gradient wrt prediction, zero where pred == target",
+        &pred.grad().expect("prediction gradient").to_vec()?,
+        &[-0.2, -0.2, 0.0, 0.0, 0.2],
+    );
+    close(
+        "absolute_error gradient wrt target",
+        &target.grad().expect("target gradient").to_vec()?,
+        &[0.2, 0.2, 0.0, 0.0, -0.2],
+    );
+
+    let mismatched = Tensor::from_slice(&[1.0, 2.0], [Axis::new("other").of(2)], &device)?;
+    assert!(x.absolute_error(&mismatched).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn abs_matches_hand_computed_oracle_under_reordered_asymmetric_cuda_storage() -> Result<()> {
+    // Elementwise ops read the raw physical buffer and keep the tensor's existing Layout
+    // unchanged (`with_layout` only ever changes physical strides), so `abs` on a permuted,
+    // asymmetric-extent tensor must still read out in the tensor's own logical Shape order via
+    // `to_vec()`, exactly like `sin` or a comparison on a reordered tensor.
+    let device = Device::cuda(0)?;
+    let (batch, time) = (Axis::new("batch"), Axis::new("time"));
+    // value(b, t) written in canonical (batch, time) order; asymmetric extents (3, 2).
+    let values: Vec<f32> = vec![-3.0, 4.0, 0.0, -5.0, 2.0, -1.0];
+    let x = Tensor::from_slice(&values, [batch.of(3), time.of(2)], &device)?
+        .with_layout([time, batch])?
+        .with_grad();
+    let absolute = x.abs()?;
+    assert_eq!(absolute.shape(), x.shape());
+    close(
+        "abs forward under reordered, asymmetric storage",
+        &absolute.to_vec()?,
+        &values
+            .iter()
+            .map(|&v| f64::from(v).abs())
+            .collect::<Vec<_>>(),
+    );
+    absolute.mean([batch, time])?.backward()?;
+    close(
+        "abs gradient under reordered storage lands on the original logical positions",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            -1.0 / 6.0,
+            1.0 / 6.0,
+            0.0,
+            -1.0 / 6.0,
+            1.0 / 6.0,
+            -1.0 / 6.0,
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn exp_forward_and_gradient_match_independent_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    // Hand-computed literals: exp(0) = 1, exp(1) = e, plus exp(-2)/exp(-1)/exp(2).
+    let values = [-2.0_f32, -1.0, 0.0, 1.0, 2.0];
+    let expected = [
+        0.1353352832366127,
+        0.36787944117144233,
+        1.0,
+        std::f64::consts::E,
+        7.38905609893065,
+    ];
+    let leaf = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let output = leaf.exp()?;
+    close("exp forward", &output.to_vec()?, &expected);
+    output.mean(sample)?.backward()?;
+    // Backward is `g * exp(x)`; mean seeds `g = 1 / len`, so the expected gradient is
+    // just the forward oracle scaled the same way.
+    let expected_gradient: Vec<f64> = expected.iter().map(|&y| y / values.len() as f64).collect();
+    close(
+        "exp derivative (g * exp(x))",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    // Reordered-storage CUDA case: physical order different from logical order.
+    let (row, col) = (Axis::new("exp_row"), Axis::new("exp_col"));
+    let wide_values: Vec<f32> = (0..201).map(|i| (i as f32 - 100.0) / 25.0).collect();
+    let wide_leaf = Tensor::from_slice(&wide_values, [row.of(3), col.of(67)], &device)?.with_grad();
+    let wide_output = wide_leaf.with_layout([col, row])?.exp()?;
+    let wide_expected: Vec<f64> = wide_values.iter().map(|&x| f64::from(x).exp()).collect();
+    close(
+        "exp forward (reordered storage)",
+        &wide_output.to_vec()?,
+        &wide_expected,
+    );
+    wide_output.mean([row, col])?.backward()?;
+    let wide_expected_gradient: Vec<f64> = wide_expected
+        .iter()
+        .map(|&y| y / wide_values.len() as f64)
+        .collect();
+    close(
+        "exp derivative (reordered storage)",
+        &wide_leaf.grad().unwrap().to_vec()?,
+        &wide_expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn ln_forward_and_gradient_match_independent_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    // Hand-computed literals: ln(1) = 0, ln(e) = 1, plus ln(0.25) = -ln(4).
+    let values = [0.25_f32, 1.0, std::f32::consts::E, 4.0];
+    let expected = [-1.3862943611198906, 0.0, 1.0, 1.3862943611198906];
+    let leaf = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let output = leaf.ln()?;
+    close("ln forward", &output.to_vec()?, &expected);
+    output.mean(sample)?.backward()?;
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| 1.0 / f64::from(x) / values.len() as f64)
+        .collect();
+    close(
+        "ln derivative (g / x)",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    // IEEE behaviour at and below zero: no clamping, matching f32::ln/torch.log.
+    let boundary = Tensor::from_slice(&[0.0_f32, -1.0], [sample.of(2)], &device)?;
+    let boundary_output = boundary.ln()?.to_vec()?;
+    assert!(
+        boundary_output[0].is_infinite() && boundary_output[0].is_sign_negative(),
+        "ln(0) must be -inf, got {}",
+        boundary_output[0]
+    );
+    assert!(
+        boundary_output[1].is_nan(),
+        "ln(-1) must be NaN, got {}",
+        boundary_output[1]
+    );
+
+    // Reordered-storage CUDA case: physical order different from logical order.
+    let (row, col) = (Axis::new("ln_row"), Axis::new("ln_col"));
+    let wide_values: Vec<f32> = (0..201).map(|i| (i as f32 + 1.0) / 25.0).collect();
+    let wide_leaf = Tensor::from_slice(&wide_values, [row.of(3), col.of(67)], &device)?.with_grad();
+    let wide_output = wide_leaf.with_layout([col, row])?.ln()?;
+    let wide_expected: Vec<f64> = wide_values.iter().map(|&x| f64::from(x).ln()).collect();
+    close(
+        "ln forward (reordered storage)",
+        &wide_output.to_vec()?,
+        &wide_expected,
+    );
+    wide_output.mean([row, col])?.backward()?;
+    let wide_expected_gradient: Vec<f64> = wide_values
+        .iter()
+        .map(|&x| 1.0 / f64::from(x) / wide_values.len() as f64)
+        .collect();
+    close(
+        "ln derivative (reordered storage)",
+        &wide_leaf.grad().unwrap().to_vec()?,
+        &wide_expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn softplus_forward_and_gradient_match_pytorch_beta1_threshold40_oracle() -> Result<()> {
+    // `world/energy-output`'s exact consumer configuration (every `fit_*.py`'s
+    // nonlinearity): `torch.nn.Softplus(beta=1, threshold=40)`.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let (beta, threshold) = (1.0_f32, 40.0_f32);
+    // Hand-computed literals: softplus(0) = ln(2); x = 41 clears beta*x > 40, so the
+    // linear branch returns x itself with gradient exactly 1; x = -41 is deep in the
+    // logarithmic branch, where softplus(x) is negligible.
+    let values = [0.0_f32, 41.0, -41.0, -2.0, 2.0];
+    let expected = [
+        std::f64::consts::LN_2,
+        41.0,
+        1.5628821893349888e-18,
+        0.1269280110429725,
+        2.1269280110429727,
+    ];
+    let leaf = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let output = leaf.softplus(beta, threshold)?;
+    close("softplus forward", &output.to_vec()?, &expected);
+    output.mean(sample)?.backward()?;
+    let n = values.len() as f64;
+    let expected_gradient = [
+        0.5 / n,
+        1.0 / n,
+        1.5628821893349888e-18 / n,
+        0.11920292202211755 / n,
+        0.8807970779778823 / n,
+    ];
+    close(
+        "softplus derivative (sigmoid(beta*x), 1 past the threshold)",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    assert!(leaf.softplus(0.0, threshold).is_err());
+    assert!(leaf.softplus(-1.0, threshold).is_err());
+    assert!(leaf.softplus(f32::NAN, threshold).is_err());
+    assert!(leaf.softplus(beta, f32::NAN).is_err());
+    assert!(leaf.softplus(beta, f32::INFINITY).is_err());
+
+    // Reordered-storage CUDA case spanning both branches (|x| up to 50 crosses
+    // beta * x > 40 on both signs of the permuted tensor).
+    let (row, col) = (Axis::new("softplus_row"), Axis::new("softplus_col"));
+    let wide_values: Vec<f32> = (0..201).map(|i| (i as f32 - 100.0) / 2.0).collect();
+    let wide_leaf = Tensor::from_slice(&wide_values, [row.of(3), col.of(67)], &device)?.with_grad();
+    let wide_output = wide_leaf
+        .with_layout([col, row])?
+        .softplus(beta, threshold)?;
+    let wide_expected: Vec<f64> = wide_values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            let scaled = f64::from(beta) * x;
+            if scaled > f64::from(threshold) {
+                x
+            } else {
+                (1.0 + scaled.exp()).ln() / f64::from(beta)
+            }
+        })
+        .collect();
+    close(
+        "softplus forward (reordered storage)",
+        &wide_output.to_vec()?,
+        &wide_expected,
+    );
+    wide_output.mean([row, col])?.backward()?;
+    let wide_expected_gradient: Vec<f64> = wide_values
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            let scaled = f64::from(beta) * x;
+            let derivative = if scaled > f64::from(threshold) {
+                1.0
+            } else {
+                1.0 / (1.0 + (-scaled).exp())
+            };
+            derivative / wide_values.len() as f64
+        })
+        .collect();
+    close(
+        "softplus derivative (reordered storage)",
+        &wide_leaf.grad().unwrap().to_vec()?,
+        &wide_expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clamp_matches_hand_computed_values_below_inside_above_at_bound_and_nan() -> Result<()> {
+    // vision/image-encode's stage_a.py:72, `sites.clamp_(0, 1)`, keeps site positions inside
+    // the unit square after each Adam step -- both bounds given, matching torch.clamp(x, 0, 1).
+    // Cover below-both-bounds, exactly-at-min, strictly-inside, exactly-at-max,
+    // above-both-bounds, and a NaN element (Axis tensors are dense f32, so a real caller can
+    // hand clamp() one).
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let values = [-2.0f32, -0.5, 0.0, 0.3, 0.7, 1.0, 1.5, 2.0, f32::NAN];
+    let x = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+
+    let clamped = x.clamp(Some(0.0), Some(1.0))?;
+    assert_eq!(clamped.shape(), x.shape());
+    let actual = clamped.to_vec()?;
+    assert!(
+        actual[8].is_nan(),
+        "a NaN input must propagate unclamped, got {}",
+        actual[8]
+    );
+    close(
+        "clamp(0, 1) forward, below/at-min/inside/at-max/above",
+        &actual[..8],
+        &[0.0, 0.0, 0.0, 0.3, 0.7, 1.0, 1.0, 1.0],
+    );
+
+    clamped.mean(sample)?.backward()?;
+    // PyTorch's clamp gradient: 1 where min <= x <= max (inclusive of both bounds), 0
+    // elsewhere -- including NaN, since `x >= min` is itself false for NaN.
+    let n = values.len() as f64;
+    close(
+        "clamp(0, 1) gradient, below/at-min/inside/at-max/above/nan",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[0.0, 0.0, 1.0 / n, 1.0 / n, 1.0 / n, 1.0 / n, 0.0, 0.0, 0.0],
+    );
+
+    // Rejections before any device launch.
+    assert!(
+        x.clamp(Some(2.0), Some(1.0)).is_err(),
+        "min > max must be rejected"
+    );
+    assert!(
+        x.clamp(Some(f32::NAN), None).is_err(),
+        "a NaN min must be rejected"
+    );
+    assert!(
+        x.clamp(None, Some(f32::NAN)).is_err(),
+        "a NaN max must be rejected"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clamp_with_only_a_min_bound_matches_energy_output_denominator_floor() -> Result<()> {
+    // world/energy-output's fit_reconstruction.py:100-101, `counts.clamp(min=1)`, floors a
+    // per-feature observed count before it becomes a division denominator -- only `min` is
+    // given, so `max` stays unbounded (`None`), matching torch.clamp(counts, min=1).
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("feature");
+    let values = [0.0f32, 0.5, 1.0, 3.0];
+    let counts = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+
+    let floored = counts.clamp(Some(1.0), None)?;
+    close(
+        "clamp(min=1) forward",
+        &floored.to_vec()?,
+        &[1.0, 1.0, 1.0, 3.0],
+    );
+
+    floored.mean(feature)?.backward()?;
+    close(
+        "clamp(min=1) gradient: zero below the floor, one at and above it",
+        &counts.grad().expect("counts gradient").to_vec()?,
+        &[0.0, 0.0, 0.25, 0.25],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clamp_matches_logical_order_under_reordered_cuda_storage() -> Result<()> {
+    // Elementwise ops read the raw physical buffer and keep the tensor's existing Layout
+    // unchanged (`with_layout` only ever changes physical strides), so clamp on a
+    // reordered-storage tensor must still read out in the tensor's own logical Shape order
+    // via `to_vec()`, exactly like `sign`, `sin`, or the scalar comparisons.
+    let device = Device::cuda(0)?;
+    let (batch, time) = (Axis::new("batch"), Axis::new("time"));
+    let values: Vec<f32> = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+    let x = Tensor::from_slice(&values, [batch.of(2), time.of(3)], &device)?
+        .with_layout([time, batch])?;
+    let clamped = x.clamp(Some(-1.0), Some(1.0))?;
+    assert_eq!(clamped.shape(), x.shape());
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&v| f64::from(v.clamp(-1.0, 1.0)))
+        .collect();
+    close(
+        "reordered-storage clamp(-1, 1)",
+        &clamped.to_vec()?,
+        &expected,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_axis_roll_matches_hand_computed_values_gradients_and_wrap_around() -> Result<()> {
+    // SwinIR's shifted-window attention (network_swinir.py:251,271): a
+    // [height, width] feature map, `torch.roll(x, shifts=(-s, -s), dims=(1, 2))`
+    // done as two independent single-axis calls. Values 0..12 in
+    // [height(4), width(3)] row-major order:
+    //   row0 [0,1,2]  row1 [3,4,5]  row2 [6,7,8]  row3 [9,10,11]
+    let device = Device::cuda(0)?;
+    let (height, width, missing) = (
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("missing"),
+    );
+    let values: Vec<f32> = (0..12).map(|v| v as f32).collect();
+    let a = Tensor::from_slice(&values, [height.of(4), width.of(3)], &device)?;
+
+    // Positive shift: torch.roll's convention moves element i to i+shift, so
+    // output row j holds input row (j - shift) mod 4. shift=1 -> row0 <- row3,
+    // row1 <- row0, row2 <- row1, row3 <- row2.
+    close(
+        "roll height by +1",
+        &a.roll(height, 1)?.to_vec()?,
+        &[9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    );
+    // Negative shift is the exact inverse: row j holds input row (j + 1) mod 4.
+    close(
+        "roll height by -1",
+        &a.roll(height, -1)?.to_vec()?,
+        &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0],
+    );
+    // Wrap-around: a shift outside [-extent, extent] reduces mod the axis
+    // extent (4), so +5 and -5 reproduce the +1 and -1 results above exactly.
+    close(
+        "roll height by +5 (wraps to +1)",
+        &a.roll(height, 5)?.to_vec()?,
+        &[9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    );
+    close(
+        "roll height by -5 (wraps to -1)",
+        &a.roll(height, -5)?.to_vec()?,
+        &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0],
+    );
+    // Shift 0 and shift = a multiple of the extent are the identity.
+    let identity: Vec<f64> = values.iter().map(|&v| f64::from(v)).collect();
+    close(
+        "roll height by 0 is identity",
+        &a.roll(height, 0)?.to_vec()?,
+        &identity,
+    );
+    close(
+        "roll height by extent (4) is identity",
+        &a.roll(height, 4)?.to_vec()?,
+        &identity,
+    );
+
+    // Rolling the OTHER named axis leaves height untouched: shift width by +1
+    // rotates each row's 3 columns independently (col0 <- col2 within the row).
+    close(
+        "roll width by +1 (independent axis)",
+        &a.roll(width, 1)?.to_vec()?,
+        &[2.0, 0.0, 1.0, 5.0, 3.0, 4.0, 8.0, 6.0, 7.0, 11.0, 9.0, 10.0],
+    );
+
+    // Gradient: y = roll(x, height, +1), loss = mean(y * w) over w = 1..12
+    // (same [height, width] layout). dLoss/dy = w / 12. The chosen composition
+    // (concat of two narrow slices) makes backward exactly the inverse roll,
+    // dLoss/dx = roll(dLoss/dy, -1): row j of dx holds row (j + 1) mod 4 of
+    // w/12 -- computed here from the mathematical definition of roll, not by
+    // calling the op under test.
+    let x = Tensor::from_slice(&values, [height.of(4), width.of(3)], &device)?.with_grad();
+    let weights: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let w = Tensor::from_slice(&weights, [height.of(4), width.of(3)], &device)?;
+    x.roll(height, 1)?
+        .mul(&w)?
+        .mean([height, width])?
+        .backward()?;
+    close(
+        "roll height by +1 gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            4.0 / 12.0,
+            5.0 / 12.0,
+            6.0 / 12.0,
+            7.0 / 12.0,
+            8.0 / 12.0,
+            9.0 / 12.0,
+            10.0 / 12.0,
+            11.0 / 12.0,
+            12.0 / 12.0,
+            1.0 / 12.0,
+            2.0 / 12.0,
+            3.0 / 12.0,
+        ],
+    );
+
+    // Reordered-storage CUDA case: the same logical tensor built with a
+    // transposed physical layout must roll to the identical logical values
+    // (`to_vec` follows `Shape.dims()` order, not physical strides).
+    let permuted = Tensor::from_slice(&values, [height.of(4), width.of(3)], &device)?
+        .with_layout([width, height])?;
+    close(
+        "roll height by +1 over reordered storage",
+        &permuted.roll(height, 1)?.to_vec()?,
+        &[9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    );
+
+    // A missing axis is rejected before any device work.
+    assert!(a.roll(missing, 1).is_err());
+    println!("named-axis roll values, gradients, and reordered-storage PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn broadcast_to_composes_an_outer_pairwise_squared_distance_matching_torch_cdist() -> Result<()> {
+    // vision/image-encode's Stage A `soft_recon` computes `torch.cdist(P, sites) ** 2`, a
+    // (pixel, site) squared-distance matrix from `P: (pixel, coord)` and `sites: (site,
+    // coord)` (`stage_a.py:42`). Neither operand's axis set is a subset of the other's --
+    // `pixel` and `site` are each missing from the other operand -- so plain elementwise
+    // `sub` refuses them ("incomparable axis sets: elementwise broadcasting cannot introduce
+    // an implicit outer product", `binary` in `algebra/tensor.rs`). `broadcast_to` gives each
+    // operand the axis it lacks, onto one explicit shared `[pixel, site, coord]` shape, so an
+    // ordinary `sub`/`mul`/`sum` composes the outer pairwise squared distance with no
+    // dedicated outer-product op.
+    let device = Device::cuda(0)?;
+    let (pixel, site, coord) = (Axis::new("pixel"), Axis::new("site"), Axis::new("coord"));
+    // [pixel, coord]: p0=(0,0) p1=(1,2) p2=(3,-1)
+    let p_values = [0.0f32, 0.0, 1.0, 2.0, 3.0, -1.0];
+    // [site, coord]: s0=(1,0) s1=(-2,3)
+    let s_values = [1.0f32, 0.0, -2.0, 3.0];
+    let p = Tensor::from_slice(&p_values, [pixel.of(3), coord.of(2)], &device)?.with_grad();
+    let sites = Tensor::from_slice(&s_values, [site.of(2), coord.of(2)], &device)?.with_grad();
+    let shape = Shape::new([pixel.of(3), site.of(2), coord.of(2)])?;
+
+    // Rejections before any device work: the target must carry every axis `self` has, at
+    // `self`'s own extent -- it can add axes, never drop or resize one.
+    let missing_coord = Shape::new([pixel.of(3), site.of(2)])?; // drops `coord`, which p has
+    assert!(p.broadcast_to(&missing_coord).is_err());
+    let wrong_extent = Shape::new([pixel.of(3), site.of(2), coord.of(5)])?; // coord resized
+    assert!(p.broadcast_to(&wrong_extent).is_err());
+
+    let p_outer = p.broadcast_to(&shape)?;
+    let sites_outer = sites.broadcast_to(&shape)?;
+    let delta = p_outer.sub(&sites_outer)?;
+    let squared_distance = delta.mul(&delta)?.sum(coord)?;
+
+    // Hand-computed: d2[p, s] = (P[p,0]-S[s,0])^2 + (P[p,1]-S[s,1])^2, pixel-major.
+    close(
+        "outer-broadcast pairwise squared distance matches torch.cdist(P, sites) ** 2",
+        &squared_distance.to_vec()?,
+        &[1.0, 13.0, 4.0, 10.0, 5.0, 41.0],
+    );
+
+    squared_distance.mean([pixel, site])?.backward()?;
+    // Broadcast backward sums the upstream gradient over the axis each side added: `p`'s
+    // gradient sums over every `site`, `sites`'s gradient sums over every `pixel`.
+    close(
+        "broadcast backward sums P's gradient over every site",
+        &p.grad().expect("P gradient").to_vec()?,
+        &[1.0 / 3.0, -1.0, 1.0, 1.0 / 3.0, 7.0 / 3.0, -5.0 / 3.0],
+    );
+    close(
+        "broadcast backward sums sites's gradient over every pixel",
+        &sites.grad().expect("sites gradient").to_vec()?,
+        &[-1.0 / 3.0, -1.0 / 3.0, -10.0 / 3.0, 8.0 / 3.0],
+    );
+    println!("outer-broadcast pairwise squared distance PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn broadcast_to_matches_hand_computed_pairwise_squared_distance_under_reordered_storage()
+-> Result<()> {
+    // Same outer-broadcast composition as the test above, this time with both operands'
+    // PHYSICAL storage transposed relative to their logical [pixel, coord] / [site, coord]
+    // order (mirroring `stage_a.py`'s `P`/`sites` tensors, which are ordinary row-major
+    // torch tensors but could equally arrive permuted): `broadcast_to` must read through
+    // `self.0.layout`'s permuted strides, not assume either operand is already contiguous
+    // in its declared axis order.
+    let device = Device::cuda(0)?;
+    let (pixel, site, coord) = (Axis::new("pixel"), Axis::new("site"), Axis::new("coord"));
+    // [pixel, coord]: p0=(0,1) p1=(2,-1) p2=(-3,0) p3=(1,1)
+    let p_values = [0.0f32, 1.0, 2.0, -1.0, -3.0, 0.0, 1.0, 1.0];
+    // [site, coord]: s0=(0,0) s1=(2,2) s2=(-1,-1)
+    let s_values = [0.0f32, 0.0, 2.0, 2.0, -1.0, -1.0];
+    let p = Tensor::from_slice(&p_values, [pixel.of(4), coord.of(2)], &device)?
+        .with_layout([coord, pixel])?
+        .with_grad();
+    let sites = Tensor::from_slice(&s_values, [site.of(3), coord.of(2)], &device)?
+        .with_layout([coord, site])?
+        .with_grad();
+    let shape = Shape::new([pixel.of(4), site.of(3), coord.of(2)])?;
+
+    let delta = p.broadcast_to(&shape)?.sub(&sites.broadcast_to(&shape)?)?;
+    let squared_distance = delta.mul(&delta)?.sum(coord)?;
+
+    close(
+        "reordered-storage outer-broadcast forward",
+        &squared_distance.to_vec()?,
+        &[1.0, 5.0, 5.0, 5.0, 9.0, 9.0, 9.0, 29.0, 5.0, 2.0, 2.0, 8.0],
+    );
+
+    squared_distance.mean([pixel, site])?.backward()?;
+    close(
+        "reordered-storage outer-broadcast P gradient",
+        &p.grad().expect("P gradient").to_vec()?,
+        &[
+            -1.0 / 6.0,
+            1.0 / 3.0,
+            5.0 / 6.0,
+            -2.0 / 3.0,
+            -5.0 / 3.0,
+            -1.0 / 6.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+        ],
+    );
+    close(
+        "reordered-storage outer-broadcast sites gradient",
+        &sites.grad().expect("sites gradient").to_vec()?,
+        &[
+            0.0,
+            -1.0 / 6.0,
+            4.0 / 3.0,
+            7.0 / 6.0,
+            -2.0 / 3.0,
+            -5.0 / 6.0,
+        ],
+    );
+    println!("reordered-storage outer-broadcast pairwise squared distance PASS");
+    Ok(())
+}

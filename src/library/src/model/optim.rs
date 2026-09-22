@@ -182,10 +182,23 @@ pub struct AdamW(Adam);
 
 impl AdamW {
     pub fn new(learning_rate: f32, weight_decay: f32) -> Result<Self> {
+        Self::with_hyperparameters(learning_rate, weight_decay, 0.9, 0.999, 1e-8)
+    }
+
+    /// AdamW with explicit `beta1`, `beta2`, and `epsilon` instead of
+    /// [`AdamW::new`]'s defaults (`0.9`, `0.999`, `1e-8`), validated exactly as
+    /// [`Adam::with_hyperparameters`] validates its own.
+    pub fn with_hyperparameters(
+        learning_rate: f32,
+        weight_decay: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+    ) -> Result<Self> {
         if !weight_decay.is_finite() || weight_decay < 0.0 {
             return Err("AdamW weight decay must be finite and nonnegative".into());
         }
-        let mut adam = Adam::new(learning_rate)?;
+        let mut adam = Adam::with_hyperparameters(learning_rate, beta1, beta2, epsilon)?;
         adam.weight_decay = weight_decay;
         Ok(Self(adam))
     }

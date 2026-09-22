@@ -65,6 +65,14 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn abs(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn abs_backward(&self, _gradient: &Buffer, _input: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn mask_gradient(&self, _gradient: &Buffer, _winners: &Buffer) -> Result<Buffer> {
         unavailable()
     }
@@ -167,7 +175,51 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn exp(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn exp_backward(&self, _gradient: &Buffer, _output: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn ln(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn ln_backward(&self, _gradient: &Buffer, _input: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn softplus(&self, _a: &Buffer, _beta: f32, _threshold: f32) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn softplus_backward(
+        &self,
+        _gradient: &Buffer,
+        _input: &Buffer,
+        _beta: f32,
+        _threshold: f32,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn compare_scalar(&self, _a: &Buffer, _scalar: f32, _op: i32) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn clamp(&self, _a: &Buffer, _min: f32, _max: f32) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn clamp_backward(
+        &self,
+        _gradient: &Buffer,
+        _a: &Buffer,
+        _min: f32,
+        _max: f32,
+    ) -> Result<Buffer> {
         unavailable()
     }
 
