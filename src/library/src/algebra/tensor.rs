@@ -2488,11 +2488,9 @@ impl Tensor {
     pub fn broadcast_to(&self, shape: &Shape) -> Result<Self> {
         for dim in self.shape().dims() {
             if !shape.contains(dim.axis) {
-                return Err(format!(
-                    "broadcast_to target shape is missing axis {:?}",
-                    dim.axis
-                )
-                .into());
+                return Err(
+                    format!("broadcast_to target shape is missing axis {:?}", dim.axis).into(),
+                );
             }
             if shape.extent(dim.axis)? != dim.extent {
                 return Err(format!("broadcast_to extent mismatch for {:?}", dim.axis).into());

@@ -5202,14 +5202,7 @@ fn broadcast_to_composes_an_outer_pairwise_squared_distance_matching_torch_cdist
     close(
         "broadcast backward sums P's gradient over every site",
         &p.grad().expect("P gradient").to_vec()?,
-        &[
-            1.0 / 3.0,
-            -1.0,
-            1.0,
-            1.0 / 3.0,
-            7.0 / 3.0,
-            -5.0 / 3.0,
-        ],
+        &[1.0 / 3.0, -1.0, 1.0, 1.0 / 3.0, 7.0 / 3.0, -5.0 / 3.0],
     );
     close(
         "broadcast backward sums sites's gradient over every pixel",
@@ -5271,7 +5264,14 @@ fn broadcast_to_matches_hand_computed_pairwise_squared_distance_under_reordered_
     close(
         "reordered-storage outer-broadcast sites gradient",
         &sites.grad().expect("sites gradient").to_vec()?,
-        &[0.0, -1.0 / 6.0, 4.0 / 3.0, 7.0 / 6.0, -2.0 / 3.0, -5.0 / 6.0],
+        &[
+            0.0,
+            -1.0 / 6.0,
+            4.0 / 3.0,
+            7.0 / 6.0,
+            -2.0 / 3.0,
+            -5.0 / 6.0,
+        ],
     );
     println!("reordered-storage outer-broadcast pairwise squared distance PASS");
     Ok(())
