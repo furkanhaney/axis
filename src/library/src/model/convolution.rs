@@ -616,8 +616,15 @@ impl Pooling1d {
         }
     }
 
+    /// Add the lifted unit axis (extent one, so it changes nothing else) to a real input shape.
+    fn lift(&self, input: &Shape) -> Result<Shape> {
+        let mut dims = input.dims().to_vec();
+        dims.push(self.unit.of(1));
+        Shape::new(dims)
+    }
+
     fn output_shape(&self, input: &Shape) -> Result<Shape> {
-        let shape = self.inner.output_shape(input)?;
+        let shape = self.inner.output_shape(&self.lift(input)?)?;
         Shape::new(
             shape
                 .dims()
@@ -628,9 +635,7 @@ impl Pooling1d {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let mut dims = input.shape().dims().to_vec();
-        dims.push(self.unit.of(1));
-        let lifted = input.broadcast_to(&Shape::new(dims)?)?;
+        let lifted = input.broadcast_to(&self.lift(input.shape())?)?;
         self.inner.forward(&lifted)?.select(self.unit, 0)
     }
 }

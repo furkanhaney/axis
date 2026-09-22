@@ -6427,3 +6427,652 @@ fn masked_softmax_matches_hand_computed_oracle_under_reordered_storage() -> Resu
     );
     Ok(())
 }
+
+#[test]
+fn pooling_family_rejects_invalid_configuration_before_launch() {
+    let (channel, height, width) = (Axis::new("channel"), Axis::new("height"), Axis::new("width"));
+    let shape = Shape::new([channel.of(2), height.of(4), width.of(4)]).unwrap();
+    let line = Shape::new([channel.of(2), height.of(5)]).unwrap();
+
+    // MaxPool1d/AvgPool1d reuse `Pooling<2>`'s own geometry through the lift, so the same
+    // padding/positive/fit checks apply through one spatial axis.
+    let error = MaxPool1d::new(channel, height, 2)
+        .padding(3)
+        .output_shape(&line)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("padding must be at most half"), "{error}");
+    let error = AvgPool1d::new(channel, height, 0)
+        .output_shape(&line)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("positive"), "{error}");
+
+    // AvgPool2d/AvgPool3d share `MaxPool2d`/`MaxPool3d`'s own padding and distinct-axis checks.
+    let error = AvgPool2d::new(channel, [height, width], [2, 2])
+        .padding([3, 0])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("padding must be at most half"), "{error}");
+    let error = AvgPool2d::new(channel, [channel, width], [2, 2])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("distinct"), "{error}");
+
+    // LPPool rejects a non-positive `p` before any shape is even consulted.
+    assert!(LPPool1d::new(channel, height, 0, 2).is_err());
+    assert!(LPPool2d::new(channel, [height, width], 0, [2, 2]).is_err());
+    assert!(LPPool3d::new(channel, [height, width, channel.role("d")], 0, [2, 2, 2]).is_err());
+    let pool = LPPool2d::new(channel, [height, width], 2, [2, 2]).unwrap();
+    assert_eq!(
+        pool.output_shape(&shape).unwrap(),
+        Shape::new([height.of(2), width.of(2), channel.of(2)]).unwrap()
+    );
+
+    // Adaptive pooling rejects a zero target and a repeated spatial axis before launch, and
+    // otherwise reports the expected pooled shape purely from shape math (no device needed).
+    let error = AdaptiveAvgPool1d::new(height, 0)
+        .output_shape(&line)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("positive"), "{error}");
+    let error = AdaptiveMaxPool2d::new([height, height], [2, 2])
+        .output_shape(&shape)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("distinct"), "{error}");
+    let adaptive = AdaptiveAvgPool2d::new([height, width], [1, 1]);
+    assert_eq!(
+        adaptive.output_shape(&shape).unwrap(),
+        Shape::new([channel.of(2), height.of(1), width.of(1)]).unwrap()
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool2d_asymmetric_kernel_matches_hand_computed_forward_and_gradient() -> Result<()> {
+    // The existing MaxPool2d oracles both use square kernels; this closes that gap with a
+    // genuinely non-square kernel/stride (height 2, width 3), auditing MaxPool2d's own CUDA
+    // coverage against the module-backlog's "asymmetric geometry" bar.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    #[rustfmt::skip]
+    let inputs: [f32; 12] = [
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0,
+    ];
+    let input = Tensor::from_slice(&inputs, [channel.of(1), height.of(3), width.of(4)], &device)?
+        .with_grad();
+
+    let mut pool = MaxPool2d::new(channel, [height, width], [2, 3]).stride([1, 1]);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([height.of(2), width.of(2), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "asymmetric-kernel MaxPool2d forward",
+        &actual.to_vec()?,
+        &[7.0, 8.0, 11.0, 12.0],
+    );
+
+    actual.mean([channel, height, width])?.backward()?;
+    #[rustfmt::skip]
+    let expected_gradient: [f64; 12] = [
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.25, 0.25,
+        0.0, 0.0, 0.25, 0.25,
+    ];
+    close(
+        "asymmetric-kernel MaxPool2d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool3d_matches_hand_computed_forward_and_gradient_under_reordered_storage() -> Result<()> {
+    // The existing MaxPool3d oracle never reorders physical storage; this closes that gap
+    // (`max_pool2d_with_padding...` already covers reordering for the 2D case). Two channels
+    // pool independently and pick different winning positions, so independence survives the
+    // reorder too.
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    #[rustfmt::skip]
+    let inputs: [f32; 8] = [
+        1.0, 2.0, 3.0, 4.0,
+        -1.0, -2.0, -3.0, -4.0,
+    ];
+    let input = Tensor::from_slice(
+        &inputs,
+        [channel.of(2), depth.of(1), height.of(2), width.of(2)],
+        &device,
+    )?
+    .with_layout([width, height, depth, channel])?
+    .with_grad();
+
+    let mut pool = MaxPool3d::new(channel, [depth, height, width], [1, 2, 2]);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([depth.of(1), height.of(1), width.of(1), channel.of(2)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "reordered-storage MaxPool3d forward",
+        &actual.to_vec()?,
+        &[4.0, -1.0],
+    );
+
+    actual.mean([channel, depth, height, width])?.backward()?;
+    close(
+        "reordered-storage MaxPool3d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn max_pool1d_matches_hand_computed_forward_and_gradient_with_padding() -> Result<()> {
+    // `MaxPool1d` has no dedicated unfold kernel; it lifts through `MaxPool2d`'s own two-axis
+    // machinery via a broadcast unit axis. Padding, overlap (stride < kernel), and negative
+    // infinity fill all round-trip through the lift correctly.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let inputs: [f32; 5] = [3.0, -1.0, 5.0, 2.0, -4.0];
+    let input = Tensor::from_slice(&inputs, [channel.of(1), length.of(5)], &device)?.with_grad();
+
+    let mut pool = MaxPool1d::new(channel, length, 3).stride(1).padding(1);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([length.of(5), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "MaxPool1d forward",
+        &actual.to_vec()?,
+        &[3.0, 5.0, 5.0, 5.0, 2.0],
+    );
+
+    actual.mean([channel, length])?.backward()?;
+    close(
+        "MaxPool1d gradient (overlapping windows sum onto their shared source)",
+        &input.grad().unwrap().to_vec()?,
+        &[0.2, 0.0, 0.6, 0.2, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool1d_matches_hand_computed_forward_and_gradient_with_padding() -> Result<()> {
+    // `count_include_pad=True` (PyTorch's default): every window divides by the full kernel
+    // extent (3), never by the count of real positions, so the edge windows here divide by 3
+    // even though one of their three positions is padding.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let inputs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let input = Tensor::from_slice(&inputs, [channel.of(1), length.of(4)], &device)?.with_grad();
+
+    let mut pool = AvgPool1d::new(channel, length, 3).stride(1).padding(1);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(output_shape, Shape::new([length.of(4), channel.of(1)])?);
+    let actual = pool.forward(&input)?;
+    close(
+        "AvgPool1d forward with count_include_pad=True",
+        &actual.to_vec()?,
+        &[1.0, 2.0, 3.0, 2.3333333333333335],
+    );
+
+    actual.mean([channel, length])?.backward()?;
+    close(
+        "AvgPool1d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[1.0 / 6.0, 0.25, 0.25, 1.0 / 6.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool2d_matches_hand_computed_forward_and_gradient_with_asymmetric_kernel_and_reordered_storage()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let inputs: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let input = Tensor::from_slice(&inputs, [channel.of(1), height.of(2), width.of(3)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+
+    let mut pool = AvgPool2d::new(channel, [height, width], [1, 2]).stride([1, 1]);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([height.of(2), width.of(2), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "reordered-storage asymmetric-kernel AvgPool2d forward",
+        &actual.to_vec()?,
+        &[1.5, 2.5, 4.5, 5.5],
+    );
+
+    actual.mean([channel, height, width])?.backward()?;
+    close(
+        "reordered-storage asymmetric-kernel AvgPool2d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.125, 0.25, 0.125, 0.125, 0.25, 0.125],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn avg_pool3d_matches_hand_computed_forward_and_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    #[rustfmt::skip]
+    let inputs: [f32; 8] = [
+        1.0, 2.0, 3.0, 4.0,
+        10.0, 20.0, 30.0, 40.0,
+    ];
+    let input = Tensor::from_slice(
+        &inputs,
+        [channel.of(1), depth.of(2), height.of(2), width.of(2)],
+        &device,
+    )?
+    .with_grad();
+
+    let mut pool = AvgPool3d::new(channel, [depth, height, width], [2, 1, 1]);
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([depth.of(1), height.of(2), width.of(2), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "AvgPool3d forward",
+        &actual.to_vec()?,
+        &[5.5, 11.0, 16.5, 22.0],
+    );
+
+    actual.mean([channel, depth, height, width])?.backward()?;
+    close(
+        "AvgPool3d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.125; 8],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn lp_pool1d_matches_sum_pooling_at_p_one() -> Result<()> {
+    // At `p = 1`, `(sum(x^1))^(1/1)` is exactly sum pooling; negative values exercise the
+    // sign-guarded root (`sign(sum) * |sum|^(1/p)`) at its simplest case, where it must reduce
+    // to the identity.
+    let device = Device::cuda(0)?;
+    let (channel, length) = (Axis::new("channel"), Axis::new("length"));
+    let inputs: [f32; 4] = [3.0, -5.0, 2.0, -1.0];
+    let input = Tensor::from_slice(&inputs, [channel.of(1), length.of(4)], &device)?.with_grad();
+
+    let mut pool = LPPool1d::new(channel, length, 1, 2)?;
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(output_shape, Shape::new([length.of(2), channel.of(1)])?);
+    let actual = pool.forward(&input)?;
+    close("LPPool1d(p=1) forward", &actual.to_vec()?, &[-2.0, 1.0]);
+
+    actual.mean([channel, length])?.backward()?;
+    close(
+        "LPPool1d(p=1) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.5, 0.5, 0.5, 0.5],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn lp_pool2d_matches_hand_computed_l2_forward_and_gradient_under_reordered_storage() -> Result<()>
+{
+    // `p = 2`: `sqrt(sum(x^2))`, the ordinary L2 norm, whose gradient `x_i / y` is an
+    // independent closed form distinct from the op's own composition.
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let inputs: [f32; 4] = [3.0, -4.0, 0.0, 0.0];
+    let input = Tensor::from_slice(&inputs, [channel.of(1), height.of(2), width.of(2)], &device)?
+        .with_layout([width, height, channel])?
+        .with_grad();
+
+    let mut pool = LPPool2d::new(channel, [height, width], 2, [2, 2])?;
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([height.of(1), width.of(1), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "reordered-storage LPPool2d(p=2) forward",
+        &actual.to_vec()?,
+        &[5.0],
+    );
+
+    actual.mean([channel, height, width])?.backward()?;
+    close(
+        "reordered-storage LPPool2d(p=2) gradient (x_i / ||x||_2)",
+        &input.grad().unwrap().to_vec()?,
+        &[0.6, -0.8, 0.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn lp_pool3d_matches_hand_computed_forward_and_gradient_with_negative_sum() -> Result<()> {
+    // `p = 3` (odd) over an all-negative window leaves `sum(x^3)` negative, exercising the
+    // `sign(sum)` branch for real: a literal `(-10.0).powf(1.0 / 3.0)` would be `NaN`.
+    let device = Device::cuda(0)?;
+    let (channel, depth, height, width) = (
+        Axis::new("channel"),
+        Axis::new("depth"),
+        Axis::new("height"),
+        Axis::new("width"),
+    );
+    let inputs: [f32; 3] = [-1.0, -2.0, -1.0];
+    let input = Tensor::from_slice(
+        &inputs,
+        [channel.of(1), depth.of(1), height.of(1), width.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let mut pool = LPPool3d::new(channel, [depth, height, width], 3, [1, 1, 3])?;
+    let output_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        output_shape,
+        Shape::new([depth.of(1), height.of(1), width.of(1), channel.of(1)])?
+    );
+    let actual = pool.forward(&input)?;
+    close(
+        "LPPool3d(p=3) forward",
+        &actual.to_vec()?,
+        &[-2.154434690031884],
+    );
+
+    actual.mean([channel, depth, height, width])?.backward()?;
+    close(
+        "LPPool3d(p=3) gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.2154434690031884, 0.8617738760127536, 0.2154434690031884],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_avg_pool1d_and_2d_match_hand_computed_uneven_bins() -> Result<()> {
+    // Generalizes `adaptive_avg_pool3d`'s own uneven-bin oracle down to one and two spatial
+    // axes, over the same private bin/weighted-sum machinery.
+    let device = Device::cuda(0)?;
+    let length = Axis::new("length");
+    let input = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0], [length.of(5)], &device)?.with_grad();
+    let actual = input.adaptive_avg_pool1d(length, 2)?;
+    assert_eq!(actual.shape(), &Shape::new([length.of(2)])?);
+    close(
+        "AdaptiveAvgPool1d forward with an uneven bin",
+        &actual.to_vec()?,
+        &[2.0, 4.0],
+    );
+    actual.mean(length)?.backward()?;
+    close(
+        "AdaptiveAvgPool1d gradient (the shared boundary element is averaged into both bins)",
+        &input.grad().unwrap().to_vec()?,
+        &[1.0 / 6.0, 1.0 / 6.0, 1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0],
+    );
+
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    #[rustfmt::skip]
+    let grid: [f32; 15] = [
+        1.0, 1.0, 5.0,
+        2.0, 2.0, 1.0,
+        9.0, 3.0, 2.0,
+        3.0, 4.0, 3.0,
+        5.0, 9.0, 4.0,
+    ];
+    let input2d = Tensor::from_slice(&grid, [height.of(5), width.of(3)], &device)?.with_grad();
+    let actual2d = input2d.adaptive_avg_pool2d([height, width], [2, 3])?;
+    assert_eq!(actual2d.shape(), &Shape::new([height.of(2), width.of(3)])?);
+    close(
+        "AdaptiveAvgPool2d forward with an uneven height bin, identity width",
+        &actual2d.to_vec()?,
+        &[
+            4.0,
+            2.0,
+            2.6666666666666665,
+            5.666666666666667,
+            5.333333333333333,
+            3.0,
+        ],
+    );
+    actual2d.mean([height, width])?.backward()?;
+    #[rustfmt::skip]
+    let expected_gradient2d: [f64; 15] = [
+        1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,
+        1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,
+        1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
+        1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,
+        1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,
+    ];
+    close(
+        "AdaptiveAvgPool2d gradient",
+        &input2d.grad().unwrap().to_vec()?,
+        &expected_gradient2d,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_max_pool1d_matches_hand_computed_forward_and_gradient_with_overlapping_bins()
+-> Result<()> {
+    // `in = 7, out = 3` gives windows [0,3), [2,5), [4,7): index 2 is the unique maximum of
+    // both the first two bins, so `gather`'s scatter-add backward must accumulate its
+    // gradient from both, exactly like PyTorch's autograd summing a value's two downstream
+    // uses.
+    let device = Device::cuda(0)?;
+    let length = Axis::new("length");
+    let inputs: [f32; 7] = [1.0, 2.0, 9.0, 3.0, 5.0, 1.0, 2.0];
+    let input = Tensor::from_slice(&inputs, [length.of(7)], &device)?.with_grad();
+
+    let actual = input.adaptive_max_pool1d(length, 3)?;
+    assert_eq!(actual.shape(), &Shape::new([length.of(3)])?);
+    close(
+        "AdaptiveMaxPool1d forward with overlapping bins",
+        &actual.to_vec()?,
+        &[9.0, 9.0, 5.0],
+    );
+
+    actual.mean(length)?.backward()?;
+    close(
+        "AdaptiveMaxPool1d gradient (the shared winner accumulates both bins' contributions)",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 2.0 / 3.0, 0.0, 1.0 / 3.0, 0.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_max_pool2d_matches_hand_computed_forward_and_gradient_over_both_axes() -> Result<()> {
+    // A genuine 5x5 -> 2x2 reduction over both spatial axes at once (not one axis held
+    // trivial), checking that reducing height then width separably reproduces the joint
+    // maximum, including a source shared between two output cells across BOTH axes.
+    let device = Device::cuda(0)?;
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    #[rustfmt::skip]
+    let inputs: [f32; 25] = [
+        -3.0, -1.99, -0.98, 0.03, 1.04,
+        2.05, 3.06, -2.93, -1.92, -0.91,
+        0.1, 1.11, 2.12, 3.13, -2.86,
+        -1.85, -0.84, 0.17, 1.18, 2.19,
+        3.2, -2.79, -1.78, -0.77, 0.24,
+    ];
+    let input = Tensor::from_slice(&inputs, [height.of(5), width.of(5)], &device)?.with_grad();
+
+    let actual = input.adaptive_max_pool2d([height, width], [2, 2])?;
+    assert_eq!(actual.shape(), &Shape::new([height.of(2), width.of(2)])?);
+    close(
+        "AdaptiveMaxPool2d forward over both axes",
+        &actual.to_vec()?,
+        &[3.06, 3.13, 3.2, 3.13],
+    );
+
+    actual.mean([height, width])?.backward()?;
+    #[rustfmt::skip]
+    let expected_gradient: [f64; 25] = [
+        0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.25, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.5, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0,
+        0.25, 0.0, 0.0, 0.0, 0.0,
+    ];
+    close(
+        "AdaptiveMaxPool2d gradient (a source shared across both axes accumulates twice)",
+        &input.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_max_pool3d_matches_hand_computed_forward_and_gradient_under_reordered_storage()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (depth, height, width) = (Axis::new("depth"), Axis::new("height"), Axis::new("width"));
+    #[rustfmt::skip]
+    let inputs: [f32; 10] = [
+        1.0, 2.0, 9.0, 3.0, 5.0,
+        10.0, 20.0, 90.0, 30.0, 50.0,
+    ];
+    let input = Tensor::from_slice(&inputs, [depth.of(2), height.of(5), width.of(1)], &device)?
+        .with_layout([width, height, depth])?
+        .with_grad();
+
+    let actual = input.adaptive_max_pool3d([depth, height, width], [1, 2, 1])?;
+    assert_eq!(
+        actual.shape(),
+        &Shape::new([depth.of(1), height.of(2), width.of(1)])?
+    );
+    close(
+        "reordered-storage AdaptiveMaxPool3d forward",
+        &actual.to_vec()?,
+        &[90.0, 90.0],
+    );
+
+    actual.mean([depth, height, width])?.backward()?;
+    // Depth 1 wins the depth reduction at every height, then also wins both height bins at
+    // height 2, so it alone carries the whole gradient; depth 0's own height-2 value (9) never
+    // wins the depth step and gets none.
+    close(
+        "reordered-storage AdaptiveMaxPool3d gradient",
+        &input.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_max_pool_ties_route_to_first_maximum() -> Result<()> {
+    // `in = 4, out = 2`: bin 0 is an exact tie between indices 0 and 1. Ties must break to the
+    // first (lowest-coordinate) maximum, matching `Tensor::max`'s own documented rule, since
+    // `adaptive_max_pool` composes it directly.
+    let device = Device::cuda(0)?;
+    let length = Axis::new("length");
+    let input = Tensor::from_slice(&[5.0, 5.0, 1.0, 2.0], [length.of(4)], &device)?.with_grad();
+
+    let actual = input.adaptive_max_pool1d(length, 2)?;
+    close(
+        "AdaptiveMaxPool1d tie forward",
+        &actual.to_vec()?,
+        &[5.0, 2.0],
+    );
+
+    actual.mean(length)?.backward()?;
+    close(
+        "AdaptiveMaxPool1d tie gradient (routes to the first logical coordinate)",
+        &input.grad().unwrap().to_vec()?,
+        &[0.5, 0.0, 0.0, 0.5],
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn adaptive_avg_pool2d_global_head_composes_with_linear() -> Result<()> {
+    // The consumer for a common primitive can be a representative composition
+    // (`docs/direction/module-backlog.md`'s admission rule): `AdaptiveAvgPool2d(1)` is exactly
+    // the global-pool head every sampled vision port uses ahead of a classifier `Linear`
+    // (`morpheus/mobilesam`'s `bootstrap2_common.py`, `gastric`'s `train_serosal_3d.py`), here
+    // as a `Module` end to end: build, forward, and backward through both layers together.
+    let device = Device::cuda(0)?;
+    let (channel, height, width, feature) = (
+        Axis::new("channel"),
+        Axis::new("height"),
+        Axis::new("width"),
+        Axis::new("feature"),
+    );
+    let inputs: [f32; 12] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+    ];
+    let input = Tensor::from_slice(&inputs, [channel.of(3), height.of(2), width.of(2)], &device)?
+        .with_grad();
+
+    let mut pool = AdaptiveAvgPool2d::new([height, width], [1, 1]);
+    let pooled_shape = pool.build(input.shape(), &device, 0)?;
+    assert_eq!(
+        pooled_shape,
+        Shape::new([channel.of(3), height.of(1), width.of(1)])?
+    );
+    let pooled = pool.forward(&input)?.merge([channel, height, width], feature)?;
+
+    let mut head = Linear::new(feature, feature.role("out").of(1));
+    head.build(pooled.shape(), &device, 1)?;
+    let logit = head.forward(&pooled)?;
+    assert_eq!(logit.shape().rank(), 1);
+    logit.mean(logit.shape().axes())?.backward()?;
+    assert!(input.grad().is_some());
+    Ok(())
+}
