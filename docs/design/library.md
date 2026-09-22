@@ -1052,3 +1052,65 @@ asymmetric `size / 2` / `(size - 1) / 2` before/after split for an even
 fractional power -- so it needs no dedicated kernel, and it has no learned
 parameters, matching PyTorch's own stateless module. The power composition
 inherits `Tensor::ln`'s ordinary IEEE domain rather than a clamp.
+
+### Pooling layers
+
+`Pooling<N>` (`model/convolution.rs`) is one shared struct for the whole
+fixed-kernel family -- `MaxPool2d`/`MaxPool3d`, `AvgPool2d`/`AvgPool3d`, and
+`LPPool2d`/`LPPool3d` -- parameterized by a `PoolReduce` enum (`Max`, `Avg`,
+`Lp(p)`) instead of three near-duplicate structs. Geometry (kernel/stride
+validation, the padding-at-most-half-the-kernel constraint, and the output
+extent formula) and the windowed-patch extraction via `unfold_grouped` are
+identical across the family; only the per-window reduction differs. There is
+no dedicated one-spatial-axis unfold kernel, so every `*Pool1d` type instead
+lifts its single spatial axis through the 2D machinery: a fresh unit axis
+(extent one, stride zero) is broadcast on before pooling and removed by
+`Tensor::select` after, contributing no extra reduction, padding, or gradient
+of its own. Stride defaults to the kernel extent and padding to zero across
+the whole family, matching PyTorch's own `MaxPool`/`AvgPool`/`LPPool`
+defaults; `ceil_mode=True` is not implemented anywhere in the family (every
+output extent uses PyTorch's default floor formula).
+
+`AvgPool1d`/`AvgPool2d`/`AvgPool3d` match PyTorch's default
+`count_include_pad=True` and `divisor_override=None`: every window divides by
+the full kernel volume, never by the count of real (non-padding) positions,
+which is exactly the ordinary axis mean over a patch tensor that already has
+zero written at padded slots (`Conv2d`'s own padding fill), so no separate
+divisor bookkeeping is needed.
+
+`LPPool1d`/`LPPool2d`/`LPPool3d` compute `(sum(x^p))^(1/p)` per window
+(`f(X) = (sum_{x in X} x^p)^(1/p)`, PyTorch's own `LPPool` formula; `p = 1` is
+sum pooling). `p` must be a positive integer -- narrower than PyTorch's
+`norm_type: float`, chosen because every practical use is an integer and a
+literal fractional root of a negative partial sum has no well-defined real
+value. `x^p` is computed by repeated multiplication (exact for negative `x`
+at an integer power, unlike a literal `powf`), and the final root is guarded
+by `sign(sum) * |sum|^(1/p)` -- `sign` computed as a constant via `gt`/`lt`
+(no gradient of its own, matching `torch.sign`) -- exactly mirroring
+PyTorch's own `lp_pool` implementation, since an odd `p` can leave `sum`
+negative and a bare `(-s).powf(1.0 / p)` would be `NaN`. PyTorch's `LPPool`
+has no `padding` parameter, so none is exposed here either.
+
+`Tensor::adaptive_avg_pool1d`/`2d`/`3d` generalize the existing
+`adaptive_avg_pool3d` bin/weighted-sum machinery (previously hardcoded to two
+or three spatial axes) down to one. `Tensor::adaptive_max_pool1d`/`2d`/`3d`
+share the same per-axis bin formula but take each bin's maximum instead of
+its mean, composed entirely from `Tensor::gather` and `Tensor::max` -- no
+dedicated kernel -- by reducing one spatial axis at a time: for that axis,
+every bin's host-computed member positions are gathered onto a fresh axis
+(a bin narrower than the window's widest one is padded by repeating its own
+last real position, which can only tie, never beat, that position, so
+padding never changes the winner), then `Tensor::max` removes the padding
+axis. `gather`'s backward is an exact scatter-add, so a position shared by
+two adjacent bins (the same uneven-division case `adaptive_avg_pool3d`
+documents) correctly receives a gradient contribution from every bin it
+wins, exactly like autograd summing a value's use in more than one
+downstream op. Reducing axes one at a time is exact for the forward value
+(max over a Cartesian-product window is separable), but a tie spanning more
+than one axis breaks to the axis reduced last first, not necessarily
+PyTorch's own row-major scan order -- an honest, low-stakes difference for
+the zero-probability case of an exact cross-axis floating-point tie.
+`AdaptiveAvgPool1d`/`2d`/`3d` and `AdaptiveMaxPool1d`/`2d`/`3d` are thin
+stateless `Module` wrappers (`AdaptivePooling<N>`) over those tensor methods,
+validating the same distinct-spatial-axes and positive-target contract
+before launch.
