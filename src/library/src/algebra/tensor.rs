@@ -2260,6 +2260,89 @@ impl Tensor {
         profile("merge", started);
         Ok(result)
     }
+    /// `F.interpolate(mode="nearest")` for one named spatial axis at an exact
+    /// integer scale factor. Composed entirely from `stack` (duplicate the
+    /// input `factor` times along a fresh axis) and `merge` (fold that axis
+    /// into the named spatial axis, spatial-axis major, so each source
+    /// element becomes `factor` adjacent identical copies) — the composition
+    /// wave 1 of the research migration proved bit-exact against a real
+    /// `F.interpolate(mode="nearest")` oracle
+    /// (`research/src/vision/morpheus/axis/tests/partitioner_trunk_fpn_obj.rs`,
+    /// `upsample2x`, filed as axis issue #66). `morpheus`'s
+    /// `mobilesam/scale10/train_partitioner.py:107` and
+    /// `detector/train_detector.py:237,239` both call this at `factor = 2` on
+    /// `height` then `width` separately (stride-16 to stride-8, stride-8 to
+    /// stride-4 in an FPN fusion); call this once per spatial axis to
+    /// reproduce that. Backward needs no dedicated rule: `stack` and `merge`
+    /// are already differentiable, so the gradient for a source element is
+    /// the sum of its `factor` output copies' incoming gradients.
+    pub fn upsample_nearest(&self, axis: Axis, factor: usize) -> Result<Self> {
+        if factor == 0 {
+            return Err("upsample_nearest factor must be at least 1".into());
+        }
+        self.shape().index(axis)?;
+        if factor == 1 {
+            return Ok(self.clone());
+        }
+        let repeat = axis.role("upsample_nearest_repeat");
+        let merged = axis.role("upsample_nearest_merged");
+        let position = self.shape().rank();
+        let copies = vec![self.clone(); factor];
+        let stacked = Self::stack(&copies, repeat, position)?;
+        stacked.merge([axis, repeat], merged)?.rename(merged, axis)
+    }
+    /// `torch.nn.Upsample(mode="bilinear", align_corners=False)` for one
+    /// named axis, at any positive output extent (`world/fluid`'s
+    /// `scripts/train.py:101-102` only ever calls this at `scale_factor=2`,
+    /// i.e. `out_extent = 2 * self.extent(axis)`, applied to `height` then
+    /// `width` separately before each of the U-Net decoder's two skip
+    /// concatenations; filed as axis issue #66). The interpolation weights
+    /// are fixed by the input/output extents alone (never by tensor data),
+    /// so this is one `contract` against a host-built `[axis, resampled]`
+    /// weight matrix rather than a dedicated kernel; `contract`'s existing
+    /// backward is already the transpose of that same matrix, so the
+    /// gradient is exact for free and distributes to up to two source
+    /// coordinates per output coordinate (up to four source cells when a
+    /// height and a width axis are each resampled, one call per axis).
+    ///
+    /// Weights follow PyTorch's own `align_corners=False` half-pixel
+    /// formula: for output coordinate `j`,
+    /// `source = max(0, (j + 0.5) * in_extent / out_extent - 0.5)`; let
+    /// `lower = floor(source)` clamped to the last valid input coordinate and
+    /// `upper = lower + 1` (or `lower` again at the last input coordinate, so
+    /// its weight is exactly 1). `lower` receives weight `1 - fract(source)`
+    /// and `upper` receives weight `fract(source)`.
+    pub fn resample_bilinear(&self, axis: Axis, out_extent: usize) -> Result<Self> {
+        let in_extent = self.extent(axis)?;
+        if out_extent == 0 {
+            return Err("resample_bilinear output extent must be at least 1".into());
+        }
+        if out_extent == in_extent {
+            return Ok(self.clone());
+        }
+        let resampled = axis.role("resample_bilinear_resampled");
+        let scale = in_extent as f64 / out_extent as f64;
+        let mut weights = vec![0f32; in_extent * out_extent];
+        for j in 0..out_extent {
+            let source = (scale * (j as f64 + 0.5) - 0.5).max(0.0);
+            let lower = (source.floor() as usize).min(in_extent - 1);
+            let upper = if lower < in_extent - 1 {
+                lower + 1
+            } else {
+                lower
+            };
+            let lambda1 = (source - lower as f64) as f32;
+            let lambda0 = 1.0 - lambda1;
+            weights[lower * out_extent + j] += lambda0;
+            weights[upper * out_extent + j] += lambda1;
+        }
+        let weight = Self::from_slice(
+            &weights,
+            [axis.of(in_extent), resampled.of(out_extent)],
+            self.device(),
+        )?;
+        self.contract(&weight, axis)?.rename(resampled, axis)
+    }
     /// Reverse mode from a scalar. Releases the graph after success; rebuild it for another backward.
     pub fn backward(&self) -> Result<()> {
         if self.shape().rank() != 0 {

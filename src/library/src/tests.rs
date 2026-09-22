@@ -3943,6 +3943,63 @@ fn sum_over_reordered_asymmetric_storage_matches_hand_computed_values_and_gradie
         &x.grad().unwrap().to_vec()?,
         &expected_gradient,
     );
+fn named_axis_nearest_upsample_matches_hand_computed_values_and_gradient() -> Result<()> {
+    // Mirrors morpheus's `upsample2x` helper (proven bit-exact against a real
+    // `F.interpolate(mode="nearest")` oracle in
+    // `research/src/vision/morpheus/axis/tests/partitioner_trunk_fpn_obj.rs`),
+    // now as one library primitive called once per spatial axis.
+    let device = Device::cuda(0)?;
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    let x = Tensor::from_slice(
+        &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [height.of(2), width.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let doubled = x.upsample_nearest(height, 2)?.upsample_nearest(width, 2)?;
+    assert_eq!(doubled.shape(), &Shape::new([height.of(4), width.of(6)])?);
+    // Source row/column (h, w) of the 2x3 input becomes the 2x2 output block
+    // at rows [2h, 2h+1], columns [2w, 2w+1].
+    close(
+        "nearest upsample values",
+        &doubled.to_vec()?,
+        &[
+            0.0, 0.0, 1.0, 1.0, 2.0, 2.0, //
+            0.0, 0.0, 1.0, 1.0, 2.0, 2.0, //
+            3.0, 3.0, 4.0, 4.0, 5.0, 5.0, //
+            3.0, 3.0, 4.0, 4.0, 5.0, 5.0,
+        ],
+    );
+
+    // Weighted upstream (distinct values 1..=24) so the gradient check is
+    // not a uniform constant: each source element's gradient is the SUM of
+    // the upstream weights over its 2x2 output block, divided by `mean`'s
+    // 24-element denominator.
+    let upstream: Vec<f32> = (1..=24).map(|v| v as f32).collect();
+    let scaled = doubled.mul(&Tensor::from_slice(
+        &upstream,
+        [height.of(4), width.of(6)],
+        &device,
+    )?)?;
+    scaled.mean([height, width])?.backward()?;
+    close(
+        "nearest upsample gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            (1.0 + 2.0 + 7.0 + 8.0) / 24.0,
+            (3.0 + 4.0 + 9.0 + 10.0) / 24.0,
+            (5.0 + 6.0 + 11.0 + 12.0) / 24.0,
+            (13.0 + 14.0 + 19.0 + 20.0) / 24.0,
+            (15.0 + 16.0 + 21.0 + 22.0) / 24.0,
+            (17.0 + 18.0 + 23.0 + 24.0) / 24.0,
+        ],
+    );
+
+    assert!(x.upsample_nearest(height, 0).is_err());
+    let missing = Axis::new("missing");
+    assert!(x.upsample_nearest(missing, 2).is_err());
+    println!("nearest upsample values, gradient, and rejections PASS");
     Ok(())
 }
 
@@ -4048,6 +4105,98 @@ fn clip_grad_norm_scales_every_gradient_by_one_global_factor_when_the_norm_excee
         untouched.grad().is_none(),
         "a parameter with no gradient must not gain one"
     );
+fn named_axis_nearest_upsample_matches_a_non_power_of_two_reordered_storage_case() -> Result<()> {
+    // The proven composition this wraps was only checked at extents that
+    // stay whole under repeated halving (2x3); this exercises extent 5
+    // (5 -> 10, not a power of two) on a tensor whose physical storage is
+    // permuted relative to its declared axis order, so the internal
+    // `stack`+`merge` reorder is exercised for real rather than skipped as
+    // a no-op. An unrelated `batch` axis is preserved through the resample.
+    let device = Device::cuda(0)?;
+    let (batch, length) = (Axis::new("batch"), Axis::new("length"));
+    let x = Tensor::from_slice(
+        &[10.0, 11.0, 12.0, 13.0, 14.0, 20.0, 21.0, 22.0, 23.0, 24.0],
+        [batch.of(2), length.of(5)],
+        &device,
+    )?
+    .with_layout([length, batch])?
+    .with_grad();
+
+    let doubled = x.upsample_nearest(length, 2)?;
+    assert_eq!(doubled.shape(), &Shape::new([batch.of(2), length.of(10)])?);
+    close(
+        "nearest upsample non-power-of-two values",
+        &doubled.to_vec()?,
+        &[
+            10.0, 10.0, 11.0, 11.0, 12.0, 12.0, 13.0, 13.0, 14.0, 14.0, //
+            20.0, 20.0, 21.0, 21.0, 22.0, 22.0, 23.0, 23.0, 24.0, 24.0,
+        ],
+    );
+
+    doubled.mean([batch, length])?.backward()?;
+    // Each source element is exactly two of the 20 mean-reduced output
+    // elements, so every gradient is 2 / 20 regardless of its value.
+    close(
+        "nearest upsample non-power-of-two gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[2.0 / 20.0; 10],
+    );
+    println!("nearest upsample non-power-of-two, reordered-storage case PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_axis_bilinear_upsample_matches_hand_computed_values_and_mass_conserving_gradient()
+-> Result<()> {
+    // align_corners=False half-pixel weight rows for 2 -> 4 are the standard
+    // [1,0], [0.75,0.25], [0.25,0.75], [0,1] (matching a real
+    // `F.interpolate(mode="bilinear", align_corners=False)` at that exact
+    // factor), and for 3 -> 6 the standard [1,0,0], [0.75,0.25,0],
+    // [0.25,0.75,0], [0,0.75,0.25], [0,0.25,0.75], [0,0,1]. Applying height
+    // then width to a hand-picked 2x3 grid gives this 4x6 grid by hand
+    // matrix multiplication.
+    let device = Device::cuda(0)?;
+    let (height, width) = (Axis::new("height"), Axis::new("width"));
+    let x = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        [height.of(2), width.of(3)],
+        &device,
+    )?
+    .with_grad();
+
+    let resized = x
+        .resample_bilinear(height, 4)?
+        .resample_bilinear(width, 6)?;
+    assert_eq!(resized.shape(), &Shape::new([height.of(4), width.of(6)])?);
+    close(
+        "bilinear upsample values",
+        &resized.to_vec()?,
+        &[
+            1.0, 1.25, 1.75, 2.25, 2.75, 3.0, //
+            1.75, 2.0, 2.5, 3.0, 3.5, 3.75, //
+            3.25, 3.5, 4.0, 4.5, 5.0, 5.25, //
+            4.0, 4.25, 4.75, 5.25, 5.75, 6.0,
+        ],
+    );
+
+    resized.mean([height, width])?.backward()?;
+    // Every interpolation weight row sums to 1 (a proper convex
+    // combination), so each source element's total downstream weight over
+    // all 24 mean-reduced outputs is exactly (4/2) * (6/3) = 4, giving a
+    // uniform gradient of 4 / 24 independent of the hand-picked input
+    // values -- an invariant check independent of the per-element weighted
+    // check below.
+    close(
+        "bilinear upsample gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[4.0 / 24.0; 6],
+    );
+
+    assert!(x.resample_bilinear(height, 0).is_err());
+    let missing = Axis::new("missing");
+    assert!(x.resample_bilinear(missing, 4).is_err());
+    println!("bilinear upsample values, mass-conserving gradient, and rejections PASS");
     Ok(())
 }
 
@@ -4075,5 +4224,53 @@ fn clip_grad_norm_leaves_gradients_bit_exact_below_max_norm() -> Result<()> {
         vec![4.0_f32],
         "untouched gradient b must be bit-exact"
     );
+fn named_axis_bilinear_upsample_matches_a_reordered_storage_weighted_gradient_case() -> Result<()> {
+    // A second, independently-derived gradient check (the raw per-element
+    // transpose-weight sum, unlike the mass-conservation shortcut above) on
+    // a tensor whose physical storage is permuted relative to its declared
+    // axis order, with an unrelated `batch` axis preserved through the
+    // resample -- this is `world/fluid`'s actual shape (`scripts/train.py:101-102`
+    // resamples `height`/`width` while preserving `batch` and `channel`).
+    let device = Device::cuda(0)?;
+    let (batch, length) = (Axis::new("batch"), Axis::new("length"));
+    let x = Tensor::from_slice(
+        &[2.0, 5.0, 20.0, 50.0],
+        [batch.of(2), length.of(2)],
+        &device,
+    )?
+    .with_layout([length, batch])?
+    .with_grad();
+
+    let resized = x.resample_bilinear(length, 4)?;
+    assert_eq!(resized.shape(), &Shape::new([batch.of(2), length.of(4)])?);
+    // Weight rows for 2 -> 4, align_corners=False: [1,0], [0.75,0.25],
+    // [0.25,0.75], [0,1].
+    close(
+        "bilinear upsample reordered-storage values",
+        &resized.to_vec()?,
+        &[
+            2.0, 2.75, 4.25, 5.0, //
+            20.0, 27.5, 42.5, 50.0,
+        ],
+    );
+
+    let upstream = Tensor::from_slice(
+        &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        [batch.of(2), length.of(4)],
+        &device,
+    )?;
+    resized.mul(&upstream)?.mean([batch, length])?.backward()?;
+    // grad[batch, source] = (1/8) * sum_j upstream[batch, j] * weight[j][source].
+    close(
+        "bilinear upsample reordered-storage gradient",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            (1.0 * 1.0 + 2.0 * 0.75 + 3.0 * 0.25 + 4.0 * 0.0) / 8.0,
+            (1.0 * 0.0 + 2.0 * 0.25 + 3.0 * 0.75 + 4.0 * 1.0) / 8.0,
+            (10.0 * 1.0 + 20.0 * 0.75 + 30.0 * 0.25 + 40.0 * 0.0) / 8.0,
+            (10.0 * 0.0 + 20.0 * 0.25 + 30.0 * 0.75 + 40.0 * 1.0) / 8.0,
+        ],
+    );
+    println!("bilinear upsample reordered-storage forward and gradient PASS");
     Ok(())
 }

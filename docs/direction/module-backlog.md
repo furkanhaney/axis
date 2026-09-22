@@ -30,7 +30,8 @@ option), `Conv2d`, `Conv3d`, named-axis
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
 `GELU`, `ExactGELU`, `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
 `Sequential`, with tensor-level losses, sine, differentiable central
-differences, softmax, causal masking, attention
+differences, softmax, causal masking, named-axis nearest and bilinear
+resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
 composition, named reductions, data regimes, metrics, trainers, and optimizers.
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
