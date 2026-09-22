@@ -2469,6 +2469,38 @@ impl Tensor {
         Ok(result)
     }
 
+    /// Broadcast `self` onto `shape`, an explicit target that must carry every one
+    /// of `self`'s axes at `self`'s own extent; `shape` may add axes `self` lacks
+    /// entirely (they read with stride zero) and may reorder `self`'s existing axes.
+    /// This is the outer-broadcast primitive: elementwise `add`/`sub`/`mul`/`div`
+    /// only ever align one operand's axis set onto the other's when it is already a
+    /// subset (`binary`, `algebra/tensor.rs`), and reject two operands that each have
+    /// an axis the other lacks as "cannot introduce an implicit outer product". A
+    /// caller with genuinely disjoint axis sets -- a `pixel`-indexed operand and a
+    /// `site`-indexed operand, say -- broadcasts each one explicitly onto a shared
+    /// `[pixel, site, ...]` shape first, then combines the results with an ordinary
+    /// elementwise op: `a.broadcast_to(&shape)?.sub(&b.broadcast_to(&shape)?)`
+    /// composes a `torch.cdist`-style outer pairwise difference from `broadcast_to`
+    /// and `sub` alone, with no dedicated outer-product op. Backward sums the
+    /// upstream gradient over every axis this call added, exactly as every other
+    /// broadcast in the crate reduces an introduced axis (elementwise add/mul/div,
+    /// `binary_cross_entropy_with_logits_weighted`'s `pos_weight`).
+    pub fn broadcast_to(&self, shape: &Shape) -> Result<Self> {
+        for dim in self.shape().dims() {
+            if !shape.contains(dim.axis) {
+                return Err(format!(
+                    "broadcast_to target shape is missing axis {:?}",
+                    dim.axis
+                )
+                .into());
+            }
+            if shape.extent(dim.axis)? != dim.extent {
+                return Err(format!("broadcast_to extent mismatch for {:?}", dim.axis).into());
+            }
+        }
+        self.align(shape)
+    }
+
     /// Stack equal named shapes, inserting a new logical axis at `position`.
     /// Physical storage is stack-major so each source remains one contiguous copy.
     pub fn stack(values: &[Self], axis: Axis, position: usize) -> Result<Self> {
