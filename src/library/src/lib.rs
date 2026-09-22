@@ -85,7 +85,8 @@ pub use optim::{
 };
 pub use preprocess::Standardizer;
 pub use recurrent::{
-    Gru, GruCell, GruRun, Lstm, LstmCell, LstmRun, LstmState, Rnn, RnnCell, RnnNonlinearity, RnnRun,
+    Gru, GruCell, GruRun, Lstm, LstmCell, LstmRun, LstmState, RecurrentConfig, Rnn, RnnCell,
+    RnnNonlinearity, RnnRun,
 };
 pub use regime::{
     FinitePasses, FinitePassesReceipt, Idr, IdrLimits, IdrReceipt, RegimeSnapshot, SinglePass,
@@ -135,11 +136,11 @@ pub mod prelude {
         MonotoneDirection, MonotonicityLimits, Muon, MuonMatrix, MuonMatrixOrientation,
         MuonWithAuxAdamW, Optimizer, PReLU, ParamId, Parameter, ParameterDict, ParameterList,
         PixelShuffle, PixelUnshuffle, PopulationLinear, PopulationMode, PopulationReceipt,
-        PopulationSpec, PositionEmbedding, ReLU, ReLU6, ReflectionPad, RegimeSnapshot,
-        ReplicationPad, ResidualClaim, ResidualEvidence, ResidualLimits, ResidualScope, Result,
-        RmsNorm, Rnn, RnnCell, RnnNonlinearity, RnnRun, SELU, SGD, Sample, Sequential, Shape, SiLU,
-        SignStraightThrough, SinglePass, Softmax2d, Softmin, Softplus, Softshrink, Softsign,
-        Standardizer, Tanh, Tanhshrink, Tensor, Threshold, TrainStep, Trainer, Unflatten, Unfold,
-        ZeroPad, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        PopulationSpec, PositionEmbedding, ReLU, ReLU6, RecurrentConfig, ReflectionPad,
+        RegimeSnapshot, ReplicationPad, ResidualClaim, ResidualEvidence, ResidualLimits,
+        ResidualScope, Result, RmsNorm, Rnn, RnnCell, RnnNonlinearity, RnnRun, SELU, SGD, Sample,
+        Sequential, Shape, SiLU, SignStraightThrough, SinglePass, Softmax2d, Softmin, Softplus,
+        Softshrink, Softsign, Standardizer, Tanh, Tanhshrink, Tensor, Threshold, TrainStep,
+        Trainer, Unflatten, Unfold, ZeroPad, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
     };
 }
