@@ -1276,6 +1276,126 @@ impl Tensor {
             None,
         ))
     }
+    /// Elementwise ELU (`torch.nn.functional.elu`): `x` where `x > 0`, otherwise
+    /// `alpha * (exp(x) - 1)`. `alpha` must be finite and positive. Composed from
+    /// [`Self::gt`]/[`Self::logical_not`], [`Self::clamp`] and [`Self::exp`]
+    /// rather than a dedicated kernel: clamping the input to `(-inf, 0]` before
+    /// `exp` keeps the positive branch -- masked out of the result anyway -- from
+    /// ever overflowing. Backward matches PyTorch's own `x > 0` split exactly,
+    /// including at `x == 0` (grouped with the negative branch, so the gradient
+    /// there is `alpha`, not `1`): `clamp`'s own pass-through gradient at its
+    /// upper bound keeps that boundary case exact through the chain rule.
+    pub fn elu(&self, alpha: f32) -> Result<Self> {
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err("elu alpha must be finite and positive".into());
+        }
+        let positive = self.gt(0.0)?;
+        let negative = positive.logical_not()?;
+        let one = Self::from_slice(&[1.0], [], self.device())?;
+        let branch = self
+            .clamp(None, Some(0.0))?
+            .exp()?
+            .sub(&one)?
+            .scale(alpha)?;
+        positive.mul(self)?.add(&negative.mul(&branch)?)
+    }
+    /// Elementwise CELU (`torch.nn.functional.celu`, the continuously
+    /// differentiable exponential linear unit): `x` where `x > 0`, otherwise
+    /// `alpha * (exp(x / alpha) - 1)`. `alpha` must be finite and positive --
+    /// PyTorch's own definition allows any nonzero `alpha`, but a negative one
+    /// makes the negative branch diverge instead of saturate, so Axis narrows
+    /// the accepted range to the saturating case every consumer wants. Composed
+    /// exactly like [`Self::elu`], scaling the clamped input by `1 / alpha`
+    /// before `exp` and the branch result back up by `alpha`; the same
+    /// `x == 0` boundary reasoning applies.
+    pub fn celu(&self, alpha: f32) -> Result<Self> {
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err("celu alpha must be finite and positive".into());
+        }
+        let positive = self.gt(0.0)?;
+        let negative = positive.logical_not()?;
+        let one = Self::from_slice(&[1.0], [], self.device())?;
+        let branch = self
+            .clamp(None, Some(0.0))?
+            .scale(1.0 / alpha)?
+            .exp()?
+            .sub(&one)?
+            .scale(alpha)?;
+        positive.mul(self)?.add(&negative.mul(&branch)?)
+    }
+    /// Elementwise SELU (`torch.nn.functional.selu`): PyTorch's fixed-constant
+    /// self-normalizing activation, `scale * elu(x, alpha)` with
+    /// `alpha = 1.6732632423543772` and `scale = 1.0507009873554805` --
+    /// PyTorch's own literals, solved so a standard-normal input keeps zero mean
+    /// and unit variance through the nonlinearity. No configurable parameters:
+    /// unlike [`Self::elu`]/[`Self::celu`], `selu` takes no `alpha`.
+    pub fn selu(&self) -> Result<Self> {
+        const SELU_ALPHA: f32 = 1.673_263_2;
+        const SELU_SCALE: f32 = 1.050_701;
+        self.elu(SELU_ALPHA)?.scale(SELU_SCALE)
+    }
+    /// Numerically stable elementwise log-sigmoid, `ln(sigmoid(x))`
+    /// (`torch.nn.functional.logsigmoid`), computed as `-softplus(-x)`: PyTorch's
+    /// own stabilization. `softplus`'s existing linear seam keeps this finite for
+    /// very negative `x`, where a literal `sigmoid` then `ln` would underflow to
+    /// `ln(0) = -inf`, and it asymptotes to `x` exactly as `log_sigmoid` should
+    /// when `x -> -inf`. Backward is `sigmoid(-x)`, which falls out of the chain
+    /// rule through [`Self::scale`] and [`Self::softplus`] with no dedicated rule.
+    pub fn log_sigmoid(&self) -> Result<Self> {
+        self.scale(-1.0)?.softplus(1.0, 20.0)?.scale(-1.0)
+    }
+    /// Elementwise Mish (`torch.nn.functional.mish`), `x * tanh(softplus(x))`,
+    /// composed from the existing stable [`Self::softplus`] (`beta = 1`,
+    /// `threshold = 20`, PyTorch's own defaults) and [`Self::tanh`] rather than a
+    /// dedicated kernel.
+    pub fn mish(&self) -> Result<Self> {
+        self.mul(&self.softplus(1.0, 20.0)?.tanh()?)
+    }
+    /// Gated Linear Unit (`torch.nn.functional.glu`): split `axis` into two
+    /// equal halves and gate the first half by the sigmoid of the second,
+    /// `a * sigmoid(b)`. `axis`'s extent must be even; both halves keep `axis`'s
+    /// own identity, at half the extent. Composed from [`Self::narrow`] and
+    /// [`Self::sigmoid`]/[`Self::mul`].
+    pub fn glu(&self, axis: Axis) -> Result<Self> {
+        let extent = self.extent(axis)?;
+        if extent % 2 != 0 {
+            return Err("glu requires an even extent on the split axis".into());
+        }
+        let half = extent / 2;
+        let a = self.narrow(axis, 0, half)?;
+        let b = self.narrow(axis, half, half)?;
+        a.mul(&b.sigmoid()?)
+    }
+    /// Elementwise parametric ReLU (`torch.nn.functional.prelu`): `x` where
+    /// `x > 0`, otherwise `weight * x`. `weight` is a constant here -- the
+    /// [`crate::PReLU`] module supplies a differentiable [`crate::Parameter`]
+    /// and composes with this method -- and follows the same subset-axis
+    /// broadcasting as [`Self::mul`], so a single shared weight (shape `[]`) or
+    /// one weight per entry of a named channel axis both work unchanged.
+    /// Composed entirely from [`Self::gt`]/[`Self::logical_not`] and
+    /// [`Self::mul`]/[`Self::add`], with the same `x > 0` boundary convention as
+    /// [`Self::elu`]; `weight`'s own gradient (when it requires one) falls out
+    /// of `mul`'s existing broadcast-sum backward with no dedicated rule.
+    pub fn prelu(&self, weight: &Self) -> Result<Self> {
+        let positive = self.gt(0.0)?;
+        let negative = positive.logical_not()?;
+        positive.mul(self)?.add(&negative.mul(self)?.mul(weight)?)
+    }
+    /// Numerically stable log-softmax along one named `axis`
+    /// (`torch.nn.functional.log_softmax`), `x - logsumexp(x, axis)`, composed
+    /// entirely from the existing [`Self::logsumexp`] (itself `max`-shifted) and
+    /// [`Self::sub`]'s broadcast over the axis `logsumexp` removes -- no
+    /// dedicated kernel or backward rule. Shares `logsumexp`'s all-non-finite
+    /// group convention (`NaN`, not PyTorch's `-infinity`).
+    pub fn log_softmax(&self, axis: Axis) -> Result<Self> {
+        self.sub(&self.logsumexp(axis)?)
+    }
+    /// Softmin along one named `axis` (`torch.nn.functional.softmin`),
+    /// `softmax(-x, axis)`, composed from [`Self::scale`] and the existing
+    /// stable [`Self::softmax`].
+    pub fn softmin(&self, axis: Axis) -> Result<Self> {
+        self.scale(-1.0)?.softmax(axis)
+    }
     /// Shared body for the scalar comparison family below. `op` selects the cuTile
     /// comparison the same way [`Self::binary`]'s `op` selects add/sub/mul/div: 0
     /// (`>`), 1 (`>=`), 2 (`<`), 3 (`<=`), 4 (`==`). Output has the same [`Shape`]
