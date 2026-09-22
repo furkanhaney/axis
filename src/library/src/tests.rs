@@ -5775,6 +5775,7 @@ fn named_axis_roll_matches_hand_computed_values_gradients_and_wrap_around() -> R
 }
 
 #[test]
+#[ignore = "requires CUDA"]
 fn broadcast_to_composes_an_outer_pairwise_squared_distance_matching_torch_cdist() -> Result<()> {
     // vision/image-encode's Stage A `soft_recon` computes `torch.cdist(P, sites) ** 2`, a
     // (pixel, site) squared-distance matrix from `P: (pixel, coord)` and `sites: (site,

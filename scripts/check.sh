@@ -9,5 +9,7 @@ bash "$workspace_root/tests/docsrs.sh"
 runner="$workspace_root/scripts/cargo.sh"
 bash "$runner" fmt --all -- --check
 bash "$runner" clippy --workspace --release --locked --all-targets -- -D warnings
-bash "$runner" test --workspace --release --locked
+# The non-ignored suite must pass without a GPU, as it does on the CI host runners;
+# hide the device so a CUDA test missing its ignore attribute fails here, not in CI.
+CUDA_VISIBLE_DEVICES= bash "$runner" test --workspace --release --locked
 bash "$runner" test --workspace --release --locked -- --ignored --test-threads=1 --nocapture
