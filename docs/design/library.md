@@ -1241,3 +1241,81 @@ Four gap-closes on wave 1's PR #125/#123 distance, margin-loss and signed-linear
   `celu`'s `exp(x / alpha)` collapsing to `exp(x)`, holds for `ELU`. The positive branch never
   reads `alpha`, so every already-recorded `alpha > 0` output and gradient stays bit-exact; only
   the validation guard widens from "positive" to "nonzero".
+
+### Likelihood losses: full options
+
+`NLLLoss`, `KLDivLoss`, `PoissonNLLLoss`, `GaussianNLLLoss`, and `BCELoss`
+(the "Regression and likelihood losses" section above) each had one stated
+gap against PyTorch. This wave closes all five, in place where the existing
+op's own output stays bit-exact, and as a new sibling method where PyTorch's
+option changes what the op returns for callers who ask for it.
+
+`Tensor::nll_loss_weighted(targets, class, weight, ignore_index)` is
+`nll_loss` plus PyTorch's per-class `weight` and `ignore_index`. `weight`
+follows the same per-class-weight convention
+`binary_cross_entropy_with_logits_weighted` already uses for `pos_weight`:
+one value per class, broadcasting like `mul`. Weighting multiplies each
+class's term before the class axis is summed,
+`-sum(class, weight * target * self)` — PyTorch's `weight[c] * log_prob[c]`
+at a one-hot target, generalized linearly to a soft one exactly the way
+`nll_loss` itself already generalizes one-hot to soft targets. PyTorch's
+`reduction='mean'` with a `weight` does **not** divide by the row count: it
+divides by the sum of the *selected* weights (`weight[target[n]]` for every
+kept row), not by `N`. This op stays unreduced like every other loss in this
+family, so a caller reproducing PyTorch's mean computes that weight sum
+itself (`targets.mul(weight)?.sum(class)` at a one-hot target) and divides
+by it rather than calling the ordinary axis `mean`. `ignore_index`, given as
+`Some(class_index)`, zeroes a row's contribution in proportion to its target
+mass on that class (`loss_row *= 1 - target[ignore_index]`) — PyTorch's
+exact all-or-nothing behavior at a one-hot target, and a linear
+generalization at a soft one, the same shape `nll_loss`'s own target
+convention already takes. `nll_loss` itself is unchanged and stays the
+`weight == None` case.
+
+`Tensor::kl_div_loss_log_target(targets)` is `kl_div_loss` at PyTorch's
+`log_target = true`: `targets` also holds log-probabilities (rather than
+probabilities), and the pointwise loss is `exp(target) * (target - self)`.
+Unlike `log_target = false`, no `xlogy` zero-target substitution is needed —
+`target` never appears inside a logarithm here — so this sibling needs no
+zero-probability special case. `kl_div_loss` itself is unchanged and stays
+the `log_target = false` case.
+
+`Tensor::poisson_nll_loss_full(targets, log_input, full, eps)` generalizes
+`poisson_nll_loss` over both of PyTorch's remaining options. At
+`log_input = false`, `self` holds the rate directly (not its log) and the
+base loss is `self - target * log(self + eps)`, PyTorch's own formula;
+`eps` (finite and positive, required only in this branch) keeps the
+logarithm finite at `self == 0`. At `full = true`, PyTorch's Stirling
+approximation term, `target*log(target) - target + 0.5*log(2*pi*target)`,
+is added where `target > 1` (strictly; PyTorch's own threshold) and `0`
+elsewhere — computed with the same `xlogy`-style safe-substitution
+`kl_div_loss` already uses, so no element's logarithm ever sees a
+non-positive input before the mask zeroes its contribution. The term
+depends only on the (non-differentiable) `target`, so it contributes no
+gradient. `poisson_nll_loss(targets)` now delegates to
+`poisson_nll_loss_full(targets, true, false, 0.0)`, bit-exact with its
+earlier, narrower implementation.
+
+`Tensor::gaussian_nll_loss_full(targets, var, eps, full)` adds PyTorch's
+`full = true` constant, `0.5 * log(2*pi)`, to `gaussian_nll_loss`'s own
+`full = false` value. The constant depends on none of `self`, `targets`, or
+`var`, so no operand's gradient changes. `gaussian_nll_loss(targets, var,
+eps)` now delegates to `gaussian_nll_loss_full(targets, var, eps, false)`,
+bit-exact with its earlier, narrower implementation.
+
+`Tensor::binary_cross_entropy(targets)` (`BCELoss`) changes what it computes
+(not just what it offers): the earlier composition floored the *input*
+probability at `f32::MIN_POSITIVE` before `ln`, the closest a
+differentiated-through-`ln` composition could reach toward PyTorch's stated
+`-100` log floor, because both direct transcriptions of that floor broke
+backward in `f32` (see the entry above for the full trace). A dedicated
+kernel pair, `bce_loss`/`bce_loss_backward`, replaces that composition: the
+forward floors the *output* of each logarithm at exactly PyTorch's literal
+`-100`, and the backward is PyTorch's own explicit formula, `(x - y) /
+max((1 - x) * x, eps)` with `eps = 1e-12`, computed directly rather than
+falling out of differentiating the floored `ln`. It matches PyTorch's
+interior gradient formula away from the `eps` floor and, unlike the earlier
+composition, stays finite (not `0`) at a saturated wrong-side prediction —
+matching PyTorch's own large-but-finite gradient there instead of Axis's
+previous zero. This is the one row in this wave whose existing output
+changes; every other row above is additive.
