@@ -718,7 +718,7 @@ impl Module for ConstantPad {
     }
 }
 
-/// A source coordinate function for [`edge_pad`]: maps an extended-domain
+/// A source coordinate function for `edge_pad`: maps an extended-domain
 /// coordinate (which may be negative or `>= extent`) back into `[0, extent)`.
 type EdgeSource = fn(usize, isize) -> usize;
 
@@ -774,8 +774,8 @@ fn edge_pad(
 
 /// Reflection padding, covering `ReflectionPad1d/2d/3d`. Matches PyTorch's
 /// own constraint that each side's padding be strictly less than the axis's
-/// extent (checked before launch, in [`reflect_source`]'s doc); see
-/// [`edge_pad`] for the composition and its exact gradient.
+/// extent (checked before launch, in `reflect_source`'s doc); see
+/// `edge_pad` for the composition and its exact gradient.
 pub struct ReflectionPad {
     pads: Vec<(Axis, usize, usize)>,
 }
@@ -812,7 +812,7 @@ impl Module for ReflectionPad {
 }
 
 /// Edge replication padding, covering `ReplicationPad1d/2d/3d`. No pad-size
-/// constraint beyond the shared overflow check: see [`edge_pad`] for the
+/// constraint beyond the shared overflow check: see `edge_pad` for the
 /// composition and its exact gradient.
 pub struct ReplicationPad {
     pads: Vec<(Axis, usize, usize)>,
@@ -867,7 +867,7 @@ fn circular_pad_axis(value: &Tensor, axis: Axis, before: usize, after: usize) ->
 /// Circular (wrap-around) padding, covering `CircularPad1d/2d/3d`. Matches
 /// PyTorch's own constraint that each side's padding be at most the axis's
 /// extent (a full wrap is allowed, unlike reflection's strict `<`); see
-/// [`circular_pad_axis`] for the composition and its exact gradient.
+/// `circular_pad_axis` for the composition and its exact gradient.
 pub struct CircularPad {
     pads: Vec<(Axis, usize, usize)>,
 }
