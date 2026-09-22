@@ -38,6 +38,9 @@ impl Parameter {
     pub fn zero_grad(&self) {
         self.0.borrow().tensor.zero_grad();
     }
+    pub(crate) fn scale_grad(&self, factor: f32) -> Result<()> {
+        self.0.borrow().tensor.scale_grad(factor)
+    }
     pub fn set_values(&self, values: &[f32]) -> Result<()> {
         let current = self.tensor();
         let new = Tensor::from_slice(
