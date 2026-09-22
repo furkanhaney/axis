@@ -8720,40 +8720,21 @@ fn nll_loss_matches_hand_computed_oracle_mirroring_cross_entropy_targets() -> Re
 fn binary_cross_entropy_matches_hand_computed_oracle_with_pytorch_log_clamp() -> Result<()> {
     // `binary_cross_entropy` takes probabilities (unlike the existing logits-based
     // `binary_cross_entropy_with_logits`). Forward matches PyTorch's documented
-    // -[y*log(x) + (1-y)*log(1-x)] with the probability floored at `f32::MIN_POSITIVE` before
-    // its logarithm -- not PyTorch's own `exp(-100)` -- because `exp(-100)` rounds to an `f32`
-    // subnormal so small that `ln`'s backward `1 / x` overflows to infinity and then hits the
-    // clamp's zeroing multiplier as `inf * 0 -> NaN` (see the doc comment on
-    // `binary_cross_entropy` for the full trace and why an output-side `-100` clamp has the
-    // same NaN problem at `x == 0` for a different reason). This oracle uses that same
-    // achieved floor (`ln(f32::MIN_POSITIVE) ~ -87.3`) rather than PyTorch's literal `-100`.
-    // The composed gradient matches PyTorch's interior formula (x-y)/(x*(1-x)) away from the
-    // floor, but is exactly zero -- not PyTorch's own large finite value -- at a saturated
-    // wrong-side prediction (x == 0, y == 1 and its mirror x == 1, y == 0), since `clamp`'s
-    // ordinary boundary rule zeroes the moved term's gradient there.
-    let floor: f32 = f32::MIN_POSITIVE;
-    fn bce(x: f32, y: f32, floor: f32) -> f64 {
-        let log_x = x.max(floor).ln();
-        let log_1mx = (1.0 - x).max(floor).ln();
-        f64::from(-(y * log_x + (1.0 - y) * log_1mx))
+    // -[y*log(x) + (1-y)*log(1-x)] with each logarithm floored at PyTorch's own exact literal
+    // `-100`, computed by a dedicated kernel pair (`bce_loss`/`bce_loss_backward`) rather than
+    // composed from `Tensor::clamp`/`Tensor::ln`, so backward stays finite at x == 0 and x == 1
+    // without needing an input-side approximation of `-100` (see the doc comment on
+    // `binary_cross_entropy` for why the earlier composed floor could only reach `~-87.3`).
+    // Backward is PyTorch's own explicit formula, `(x - y) / max((1 - x) * x, eps)` with
+    // `eps = 1e-12`, not a derivative of the floored forward expression.
+    fn bce(x: f32, y: f32) -> f64 {
+        let log_x = f64::from(x).ln().max(-100.0);
+        let log_1mx = f64::from(1.0 - x).ln().max(-100.0);
+        -(f64::from(y) * log_x + f64::from(1.0 - y) * log_1mx)
     }
-    fn bce_grad(x: f32, y: f32, floor: f32) -> f64 {
-        // Composition trace: term1 = y * ln(max(x, floor)), term2 = (1-y) * ln(max(1-x,
-        // floor)); the input-side clamp's own boundary rule zeroes a term's local derivative
-        // wherever its *own* value fell below the floor, independent of the other term's
-        // weight.
-        let d_term1 = if x >= floor {
-            f64::from(y) / f64::from(x)
-        } else {
-            0.0
-        };
-        let complement = 1.0 - x;
-        let d_term2 = if complement >= floor {
-            -f64::from(1.0 - y) / f64::from(complement)
-        } else {
-            0.0
-        };
-        -(d_term1 + d_term2)
+    fn bce_grad(x: f32, y: f32) -> f64 {
+        let denominator = (f64::from(1.0 - x) * f64::from(x)).max(1e-12);
+        (f64::from(x) - f64::from(y)) / denominator
     }
 
     let device = Device::cuda(0)?;
@@ -8765,12 +8746,12 @@ fn binary_cross_entropy_matches_hand_computed_oracle_with_pytorch_log_clamp() ->
     let expected_loss: Vec<f64> = x_values
         .iter()
         .zip(y_values)
-        .map(|(&x, y)| bce(x, y, floor))
+        .map(|(&x, y)| bce(x, y))
         .collect();
     let expected_grad: Vec<f64> = x_values
         .iter()
         .zip(y_values)
-        .map(|(&x, y)| bce_grad(x, y, floor) / n)
+        .map(|(&x, y)| bce_grad(x, y) / n)
         .collect();
 
     let x = Tensor::from_slice(&x_values, [batch.of(2), feature.of(3)], &device)?
@@ -8781,13 +8762,13 @@ fn binary_cross_entropy_matches_hand_computed_oracle_with_pytorch_log_clamp() ->
 
     let loss = x.binary_cross_entropy(&y)?;
     close(
-        "BCELoss forward under reordered, asymmetric storage",
+        "BCELoss forward with PyTorch's exact -100 log floor",
         &loss.to_vec()?,
         &expected_loss,
     );
     loss.mean([batch, feature])?.backward()?;
     close(
-        "BCELoss gradient (exact zero at the floor boundary)",
+        "BCELoss gradient (PyTorch's explicit clamped-denominator form, finite at 0 and 1)",
         &x.grad().unwrap().to_vec()?,
         &expected_grad,
     );
@@ -12209,5 +12190,344 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
         .unwrap_err()
         .to_string();
     assert!(error.contains("does not match"), "{error}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn nll_loss_weighted_matches_hand_computed_oracle_with_weight_and_ignore_index() -> Result<()> {
+    // `nll_loss_weighted` generalizes `nll_loss` with a per-class `weight` (multiplying each
+    // class's term before the class axis is summed) and an `ignore_index` (zeroing a row in
+    // proportion to its target mass on that class). Row 0 is one-hot at the ignored class and
+    // is fully zeroed; row 1 has no mass there and is unaffected by `ignore_index`, only by
+    // `weight`.
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("batch"), Axis::new("class"));
+    let probabilities = [[0.7f64, 0.2, 0.1], [0.2, 0.3, 0.5]];
+    let log_prob_values: Vec<f32> = probabilities
+        .iter()
+        .flat_map(|row| row.iter().map(|p| p.ln() as f32))
+        .collect();
+    let target_rows = [[1.0f64, 0.0, 0.0], [0.0, 0.5, 0.5]];
+    let target_values: Vec<f32> = target_rows
+        .iter()
+        .flat_map(|row| row.iter().map(|&t| t as f32))
+        .collect();
+    let weight_values = [2.0f32, 0.5, 1.0];
+    let ignore_index = 0usize;
+
+    let expected_loss: Vec<f64> = probabilities
+        .iter()
+        .zip(target_rows)
+        .map(|(probs, targets)| {
+            let keep = 1.0 - targets[ignore_index];
+            let raw: f64 = -probs
+                .iter()
+                .zip(targets)
+                .zip(weight_values)
+                .map(|((&p, t), w)| f64::from(w) * t * p.ln())
+                .sum::<f64>();
+            keep * raw
+        })
+        .collect();
+    let n_rows = probabilities.len() as f64;
+    let expected_grad: Vec<f64> = target_rows
+        .iter()
+        .flat_map(|row| {
+            let keep = 1.0 - row[ignore_index];
+            row.iter()
+                .zip(weight_values)
+                .map(move |(&t, w)| -keep * f64::from(w) * t / n_rows)
+        })
+        .collect();
+
+    // value(b, c) written in canonical (batch, class) order; asymmetric extents (2, 3).
+    let log_prob = Tensor::from_slice(&log_prob_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let targets = Tensor::from_slice(&target_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+    let weight = Tensor::from_slice(&weight_values, [class.of(3)], &device)?;
+
+    let loss = log_prob.nll_loss_weighted(&targets, class, &weight, Some(ignore_index))?;
+    assert_eq!(loss.shape(), &Shape::new([batch.of(2)])?);
+    close(
+        "NLLLoss(weight, ignore_index) forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean(batch)?.backward()?;
+    close(
+        "NLLLoss(weight, ignore_index) gradient",
+        &log_prob.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        log_prob
+            .detach()
+            .nll_loss_weighted(&targets.with_grad(), class, &weight, None)
+            .is_err()
+    );
+    assert!(
+        log_prob
+            .detach()
+            .nll_loss_weighted(&targets, class, &weight.with_grad(), None)
+            .is_err()
+    );
+    let error = log_prob
+        .detach()
+        .nll_loss_weighted(&targets, class, &weight, Some(3))
+        .err()
+        .expect("out of range ignore_index")
+        .to_string();
+    assert!(error.contains("out of range"), "{error}");
+    let other = Axis::new("other");
+    let wrong_weight = Tensor::from_slice(&[1.0f32], [other.of(1)], &device)?;
+    assert!(
+        log_prob
+            .detach()
+            .nll_loss_weighted(&targets, class, &wrong_weight, None)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn kl_div_loss_log_target_matches_hand_computed_oracle() -> Result<()> {
+    // `kl_div_loss_log_target` is `kl_div_loss` at PyTorch's `log_target = true`: `targets`
+    // also holds log-probabilities, and the pointwise loss is `exp(target) * (target - self)`.
+    // Unlike `log_target = false`, no `xlogy` zero-target substitution is needed, so this
+    // oracle needs no zero-probability row.
+    fn kl_term(log_q: f64, log_p: f64) -> f64 {
+        log_p.exp() * (log_p - log_q)
+    }
+    let device = Device::cuda(0)?;
+    let (batch, class) = (Axis::new("batch"), Axis::new("class"));
+    // value(b, c) written in canonical (batch, class) order; asymmetric extents (2, 3).
+    let log_q_values = [-0.5f32, -1.0, -2.0, -0.3, -0.9, -1.6];
+    let p_values = [0.5f64, 0.3, 0.2, 0.1, 0.4, 0.5];
+    let log_p_values: Vec<f32> = p_values.iter().map(|p| p.ln() as f32).collect();
+    let n = log_q_values.len() as f64;
+    let expected_loss: Vec<f64> = log_q_values
+        .iter()
+        .zip(log_p_values.iter())
+        .map(|(&lq, &lp)| kl_term(f64::from(lq), f64::from(lp)))
+        .collect();
+    let expected_grad: Vec<f64> = log_p_values
+        .iter()
+        .map(|&lp| -f64::from(lp).exp() / n)
+        .collect();
+
+    let log_q = Tensor::from_slice(&log_q_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?
+        .with_grad();
+    let log_p = Tensor::from_slice(&log_p_values, [batch.of(2), class.of(3)], &device)?
+        .with_layout([class, batch])?;
+
+    let loss = log_q.kl_div_loss_log_target(&log_p)?;
+    close(
+        "KLDivLoss(log_target=true) forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, class])?.backward()?;
+    close(
+        "KLDivLoss(log_target=true) gradient (exactly -exp(target))",
+        &log_q.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    assert!(
+        log_q
+            .detach()
+            .kl_div_loss_log_target(&log_p.with_grad())
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn poisson_nll_loss_full_matches_hand_computed_oracle_at_log_input_false_and_full_true()
+-> Result<()> {
+    // `poisson_nll_loss_full` generalizes `poisson_nll_loss` with PyTorch's remaining
+    // `PoissonNLLLoss` options. This oracle exercises `log_input = false` (`self` holds the
+    // rate itself, base loss `self - target*log(self+eps)`) together with `full = true` (adds
+    // the Stirling term `target*log(target) - target + 0.5*log(2*pi*target)` where
+    // `target > 1`, else `0`); target `1.0` sits exactly at the `> 1` boundary (excluded) to
+    // exercise the mask's strictness.
+    let eps = 1e-3f64;
+    fn base(rate: f64, target: f64, eps: f64) -> f64 {
+        rate - target * (rate + eps).ln()
+    }
+    fn base_grad(rate: f64, target: f64, eps: f64) -> f64 {
+        1.0 - target / (rate + eps)
+    }
+    fn stirling(target: f64) -> f64 {
+        if target > 1.0 {
+            target * target.ln() - target + 0.5 * (2.0 * std::f64::consts::PI * target).ln()
+        } else {
+            0.0
+        }
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    // value(b, f) written in canonical (batch, feature) order; asymmetric extents (2, 3).
+    let rate_values = [0.5f32, 2.0, 1.0, 3.0, 0.1, 5.0];
+    let target_values = [1.0f32, 3.0, 0.5, 8.0, 0.2, 1.5];
+    let n = rate_values.len() as f64;
+    let expected_loss: Vec<f64> = rate_values
+        .iter()
+        .zip(target_values)
+        .map(|(&r, t)| base(f64::from(r), f64::from(t), eps) + stirling(f64::from(t)))
+        .collect();
+    let expected_grad: Vec<f64> = rate_values
+        .iter()
+        .zip(target_values)
+        .map(|(&r, t)| base_grad(f64::from(r), f64::from(t), eps) / n)
+        .collect();
+
+    let rate = Tensor::from_slice(&rate_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+
+    let loss = rate.poisson_nll_loss_full(&target, false, true, eps as f32)?;
+    close(
+        "PoissonNLLLoss(log_input=false, full=true) forward under reordered, asymmetric storage",
+        &loss.to_vec()?,
+        &expected_loss,
+    );
+    loss.mean([batch, feature])?.backward()?;
+    close(
+        "PoissonNLLLoss(log_input=false, full=true) gradient (Stirling term contributes none)",
+        &rate.grad().unwrap().to_vec()?,
+        &expected_grad,
+    );
+
+    // `poisson_nll_loss` delegates to `poisson_nll_loss_full` with `full = false`; confirm the
+    // two remain bit-exact for the default `log_input = true` case.
+    let log_rate = Tensor::from_slice(&rate_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let default_loss = log_rate.poisson_nll_loss(&target)?;
+    let explicit_loss = log_rate.poisson_nll_loss_full(&target, true, false, 0.0)?;
+    let explicit_loss_f64: Vec<f64> = explicit_loss.to_vec()?.iter().map(|&v| f64::from(v)).collect();
+    close(
+        "poisson_nll_loss / poisson_nll_loss_full(true, false) bit-exact delegation",
+        &default_loss.to_vec()?,
+        &explicit_loss_f64,
+    );
+
+    assert!(
+        rate.detach()
+            .poisson_nll_loss_full(&target.with_grad(), false, true, eps as f32)
+            .is_err()
+    );
+    assert!(
+        rate.detach()
+            .poisson_nll_loss_full(&target, false, true, 0.0)
+            .is_err()
+    );
+    assert!(
+        rate.detach()
+            .poisson_nll_loss_full(&target, false, true, f32::NAN)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn gaussian_nll_loss_full_matches_hand_computed_oracle_with_full_true_constant() -> Result<()> {
+    // `gaussian_nll_loss_full` adds PyTorch's `full = true` constant term `0.5*log(2*pi)` to
+    // `gaussian_nll_loss`'s own `full = false` value; that constant depends on none of `self`,
+    // `targets`, or `var`, so no operand's gradient changes.
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (Axis::new("batch"), Axis::new("feature"));
+    let eps = 1e-3f32;
+    let mean_values = [0.0f32, 2.0, -1.0, 0.5, 1.0, -2.0];
+    let target_values = [1.0f32, 2.0, 0.0, 0.5, 1.5, -2.0];
+    let var_values = [0.5f32, 1e-8, 2.0, 1.0, 3.0, 0.25];
+    let half_ln_two_pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+
+    let mean = Tensor::from_slice(&mean_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let target = Tensor::from_slice(&target_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let var = Tensor::from_slice(&var_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+
+    let base = mean.gaussian_nll_loss(&target, &var, eps)?;
+    let expected_loss: Vec<f64> = base
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v) + half_ln_two_pi)
+        .collect();
+
+    let mean_full = mean.gaussian_nll_loss_full(&target, &var, eps, true)?;
+    close(
+        "GaussianNLLLoss(full=true) forward adds 0.5*ln(2*pi) to the full=false value",
+        &mean_full.to_vec()?,
+        &expected_loss,
+    );
+    mean_full.mean([batch, feature])?.backward()?;
+    let mean_grad = mean.grad().unwrap().to_vec()?;
+    let var_grad = var.grad().unwrap().to_vec()?;
+
+    // Independent second graph at full=false, to compare gradients against (the constant term
+    // contributes none).
+    let mean2 = Tensor::from_slice(&mean_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    let var2 = Tensor::from_slice(&var_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?
+        .with_grad();
+    mean2
+        .gaussian_nll_loss(&target, &var2, eps)?
+        .mean([batch, feature])?
+        .backward()?;
+    let mean2_grad_f64: Vec<f64> = mean2
+        .grad()
+        .unwrap()
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    let var2_grad_f64: Vec<f64> = var2
+        .grad()
+        .unwrap()
+        .to_vec()?
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    close(
+        "GaussianNLLLoss(full=true) mean gradient matches full=false (constant term, no gradient)",
+        &mean_grad,
+        &mean2_grad_f64,
+    );
+    close(
+        "GaussianNLLLoss(full=true) var gradient matches full=false (constant term, no gradient)",
+        &var_grad,
+        &var2_grad_f64,
+    );
+
+    // `gaussian_nll_loss_full(..., false)` is bit-exact with `gaussian_nll_loss`.
+    let mean3 = Tensor::from_slice(&mean_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let var3 = Tensor::from_slice(&var_values, [batch.of(2), feature.of(3)], &device)?
+        .with_layout([feature, batch])?;
+    let delegated = mean3.gaussian_nll_loss_full(&target, &var3, eps, false)?;
+    let delegated_f64: Vec<f64> = delegated.to_vec()?.iter().map(|&v| f64::from(v)).collect();
+    close(
+        "gaussian_nll_loss / gaussian_nll_loss_full(eps, false) bit-exact delegation",
+        &base.to_vec()?,
+        &delegated_f64,
+    );
     Ok(())
 }
