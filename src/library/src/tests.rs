@@ -4000,6 +4000,40 @@ fn named_axis_nearest_upsample_matches_hand_computed_values_and_gradient() -> Re
     let missing = Axis::new("missing");
     assert!(x.upsample_nearest(missing, 2).is_err());
     println!("nearest upsample values, gradient, and rejections PASS");
+fn named_axis_maximum_preserves_axes_across_layouts_and_routes_ties() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate, time) = (
+        Axis::new("batch"),
+        Axis::new("candidate"),
+        Axis::new("time"),
+    );
+    let values = Tensor::from_slice(
+        &[
+            2.0, -5.0, 9.0, 9.0, 4.0, 9.0, 4.0, 0.0, -2.0, 5.0, 6.0, -1.0,
+        ],
+        [batch.of(2), candidate.of(3), time.of(2)],
+        &device,
+    )?
+    .with_layout([candidate, time, batch])?
+    .with_grad();
+
+    let maximum = values.max(candidate)?;
+    assert_eq!(maximum.shape(), &Shape::new([batch.of(2), time.of(2)])?);
+    close(
+        "named-axis maximum",
+        &maximum.to_vec()?,
+        &[9.0, 9.0, 6.0, 5.0],
+    );
+    maximum.mean([batch, time])?.backward()?;
+    close(
+        "named-axis maximum gradient",
+        &values.grad().unwrap().to_vec()?,
+        &[
+            0.0, 0.0, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25, 0.0,
+        ],
+    );
+    let error = values.max(Axis::new("missing")).err().unwrap().to_string();
+    assert!(error.contains("missing axis missing#"), "{error}");
     Ok(())
 }
 
@@ -4272,5 +4306,89 @@ fn named_axis_bilinear_upsample_matches_a_reordered_storage_weighted_gradient_ca
         ],
     );
     println!("bilinear upsample reordered-storage forward and gradient PASS");
+fn named_axis_maximum_ignores_nonfinite_values_and_marks_empty_groups() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = Tensor::from_slice(
+        &[
+            f32::NAN,
+            f32::INFINITY,
+            3.0,
+            f32::NEG_INFINITY,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::INFINITY,
+        ],
+        [batch.of(2), candidate.of(5)],
+        &device,
+    )?
+    .with_grad();
+
+    let maximum = values.max(candidate)?;
+    let actual = maximum.to_vec()?;
+    assert_eq!(actual[0], 3.0);
+    assert!(actual[1].is_nan());
+
+    maximum.mean(batch)?.backward()?;
+    close(
+        "non-finite maximum gradient",
+        &values.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+
+    let all_nonfinite = Tensor::from_slice(
+        &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        [batch.of(1), candidate.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let zero = Tensor::from_slice(&[0.0], [batch.of(1)], &device)?;
+    let loss = all_nonfinite
+        .max(candidate)?
+        .squared_error(&zero)?
+        .mean(batch)?;
+    assert!(loss.to_vec()?[0].is_nan());
+    loss.backward()?;
+    close(
+        "all-nonfinite maximum with NaN cotangent",
+        &all_nonfinite.grad().unwrap().to_vec()?,
+        &[0.0, 0.0, 0.0],
+    );
+    Ok(())
+}
+
+/// Issue #69's exact evidence bar: `gastric`'s and `energy-output`'s production code
+/// already computes max-pooling and stability shifts as
+/// `x.scale(-1.0)?.min(axis)?.scale(-1.0)?`. That forward composition is exact, but
+/// its backward path was never checked in either study. This proves the native
+/// `Tensor::max` kernel and the negate-min-negate composition agree bit-for-bit on
+/// both the forward value and the gradient, on a group with a tie, before the native
+/// kernel replaces the composition in either consumer.
+#[test]
+#[ignore = "requires CUDA"]
+fn named_axis_maximum_matches_negate_min_negate_composition_bit_exact() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, candidate) = (Axis::new("batch"), Axis::new("candidate"));
+    let values = [2.0, 9.0, 9.0, -5.0, 4.0, -2.0, 6.0, 6.0];
+    let native = Tensor::from_slice(&values, [batch.of(2), candidate.of(4)], &device)?.with_grad();
+    let composed =
+        Tensor::from_slice(&values, [batch.of(2), candidate.of(4)], &device)?.with_grad();
+
+    let native_max = native.max(candidate)?;
+    let composed_max = composed.scale(-1.0)?.min(candidate)?.scale(-1.0)?;
+    assert_eq!(native_max.to_vec()?, composed_max.to_vec()?);
+
+    native_max.mean(batch)?.backward()?;
+    composed_max.mean(batch)?.backward()?;
+    let native_gradient = native.grad().unwrap().to_vec()?;
+    assert_eq!(native_gradient, composed.grad().unwrap().to_vec()?);
+    close(
+        "maximum gradient (native, cross-checked bit-exact against negate-min-negate)",
+        &native_gradient,
+        &[0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
+    );
     Ok(())
 }

@@ -358,6 +358,15 @@ impl Device {
     ) -> Result<(Buffer, Buffer)> {
         unavailable()
     }
+
+    pub(crate) fn grouped_maximum(
+        &self,
+        _a: &Buffer,
+        _forward: &Plan,
+        _reverse: &Plan,
+    ) -> Result<(Buffer, Buffer)> {
+        unavailable()
+    }
 }
 
 #[derive(Clone)]
