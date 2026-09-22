@@ -7965,8 +7965,9 @@ fn triplet_margin_loss_matches_hand_computed_oracle_with_and_without_swap() -> R
             &device,
         )?
         .with_grad();
-        let loss =
-            anchor.triplet_margin_loss(&positive, &negative, feature, margin, 2.0, eps as f32, false)?;
+        let loss = anchor.triplet_margin_loss(
+            &positive, &negative, feature, margin, 2.0, eps as f32, false,
+        )?;
         close(
             "triplet margin loss forward (no swap)",
             &loss.to_vec()?,
@@ -8038,8 +8039,8 @@ fn triplet_margin_loss_matches_hand_computed_oracle_with_and_without_swap() -> R
             &device,
         )?
         .with_grad();
-        let loss =
-            anchor.triplet_margin_loss(&positive, &negative, feature, margin, 2.0, eps as f32, true)?;
+        let loss = anchor
+            .triplet_margin_loss(&positive, &negative, feature, margin, 2.0, eps as f32, true)?;
         close(
             "triplet margin loss forward (swap)",
             &loss.to_vec()?,
@@ -12223,10 +12224,7 @@ fn fold_module_matches_scalar_col2im_and_is_unfolds_adjoint() -> Result<()> {
 fn pairwise_distance_supports_general_p_and_infinity_norm_matching_hand_computed_oracle()
 -> Result<()> {
     let device = Device::cuda(0)?;
-    let (batch, feature) = (
-        Axis::new("pdist_p_batch"),
-        Axis::new("pdist_p_feature"),
-    );
+    let (batch, feature) = (Axis::new("pdist_p_batch"), Axis::new("pdist_p_feature"));
     // Chosen so no diff-component lands near a norm's non-smooth point: p=1's |.| kink at 0,
     // and p=inf's max() tie when two components share a magnitude, both make central-difference
     // gradient checks spurious near those exact points, so every |diff| here is both bounded
@@ -12255,13 +12253,15 @@ fn pairwise_distance_supports_general_p_and_infinity_norm_matching_hand_computed
 
     // p=1, p=3 (a non-special general exponent), and p -> the infinity-norm sentinel.
     for &p in &[1.0_f64, 3.0, f64::INFINITY] {
-        let x1 =
-            Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?
-                .with_grad();
-        let x2 =
-            Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?
-                .with_grad();
-        let p32 = if p.is_infinite() { f32::INFINITY } else { p as f32 };
+        let x1 = Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?
+            .with_grad();
+        let x2 = Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?
+            .with_grad();
+        let p32 = if p.is_infinite() {
+            f32::INFINITY
+        } else {
+            p as f32
+        };
         let distance = x1.pairwise_distance(&x2, feature, p32, eps as f32)?;
         let expected: Vec<f64> = (0..2)
             .map(|row| {
@@ -12302,15 +12302,24 @@ fn pairwise_distance_supports_general_p_and_infinity_norm_matching_hand_computed
 #[ignore = "requires CUDA"]
 fn pairwise_distance_p_must_be_a_positive_real_or_infinite() -> Result<()> {
     let device = Device::cuda(0)?;
-    let (batch, feature) = (Axis::new("pdist_p_err_batch"), Axis::new("pdist_p_err_feature"));
+    let (batch, feature) = (
+        Axis::new("pdist_p_err_batch"),
+        Axis::new("pdist_p_err_feature"),
+    );
     let x1 = Tensor::from_slice(&[1.0_f32, 2.0], [batch.of(1), feature.of(2)], &device)?;
     let x2 = Tensor::from_slice(&[0.0_f32, 0.0], [batch.of(1), feature.of(2)], &device)?;
     assert!(x1.pairwise_distance(&x2, feature, 0.0, 1e-6).is_err());
     assert!(x1.pairwise_distance(&x2, feature, -1.0, 1e-6).is_err());
     assert!(x1.pairwise_distance(&x2, feature, f32::NAN, 1e-6).is_err());
-    assert!(x1.pairwise_distance(&x2, feature, f32::NEG_INFINITY, 1e-6).is_err());
+    assert!(
+        x1.pairwise_distance(&x2, feature, f32::NEG_INFINITY, 1e-6)
+            .is_err()
+    );
     assert!(x1.pairwise_distance(&x2, feature, 1.0, 1e-6).is_ok());
-    assert!(x1.pairwise_distance(&x2, feature, f32::INFINITY, 1e-6).is_ok());
+    assert!(
+        x1.pairwise_distance(&x2, feature, f32::INFINITY, 1e-6)
+            .is_ok()
+    );
     Ok(())
 }
 
@@ -12347,9 +12356,12 @@ fn triplet_margin_loss_p_generalizes_the_underlying_pairwise_distance() -> Resul
             / 2.0
     }
 
-    let anchor =
-        Tensor::from_slice(&to_f32(&anchor_values), [batch.of(2), feature.of(3)], &device)?
-            .with_grad();
+    let anchor = Tensor::from_slice(
+        &to_f32(&anchor_values),
+        [batch.of(2), feature.of(3)],
+        &device,
+    )?
+    .with_grad();
     let positive = Tensor::from_slice(
         &to_f32(&positive_values),
         [batch.of(2), feature.of(3)],
@@ -12364,13 +12376,7 @@ fn triplet_margin_loss_p_generalizes_the_underlying_pairwise_distance() -> Resul
     .with_grad();
 
     let loss = anchor.triplet_margin_loss(
-        &positive,
-        &negative,
-        feature,
-        margin,
-        p as f32,
-        eps as f32,
-        false,
+        &positive, &negative, feature, margin, p as f32, eps as f32, false,
     )?;
     let expected: Vec<f64> = (0..2)
         .map(|row| {
@@ -12380,14 +12386,24 @@ fn triplet_margin_loss_p_generalizes_the_underlying_pairwise_distance() -> Resul
             (f64::from(margin) + l1_row(a, pos, eps) - l1_row(a, neg, eps)).max(0.0)
         })
         .collect();
-    close("triplet margin loss forward (p=1)", &loss.to_vec()?, &expected);
+    close(
+        "triplet margin loss forward (p=1)",
+        &loss.to_vec()?,
+        &expected,
+    );
 
     loss.mean(batch)?.backward()?;
     close(
         "triplet margin loss gradient wrt anchor (p=1)",
         &anchor.grad().unwrap().to_vec()?,
         &central_difference(&anchor_values, 1e-4, |candidate| {
-            triplet_scalar_loss_p1(candidate, &positive_values, &negative_values, f64::from(margin), eps)
+            triplet_scalar_loss_p1(
+                candidate,
+                &positive_values,
+                &negative_values,
+                f64::from(margin),
+                eps,
+            )
         }),
     );
     Ok(())
@@ -12395,8 +12411,8 @@ fn triplet_margin_loss_p_generalizes_the_underlying_pairwise_distance() -> Resul
 
 #[test]
 #[ignore = "requires CUDA"]
-fn multi_margin_loss_supports_p2_and_per_class_weight_matching_hand_computed_oracle()
--> Result<()> {
+fn multi_margin_loss_supports_p2_and_per_class_weight_matching_hand_computed_oracle() -> Result<()>
+{
     let device = Device::cuda(0)?;
     let (batch, class) = (Axis::new("mml_w_batch"), Axis::new("mml_w_class"));
     let x_values = [2.0_f64, 1.5, -1.0, 0.0, 2.5, 3.0];
@@ -12455,7 +12471,11 @@ fn multi_margin_loss_supports_p2_and_per_class_weight_matching_hand_computed_ora
         }),
     );
 
-    assert!(x.detach().multi_margin_loss(&target, class, 1.5, margin, None).is_err());
+    assert!(
+        x.detach()
+            .multi_margin_loss(&target, class, 1.5, margin, None)
+            .is_err()
+    );
     let wrong_extent = Tensor::from_slice(&[1.0_f32, 1.0], [class.of(2)], &device)?;
     assert!(
         x.detach()
@@ -12489,11 +12509,9 @@ fn cosine_similarity_joint_clamp_matches_pytorch_and_diverges_from_the_old_per_v
     let x1_values = [1e-5_f64, 0.0, 0.0, 3.0, 4.0, 0.0];
     let x2_values = [3.0_f64, 4.0, 0.0, 0.0, 3.0, 4.0];
     let x1 =
-        Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?
-            .with_grad();
+        Tensor::from_slice(&to_f32(&x1_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
     let x2 =
-        Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?
-            .with_grad();
+        Tensor::from_slice(&to_f32(&x2_values), [batch.of(2), feature.of(3)], &device)?.with_grad();
 
     let similarity = x1.cosine_similarity(&x2, feature, eps)?;
     // Hand-computed (not from the op under test): row 0's joint-clamp value is 0.03, five
@@ -12552,16 +12570,19 @@ fn elu_and_celu_support_negative_alpha_matching_hand_computed_oracle_under_reord
         if x > 0.0 { 1.0 } else { alpha * x.exp() }
     }
     fn celu(x: f64, alpha: f64) -> f64 {
-        if x > 0.0 { x } else { alpha * ((x / alpha).exp() - 1.0) }
+        if x > 0.0 {
+            x
+        } else {
+            alpha * ((x / alpha).exp() - 1.0)
+        }
     }
     fn celu_grad(x: f64, alpha: f64) -> f64 {
         if x > 0.0 { 1.0 } else { (x / alpha).exp() }
     }
 
-    let elu_leaf =
-        Tensor::from_slice(&to_f32(&values), [row.of(5), col.of(2)], &device)?
-            .with_layout([col, row])?
-            .with_grad();
+    let elu_leaf = Tensor::from_slice(&to_f32(&values), [row.of(5), col.of(2)], &device)?
+        .with_layout([col, row])?
+        .with_grad();
     let elu_output = elu_leaf.elu(alpha as f32)?;
     let expected_elu: Vec<f64> = values.iter().map(|&x| elu(x, alpha)).collect();
     close(
@@ -12577,10 +12598,9 @@ fn elu_and_celu_support_negative_alpha_matching_hand_computed_oracle_under_reord
         &expected_elu_gradient,
     );
 
-    let celu_leaf =
-        Tensor::from_slice(&to_f32(&values), [row.of(5), col.of(2)], &device)?
-            .with_layout([col, row])?
-            .with_grad();
+    let celu_leaf = Tensor::from_slice(&to_f32(&values), [row.of(5), col.of(2)], &device)?
+        .with_layout([col, row])?
+        .with_grad();
     let celu_output = celu_leaf.celu(alpha as f32)?;
     let expected_celu: Vec<f64> = values.iter().map(|&x| celu(x, alpha)).collect();
     close(
