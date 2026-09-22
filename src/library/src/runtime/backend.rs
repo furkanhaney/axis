@@ -310,6 +310,11 @@ impl Device {
             .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    pub(crate) fn sign(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::sign((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn inverse_sqrt_backward(
         &self,
         gradient: &Buffer,
@@ -2181,6 +2186,13 @@ mod kernels {
         let root = sqrt(a.load_like(out) + eps, rounding::NearestEven, ftz::Disabled);
         let scale = broadcast_scalar(-0.5f32, shape![128]);
         out.store(gradient.load_like(out) * scale / (root * root * root));
+    }
+    #[cutile::entry()]
+    fn sign(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        let zero: Tile<f32, { [128] }> = constant(0.0f32, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let negative_one = constant(-1.0f32, shape![128]);
+        out.store(select(gt_tile(a.load_like(out), zero), one, negative_one));
     }
     #[cutile::entry()]
     fn grouped<const PRODUCT: i32>(

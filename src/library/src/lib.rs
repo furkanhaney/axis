@@ -66,7 +66,7 @@ pub use monotonicity::{
 };
 pub use nn::{
     Embedding, ExactGELU, GELU, IntoLayers, LeakyReLU, Linear, Module, ParamId, Parameter,
-    PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU, Tanh,
+    PopulationLinear, PositionEmbedding, ReLU, Sequential, SiLU, SignStraightThrough, Tanh,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, RmsNorm};
 pub use optim::{Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD};
@@ -115,6 +115,7 @@ pub mod prelude {
         MuonWithAuxAdamW, Optimizer, ParamId, Parameter, PopulationLinear, PopulationMode,
         PopulationReceipt, PopulationSpec, PositionEmbedding, ReLU, RegimeSnapshot, ResidualClaim,
         ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, SGD, Sample, Sequential,
-        Shape, SiLU, SinglePass, Standardizer, Tanh, Tensor, TrainStep, Trainer,
+        Shape, SiLU, SignStraightThrough, SinglePass, Standardizer, Tanh, Tensor, TrainStep,
+        Trainer,
     };
 }
