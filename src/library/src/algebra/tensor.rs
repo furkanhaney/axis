@@ -1828,6 +1828,76 @@ impl Tensor {
             .mean(self.shape().axes())?
             .scale(self.shape().len() as f32 / selected as f32)
     }
+    /// Softmax over one named `axis`, with positions `mask` marks `0.0` receiving
+    /// exactly zero probability and exactly zero gradient, and a group whose mask
+    /// is entirely zero along `axis` returning all zeros for that group instead of
+    /// `NaN`. `mask` is a constant `{0.0, 1.0}` tensor sharing every one of
+    /// `self`'s named axes, validated exactly like [`Self::masked_mean`]'s mask
+    /// (finite `0`/`1` values only, rejected if it requires gradients) -- except
+    /// an all-zero *group* along `axis` is the expected fully-masked case here,
+    /// not an error the way an entirely empty mask is for `masked_mean`.
+    ///
+    /// This is the named-axis equivalent of
+    /// `torch.softmax(score.masked_fill(~keep, -inf), dim)` followed by
+    /// `torch.nan_to_num(..., neginf=0.0)` for a fully-masked row -- the exact
+    /// pair every gated-attention consumer with a variable-length validity mask
+    /// (`InterfaceMIL`, `PhaseSeparableFusion`) otherwise repeats by hand. Folding
+    /// the `nan_to_num` cleanup into the op's own contract, rather than leaving a
+    /// `NaN` for the caller to catch, is a deliberate difference from PyTorch's
+    /// two-call composition.
+    ///
+    /// Composed as `softmax(self + (1 - mask) * MASKED_SOFTMAX_OFFSET) *
+    /// any_valid`, where `any_valid` (`mask.max(axis)`) is `1.0` for a group with
+    /// any valid position and `0.0` for a fully-masked one, and
+    /// `MASKED_SOFTMAX_OFFSET` is a large *finite* negative constant rather than
+    /// literal `-inf`. An actually-infinite offset would make a fully-masked
+    /// row's own maximum `-inf` too, so the stable-softmax step computes
+    /// `exp(-inf - -inf)`, i.e. `NaN`, for every position in that row -- and
+    /// `NaN * 0.0` is still `NaN`, so the trailing `any_valid` multiply could
+    /// never clean it up. The finite offset keeps every intermediate value
+    /// finite: a masked position's probability underflows `exp` to exactly
+    /// `0.0f32` once its row has any valid position (the offset sits far past
+    /// `f32`'s roughly -104 underflow threshold at any realistic score
+    /// magnitude, with wide margin below overflowing the addition itself to
+    /// `-inf`), and a fully-masked row instead computes an ordinary finite (if
+    /// meaningless) distribution that the trailing multiply by `any_valid` zeroes
+    /// out cleanly, since it is never `NaN`.
+    ///
+    /// Gradient into `self` at a masked position is exactly zero either way:
+    /// softmax's backward rule scales the upstream gradient by the
+    /// (exactly-zero) probability there, so it does not matter that the offset's
+    /// own local derivative into `self` is nominally `1.0`. A fully-masked
+    /// group's gradient is exactly zero throughout, for the same reason applied
+    /// to the `any_valid` multiply: it zeros the upstream gradient into that
+    /// group's raw softmax before the softmax backward rule ever runs.
+    pub fn masked_softmax(&self, axis: Axis, mask: &Self) -> Result<Self> {
+        const MASKED_SOFTMAX_OFFSET: f32 = -1.0e9;
+        if mask.requires_grad() {
+            return Err("masked_softmax mask cannot require gradients".into());
+        }
+        if self.shape().rank() != mask.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&own_axis| !mask.shape().contains(own_axis))
+        {
+            return Err("masked_softmax requires identical axis sets".into());
+        }
+        self.compatible_device(mask)?;
+        self.shared_extents(mask)?;
+        let mask = mask.align(self.shape())?;
+        let values = mask.to_vec()?;
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || (*value != 0.0 && *value != 1.0))
+        {
+            return Err("masked_softmax mask must contain only finite zero or one values".into());
+        }
+        let offset = mask.logical_not()?.scale(MASKED_SOFTMAX_OFFSET)?;
+        let any_valid = mask.max(axis)?;
+        self.add(&offset)?.softmax(axis)?.mul(&any_valid)
+    }
     /// Mask key positions greater than query positions with -infinity.
     /// This is square, zero-offset self-attention; cached/offset attention is not supported.
     pub fn causal_mask(&self, query: Axis, key: Axis) -> Result<Self> {
