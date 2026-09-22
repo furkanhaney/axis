@@ -508,6 +508,356 @@ impl Module for GELU {
     }
 }
 
+/// Elementwise ELU with an explicit, finite, positive `alpha`. See
+/// [`Tensor::elu`] for the exact forward/backward split at `x == 0`.
+#[derive(Clone, Copy)]
+pub struct ELU {
+    alpha: f32,
+}
+impl ELU {
+    pub fn new(alpha: f32) -> Result<Self> {
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err("ELU alpha must be finite and positive".into());
+        }
+        Ok(Self { alpha })
+    }
+}
+impl Module for ELU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.elu(self.alpha)
+    }
+}
+
+/// Elementwise CELU with an explicit, finite, positive `alpha`. See
+/// [`Tensor::celu`] for the exact forward/backward split at `x == 0`.
+#[derive(Clone, Copy)]
+pub struct CELU {
+    alpha: f32,
+}
+impl CELU {
+    pub fn new(alpha: f32) -> Result<Self> {
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err("CELU alpha must be finite and positive".into());
+        }
+        Ok(Self { alpha })
+    }
+}
+impl Module for CELU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.celu(self.alpha)
+    }
+}
+
+/// Parameter-free SELU: PyTorch's fixed-constant self-normalizing activation.
+/// See [`Tensor::selu`] for the exact constants.
+#[derive(Clone, Copy)]
+pub struct SELU;
+impl Module for SELU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.selu()
+    }
+}
+
+/// Elementwise Softplus with explicit `beta`/`threshold`, defaulting to
+/// PyTorch's own `beta = 1`, `threshold = 20`. See [`Tensor::softplus`] for the
+/// exact branch seam.
+#[derive(Clone, Copy)]
+pub struct Softplus {
+    beta: f32,
+    threshold: f32,
+}
+impl Softplus {
+    pub fn new() -> Self {
+        Self {
+            beta: 1.0,
+            threshold: 20.0,
+        }
+    }
+    pub fn beta(mut self, beta: f32) -> Result<Self> {
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err("Softplus beta must be finite and positive".into());
+        }
+        self.beta = beta;
+        Ok(self)
+    }
+    pub fn threshold(mut self, threshold: f32) -> Result<Self> {
+        if !threshold.is_finite() {
+            return Err("Softplus threshold must be finite".into());
+        }
+        self.threshold = threshold;
+        Ok(self)
+    }
+}
+impl Default for Softplus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Module for Softplus {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.softplus(self.beta, self.threshold)
+    }
+}
+
+/// Parameter-free numerically stable log-sigmoid. See [`Tensor::log_sigmoid`].
+#[derive(Clone, Copy)]
+pub struct LogSigmoid;
+impl Module for LogSigmoid {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.log_sigmoid()
+    }
+}
+
+/// Parameter-free Mish, `x * tanh(softplus(x))`. See [`Tensor::mish`].
+#[derive(Clone, Copy)]
+pub struct Mish;
+impl Module for Mish {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.mish()
+    }
+}
+
+/// Gated Linear Unit over an explicit named `axis`, halved by the gate. See
+/// [`Tensor::glu`].
+#[derive(Clone, Copy)]
+pub struct GLU {
+    axis: Axis,
+}
+impl GLU {
+    pub fn new(axis: Axis) -> Self {
+        Self { axis }
+    }
+}
+impl Module for GLU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        let extent = input.extent(self.axis)?;
+        if extent % 2 != 0 {
+            return Err("GLU requires an even extent on the split axis".into());
+        }
+        let dims: Vec<_> = input
+            .dims()
+            .iter()
+            .copied()
+            .map(|dim| {
+                if dim.axis == self.axis {
+                    self.axis.of(extent / 2)
+                } else {
+                    dim
+                }
+            })
+            .collect();
+        Shape::new(dims)
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        input.glu(self.axis)
+    }
+}
+
+/// Parametric ReLU with a learnable weight, either shared across every element
+/// ([`PReLU::shared`], PyTorch's default `num_parameters=1`) or one per entry
+/// of an explicit named channel axis ([`PReLU::channel`], PyTorch's
+/// `num_parameters=C`); both start at PyTorch's default init, `0.25`. See
+/// [`Tensor::prelu`].
+#[derive(Clone)]
+pub struct PReLU {
+    channel: Option<Axis>,
+    bound: Option<(usize, Parameter)>,
+}
+impl PReLU {
+    /// One weight shared by every element (PyTorch's `num_parameters=1` default).
+    pub fn shared() -> Self {
+        Self {
+            channel: None,
+            bound: None,
+        }
+    }
+    /// One weight per entry of `channel` (PyTorch's `num_parameters=C`).
+    pub fn channel(channel: Axis) -> Self {
+        Self {
+            channel: Some(channel),
+            bound: None,
+        }
+    }
+}
+impl Module for PReLU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        if let Some(channel) = self.channel {
+            input.extent(channel)?;
+        }
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, device: &Device, _seed: u64) -> Result<Shape> {
+        let shape = self.output_shape(input)?;
+        if let Some((_, weight)) = &self.bound {
+            if !weight.tensor().device().same(device) {
+                return Err("PReLU is already built on a different Device".into());
+            }
+            return Ok(shape);
+        }
+        let extent = match self.channel {
+            Some(channel) => input.extent(channel)?,
+            None => 1,
+        };
+        let weight_dims: Vec<Dim> = match self.channel {
+            Some(channel) => vec![channel.of(extent)],
+            None => vec![],
+        };
+        let weight = Parameter::new(Tensor::from_slice(
+            &vec![0.25; extent],
+            weight_dims,
+            device,
+        )?);
+        self.bound = Some((extent, weight));
+        Ok(shape)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        let (_, weight) = self
+            .bound
+            .as_ref()
+            .ok_or("PReLU must be built before forward")?;
+        input.prelu(&weight.tensor())
+    }
+    fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        self.bound
+            .as_ref()
+            .map(|(_, weight)| vec![("weight".into(), weight.clone())])
+            .unwrap_or_default()
+    }
+}
+
+/// Numerically stable log-softmax over an explicit named `axis`. See
+/// [`Tensor::log_softmax`].
+#[derive(Clone, Copy)]
+pub struct LogSoftmax {
+    axis: Axis,
+}
+impl LogSoftmax {
+    pub fn new(axis: Axis) -> Self {
+        Self { axis }
+    }
+}
+impl Module for LogSoftmax {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        input.extent(self.axis)?;
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        input.log_softmax(self.axis)
+    }
+}
+
+/// Softmin over an explicit named `axis`. See [`Tensor::softmin`].
+#[derive(Clone, Copy)]
+pub struct Softmin {
+    axis: Axis,
+}
+impl Softmin {
+    pub fn new(axis: Axis) -> Self {
+        Self { axis }
+    }
+}
+impl Module for Softmin {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        input.extent(self.axis)?;
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        input.softmin(self.axis)
+    }
+}
+
+/// Softmax over an explicit named `channel` axis of a `[channel, height,
+/// width]` input (PyTorch's `Softmax2d`, which requires exactly that rank).
+/// Delegates to the existing named-axis [`Tensor::softmax`]; `height`/`width`
+/// exist to state and check the contract, since `softmax` already treats every
+/// other axis independently.
+#[derive(Clone, Copy)]
+pub struct Softmax2d {
+    channel: Axis,
+    height: Axis,
+    width: Axis,
+}
+impl Softmax2d {
+    pub fn new(channel: Axis, height: Axis, width: Axis) -> Result<Self> {
+        if channel == height || channel == width || height == width {
+            return Err("Softmax2d requires distinct channel, height, and width axes".into());
+        }
+        Ok(Self {
+            channel,
+            height,
+            width,
+        })
+    }
+}
+impl Module for Softmax2d {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        if input.rank() != 3
+            || !input.contains(self.channel)
+            || !input.contains(self.height)
+            || !input.contains(self.width)
+        {
+            return Err("Softmax2d requires exactly the channel, height, and width axes".into());
+        }
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        input.softmax(self.channel)
+    }
+}
+
 /// Parameter-free erf-form GELU for checkpoints trained with exact GELU, which is
 /// PyTorch's default `nn.GELU()`.
 #[derive(Clone, Copy)]

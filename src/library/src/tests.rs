@@ -6427,3 +6427,720 @@ fn masked_softmax_matches_hand_computed_oracle_under_reordered_storage() -> Resu
     );
     Ok(())
 }
+
+// -- nn-act-smooth: ELU, CELU, SELU, Softplus (module), LogSigmoid, Mish,
+// GLU, PReLU, LogSoftmax, Softmin, Softmax2d. --
+
+#[test]
+fn smooth_activation_modules_reject_invalid_configuration() -> Result<()> {
+    let (row, feature, channel, height, width) = (
+        Axis::new("smooth_row"),
+        Axis::new("smooth_feature"),
+        Axis::new("smooth_channel"),
+        Axis::new("smooth_height"),
+        Axis::new("smooth_width"),
+    );
+
+    assert!(ELU::new(0.0).is_err());
+    assert!(ELU::new(-1.0).is_err());
+    assert!(ELU::new(f32::NAN).is_err());
+    assert!(ELU::new(f32::INFINITY).is_err());
+    assert!(ELU::new(1.0).is_ok());
+
+    assert!(CELU::new(0.0).is_err());
+    assert!(CELU::new(-0.5).is_err());
+    assert!(CELU::new(f32::NAN).is_err());
+    assert!(CELU::new(1.0).is_ok());
+
+    assert!(Softplus::new().beta(0.0).is_err());
+    assert!(Softplus::new().beta(-1.0).is_err());
+    assert!(Softplus::new().beta(f32::NAN).is_err());
+    assert!(Softplus::new().threshold(f32::NAN).is_err());
+    assert!(Softplus::new().threshold(f32::INFINITY).is_err());
+    assert!(Softplus::new().beta(2.0).is_ok());
+
+    let full = Shape::new([row.of(2), feature.of(6)])?;
+    assert_eq!(
+        GLU::new(feature).output_shape(&full)?,
+        Shape::new([row.of(2), feature.of(3)])?
+    );
+    let odd = Shape::new([row.of(2), feature.of(5)])?;
+    assert!(GLU::new(feature).output_shape(&odd).is_err());
+    assert!(GLU::new(channel).output_shape(&full).is_err());
+
+    assert!(
+        PReLU::channel(channel)
+            .output_shape(&Shape::new([row.of(2), feature.of(5)])?)
+            .is_err()
+    );
+    assert!(
+        PReLU::channel(channel)
+            .output_shape(&Shape::new([row.of(2), channel.of(3)])?)
+            .is_ok()
+    );
+    assert!(PReLU::shared().output_shape(&full).is_ok());
+
+    assert!(LogSoftmax::new(channel).output_shape(&full).is_err());
+    assert!(LogSoftmax::new(feature).output_shape(&full).is_ok());
+    assert!(Softmin::new(channel).output_shape(&full).is_err());
+    assert!(Softmin::new(feature).output_shape(&full).is_ok());
+
+    assert!(Softmax2d::new(channel, channel, width).is_err());
+    assert!(Softmax2d::new(channel, height, channel).is_err());
+    let softmax2d = Softmax2d::new(channel, height, width)?;
+    assert!(
+        softmax2d
+            .output_shape(&Shape::new([channel.of(3), height.of(2)])?)
+            .is_err()
+    );
+    assert!(
+        softmax2d
+            .output_shape(&Shape::new([
+                row.of(1),
+                channel.of(3),
+                height.of(2),
+                width.of(4),
+            ])?)
+            .is_err()
+    );
+    assert!(
+        softmax2d
+            .output_shape(&Shape::new([channel.of(3), height.of(2), width.of(4)])?)
+            .is_ok()
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn elu_and_celu_match_hand_computed_oracle_under_reordered_asymmetric_storage() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("elu_row"), Axis::new("elu_col"));
+    // Asymmetric extents (3 x 67 = 201), spanning the x == 0 boundary at index 100.
+    let values: Vec<f64> = (0..201).map(|i| (i as f64 - 100.0) / 20.0).collect();
+    let n = values.len() as f64;
+
+    let alpha = 1.5_f64;
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(3), col.of(67)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([col, row])?;
+    let output = ELU::new(alpha as f32)?.forward(&input)?;
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&x| if x > 0.0 { x } else { alpha * (x.exp() - 1.0) })
+        .collect();
+    close("ELU module forward", &output.to_vec()?, &expected);
+    output.mean([row, col])?.backward()?;
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| (if x > 0.0 { 1.0 } else { alpha * x.exp() }) / n)
+        .collect();
+    close(
+        "ELU module derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    assert!(input.elu(f32::INFINITY).is_err());
+
+    let celu_alpha = 0.8_f64;
+    let celu_leaf = input.detach().with_layout([row, col])?.with_grad();
+    let celu_input = celu_leaf.with_layout([col, row])?;
+    let celu_output = CELU::new(celu_alpha as f32)?.forward(&celu_input)?;
+    let expected_celu: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            if x > 0.0 {
+                x
+            } else {
+                celu_alpha * ((x / celu_alpha).exp() - 1.0)
+            }
+        })
+        .collect();
+    close(
+        "CELU module forward",
+        &celu_output.to_vec()?,
+        &expected_celu,
+    );
+    celu_output.mean([row, col])?.backward()?;
+    let expected_celu_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| (if x > 0.0 { 1.0 } else { (x / celu_alpha).exp() }) / n)
+        .collect();
+    close(
+        "CELU module derivative",
+        &celu_leaf.grad().unwrap().to_vec()?,
+        &expected_celu_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn selu_matches_hand_computed_oracle_under_reordered_asymmetric_storage() -> Result<()> {
+    const SELU_ALPHA: f64 = 1.6732632423543772;
+    const SELU_SCALE: f64 = 1.0507009873554805;
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("selu_row"), Axis::new("selu_col"));
+    // Asymmetric extents (7 x 25 = 175).
+    let values: Vec<f64> = (0..175).map(|i| (i as f64 - 87.0) / 25.0).collect();
+    let n = values.len() as f64;
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(7), col.of(25)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([col, row])?;
+    let output = SELU.forward(&input)?;
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            SELU_SCALE
+                * if x > 0.0 {
+                    x
+                } else {
+                    SELU_ALPHA * (x.exp() - 1.0)
+                }
+        })
+        .collect();
+    close("SELU forward", &output.to_vec()?, &expected);
+    output.mean([row, col])?.backward()?;
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| SELU_SCALE * (if x > 0.0 { 1.0 } else { SELU_ALPHA * x.exp() }) / n)
+        .collect();
+    close(
+        "SELU derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn softplus_module_matches_tensor_op_with_default_and_explicit_parameters() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (
+        Axis::new("softplus_module_row"),
+        Axis::new("softplus_module_col"),
+    );
+    // Asymmetric extents (7 x 25 = 175), within [-20, 20] so the default
+    // threshold never engages.
+    let values: Vec<f64> = (0..175).map(|i| (i as f64 - 87.0) / 8.0).collect();
+    let n = values.len() as f64;
+
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(7), col.of(25)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([col, row])?;
+    let output = Softplus::new().forward(&input)?;
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&x| if x > 20.0 { x } else { (1.0 + x.exp()).ln() })
+        .collect();
+    close(
+        "Softplus module default forward",
+        &output.to_vec()?,
+        &expected,
+    );
+    output.mean([row, col])?.backward()?;
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            (if x > 20.0 {
+                1.0
+            } else {
+                1.0 / (1.0 + (-x).exp())
+            }) / n
+        })
+        .collect();
+    close(
+        "Softplus module default derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    // Explicit override, beta = 2, threshold = 3 -- this range's positive tail
+    // (up to 10.875) crosses beta * x > threshold.
+    let explicit_leaf = input.detach().with_layout([row, col])?.with_grad();
+    let explicit_input = explicit_leaf.with_layout([col, row])?;
+    let explicit = Softplus::new().beta(2.0)?.threshold(3.0)?;
+    let explicit_output = explicit.forward(&explicit_input)?;
+    let expected_explicit: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let scaled = 2.0 * x;
+            if scaled > 3.0 {
+                x
+            } else {
+                (1.0 + scaled.exp()).ln() / 2.0
+            }
+        })
+        .collect();
+    close(
+        "Softplus module explicit forward",
+        &explicit_output.to_vec()?,
+        &expected_explicit,
+    );
+    explicit_output.mean([row, col])?.backward()?;
+    let expected_explicit_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let scaled = 2.0 * x;
+            let derivative = if scaled > 3.0 {
+                1.0
+            } else {
+                1.0 / (1.0 + (-scaled).exp())
+            };
+            derivative / n
+        })
+        .collect();
+    close(
+        "Softplus module explicit derivative",
+        &explicit_leaf.grad().unwrap().to_vec()?,
+        &expected_explicit_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn log_sigmoid_matches_hand_computed_oracle_under_reordered_asymmetric_storage() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("log_sigmoid_row"), Axis::new("log_sigmoid_col"));
+    // Asymmetric extents (7 x 25 = 175), including large-magnitude values that
+    // cross softplus's internal linear seam.
+    let values: Vec<f64> = (0..175).map(|i| (i as f64 - 87.0) / 4.0).collect();
+    let n = values.len() as f64;
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(7), col.of(25)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([col, row])?;
+    let output = LogSigmoid.forward(&input)?;
+    let expected: Vec<f64> = values.iter().map(|&x| -(1.0 + (-x).exp()).ln()).collect();
+    close("LogSigmoid forward", &output.to_vec()?, &expected);
+    output.mean([row, col])?.backward()?;
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| (1.0 / (1.0 + x.exp())) / n)
+        .collect();
+    close(
+        "LogSigmoid derivative (sigmoid(-x))",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn mish_matches_hand_computed_oracle_under_reordered_asymmetric_storage() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, col) = (Axis::new("mish_row"), Axis::new("mish_col"));
+    // Asymmetric extents (7 x 25 = 175).
+    let values: Vec<f64> = (0..175).map(|i| (i as f64 - 87.0) / 20.0).collect();
+    let n = values.len() as f64;
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(7), col.of(25)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([col, row])?;
+    let output = Mish.forward(&input)?;
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let softplus = (1.0 + x.exp()).ln();
+            x * softplus.tanh()
+        })
+        .collect();
+    close("Mish forward", &output.to_vec()?, &expected);
+    output.mean([row, col])?.backward()?;
+    // d/dx [x * tanh(softplus(x))] = tanh(sp) + x * sigmoid(x) * (1 - tanh(sp)^2).
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| {
+            let softplus = (1.0 + x.exp()).ln();
+            let tanh_sp = softplus.tanh();
+            let sigmoid = 1.0 / (1.0 + (-x).exp());
+            (tanh_sp + x * sigmoid * (1.0 - tanh_sp * tanh_sp)) / n
+        })
+        .collect();
+    close(
+        "Mish derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn glu_splits_named_axis_and_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, feature) = (Axis::new("glu_row"), Axis::new("glu_feature"));
+    // Asymmetric extents (3 rows x 8 features, split into two 4-wide halves).
+    let values: Vec<f64> = (0..24).map(|i| (i as f64 - 12.0) / 3.0).collect();
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(3), feature.of(8)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([feature, row])?;
+    let output = GLU::new(feature).forward(&input)?;
+    assert_eq!(output.extent(feature)?, 4);
+    let n_out = 12.0_f64; // 3 rows x 4 output features
+
+    let mut expected = Vec::with_capacity(12);
+    let mut expected_gradient = vec![0.0_f64; 24];
+    for r in 0..3usize {
+        for c in 0..4usize {
+            let a = values[r * 8 + c];
+            let b = values[r * 8 + 4 + c];
+            let sigmoid_b = 1.0 / (1.0 + (-b).exp());
+            expected.push(a * sigmoid_b);
+            expected_gradient[r * 8 + c] = sigmoid_b / n_out;
+            expected_gradient[r * 8 + 4 + c] = a * sigmoid_b * (1.0 - sigmoid_b) / n_out;
+        }
+    }
+    close("GLU forward", &output.to_vec()?, &expected);
+    output.mean([row, feature])?.backward()?;
+    close(
+        "GLU derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    assert!(
+        GLU::new(feature)
+            .output_shape(&Shape::new([row.of(3), feature.of(7)])?)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prelu_shared_and_per_channel_match_hand_computed_oracle_including_weight_gradient() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let (row, channel) = (Axis::new("prelu_row"), Axis::new("prelu_channel"));
+    // Asymmetric extents (5 rows x 3 channels).
+    let values: Vec<f64> = (0..15).map(|i| (i as f64 - 7.0) / 2.0).collect();
+    let n = values.len() as f64;
+
+    // Shared: one weight for every element, default init 0.25 (PyTorch's
+    // num_parameters=1 default).
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(5), channel.of(3)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([channel, row])?;
+    assert!(PReLU::shared().forward(&input).is_err());
+    let mut shared = PReLU::shared();
+    shared.build(input.shape(), &device, 0)?;
+    assert_eq!(shared.named_parameters().len(), 1);
+    let weight = shared.parameter("weight")?;
+    close(
+        "PReLU shared weight init",
+        &weight.tensor().to_vec()?,
+        &[0.25],
+    );
+    let output = shared.forward(&input)?;
+    let w = 0.25_f64;
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&x| if x > 0.0 { x } else { w * x })
+        .collect();
+    close("PReLU shared forward", &output.to_vec()?, &expected);
+    output.mean([row, channel])?.backward()?;
+    let expected_gradient: Vec<f64> = values
+        .iter()
+        .map(|&x| (if x > 0.0 { 1.0 } else { w }) / n)
+        .collect();
+    close(
+        "PReLU shared input derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    let expected_weight_gradient: f64 = values
+        .iter()
+        .map(|&x| if x > 0.0 { 0.0 } else { x / n })
+        .sum();
+    close(
+        "PReLU shared weight derivative",
+        &weight.grad().unwrap().to_vec()?,
+        &[expected_weight_gradient],
+    );
+
+    // Per-channel: one weight per entry of `channel` (PyTorch's
+    // num_parameters=C), perturbed away from the shared init so the oracle
+    // exercises three distinct slopes.
+    let channel_leaf = input.detach().with_layout([row, channel])?.with_grad();
+    let channel_input = channel_leaf.with_layout([channel, row])?;
+    let mut per_channel = PReLU::channel(channel);
+    per_channel.build(channel_input.shape(), &device, 0)?;
+    let channel_weight = per_channel.parameter("weight")?;
+    close(
+        "PReLU per-channel weight init",
+        &channel_weight.tensor().to_vec()?,
+        &[0.25, 0.25, 0.25],
+    );
+    channel_weight.set_values(&[0.1, 0.25, 0.6])?;
+    let channel_output = per_channel.forward(&channel_input)?;
+    let weights = [0.1_f64, 0.25, 0.6];
+    let mut expected_channel = Vec::with_capacity(15);
+    let mut expected_channel_gradient = vec![0.0_f64; 15];
+    let mut expected_channel_weight_gradient = [0.0_f64; 3];
+    for r in 0..5usize {
+        for c in 0..3usize {
+            let x = values[r * 3 + c];
+            let w = weights[c];
+            expected_channel.push(if x > 0.0 { x } else { w * x });
+            expected_channel_gradient[r * 3 + c] = (if x > 0.0 { 1.0 } else { w }) / n;
+            if x <= 0.0 {
+                expected_channel_weight_gradient[c] += x / n;
+            }
+        }
+    }
+    close(
+        "PReLU per-channel forward",
+        &channel_output.to_vec()?,
+        &expected_channel,
+    );
+    channel_output.mean([row, channel])?.backward()?;
+    close(
+        "PReLU per-channel input derivative",
+        &channel_leaf.grad().unwrap().to_vec()?,
+        &expected_channel_gradient,
+    );
+    close(
+        "PReLU per-channel weight derivative",
+        &channel_weight.grad().unwrap().to_vec()?,
+        &expected_channel_weight_gradient,
+    );
+
+    assert!(
+        PReLU::channel(channel)
+            .output_shape(&Shape::new([row.of(5)])?)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn log_softmax_matches_hand_computed_oracle_and_stays_finite_for_large_logits() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, class) = (Axis::new("log_softmax_row"), Axis::new("log_softmax_class"));
+    // Asymmetric extents (3 rows x 5 classes); the middle row's raw logits are
+    // large enough (~1000) that a literal exp/sum/ln composition without the
+    // logsumexp shift would overflow toward `inf`.
+    let values: Vec<f64> = vec![
+        0.5, -1.0, 2.0, 0.0, 3.0, 1000.0, 1001.0, 999.0, 1000.5, 998.0, -2.0, -1.0, 0.0, 1.0, 2.0,
+    ];
+    let n = values.len() as f64;
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(3), class.of(5)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([class, row])?;
+    let output = LogSoftmax::new(class).forward(&input)?;
+
+    let mut expected = Vec::with_capacity(15);
+    let mut softmax_rows = Vec::with_capacity(15);
+    for row_values in values.chunks(5) {
+        let max = row_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let sum_exp: f64 = row_values.iter().map(|&x| (x - max).exp()).sum();
+        let logsumexp = max + sum_exp.ln();
+        for &x in row_values {
+            expected.push(x - logsumexp);
+            softmax_rows.push((x - max).exp() / sum_exp);
+        }
+    }
+    let output_values = output.to_vec()?;
+    close("LogSoftmax forward", &output_values, &expected);
+    assert!(output_values.iter().all(|v| v.is_finite()));
+
+    output.mean([row, class])?.backward()?;
+    // d(log_softmax_i)/dx_j = delta_ij - softmax_j; the uniform 1/n upstream
+    // gradient from `mean` over each 5-wide row gives grad_j = (1 - 5*p_j)/n.
+    let mut expected_gradient = Vec::with_capacity(15);
+    for chunk in softmax_rows.chunks(5) {
+        for &p in chunk {
+            expected_gradient.push((1.0 - 5.0 * p) / n);
+        }
+    }
+    close(
+        "LogSoftmax derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn softmin_matches_hand_computed_oracle_under_reordered_storage() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (row, class) = (Axis::new("softmin_row"), Axis::new("softmin_class"));
+    // Asymmetric extents (2 rows x 6 classes).
+    let values: Vec<f64> = vec![
+        0.5, -1.0, 2.0, 0.0, 3.0, -0.5, 4.0, -2.0, 1.0, 0.0, 2.5, -1.5,
+    ];
+    let weights = [2.0_f64, 0.5, 1.0, 3.0, 0.25, 1.5];
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [row.of(2), class.of(6)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([class, row])?;
+    let output = Softmin::new(class).forward(&input)?;
+
+    let mut expected = Vec::with_capacity(12);
+    let mut prob_rows: Vec<Vec<f64>> = Vec::with_capacity(2);
+    for row_values in values.chunks(6) {
+        let negated: Vec<f64> = row_values.iter().map(|&x| -x).collect();
+        let max = negated.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let sum_exp: f64 = negated.iter().map(|&x| (x - max).exp()).sum();
+        let probabilities: Vec<f64> = negated.iter().map(|&x| (x - max).exp() / sum_exp).collect();
+        expected.extend(&probabilities);
+        prob_rows.push(probabilities);
+    }
+    close("Softmin forward", &output.to_vec()?, &expected);
+
+    let weight_tensor = Tensor::from_slice(
+        &weights.iter().map(|&w| w as f32).collect::<Vec<_>>(),
+        [class.of(6)],
+        &device,
+    )?;
+    output.mul(&weight_tensor)?.mean([row, class])?.backward()?;
+
+    // Softmin(x) = softmax(-x), so d(softmin_i)/dx_j = p_i * (p_j - delta_ij)
+    // (the sign-flipped softmax Jacobian). Weighted and reduced uniformly
+    // over the 12 outputs: grad_j = p_j * (sum_i w_i*p_i - w_j) / n.
+    let n = values.len() as f64;
+    let mut expected_gradient = Vec::with_capacity(12);
+    for probabilities in &prob_rows {
+        let weighted_sum: f64 = probabilities
+            .iter()
+            .zip(&weights)
+            .map(|(&p, &w)| p * w)
+            .sum();
+        for (j, &p_j) in probabilities.iter().enumerate() {
+            expected_gradient.push(p_j * (weighted_sum - weights[j]) / n);
+        }
+    }
+    close(
+        "Softmin weighted derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn softmax2d_normalizes_channel_axis_and_matches_hand_computed_oracle() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (channel, height, width) = (
+        Axis::new("softmax2d_channel"),
+        Axis::new("softmax2d_height"),
+        Axis::new("softmax2d_width"),
+    );
+    // Asymmetric extents: 3 channels x 2 height x 5 width = 30 elements.
+    let values: Vec<f64> = (0..30).map(|i| ((i as f64) * 7.0 % 23.0) - 11.0).collect();
+    let weights = [2.0_f64, 0.5, 1.5];
+    let leaf = Tensor::from_slice(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        [channel.of(3), height.of(2), width.of(5)],
+        &device,
+    )?
+    .with_grad();
+    let input = leaf.with_layout([width, height, channel])?;
+    let module = Softmax2d::new(channel, height, width)?;
+    let output = module.forward(&input)?;
+
+    let index = |c: usize, h: usize, w: usize| (c * 2 + h) * 5 + w;
+    let mut expected = vec![0.0_f64; 30];
+    let mut probabilities = vec![0.0_f64; 30];
+    for h in 0..2usize {
+        for w in 0..5usize {
+            let column = [
+                values[index(0, h, w)],
+                values[index(1, h, w)],
+                values[index(2, h, w)],
+            ];
+            let max = column.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let sum_exp: f64 = column.iter().map(|&x| (x - max).exp()).sum();
+            for (c, &value) in column.iter().enumerate() {
+                let p = (value - max).exp() / sum_exp;
+                expected[index(c, h, w)] = p;
+                probabilities[index(c, h, w)] = p;
+            }
+        }
+    }
+    close("Softmax2d forward", &output.to_vec()?, &expected);
+
+    let weight_tensor = Tensor::from_slice(
+        &weights.iter().map(|&w| w as f32).collect::<Vec<_>>(),
+        [channel.of(3)],
+        &device,
+    )?;
+    output
+        .mul(&weight_tensor)?
+        .mean([channel, height, width])?
+        .backward()?;
+
+    // Weighted, uniformly-reduced softmax gradient: grad_j = p_j * (w_j - S)/n
+    // where S = sum_i w_i*p_i over the 3-entry channel axis at that location.
+    let n = values.len() as f64;
+    let mut expected_gradient = vec![0.0_f64; 30];
+    for h in 0..2usize {
+        for w in 0..5usize {
+            let weighted_sum: f64 = (0..3)
+                .map(|i| weights[i] * probabilities[index(i, h, w)])
+                .sum();
+            for j in 0..3usize {
+                let p_j = probabilities[index(j, h, w)];
+                expected_gradient[index(j, h, w)] = p_j * (weights[j] - weighted_sum) / n;
+            }
+        }
+    }
+    close(
+        "Softmax2d weighted derivative",
+        &leaf.grad().unwrap().to_vec()?,
+        &expected_gradient,
+    );
+
+    assert!(
+        Softmax2d::new(channel, channel, width).is_err(),
+        "Softmax2d must reject reused axis identities"
+    );
+    assert!(
+        module
+            .output_shape(&Shape::new([channel.of(3), height.of(2)])?)
+            .is_err(),
+        "Softmax2d must reject a non-3D input"
+    );
+    Ok(())
+}

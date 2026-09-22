@@ -64,7 +64,11 @@ parity; `Tensor::gelu()` and `GELU` retain their tanh formulation. `SiLU` and
 configurable `LeakyReLU` compose existing differentiable tensor primitives.
 The exact-form operation uses FP32 normal-CDF evaluation and its analytic
 derivative, not bitwise libm equivalence. `gelu` is the tanh form; a model
-ported from PyTorch's default `nn.GELU` wants `gelu_exact`.
+ported from PyTorch's default `nn.GELU` wants `gelu_exact`. `ELU`, `CELU`,
+`SELU`, `Softplus`, `LogSigmoid`, `Mish`, `GLU`, `PReLU`, `LogSoftmax`,
+`Softmin`, and `Softmax2d` compose the same way from `exp`/`ln`/`softplus`/
+`logsumexp`/`softmax`/`tanh`/`sigmoid`; `PReLU` is the one with a learnable
+weight, shared or one per named channel.
 
 The Muon implementation's pinned upstream revision and MIT attribution are in
 [THIRD_PARTY.md](THIRD_PARTY.md), which is included in every published crate.
