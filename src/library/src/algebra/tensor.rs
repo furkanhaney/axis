@@ -1,7 +1,7 @@
 use crate::{
     Axis, Device, Dim, IntoAxes, Result, Shape,
     axis::Layout,
-    backend::{Buffer, Plan, SelectSpec, UnfoldSpec},
+    backend::{Buffer, Plan, SelectSpec, UnfoldSpec, WindowSpec},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -98,6 +98,11 @@ enum Rule {
     Multiply(Buffer),
     Relu(Buffer),
     Sigmoid(Buffer),
+    Silu(Buffer),
+    LeakyRelu {
+        input: Buffer,
+        negative_slope: f32,
+    },
     Tanh(Buffer),
     Sin(Buffer),
     Gelu(Buffer),
@@ -144,6 +149,7 @@ enum Rule {
     },
     Unfold(Rc<UnfoldSpec>),
     Select(Rc<SelectSpec>),
+    Window(Rc<WindowSpec>),
     StackSlice {
         offset: usize,
         len: usize,
@@ -833,22 +839,41 @@ impl Tensor {
         ))
     }
     /// Elementwise sigmoid linear unit, `x * sigmoid(x)`.
-    ///
-    /// This is composed from the same verified elementwise primitives used by
-    /// the rest of the graph, so reverse mode preserves named axes and layout.
     pub fn silu(&self) -> Result<Self> {
-        self.mul(&self.sigmoid()?)
+        let value = self.device().silu(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Silu(self.0.value.clone()))],
+            false,
+            None,
+        ))
     }
 
     /// Elementwise leaky ReLU with an explicit finite, non-negative slope.
-    /// Its derivative at exactly zero is zero, matching Axis's compositional
-    /// ReLU convention.
+    /// Its derivative at exactly zero is the negative slope, matching PyTorch.
     pub fn leaky_relu(&self, negative_slope: f32) -> Result<Self> {
         if !negative_slope.is_finite() || negative_slope < 0.0 {
             return Err("leaky_relu negative slope must be finite and non-negative".into());
         }
-        self.relu()?
-            .add(&self.scale(-1.0)?.relu()?.scale(-negative_slope)?)
+        let value = self.device().leaky_relu(&self.0.value, negative_slope)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::LeakyRelu {
+                    input: self.0.value.clone(),
+                    negative_slope,
+                },
+            )],
+            false,
+            None,
+        ))
     }
     /// Elementwise hyperbolic tangent.
     pub fn tanh(&self) -> Result<Self> {
@@ -1689,6 +1714,88 @@ impl Tensor {
             None,
         ))
     }
+    /// Add exact zeros before and after one named axis, preserving logical axis order.
+    /// Zero padding on both sides shares the original storage. Otherwise the result
+    /// is materialized on-device using rank-sized geometry, including for backward.
+    pub fn pad_zeros(&self, axis: Axis, before: usize, after: usize) -> Result<Self> {
+        let extent = self.extent(axis)?;
+        let padded = extent
+            .checked_add(before)
+            .and_then(|n| n.checked_add(after))
+            .ok_or("padding extent overflow")?;
+        self.window(axis, padded, -i32::try_from(before)?)
+    }
+
+    /// Keep a contiguous, nonempty interval of one named axis without removing it.
+    /// Reject out-of-range or overflowing intervals. A full-axis interval shares
+    /// storage; other intervals use device-side copies and zero-scattered gradients.
+    pub fn narrow(&self, axis: Axis, start: usize, length: usize) -> Result<Self> {
+        let extent = self.extent(axis)?;
+        let end = start
+            .checked_add(length)
+            .ok_or("narrow interval overflow")?;
+        if length == 0 || end > extent {
+            return Err("narrow requires a nonempty interval inside the named axis".into());
+        }
+        self.window(axis, length, i32::try_from(start)?)
+    }
+
+    fn window(&self, axis: Axis, extent: usize, shift: i32) -> Result<Self> {
+        let dimension = self.shape().index(axis)?;
+        if extent == self.extent(axis)? && shift == 0 {
+            return Ok(self.clone());
+        }
+        let mut dims = self.shape().dims().to_vec();
+        dims[dimension] = axis.of(extent);
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape);
+        // (destination extent, destination stride, source extent, source stride,
+        // source coordinate - destination coordinate), per logical dimension.
+        let mut forward = Vec::with_capacity(shape.rank() * 5);
+        let mut reverse = Vec::with_capacity(shape.rank() * 5);
+        for (index, dim) in shape.dims().iter().enumerate() {
+            let output_extent = i32::try_from(dim.extent)?;
+            let output_stride = i32::try_from(layout.strides[index])?;
+            let input_extent = i32::try_from(self.shape().dims()[index].extent)?;
+            let input_stride = i32::try_from(self.0.layout.strides[index])?;
+            let offset = if index == dimension { shift } else { 0 };
+            forward.extend([
+                output_extent,
+                output_stride,
+                input_extent,
+                input_stride,
+                offset,
+            ]);
+            reverse.extend([
+                input_extent,
+                input_stride,
+                output_extent,
+                output_stride,
+                -offset,
+            ]);
+        }
+        let spec = WindowSpec {
+            output_len: shape.len(),
+            rank: i32::try_from(shape.rank())?,
+            metadata: forward,
+        };
+        let reverse = Rc::new(WindowSpec {
+            output_len: self.shape().len(),
+            rank: spec.rank,
+            metadata: reverse,
+        });
+        let value = self.device().copy_window(&self.0.value, &spec)?;
+        Ok(Self::node(
+            shape,
+            layout,
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Window(reverse))],
+            false,
+            None,
+        ))
+    }
+
     /// Select one logical coordinate of a named axis and remove that axis.
     ///
     /// The compact backend computes offsets from rank-sized metadata rather
@@ -1972,6 +2079,14 @@ impl Tensor {
                         Rule::Sigmoid(probability) => {
                             self.device().sigmoid_backward(&gradient, probability)?
                         }
+                        Rule::Silu(input) => self.device().silu_backward(&gradient, input)?,
+                        Rule::LeakyRelu {
+                            input,
+                            negative_slope,
+                        } => {
+                            self.device()
+                                .leaky_relu_backward(&gradient, input, *negative_slope)?
+                        }
                         Rule::Tanh(output) => self.device().tanh_backward(&gradient, output)?,
                         Rule::Sin(input) => self.device().sin_backward(&gradient, input)?,
                         Rule::Gelu(x) => self.device().gelu_backward(&gradient, x)?,
@@ -2031,6 +2146,9 @@ impl Tensor {
                         Rule::Select(spec) => self
                             .device()
                             .select_axis_backward(&gradient, spec.as_ref())?,
+                        Rule::Window(spec) => {
+                            self.device().copy_window(&gradient, spec.as_ref())?
+                        }
                         Rule::StackSlice { offset, len } => {
                             self.device().contiguous_slice(&gradient, *offset, *len)?
                         }

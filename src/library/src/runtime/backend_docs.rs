@@ -88,6 +88,27 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn silu(&self, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn silu_backward(&self, _gradient: &Buffer, _a: &Buffer) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn leaky_relu(&self, _a: &Buffer, _negative_slope: f32) -> Result<Buffer> {
+        unavailable()
+    }
+
+    pub(crate) fn leaky_relu_backward(
+        &self,
+        _gradient: &Buffer,
+        _a: &Buffer,
+        _negative_slope: f32,
+    ) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn tanh(&self, _a: &Buffer) -> Result<Buffer> {
         unavailable()
     }
@@ -268,6 +289,10 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn copy_window(&self, _input: &Buffer, _spec: &WindowSpec) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn select_axis(&self, _input: &Buffer, _spec: &SelectSpec) -> Result<Buffer> {
         unavailable()
     }
@@ -321,6 +346,13 @@ pub(crate) struct UnfoldSpec {
     pub output_spatial: [i32; 3],
     pub input_special_strides: [i32; 4],
     pub output_special_strides: [i32; 5],
+}
+
+#[allow(dead_code)]
+pub(crate) struct WindowSpec {
+    pub output_len: usize,
+    pub rank: i32,
+    pub metadata: Vec<i32>,
 }
 
 #[derive(Clone)]
