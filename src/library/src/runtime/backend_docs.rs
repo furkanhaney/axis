@@ -167,6 +167,10 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn compare_scalar(&self, _a: &Buffer, _scalar: f32, _op: i32) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn binary_cross_entropy(
         &self,
         _logits: &Buffer,

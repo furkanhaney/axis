@@ -332,6 +332,15 @@ impl Device {
         kernels::sign((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    /// `op` selects the comparison the same way [`Self::binary`]'s `op` selects
+    /// add/sub/mul/div: 0 (`>`), 1 (`>=`), 2 (`<`), 3 (`<=`), 4 (`==`).
+    pub(crate) fn compare_scalar(&self, a: &Buffer, scalar: f32, op: i32) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::compare_scalar((&mut out).partition([128]), a.as_ref(), scalar)
+            .generics(vec![op.to_string()])
+            .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn inverse_sqrt_backward(
         &self,
         gradient: &Buffer,
@@ -2288,6 +2297,34 @@ mod kernels {
         let one = constant(1.0f32, shape![128]);
         let negative_one = constant(-1.0f32, shape![128]);
         out.store(select(gt_tile(a.load_like(out), zero), one, negative_one));
+    }
+    /// One elementwise comparison kernel for the whole `gt`/`ge`/`lt`/`le`/`eq`
+    /// family, mirroring `sign`'s `select`-of-a-comparison shape. `OP` picks the
+    /// operator (0=`>`, 1=`>=`, 2=`<`, 3=`<=`, 4=`==`); each `gt_tile`/`ge_tile`/
+    /// `lt_tile`/`le_tile`/`eq_tile` is an ordered IEEE comparison, so any
+    /// comparison against `NaN` is `false` on either input.
+    #[cutile::entry()]
+    fn compare_scalar<const OP: i32>(
+        out: &mut Tensor<f32, { [128] }>,
+        a: &Tensor<f32, { [-1] }>,
+        scalar: f32,
+    ) {
+        let x = a.load_like(out);
+        let s = broadcast_scalar(scalar, shape![128]);
+        let one = constant(1.0f32, shape![128]);
+        let zero = constant(0.0f32, shape![128]);
+        let condition = if OP == 0 {
+            gt_tile(x, s)
+        } else if OP == 1 {
+            ge_tile(x, s)
+        } else if OP == 2 {
+            lt_tile(x, s)
+        } else if OP == 3 {
+            le_tile(x, s)
+        } else {
+            eq_tile(x, s)
+        };
+        out.store(select(condition, one, zero));
     }
     #[cutile::entry()]
     fn grouped<const PRODUCT: i32>(

@@ -1047,6 +1047,69 @@ impl Tensor {
             None,
         ))
     }
+    /// Shared body for the scalar comparison family below. `op` selects the cuTile
+    /// comparison the same way [`Self::binary`]'s `op` selects add/sub/mul/div: 0
+    /// (`>`), 1 (`>=`), 2 (`<`), 3 (`<=`), 4 (`==`). Output has the same [`Shape`]
+    /// as the input, holds exactly `0.0` or `1.0`, and carries no autograd edge:
+    /// like PyTorch's comparison operators, a comparison is not differentiable, so
+    /// the result is built the same way a leaf constant is (`Tensor::from_slice`) --
+    /// empty edges, not a leaf -- rather than routing a `Rule` through `self`. A
+    /// downstream op such as `x.mul(&mask)` still back-propagates correctly to `x`:
+    /// only the mask's own gradient path is absent, matching the masking
+    /// convention `causal_mask` and `minimum_winner_mask` already use for their
+    /// constant 0/1 outputs.
+    fn compare_scalar(&self, scalar: f32, op: i32) -> Result<Self> {
+        let value = self.device().compare_scalar(&self.0.value, scalar, op)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise `self > scalar` as a `{0.0, 1.0}` mask, IEEE-ordered so any
+    /// comparison against `NaN` is `false` (`0.0`), exactly like PyTorch's `>`.
+    /// No autograd edge; see [`Self::compare_scalar`].
+    pub fn gt(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 0)
+    }
+    /// Elementwise `self >= scalar`. Same NaN and no-gradient contract as [`Self::gt`].
+    pub fn ge(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 1)
+    }
+    /// Elementwise `self < scalar`. Same NaN and no-gradient contract as [`Self::gt`].
+    pub fn lt(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 2)
+    }
+    /// Elementwise `self <= scalar`. Same NaN and no-gradient contract as [`Self::gt`].
+    pub fn le(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 3)
+    }
+    /// Elementwise `self == scalar`, bit-for-bit IEEE equality (no epsilon). Same
+    /// NaN and no-gradient contract as [`Self::gt`].
+    pub fn eq(&self, scalar: f32) -> Result<Self> {
+        self.compare_scalar(scalar, 4)
+    }
+    /// Elementwise logical AND of two `{0.0, 1.0}` masks, spelled as their product
+    /// (`mask * mask` is exactly PyTorch's `&` on 0/1 tensors). Same axis-agreement
+    /// contract as [`Self::mul`]; the result carries a gradient only if `mul` would
+    /// give one, which is never the case for two comparison-derived masks since
+    /// neither operand has an autograd edge to begin with.
+    pub fn logical_and(&self, rhs: &Self) -> Result<Self> {
+        self.mul(rhs)
+    }
+    /// Elementwise logical NOT of a `{0.0, 1.0}` mask, spelled as `1.0 - mask`
+    /// (PyTorch's `~` on a 0/1 tensor). Logical OR has no named method because no
+    /// migrated consumer calls it; on 0/1 masks it is an elementwise maximum
+    /// (`a | b` == `max(a, b)`, since both are `{0.0, 1.0}`), which Axis has no
+    /// tensor/tensor primitive for yet -- add one only when a consumer needs it.
+    pub fn logical_not(&self) -> Result<Self> {
+        let one = Self::from_slice(&[1.0], [], self.device())?;
+        one.sub(self)
+    }
     /// Elementwise `(x + epsilon)^-1/2`; inputs plus epsilon must be positive.
     pub fn inverse_sqrt(&self, epsilon: f32) -> Result<Self> {
         if !epsilon.is_finite() || epsilon <= 0.0 {
