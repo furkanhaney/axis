@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(git rev-parse --show-toplevel)"
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 proof_root="$(mktemp -d "${TMPDIR:-/tmp}/axis-docsrs.XXXXXX")"
 trap 'rm -rf -- "$proof_root"' EXIT
 
@@ -19,7 +19,7 @@ version="$(
 package_target="$proof_root/package-target"
 
 CARGO_TARGET_DIR="$package_target" \
-    cargo package -p axis --locked --allow-dirty --no-verify
+    cargo package --manifest-path "$root/Cargo.toml" -p axis --locked --allow-dirty --no-verify
 
 mkdir -p "$proof_root/unpacked"
 tar -xzf "$package_target/package/axis-$version.crate" -C "$proof_root/unpacked"
