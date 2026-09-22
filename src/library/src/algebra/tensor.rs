@@ -153,6 +153,7 @@ enum Rule {
     },
     Tanh(Buffer),
     Sin(Buffer),
+    Abs(Buffer),
     Gelu(Buffer),
     GeluExact(Buffer),
     InverseSqrt {
@@ -743,6 +744,37 @@ impl Tensor {
         }
         let delta = self.sub(rhs)?;
         delta.mul(&delta)
+    }
+    /// Elementwise absolute value. Backward is `gradient * sign(x)`, matching PyTorch's `abs`
+    /// backward: the gradient is exactly zero at `x == 0` (PyTorch's own subgradient choice
+    /// there, not `NaN` or either one-sided slope).
+    pub fn abs(&self) -> Result<Self> {
+        let value = self.device().abs(&self.0.value)?;
+        Ok(Self::node(
+            self.shape().clone(),
+            self.0.layout.clone(),
+            value,
+            self.device(),
+            vec![Edge::new(self, Rule::Abs(self.0.value.clone()))],
+            false,
+            None,
+        ))
+    }
+    /// Elementwise mean absolute error (PyTorch's unreduced `F.l1_loss`): `(self -
+    /// rhs).abs()`. Same axis-agreement contract as [`Tensor::squared_error`] — identical axis
+    /// sets, equal extents, unreduced shape — leaving the reduction (typically `.mean(axes)`) to
+    /// the caller.
+    pub fn absolute_error(&self, rhs: &Self) -> Result<Self> {
+        if self.shape().rank() != rhs.shape().rank()
+            || self
+                .shape()
+                .axes()
+                .iter()
+                .any(|&a| !rhs.shape().contains(a))
+        {
+            return Err("absolute_error requires identical axis sets".into());
+        }
+        self.sub(rhs)?.abs()
     }
     /// Stable elementwise binary cross-entropy. Targets are constants in reverse mode.
     pub fn binary_cross_entropy_with_logits(&self, targets: &Self) -> Result<Self> {
@@ -2851,6 +2883,7 @@ impl Tensor {
                         }
                         Rule::Tanh(output) => self.device().tanh_backward(&gradient, output)?,
                         Rule::Sin(input) => self.device().sin_backward(&gradient, input)?,
+                        Rule::Abs(input) => self.device().abs_backward(&gradient, input)?,
                         Rule::Gelu(x) => self.device().gelu_backward(&gradient, x)?,
                         Rule::GeluExact(x) => self.device().gelu_exact_backward(&gradient, x)?,
                         Rule::InverseSqrt { input, epsilon } => self

@@ -173,6 +173,23 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         Ok(self.track(out))
     }
+    /// Elementwise absolute value.
+    pub(crate) fn abs(&self, a: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(a.shape()[0] as usize)?;
+        kernels::abs((&mut out).partition([128]), a.as_ref()).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
+    /// `gradient * sign(input)`, zero at exactly `input == 0`.
+    pub(crate) fn abs_backward(&self, gradient: &Buffer, input: &Buffer) -> Result<Buffer> {
+        let mut out = self.zeros(input.shape()[0] as usize)?;
+        kernels::abs_backward(
+            (&mut out).partition([128]),
+            gradient.as_ref(),
+            input.as_ref(),
+        )
+        .enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     pub(crate) fn mask_gradient(&self, gradient: &Buffer, winners: &Buffer) -> Result<Buffer> {
         let mut out = self.zeros(gradient.shape()[0] as usize)?;
         kernels::mask_gradient(
@@ -2518,5 +2535,28 @@ mod kernels {
         let b = denominator.load_like(out);
         let zero = constant(0.0f32, shape![128]);
         out.store((zero - g) * a / (b * b));
+    }
+
+    #[cutile::entry()]
+    fn abs(out: &mut Tensor<f32, { [128] }>, a: &Tensor<f32, { [-1] }>) {
+        out.store(absf(a.load_like(out)));
+    }
+
+    /// `gradient * sign(input)`; PyTorch's `abs` backward convention gives exactly zero at
+    /// `input == 0`, so neither branch of the select fires there.
+    #[cutile::entry()]
+    fn abs_backward(
+        out: &mut Tensor<f32, { [128] }>,
+        gradient: &Tensor<f32, { [-1] }>,
+        input: &Tensor<f32, { [-1] }>,
+    ) {
+        let x = input.load_like(out);
+        let g = gradient.load_like(out);
+        let zero = constant(0.0f32, shape![128]);
+        out.store(select(
+            gt_tile(x, zero),
+            g,
+            select(lt_tile(x, zero), zero - g, zero),
+        ));
     }
 }

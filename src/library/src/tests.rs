@@ -5257,3 +5257,99 @@ fn adamw_new_matches_with_hyperparameters_at_defaults_bit_exactly() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn abs_and_absolute_error_match_hand_computed_forward_and_gradient_oracles() -> Result<()> {
+    // morpheus's ctr/scl/rad heads train with masked `F.l1_loss` (mean absolute error over
+    // positive-class slots only); it composes as `(pred - target).abs()` then a caller-side
+    // masked mean, exactly like `squared_error`'s own unreduced-then-`.mean()` convention
+    // (research/src/vision/morpheus/docs/axis-issues.md "Elementwise L1 loss (abs)",
+    // axis#89). `sign(0) == 0` below matches PyTorch's own `abs` backward subgradient choice
+    // at exactly zero, not `NaN` or either one-sided slope.
+    let device = Device::cuda(0)?;
+    let sample = Axis::new("sample");
+    let values = [-3.0f32, -1.0, 0.0, 2.0, 5.0];
+    let x = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let absolute = x.abs()?;
+    close(
+        "abs forward",
+        &absolute.to_vec()?,
+        &values
+            .iter()
+            .map(|&v| f64::from(v).abs())
+            .collect::<Vec<_>>(),
+    );
+    absolute.mean(sample)?.backward()?;
+    close(
+        "abs gradient, zero exactly at x == 0",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[-0.2, -0.2, 0.0, 0.2, 0.2],
+    );
+
+    let target_values = [-1.0f32, 2.0, 0.0, 2.0, 1.0];
+    let pred = Tensor::from_slice(&values, [sample.of(values.len())], &device)?.with_grad();
+    let target =
+        Tensor::from_slice(&target_values, [sample.of(values.len())], &device)?.with_grad();
+    let loss = pred.absolute_error(&target)?;
+    close(
+        "absolute_error forward (unreduced |pred - target|)",
+        &loss.to_vec()?,
+        &[2.0, 3.0, 0.0, 0.0, 4.0],
+    );
+    loss.mean(sample)?.backward()?;
+    close(
+        "absolute_error gradient wrt prediction, zero where pred == target",
+        &pred.grad().expect("prediction gradient").to_vec()?,
+        &[-0.2, -0.2, 0.0, 0.0, 0.2],
+    );
+    close(
+        "absolute_error gradient wrt target",
+        &target.grad().expect("target gradient").to_vec()?,
+        &[0.2, 0.2, 0.0, 0.0, -0.2],
+    );
+
+    let mismatched = Tensor::from_slice(&[1.0, 2.0], [Axis::new("other").of(2)], &device)?;
+    assert!(x.absolute_error(&mismatched).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn abs_matches_hand_computed_oracle_under_reordered_asymmetric_cuda_storage() -> Result<()> {
+    // Elementwise ops read the raw physical buffer and keep the tensor's existing Layout
+    // unchanged (`with_layout` only ever changes physical strides), so `abs` on a permuted,
+    // asymmetric-extent tensor must still read out in the tensor's own logical Shape order via
+    // `to_vec()`, exactly like `sin` or a comparison on a reordered tensor.
+    let device = Device::cuda(0)?;
+    let (batch, time) = (Axis::new("batch"), Axis::new("time"));
+    // value(b, t) written in canonical (batch, time) order; asymmetric extents (3, 2).
+    let values: Vec<f32> = vec![-3.0, 4.0, 0.0, -5.0, 2.0, -1.0];
+    let x = Tensor::from_slice(&values, [batch.of(3), time.of(2)], &device)?
+        .with_layout([time, batch])?
+        .with_grad();
+    let absolute = x.abs()?;
+    assert_eq!(absolute.shape(), x.shape());
+    close(
+        "abs forward under reordered, asymmetric storage",
+        &absolute.to_vec()?,
+        &values
+            .iter()
+            .map(|&v| f64::from(v).abs())
+            .collect::<Vec<_>>(),
+    );
+    absolute.mean([batch, time])?.backward()?;
+    close(
+        "abs gradient under reordered storage lands on the original logical positions",
+        &x.grad().expect("x gradient").to_vec()?,
+        &[
+            -1.0 / 6.0,
+            1.0 / 6.0,
+            0.0,
+            -1.0 / 6.0,
+            1.0 / 6.0,
+            -1.0 / 6.0,
+        ],
+    );
+    Ok(())
+}

@@ -420,6 +420,8 @@ provenance contract; reading a file is not itself a research guarantee.
 |---|---|
 | `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. Carries a learned `[output]` bias by default; `.bias(false)` before `build` omits it entirely, so `named_parameters` has only `weight`. |
 | `x.squared_error(y)` | Align identical axis sets by identity, require equal extents, preserve the unreduced shape. |
+| `x.abs()` | Elementwise absolute value, layout and axes unchanged. Backward is `gradient * sign(x)`; matching PyTorch's `abs` backward, the gradient is exactly zero at `x == 0`, not a one-sided slope or `NaN`. |
+| `x.absolute_error(y)` | `(x - y).abs()` (PyTorch's unreduced `F.l1_loss`). Same axis-agreement contract as `x.squared_error(y)`, leaving the reduction to the caller. |
 | `x.mean(axes)` | Remove precisely those axes; backward broadcasts and divides by their extent product. Scalar `.backward()` requires all loss axes to have been reduced. |
 | `x.sum(axes)` | Remove precisely those axes; backward broadcasts the upstream gradient across them unchanged (unit local derivative per contributing element). Runs `mean`'s own group-sum kernel with a constant scale of `1.0` in place of `mean`'s `1 / extent`, so it recovers a caller's own division (e.g. by a data-dependent count) exactly where the divisor is not a compile-time constant. |
 | `x.moments(axes)` / `x.mean_square(axes)` | Require at least one named axis and return population statistics with precisely those axes removed. Gradients broadcast through the original logical axes. |
