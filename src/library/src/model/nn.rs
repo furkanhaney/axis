@@ -508,16 +508,17 @@ impl Module for GELU {
     }
 }
 
-/// Elementwise ELU with an explicit, finite, positive `alpha`. See
-/// [`Tensor::elu`] for the exact forward/backward split at `x == 0`.
+/// Elementwise ELU with an explicit, finite, nonzero `alpha` (PyTorch's own domain --
+/// negative `alpha` included). See [`Tensor::elu`] for the exact forward/backward split at
+/// `x == 0` and the sign-algebra argument for why negative `alpha` is safe here.
 #[derive(Clone, Copy)]
 pub struct ELU {
     alpha: f32,
 }
 impl ELU {
     pub fn new(alpha: f32) -> Result<Self> {
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Err("ELU alpha must be finite and positive".into());
+        if !alpha.is_finite() || alpha == 0.0 {
+            return Err("ELU alpha must be finite and nonzero".into());
         }
         Ok(Self { alpha })
     }
@@ -534,16 +535,18 @@ impl Module for ELU {
     }
 }
 
-/// Elementwise CELU with an explicit, finite, positive `alpha`. See
-/// [`Tensor::celu`] for the exact forward/backward split at `x == 0`.
+/// Elementwise CELU with an explicit, finite, nonzero `alpha` -- PyTorch's own documented
+/// domain, "valid for alpha != 0", negative `alpha` included. See [`Tensor::celu`] for the
+/// exact forward/backward split at `x == 0` and why the two-branch composition already matches
+/// PyTorch's `max(0, x) + min(0, ...)` definition for any nonzero `alpha`.
 #[derive(Clone, Copy)]
 pub struct CELU {
     alpha: f32,
 }
 impl CELU {
     pub fn new(alpha: f32) -> Result<Self> {
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Err("CELU alpha must be finite and positive".into());
+        if !alpha.is_finite() || alpha == 0.0 {
+            return Err("CELU alpha must be finite and nonzero".into());
         }
         Ok(Self { alpha })
     }
