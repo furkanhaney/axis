@@ -1483,9 +1483,7 @@ impl Tensor {
         let shortlist_size = cutoffs[0];
         let mut cluster_of = vec![usize::MAX; n_classes];
         for (c, window) in edges.windows(2).enumerate() {
-            for class in window[0]..window[1] {
-                cluster_of[class] = c;
-            }
+            cluster_of[window[0]..window[1]].fill(c);
         }
         let mut head_selector = vec![0f32; batch_extent * head_width];
         for (row, &target) in targets.iter().enumerate() {

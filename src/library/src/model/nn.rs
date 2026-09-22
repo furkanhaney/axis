@@ -1763,7 +1763,7 @@ impl Upsample {
             return Err("Upsample scale_factor must give exactly one factor per axis".into());
         }
         for &factor in &scale_factor {
-            if !(factor > 0.0) {
+            if factor <= 0.0 || factor.is_nan() {
                 return Err("Upsample scale_factor values must be positive".into());
             }
         }
