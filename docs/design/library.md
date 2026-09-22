@@ -72,6 +72,20 @@ are pure functions of the step index that reproduce PyTorch's own
 loop to call once per step and feed to the setter — Axis has no stateful
 scheduler object.
 
+`clip_grad_norm` matches PyTorch's `clip_grad_norm_`: one global L2 norm over
+every listed parameter's gradient together (never a per-tensor norm), scaling
+all of them by the same `max_norm / (total_norm + 1e-6)` factor only when the
+norm exceeds `max_norm`, and returning the pre-clip norm either way. It is a
+free function over `impl IntoIterator<Item = Parameter>`, not a `Trainer`
+option or an `Optimizer`: consumers that clip call it once themselves between
+`loss.backward()` and the optimizer's own step, exactly where every sampled
+consumer's own Python loop already calls `clip_grad_norm_`. Each parameter's
+squared-sum reuses `Tensor::mean_square` over every axis, scaled back up by
+the element count it divided by, since the crate has no direct sum reduction
+yet; every reduction and the cross-parameter accumulation stay on device, and
+the whole parameter set costs exactly one host read (for one `sqrt`), not one
+per parameter.
+
 `Muon` applies EMA momentum, optional Nesterov interpolation, five-step
 Newton-Schulz orthogonalization, original rectangular-matrix scaling, and
 decoupled decay to explicitly oriented rank-2 parameters. `MuonWithAuxAdamW`
@@ -382,19 +396,24 @@ provenance contract; reading a file is not itself a research guarantee.
 | `Linear(input, hidden.of(32))` | Contract the named input axis, introduce the output axis, preserve every unrelated axis. Bind the input extent when building the model. Carries a learned `[output]` bias by default; `.bias(false)` before `build` omits it entirely, so `named_parameters` has only `weight`. |
 | `x.squared_error(y)` | Align identical axis sets by identity, require equal extents, preserve the unreduced shape. |
 | `x.mean(axes)` | Remove precisely those axes; backward broadcasts and divides by their extent product. Scalar `.backward()` requires all loss axes to have been reduced. |
+| `x.sum(axes)` | Remove precisely those axes; backward broadcasts the upstream gradient across them unchanged (unit local derivative per contributing element). Runs `mean`'s own group-sum kernel with a constant scale of `1.0` in place of `mean`'s `1 / extent`, so it recovers a caller's own division (e.g. by a data-dependent count) exactly where the divisor is not a compile-time constant. |
 | `x.moments(axes)` / `x.mean_square(axes)` | Require at least one named axis and return population statistics with precisely those axes removed. Gradients broadcast through the original logical axes. |
 | `x.sin()` | Apply elementwise sine in radians without changing axes or layout; backward multiplies by cosine of the saved input. |
 | `CentralDifference(coordinate, step)` | Record which coordinate was shifted, require a finite positive step and identically ordered shapes on one device, and construct differentiable first or second centered stencils. It does not prove the caller's sampling or discretization method. |
 | `x.min(axis)` | Remove one named axis and preserve unrelated axes. Ignore NaN and infinities, choose the first logical coordinate on finite ties, and route backward only to that winner. A group with no finite value returns NaN with zero derivative even under a non-finite upstream derivative. Forward and backward remain device-resident. |
+| `x.max(axis)` | Exact mirror of `x.min(axis)`: same axis-removal contract, the same first-logical-coordinate tie rule, and the same NaN/zero-derivative empty-group behavior, over the maximum instead of the minimum. No `argmax`. |
 | Elementwise add/multiply/divide | Align shared identities with equal extents. Permit scalar or subset-axis broadcasting, such as a `[hidden]` bias on `[batch, hidden]`. `x.div(y)` applies no epsilon or clamping; division by zero yields IEEE `inf`/`nan`, as in PyTorch, and callers that need a safe denominator (such as a masked-mean count) must clamp it themselves before dividing. |
 | Incomparable axis sets | Require explicit expansion. `[batch, time] + [batch, hidden]` must not silently create `[batch, time, hidden]`. |
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
 | `select(axis, coordinate)` | Remove one named axis at a checked logical coordinate. Compute offsets from compact rank-sized geometry and scatter its derivative back into the original physical layout. |
+| `gather(axis, index, output)` | Replace one named axis with a new named axis sized by a host-side `&[usize]` index (checked against the axis extent before any device work); every other axis and the physical layout it reads carry through unchanged. Forward and backward reuse the same host-built, CSR-grouped index plan `mean`/`min` already use for reduction and broadcast (`Plan::gather`/`Plan::reverse`), so backward is an exact, deterministic scatter-add — a repeated index accumulates every contribution, an unpicked row gets zero — without `Embedding`'s dense one-hot contraction. Shares that plan's 16,777,216-contribution limit, counted against the gathered output's size, not the table's row count. |
 | `pad_zeros(axis, before, after)` | Preserve logical axis order and add exact zero-valued coordinates independently on each side. Backward crops to the original extent and layout. Zero/zero padding shares storage. |
 | `narrow(axis, start, length)` | Preserve the named axis and select a checked nonempty contiguous interval. Backward inserts exact zeros outside the interval. A full-axis interval shares storage. |
 | `Tensor::stack(values, axis, position)` | Require identical named input shapes and devices; insert the new logical axis at the declared position. Store sources contiguously under a stack-major physical layout and slice each derivative back to its source. |
 | `Tensor::concat(values, axis)` | Require an axis every operand already has, with every other axis identical by identity and extent; sum each operand's extent on that axis and preserve the first operand's axis order. Composed from `pad_zeros` and `add`: each operand is zero-padded into its own slice, then summed, so backward narrows the incoming gradient to each operand without a dedicated rule. |
+| `Tensor::upsample_nearest(axis, factor)` | One named axis, exact integer scale factor only; every other axis preserved. Composed from `stack` (duplicate `factor` times along a fresh axis) and `merge` (fold that axis into the named one, spatial-axis major); no dedicated backward rule, since `stack`/`merge` are already differentiable. |
+| `Tensor::resample_bilinear(axis, out_extent)` | One named axis, any positive output extent; every other axis preserved. PyTorch's `align_corners=False` half-pixel weights, built host-side as a fixed (non-learned) `[axis, resampled]` matrix and applied with `contract`; backward is `contract`'s existing transpose-weighted gradient, exact for free. |
 | `causal_mask(query, key)` | Require distinct axes with equal extents; replace key positions greater than query positions with negative infinity and give them zero derivative. Square, zero-offset self-attention only. |
 | `softmax(axis)` | Normalize along one named axis without changing logical shape. Subtract each row's maximum. Rows need at least one finite value; other values may be finite or negative infinity. |
 | `unfold2d(channels, spatial, patch, kernel)` | Extract valid stride-one patches, preserve unrelated axes, and replace channels with one flattened patch axis. Backward sums overlapping contributions into the input. |

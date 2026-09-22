@@ -150,6 +150,10 @@ enum Rule {
         plan: Rc<Plan>,
         winners: Buffer,
     },
+    Maximum {
+        plan: Rc<Plan>,
+        winners: Buffer,
+    },
     Unfold(Rc<UnfoldSpec>),
     Select(Rc<SelectSpec>),
     Window(Rc<WindowSpec>),
@@ -293,6 +297,18 @@ impl Tensor {
     }
     pub fn zero_grad(&self) {
         self.0.grad.borrow_mut().take();
+    }
+    /// Rescale this leaf's accumulated gradient in place by a global factor,
+    /// without touching the forward value or building any autograd edge. A
+    /// no-op when there is no gradient yet. Used by [`crate::clip_grad_norm`]
+    /// to apply one global-norm scale factor to every parameter after the
+    /// norm has already been computed from the unscaled gradients.
+    pub(crate) fn scale_grad(&self, factor: f32) -> Result<()> {
+        let mut grad = self.0.grad.borrow_mut();
+        if let Some(buffer) = grad.as_ref() {
+            *grad = Some(self.device().scale(buffer, factor)?);
+        }
+        Ok(())
     }
     pub(crate) fn parameter_leaf(&self, version: Rc<Cell<u64>>) -> Self {
         let expected = version.get();
@@ -1070,49 +1086,73 @@ impl Tensor {
             None,
         ))
     }
-    pub fn mean(&self, axes: impl IntoAxes) -> Result<Self> {
-        let started = Instant::now();
-        let axes = self.shape().select_axes(axes)?;
-        let key = (0, self.shape().clone(), self.0.layout.clone(), axes.clone());
+    /// Shared plan for the group-sum kernel behind [`Tensor::mean`] and [`Tensor::sum`]:
+    /// remove exactly `axes`, keep every other axis, and scale the summed contributions by
+    /// `factor` (computed from the output/input element counts so callers can pick `1.0` for
+    /// an exact sum or `output/input` for a mean). `discriminant` keeps the two ops' cached
+    /// plans apart, since they share a shape/layout/axes key but not a factor.
+    fn reduction_plans(
+        &self,
+        discriminant: u8,
+        axes: &[Axis],
+        factor: fn(usize, usize) -> f32,
+    ) -> Result<ReductionPlans> {
+        let key = (
+            discriminant,
+            self.shape().clone(),
+            self.0.layout.clone(),
+            axes.to_vec(),
+        );
         let cached = REDUCTION_PLANS.with(|cache| cache.borrow().get(&key).cloned());
-        let plans = match cached {
-            Some(plans) => plans,
-            None => {
-                let output = Shape::new(
-                    self.shape()
-                        .dims()
-                        .iter()
-                        .copied()
-                        .filter(|d| !axes.contains(&d.axis)),
-                )?;
-                let layout = Layout::contiguous(&output);
-                let factor = output.len() as f32 / self.shape().len() as f32;
-                let mut map = vec![0; self.shape().len()];
-                for i in 0..self.shape().len() {
-                    let coords = self.shape().coords(i);
-                    let retained: Vec<_> = self
-                        .shape()
-                        .dims()
-                        .iter()
-                        .zip(&coords)
-                        .filter(|(d, _)| !axes.contains(&d.axis))
-                        .map(|(_, &coordinate)| coordinate)
-                        .collect();
-                    map[self.0.layout.offset(&coords)] = layout.offset(&retained);
-                }
-                let plans = ReductionPlans {
-                    output: output.clone(),
-                    layout,
-                    factor,
-                    forward: Rc::new(Plan::reverse(&map, output.len())?),
-                    reverse: Rc::new(Plan::gather(&map)?),
-                };
-                REDUCTION_PLANS.with(|cache| {
-                    cache.borrow_mut().insert(key, plans.clone());
-                });
-                plans
-            }
+        if let Some(plans) = cached {
+            return Ok(plans);
+        }
+        let output = Shape::new(
+            self.shape()
+                .dims()
+                .iter()
+                .copied()
+                .filter(|d| !axes.contains(&d.axis)),
+        )?;
+        let layout = Layout::contiguous(&output);
+        let factor = factor(output.len(), self.shape().len());
+        let mut map = vec![0; self.shape().len()];
+        for i in 0..self.shape().len() {
+            let coords = self.shape().coords(i);
+            let retained: Vec<_> = self
+                .shape()
+                .dims()
+                .iter()
+                .zip(&coords)
+                .filter(|(d, _)| !axes.contains(&d.axis))
+                .map(|(_, &coordinate)| coordinate)
+                .collect();
+            map[self.0.layout.offset(&coords)] = layout.offset(&retained);
+        }
+        let plans = ReductionPlans {
+            output: output.clone(),
+            layout,
+            factor,
+            forward: Rc::new(Plan::reverse(&map, output.len())?),
+            reverse: Rc::new(Plan::gather(&map)?),
         };
+        REDUCTION_PLANS.with(|cache| {
+            cache.borrow_mut().insert(key, plans.clone());
+        });
+        Ok(plans)
+    }
+    /// Run the group-sum kernel for a [`reduction_plans`](Self::reduction_plans) plan and wrap
+    /// the result in a graph node whose backward broadcasts the upstream gradient back across
+    /// the reduced axes, scaled by the same `factor`.
+    fn reduce_grouped(
+        &self,
+        discriminant: u8,
+        axes: Vec<Axis>,
+        factor: fn(usize, usize) -> f32,
+        label: &str,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let plans = self.reduction_plans(discriminant, &axes, factor)?;
         let value =
             self.device()
                 .grouped(&self.0.value, None, plans.forward.as_ref(), plans.factor)?;
@@ -1130,8 +1170,26 @@ impl Tensor {
             false,
             None,
         );
-        profile("mean", started);
+        profile(label, started);
         Ok(result)
+    }
+    pub fn mean(&self, axes: impl IntoAxes) -> Result<Self> {
+        let axes = self.shape().select_axes(axes)?;
+        self.reduce_grouped(
+            0,
+            axes,
+            |output, input| output as f32 / input as f32,
+            "mean",
+        )
+    }
+    /// Reduce precisely the named `axes` to their sum; every other axis is preserved
+    /// unchanged. Backward broadcasts the upstream gradient across the reduced axes without
+    /// scaling it, since each contributing element has unit local derivative. This runs the
+    /// same group-sum kernel `mean` uses, with the constant scale `1.0` in place of `mean`'s
+    /// `1 / extent` — the two are the same primitive, not a division after the fact.
+    pub fn sum(&self, axes: impl IntoAxes) -> Result<Self> {
+        let axes = self.shape().select_axes(axes)?;
+        self.reduce_grouped(2, axes, |_, _| 1.0, "sum")
     }
     /// Population mean and variance over exactly the declared named axes.
     pub fn moments(&self, axes: impl IntoAxes) -> Result<(Self, Self)> {
@@ -1340,6 +1398,79 @@ impl Tensor {
             None,
         );
         profile(&name, started);
+        Ok(result)
+    }
+    /// Reduce one named axis to its maximum finite value.
+    ///
+    /// Non-finite candidates are ignored. A group without a finite candidate returns NaN and
+    /// has zero derivative even if its upstream derivative is non-finite. Ties route the
+    /// derivative to the first logical coordinate along `axis`, independently of physical
+    /// layout. Exact mirror of [`Self::min`].
+    pub fn max(&self, axis: Axis) -> Result<Self> {
+        let started = Instant::now();
+        let reduced_index = self.shape().index(axis)?;
+        let extent = self.extent(axis)?;
+        let key = (1, self.shape().clone(), self.0.layout.clone(), vec![axis]);
+        let cached = REDUCTION_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        let plans = match cached {
+            Some(plans) => plans,
+            None => {
+                let output = Shape::new(
+                    self.shape()
+                        .dims()
+                        .iter()
+                        .copied()
+                        .filter(|d| d.axis != axis),
+                )?;
+                let layout = Layout::contiguous(&output);
+                let mut map = vec![0; self.shape().len()];
+                let mut groups = Vec::with_capacity(output.len());
+                for output_index in 0..output.len() {
+                    let output_coords = output.coords(output_index);
+                    let mut group = Vec::with_capacity(extent);
+                    for coordinate in 0..extent {
+                        let mut input_coords = output_coords.clone();
+                        input_coords.insert(reduced_index, coordinate);
+                        let physical = self.0.layout.offset(&input_coords);
+                        map[physical] = output_index;
+                        group.push((physical, 0));
+                    }
+                    groups.push(group);
+                }
+                let plans = ReductionPlans {
+                    output: output.clone(),
+                    layout,
+                    factor: 1.0,
+                    forward: Rc::new(Plan::groups(groups, false)?),
+                    reverse: Rc::new(Plan::gather(&map)?),
+                };
+                REDUCTION_PLANS.with(|cache| {
+                    cache.borrow_mut().insert(key, plans.clone());
+                });
+                plans
+            }
+        };
+        let (value, winners) = self.device().grouped_maximum(
+            &self.0.value,
+            plans.forward.as_ref(),
+            plans.reverse.as_ref(),
+        )?;
+        let result = Self::node(
+            plans.output,
+            plans.layout,
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Maximum {
+                    plan: plans.reverse,
+                    winners,
+                },
+            )],
+            false,
+            None,
+        );
+        profile("max", started);
         Ok(result)
     }
     /// Reduce a tensor to the mean of elements selected by a constant binary mask.
@@ -2105,6 +2236,74 @@ impl Tensor {
         ))
     }
 
+    /// Gather rows of a named axis by an arbitrary host-computed integer index,
+    /// replacing that axis with a new named axis laid out along the index.
+    ///
+    /// `index[i]` selects one logical coordinate of `axis` for output position
+    /// `i` of `output`; every other axis carries through unchanged and every
+    /// coordinate is checked against `axis`'s extent before any device work.
+    /// This is a row copy, not `Embedding`'s dense one-hot contraction, so it
+    /// stays affordable at table sizes a one-hot vector could never reach: the
+    /// index lives on the host as plain integers, never as device-side
+    /// vocabulary weight. Backward scatter-adds the upstream gradient into the
+    /// picked rows using the same host-built, CSR-grouped reduction plan
+    /// `mean` and `min` already use for their own broadcast and reduction
+    /// gradients (`Plan::gather`/`Plan::reverse` in `runtime::backend`), so a
+    /// repeated index accumulates every contribution deterministically and a
+    /// row that is never picked gets an exact zero gradient. It shares that
+    /// plan's 16,777,216-contribution limit, counted against the gathered
+    /// output's size (`index.len()` times the extent of every other axis),
+    /// never against the table's own row count.
+    pub fn gather(&self, axis: Axis, index: &[usize], output: Axis) -> Result<Self> {
+        let started = Instant::now();
+        let dimension = self.shape().index(axis)?;
+        let extent = self.shape().dims()[dimension].extent;
+        if index.is_empty() {
+            return Err("gather requires a nonempty index".into());
+        }
+        for (position, &row) in index.iter().enumerate() {
+            if row >= extent {
+                return Err(format!(
+                    "gather index {row} at position {position} is outside {axis:?} extent {extent}"
+                )
+                .into());
+            }
+        }
+        let mut dims = self.shape().dims().to_vec();
+        dims[dimension] = output.of(index.len());
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape);
+        let mut map = vec![0usize; shape.len()];
+        for (output_position, slot) in map.iter_mut().enumerate() {
+            let mut coords = shape.coords(output_position);
+            coords[dimension] = index[coords[dimension]];
+            *slot = self.0.layout.offset(&coords);
+        }
+        let forward_plan = Rc::new(Plan::gather(&map)?);
+        let reverse_plan = Rc::new(Plan::reverse(&map, self.shape().len())?);
+        let value = self
+            .device()
+            .grouped(&self.0.value, None, forward_plan.as_ref(), 1.0)?;
+        let result = Self::node(
+            shape,
+            layout,
+            value,
+            self.device(),
+            vec![Edge::new(
+                self,
+                Rule::Group {
+                    plan: reverse_plan,
+                    rhs: None,
+                    factor: 1.0,
+                },
+            )],
+            false,
+            None,
+        );
+        profile("gather", started);
+        Ok(result)
+    }
+
     /// Stack equal named shapes, inserting a new logical axis at `position`.
     /// Physical storage is stack-major so each source remains one contiguous copy.
     pub fn stack(values: &[Self], axis: Axis, position: usize) -> Result<Self> {
@@ -2335,6 +2534,89 @@ impl Tensor {
         profile("merge", started);
         Ok(result)
     }
+    /// `F.interpolate(mode="nearest")` for one named spatial axis at an exact
+    /// integer scale factor. Composed entirely from `stack` (duplicate the
+    /// input `factor` times along a fresh axis) and `merge` (fold that axis
+    /// into the named spatial axis, spatial-axis major, so each source
+    /// element becomes `factor` adjacent identical copies) — the composition
+    /// wave 1 of the research migration proved bit-exact against a real
+    /// `F.interpolate(mode="nearest")` oracle
+    /// (`research/src/vision/morpheus/axis/tests/partitioner_trunk_fpn_obj.rs`,
+    /// `upsample2x`, filed as axis issue #66). `morpheus`'s
+    /// `mobilesam/scale10/train_partitioner.py:107` and
+    /// `detector/train_detector.py:237,239` both call this at `factor = 2` on
+    /// `height` then `width` separately (stride-16 to stride-8, stride-8 to
+    /// stride-4 in an FPN fusion); call this once per spatial axis to
+    /// reproduce that. Backward needs no dedicated rule: `stack` and `merge`
+    /// are already differentiable, so the gradient for a source element is
+    /// the sum of its `factor` output copies' incoming gradients.
+    pub fn upsample_nearest(&self, axis: Axis, factor: usize) -> Result<Self> {
+        if factor == 0 {
+            return Err("upsample_nearest factor must be at least 1".into());
+        }
+        self.shape().index(axis)?;
+        if factor == 1 {
+            return Ok(self.clone());
+        }
+        let repeat = axis.role("upsample_nearest_repeat");
+        let merged = axis.role("upsample_nearest_merged");
+        let position = self.shape().rank();
+        let copies = vec![self.clone(); factor];
+        let stacked = Self::stack(&copies, repeat, position)?;
+        stacked.merge([axis, repeat], merged)?.rename(merged, axis)
+    }
+    /// `torch.nn.Upsample(mode="bilinear", align_corners=False)` for one
+    /// named axis, at any positive output extent (`world/fluid`'s
+    /// `scripts/train.py:101-102` only ever calls this at `scale_factor=2`,
+    /// i.e. `out_extent = 2 * self.extent(axis)`, applied to `height` then
+    /// `width` separately before each of the U-Net decoder's two skip
+    /// concatenations; filed as axis issue #66). The interpolation weights
+    /// are fixed by the input/output extents alone (never by tensor data),
+    /// so this is one `contract` against a host-built `[axis, resampled]`
+    /// weight matrix rather than a dedicated kernel; `contract`'s existing
+    /// backward is already the transpose of that same matrix, so the
+    /// gradient is exact for free and distributes to up to two source
+    /// coordinates per output coordinate (up to four source cells when a
+    /// height and a width axis are each resampled, one call per axis).
+    ///
+    /// Weights follow PyTorch's own `align_corners=False` half-pixel
+    /// formula: for output coordinate `j`,
+    /// `source = max(0, (j + 0.5) * in_extent / out_extent - 0.5)`; let
+    /// `lower = floor(source)` clamped to the last valid input coordinate and
+    /// `upper = lower + 1` (or `lower` again at the last input coordinate, so
+    /// its weight is exactly 1). `lower` receives weight `1 - fract(source)`
+    /// and `upper` receives weight `fract(source)`.
+    pub fn resample_bilinear(&self, axis: Axis, out_extent: usize) -> Result<Self> {
+        let in_extent = self.extent(axis)?;
+        if out_extent == 0 {
+            return Err("resample_bilinear output extent must be at least 1".into());
+        }
+        if out_extent == in_extent {
+            return Ok(self.clone());
+        }
+        let resampled = axis.role("resample_bilinear_resampled");
+        let scale = in_extent as f64 / out_extent as f64;
+        let mut weights = vec![0f32; in_extent * out_extent];
+        for j in 0..out_extent {
+            let source = (scale * (j as f64 + 0.5) - 0.5).max(0.0);
+            let lower = (source.floor() as usize).min(in_extent - 1);
+            let upper = if lower < in_extent - 1 {
+                lower + 1
+            } else {
+                lower
+            };
+            let lambda1 = (source - lower as f64) as f32;
+            let lambda0 = 1.0 - lambda1;
+            weights[lower * out_extent + j] += lambda0;
+            weights[upper * out_extent + j] += lambda1;
+        }
+        let weight = Self::from_slice(
+            &weights,
+            [axis.of(in_extent), resampled.of(out_extent)],
+            self.device(),
+        )?;
+        self.contract(&weight, axis)?.rename(resampled, axis)
+    }
     /// Reverse mode from a scalar. Releases the graph after success; rebuild it for another backward.
     pub fn backward(&self) -> Result<()> {
         if self.shape().rank() != 0 {
@@ -2457,7 +2739,7 @@ impl Tensor {
                             plan.as_ref(),
                             *factor,
                         )?,
-                        Rule::Minimum { plan, winners } => {
+                        Rule::Minimum { plan, winners } | Rule::Maximum { plan, winners } => {
                             let expanded =
                                 self.device().grouped(&gradient, None, plan.as_ref(), 1.0)?;
                             self.device().mask_gradient(&expanded, winners)?

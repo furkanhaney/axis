@@ -12,7 +12,9 @@ The crate currently provides:
 
 - named-axis tensor algebra and reverse-mode differentiation, including
   deterministic finite minimum reductions, asymmetric zero-padding, contiguous
-  slicing, and compact device copies for layout, merge, and alignment;
+  slicing, compact device copies for layout, merge, and alignment, and
+  integer-factor nearest and half-pixel bilinear resampling along a named
+  axis;
 - `Linear`, `Conv2d`, and `Conv3d` with stride, symmetric padding, and
   grouped/depthwise channels, `MaxPool2d`/`MaxPool3d` and
   `Tensor::adaptive_avg_pool3d`, named-axis `LayerNorm`, `RmsNorm`,
@@ -81,6 +83,13 @@ give asymmetric zero-padding and contiguous nonempty slicing. Both preserve
 named axes, keep values and gradients on-device, and use rank-sized metadata
 instead of element-sized index tables; padding, slicing, layout changes, merge,
 and alignment run as compact device copies. Identity operations share storage.
+
+`tensor.gather(axis, index, output)` replaces a named axis with a new named
+axis sized by a host-side `&[usize]` index, checked against the axis extent
+before any device work. It is a row copy, not `Embedding`'s one-hot
+contraction, so it stays affordable at table sizes a one-hot vector could
+never reach; backward scatter-adds the upstream gradient into the picked
+rows, so a repeated index accumulates deterministically.
 
 `Embedding` looks a one-hot `vocabulary` axis up in a learned
 `[vocabulary, feature]` table, so a token is a coordinate rather than an integer

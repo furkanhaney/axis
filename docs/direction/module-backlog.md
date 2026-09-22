@@ -31,12 +31,16 @@ option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
 `GELU`, `ExactGELU`, `SiLU`, `LeakyReLU`, `Tanh`, `SignStraightThrough`, and
 `Sequential`, with tensor-level losses, sine, differentiable central
-differences, softmax, causal masking, attention
-composition, named reductions, data regimes, metrics, trainers, and optimizers.
+differences, softmax, causal masking, named-axis nearest and bilinear
+resampling (`Tensor::upsample_nearest`, `Tensor::resample_bilinear`), attention
+composition, named reductions, an arbitrary-index `gather` (a host-side integer
+index, not a one-hot contraction, so it scales to a large table where
+`Embedding` cannot), data regimes, metrics, trainers, and optimizers.
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
-`one_cycle_lr` schedule functions (`optim.rs`); there is still no gradient
-clipping or mixed precision.
+`one_cycle_lr` schedule functions (`optim.rs`), and a global-norm
+`clip_grad_norm` matching `torch.nn.utils.clip_grad_norm_` (`optim.rs`);
+there is still no mixed precision.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
 
