@@ -1408,6 +1408,143 @@ impl Tensor {
             None,
         ))
     }
+    /// A scalar constant broadcast against any shape, built the same way
+    /// [`Self::logical_not`] and `normalized_l2`'s epsilon term already are
+    /// (`Tensor::from_slice` with an empty axis list): no autograd edge, and
+    /// [`Self::binary`]'s subset-axis rule aligns an axis-less operand onto
+    /// any other shape for free.
+    fn constant(&self, value: f32) -> Result<Self> {
+        Self::from_slice(&[value], [], self.device())
+    }
+    /// Elementwise `Hardtanh`, PyTorch's `F.hardtanh(x, min_val, max_val)`: the same
+    /// values as [`Self::clamp`]`(Some(min_val), Some(max_val))`, but with `hardtanh`'s
+    /// OWN kink convention rather than `clamp`'s. PyTorch's `hardtanh_backward` tests
+    /// `self <= min_val || self >= max_val` (zero there, at BOTH bounds, not just
+    /// outside them), so the gradient passes through only strictly inside
+    /// `(min_val, max_val)` -- unlike [`Self::clamp`], whose own gradient is inclusive of
+    /// both bounds. Composed from three disjoint region masks (`<= min_val`, the open
+    /// interior, `>= max_val`) rather than reusing `clamp`'s `Rule`, so the boundary
+    /// convention is exact even when `min_val == max_val`. Rejects a non-finite bound or
+    /// `min_val > max_val` before any device launch, matching `clamp`.
+    pub fn hardtanh(&self, min_val: f32, max_val: f32) -> Result<Self> {
+        if !min_val.is_finite() || !max_val.is_finite() {
+            return Err("hardtanh bounds must be finite".into());
+        }
+        if min_val > max_val {
+            return Err(format!(
+                "hardtanh requires min_val <= max_val, got min_val={min_val} max_val={max_val}"
+            )
+            .into());
+        }
+        let mask_lo = self.le(min_val)?;
+        let mask_mid = self.gt(min_val)?.logical_and(&self.lt(max_val)?)?;
+        // `1 - mask_lo - mask_mid` rather than `self.ge(max_val)`: the two subtractions
+        // stay exact (and mutually exclusive with `mask_lo`) even when `min_val ==
+        // max_val`, where a literal `ge(max_val)` would double-count the single point
+        // `x == min_val == max_val` against `mask_lo`.
+        let mask_hi = mask_lo.logical_not()?.sub(&mask_mid)?;
+        let low = mask_lo.scale(min_val)?;
+        let mid = self.mul(&mask_mid)?;
+        let high = mask_hi.scale(max_val)?;
+        low.add(&mid)?.add(&high)
+    }
+    /// Elementwise `ReLU6`, PyTorch's `F.hardtanh(x, 0., 6.)`: [`Self::hardtanh`] with
+    /// fixed bounds `0` and `6`, including its strictly-interior gradient at both kinks.
+    pub fn relu6(&self) -> Result<Self> {
+        self.hardtanh(0.0, 6.0)
+    }
+    /// Elementwise `Hardsigmoid`, PyTorch's piecewise-linear sigmoid approximation:
+    /// `clamp(x + 3, 0, 6) / 6`. Backward matches PyTorch's `hardsigmoid_backward`:
+    /// `grad / 6` strictly inside `(-3, 3)`, exactly `0` at and outside either bound
+    /// (`self > -3 && self < 3`, both strict). Composed from an interior mask and a
+    /// saturated-high mask rather than `clamp`, for the same boundary reason as
+    /// [`Self::hardtanh`].
+    pub fn hardsigmoid(&self) -> Result<Self> {
+        let mask_hi = self.ge(3.0)?;
+        let mask_mid = self.gt(-3.0)?.logical_and(&self.lt(3.0)?)?;
+        let mid_value = self.scale(1.0 / 6.0)?.add(&self.constant(0.5)?)?;
+        mask_mid.mul(&mid_value)?.add(&mask_hi)
+    }
+    /// Elementwise `Hardswish`, PyTorch's `x * relu6(x + 3) / 6`. Backward matches
+    /// PyTorch's `hardswish_backward` exactly, including its asymmetric kinks: `0` for
+    /// `x <= -3`, `grad * (x / 3 + 0.5)` strictly inside `(-3, 3)`, and `grad` (pass-through,
+    /// derivative `1`) for `x >= 3` -- so, unlike [`Self::hardtanh`]/[`Self::hardsigmoid`],
+    /// the two kinks are NOT symmetric: `x == -3` routes to the zero branch but `x == 3`
+    /// routes to the pass-through branch, not the interior formula (whose limit there is
+    /// `1.5`, not `1`). The interior region is composed as `x * (x + 3) / 6`, whose own
+    /// derivative `x / 3 + 0.5` falls out of the product rule for free.
+    pub fn hardswish(&self) -> Result<Self> {
+        let mask_hi = self.ge(3.0)?;
+        let mask_mid = self.gt(-3.0)?.logical_and(&self.lt(3.0)?)?;
+        let mid_value = self
+            .mul(&self.add(&self.constant(3.0)?)?)?
+            .scale(1.0 / 6.0)?;
+        mask_mid.mul(&mid_value)?.add(&mask_hi.mul(self)?)
+    }
+    /// Elementwise `Hardshrink`: `0` where `|x| <= lambd`, otherwise `x` (PyTorch's
+    /// `torch.where(x.abs() <= lambd, 0, x)`). Backward matches PyTorch's shared
+    /// `shrink_backward_kernel` (also behind [`Self::softshrink`]): `0` on the closed
+    /// band `-lambd <= x <= lambd` (inclusive of both bounds), `grad` outside it. Composed
+    /// as `x * outside_mask`, so this natural product-rule derivative already equals that
+    /// target with no extra masking trick. Rejects a non-finite or negative `lambd`
+    /// before any device launch.
+    pub fn hardshrink(&self, lambd: f32) -> Result<Self> {
+        if !lambd.is_finite() || lambd < 0.0 {
+            return Err("hardshrink lambd must be finite and non-negative".into());
+        }
+        let inside = self.abs()?.le(lambd)?;
+        self.mul(&inside.logical_not()?)
+    }
+    /// Elementwise `Softshrink`: `x - lambd` where `x > lambd`, `x + lambd` where
+    /// `x < -lambd`, otherwise `0` on the closed band `-lambd <= x <= lambd` (PyTorch's
+    /// `torch.where(x.abs() > lambd, x - x.sign() * lambd, 0)`). Backward shares
+    /// [`Self::hardshrink`]'s exact `shrink_backward_kernel` convention: `0` on that same
+    /// closed band, `grad` outside it. Composed from two directional shift terms (each
+    /// `(x -+ lambd) * mask`) whose masks are already mutually exclusive and complementary
+    /// to the zero band, so the natural derivative equals the target directly. Rejects a
+    /// non-finite or negative `lambd` before any device launch.
+    pub fn softshrink(&self, lambd: f32) -> Result<Self> {
+        if !lambd.is_finite() || lambd < 0.0 {
+            return Err("softshrink lambd must be finite and non-negative".into());
+        }
+        let mask_pos = self.gt(lambd)?;
+        let mask_neg = self.lt(-lambd)?;
+        let shifted_pos = self.sub(&self.constant(lambd)?)?.mul(&mask_pos)?;
+        let shifted_neg = self.add(&self.constant(lambd)?)?.mul(&mask_neg)?;
+        shifted_pos.add(&shifted_neg)
+    }
+    /// Elementwise `Threshold(threshold, value)`: `x` where `x > threshold`, otherwise the
+    /// constant `value` (PyTorch's `torch.where(x <= threshold, value, x)`; note the
+    /// `<=`/`>` split, shared by forward and backward alike). Backward matches PyTorch's
+    /// `threshold_backward`: `grad` where `x > threshold`, exactly `0` at and below it.
+    /// Composed as `x * mask + value * (1 - mask)`, so the natural product-rule derivative
+    /// already equals that target with no extra masking trick. Rejects a non-finite
+    /// `threshold` or `value` before any device launch.
+    pub fn threshold(&self, threshold: f32, value: f32) -> Result<Self> {
+        if !threshold.is_finite() || !value.is_finite() {
+            return Err("threshold and value must both be finite".into());
+        }
+        let mask_hi = self.gt(threshold)?;
+        let mask_lo = mask_hi.logical_not()?;
+        self.mul(&mask_hi)?.add(&mask_lo.scale(value)?)
+    }
+    /// Elementwise `Softsign`, PyTorch's `x / (1 + x.abs())`. No true kink: although the
+    /// forward composes through [`Self::abs`], its derivative `1 / (1 + x.abs())^2` is
+    /// continuous through `x == 0` (both one-sided limits agree), and the ordinary
+    /// composed chain rule already reproduces it exactly there because `abs`'s own
+    /// backward is exactly zero at `x == 0` (its documented convention) rather than a
+    /// one-sided slope, which is exactly the missing term the analytic derivative also
+    /// drops at that point.
+    pub fn softsign(&self) -> Result<Self> {
+        let denominator = self.abs()?.add(&self.constant(1.0)?)?;
+        self.div(&denominator)
+    }
+    /// Elementwise `Tanhshrink`, PyTorch's `x - x.tanh()`. Smooth everywhere; composed
+    /// directly from [`Self::tanh`], so the chain rule gives the exact derivative
+    /// `1 - (1 - tanh(x)^2) == tanh(x)^2` for free, with no dedicated rule.
+    pub fn tanhshrink(&self) -> Result<Self> {
+        self.sub(&self.tanh()?)
+    }
     /// Shared plan for the group-sum kernel behind [`Tensor::mean`] and [`Tensor::sum`]:
     /// remove exactly `axes`, keep every other axis, and scale the summed contributions by
     /// `factor` (computed from the output/input element counts so callers can pick `1.0` for

@@ -607,3 +607,41 @@ an accidental public restriction.
 Success is the existing training behavior expressed through short programs
 with these contracts enforced. The four golden programs remain acceptance
 targets, and each capability gains its status from a running witness.
+
+### Piecewise activations
+
+`ReLU6`, `Hardtanh`, `Hardsigmoid`, `Hardswish`, `Hardshrink`, `Softshrink`,
+`Threshold`, `Softsign`, and `Tanhshrink` are nine parameter-free modules
+(`model/nn.rs`) each backed by a matching `Tensor` method (`algebra/tensor.rs`,
+mirroring how `LeakyReLU`'s tensor-level slope argument already has one),
+composed entirely from existing elementwise primitives (`clamp`, `abs`,
+`gt`/`ge`/`lt`/`le`, `logical_and`/`logical_not`, `scale`, `mul`, `add`, `sub`,
+`div`, `tanh`) rather than new backend kernels. Every forward matches
+PyTorch's documented formula exactly; every backward matches PyTorch's own
+kink convention, which is not always the strict-interior rule a reader might
+guess:
+
+| Module | Forward | Backward at the kink(s) |
+| --- | --- | --- |
+| `ReLU6` | `clamp(x, 0, 6)` | Same as `Hardtanh(0, 6)`. |
+| `Hardtanh(min_val, max_val)` | `clamp(x, min_val, max_val)` | Zero AT as well as outside either bound: `x <= min_val \|\| x >= max_val` zeros it, so the gradient passes through only strictly inside `(min_val, max_val)` -- unlike [`Tensor::clamp`](../../src/library/src/algebra/tensor.rs), whose own gradient is inclusive of both bounds. |
+| `Hardsigmoid` | `clamp(x + 3, 0, 6) / 6` | `grad / 6` strictly inside `(-3, 3)`; zero at and outside either bound (both comparisons strict). |
+| `Hardswish` | `x * clamp(x + 3, 0, 6) / 6` | Zero for `x <= -3`; `x / 3 + 0.5` strictly inside `(-3, 3)`; exactly `1` (pass-through) for `x >= 3`. The two kinks are asymmetric: `x == -3` takes the zero branch, but `x == 3` takes the pass-through branch rather than the interior formula's limit there (`1.5`). |
+| `Hardshrink(lambd)` | `0` where `\|x\| <= lambd`, else `x` | Zero on the CLOSED band `-lambd <= x <= lambd`, `grad` outside it. Shares its backward formula (`shrink_backward_kernel`) with `Softshrink`. |
+| `Softshrink(lambd)` | `x - lambd` where `x > lambd`, `x + lambd` where `x < -lambd`, else `0` | Same closed-band rule as `Hardshrink`, since both forward branches split exactly at `\|x\| == lambd`. |
+| `Threshold(threshold, value)` | `x` where `x > threshold`, else the constant `value` | `grad` where `x > threshold`, zero at and below it -- the same `<=`/`>` split as the forward, so `threshold_backward` needs no separate convention. |
+| `Softsign` | `x / (1 + \|x\|)` | `1 / (1 + \|x\|)^2` everywhere, including `x == 0`: no true kink, since both one-sided limits agree and `abs`'s own zero-at-origin backward convention supplies exactly the missing term. |
+| `Tanhshrink` | `x - tanh(x)` | `tanh(x)^2` everywhere (the ordinary chain rule through `tanh`); no true kink. |
+
+`Hardtanh` validates `min_val`/`max_val` finite with `min_val <= max_val`
+(matching `clamp`) and is composed from three disjoint region masks rather
+than reusing `clamp`'s own `Rule`, so its boundary convention stays exact
+even when `min_val == max_val` (where a naive `x >= max_val` mask would
+double-count the single point `x == min_val == max_val` against the
+`x <= min_val` mask). `Hardshrink`/`Softshrink` validate `lambd` finite and
+non-negative; `Threshold` validates `threshold`/`value` finite. None of the
+nine carry PyTorch's own defaults (`Hardtanh`'s `-1`/`1`, `Hardshrink`'s and
+`Softshrink`'s `0.5`) as a zero-argument constructor, matching `LeakyReLU`'s
+existing precedent of requiring every argument explicitly; `Threshold` has no
+PyTorch default to omit; `ReLU6`, `Hardsigmoid`, `Hardswish`, `Softsign`, and
+`Tanhshrink` take no arguments at all.
