@@ -35,7 +35,10 @@ composition, named reductions, data regimes, metrics, trainers, and optimizers.
 `SGD`, `Adam`, and `AdamW` take a per-step learning rate through
 `set_learning_rate`, driven by the pure `cosine_annealing_lr` and
 `one_cycle_lr` schedule functions (`optim.rs`); there is still no gradient
-clipping or mixed precision.
+clipping or mixed precision. `Tensor::uniform` and `Tensor::normal` are the
+public, seeded random tensor constructors: generated host-side from the same
+shared xorshift stream that initializes parameters, then uploaded, with no
+gradient edge, since a random draw is a constant, not a parameter.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
 

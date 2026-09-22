@@ -184,6 +184,31 @@ whole local Jacobian is the straight-through pass-through, `Rule::Identity`.
 Axis leaves any squashing (bae applies `tanh` first) to the caller rather than
 folding it into this op, matching bae's own composition of the two steps.
 
+`Tensor::uniform(dims, seed, low, high, device)` and `Tensor::normal(dims,
+seed, mean, std, device)` are the public, seeded random tensor constructors:
+`world/energy-output` needs a fresh reproducible Bernoulli mask drawn every
+epoch from one seed, and `world/fluid` needs seeded Gaussian noise added to
+training inputs. Both draw from the same shared xorshift64 stream that
+`Linear`/`Embedding`/`PositionEmbedding` initialization already uses
+(`model/nn.rs`'s `uniform_values`, itself now a thin wrapper over the shared
+`crate::tensor::xorshift_unit_stream`), so a seed reproduces bit-exact values
+everywhere it is used, on any run or machine. `uniform` rescales each raw
+`[0, 1)` sample to `[low, high)`; `normal` consumes successive raw pairs
+`(u1, u2)` through the Box-Muller transform, `z0 = sqrt(-2 * ln(1 - u1)) *
+cos(2*pi*u2)`, `z1 = sqrt(-2 * ln(1 - u1)) * sin(2*pi*u2)`, each scaled to
+`mean + std * z`; an odd element count drops the unused second value of the
+final pair. Using `1 - u1` rather than `u1` keeps the logarithm defined on
+the shared stream's documented first-sample-exactly-zero seeds, at the cost
+of collapsing that pair's first two normal draws to exactly `mean`. Both
+constructors generate their values host-side, then upload them exactly like
+`Tensor::from_slice` — the simplest honest implementation, and adequate for
+the small per-epoch draws both consumers need. A random draw has no upstream
+input, so neither constructor produces a gradient edge; it is a constant a
+program can then compose with `mul`/`add` like any other tensor, not a
+trainable parameter. Neither is dropout (a train/eval-mode masking module,
+tracked separately) or an `RNG`-state object: each call is deterministic in
+its seed alone, with no mutable generator to advance or restore.
+
 `DataLoader` batches any `DataSource` and checks its regime before releasing a
 batch. Finite `InMemoryDataset` sources report corpus size; generated sources
 such as `AdditionDataset` do not invent one. Each guarded batch carries a
