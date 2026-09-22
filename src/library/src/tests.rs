@@ -3849,3 +3849,95 @@ fn named_axis_concat_matches_independent_values_gradients_and_composed_paths() -
     println!("concat values, gradients, and composed-path cross-check PASS");
     Ok(())
 }
+
+#[test]
+fn clip_grad_norm_rejects_invalid_max_norm() {
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), 0.0).is_err());
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), -1.0).is_err());
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), f32::NAN).is_err());
+    assert!(clip_grad_norm(std::iter::empty::<Parameter>(), f32::INFINITY).is_err());
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clip_grad_norm_scales_every_gradient_by_one_global_factor_when_the_norm_exceeds_max_norm()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let f = Axis::new("feature");
+    // mean(x*x) over a single-element axis has derivative 2*x/1 = 2*x, so
+    // x = 1.5 and x = 2.0 give clean gradients 3.0 and 4.0 by construction —
+    // a closed form independent of clip_grad_norm itself, the same trick
+    // `parameter_versions_accumulation_and_shared_updates` above uses.
+    let a = Parameter::new(Tensor::from_slice(&[1.5], [f.of(1)], &device)?);
+    a.tensor().mul(&a.tensor())?.mean(f)?.backward()?;
+    let b = Parameter::new(Tensor::from_slice(&[2.0], [f.of(1)], &device)?);
+    b.tensor().mul(&b.tensor())?.mean(f)?.backward()?;
+    // A third parameter with no gradient yet must be skipped, not erred on.
+    let untouched = Parameter::new(Tensor::from_slice(&[9.0], [f.of(1)], &device)?);
+    close(
+        "gradient a before clipping",
+        &a.grad().unwrap().to_vec()?,
+        &[3.0],
+    );
+    close(
+        "gradient b before clipping",
+        &b.grad().unwrap().to_vec()?,
+        &[4.0],
+    );
+
+    // total_norm = sqrt(3.0^2 + 4.0^2) = sqrt(25) = 5.0, hand-computed and
+    // independent of the op under test. `a` is listed twice below (as a
+    // stand-in for a tied/shared parameter reachable through two paths): if
+    // ParamId deduplication failed, the sum of squares would double-count it
+    // to 2*9 + 16 = 34 and total_norm would be sqrt(34) =/= 5.0, failing the
+    // very next assertion.
+    let total_norm = clip_grad_norm([a.clone(), b.clone(), untouched.clone(), a.clone()], 4.0)?;
+    close("pre-clip total norm", &[total_norm], &[5.0]);
+
+    // 5.0 > max_norm (4.0), so every gradient is scaled by the SAME factor
+    // max_norm / (total_norm + 1e-6) = 4.0 / 5.000001 = 0.79999984 (by hand,
+    // long division to 8 significant figures): 3.0*0.79999984 = 2.39999952,
+    // 4.0*0.79999984 = 3.19999936.
+    close(
+        "gradient a scaled by the global factor",
+        &a.grad().unwrap().to_vec()?,
+        &[2.39999952],
+    );
+    close(
+        "gradient b scaled by the SAME global factor",
+        &b.grad().unwrap().to_vec()?,
+        &[3.19999936],
+    );
+    assert!(
+        untouched.grad().is_none(),
+        "a parameter with no gradient must not gain one"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn clip_grad_norm_leaves_gradients_bit_exact_below_max_norm() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let f = Axis::new("feature");
+    let a = Parameter::new(Tensor::from_slice(&[1.5], [f.of(1)], &device)?);
+    a.tensor().mul(&a.tensor())?.mean(f)?.backward()?;
+    let b = Parameter::new(Tensor::from_slice(&[2.0], [f.of(1)], &device)?);
+    b.tensor().mul(&b.tensor())?.mean(f)?.backward()?;
+
+    // Same hand-computed total_norm = 5.0 as above, but max_norm = 10.0 is
+    // above it: a no-op, never a silent renormalization to exactly max_norm.
+    let total_norm = clip_grad_norm([a.clone(), b.clone()], 10.0)?;
+    close("pre-clip total norm below threshold", &[total_norm], &[5.0]);
+    assert_eq!(
+        a.grad().unwrap().to_vec()?,
+        vec![3.0_f32],
+        "untouched gradient a must be bit-exact"
+    );
+    assert_eq!(
+        b.grad().unwrap().to_vec()?,
+        vec![4.0_f32],
+        "untouched gradient b must be bit-exact"
+    );
+    Ok(())
+}
