@@ -5155,3 +5155,124 @@ fn seeded_uniform_and_normal_tensors_build_named_axis_tensors_with_no_gradient_e
     println!("seeded uniform/normal tensor construction PASS");
     Ok(())
 }
+
+#[test]
+fn broadcast_to_composes_an_outer_pairwise_squared_distance_matching_torch_cdist() -> Result<()> {
+    // vision/image-encode's Stage A `soft_recon` computes `torch.cdist(P, sites) ** 2`, a
+    // (pixel, site) squared-distance matrix from `P: (pixel, coord)` and `sites: (site,
+    // coord)` (`stage_a.py:42`). Neither operand's axis set is a subset of the other's --
+    // `pixel` and `site` are each missing from the other operand -- so plain elementwise
+    // `sub` refuses them ("incomparable axis sets: elementwise broadcasting cannot introduce
+    // an implicit outer product", `binary` in `algebra/tensor.rs`). `broadcast_to` gives each
+    // operand the axis it lacks, onto one explicit shared `[pixel, site, coord]` shape, so an
+    // ordinary `sub`/`mul`/`sum` composes the outer pairwise squared distance with no
+    // dedicated outer-product op.
+    let device = Device::cuda(0)?;
+    let (pixel, site, coord) = (Axis::new("pixel"), Axis::new("site"), Axis::new("coord"));
+    // [pixel, coord]: p0=(0,0) p1=(1,2) p2=(3,-1)
+    let p_values = [0.0f32, 0.0, 1.0, 2.0, 3.0, -1.0];
+    // [site, coord]: s0=(1,0) s1=(-2,3)
+    let s_values = [1.0f32, 0.0, -2.0, 3.0];
+    let p = Tensor::from_slice(&p_values, [pixel.of(3), coord.of(2)], &device)?.with_grad();
+    let sites = Tensor::from_slice(&s_values, [site.of(2), coord.of(2)], &device)?.with_grad();
+    let shape = Shape::new([pixel.of(3), site.of(2), coord.of(2)])?;
+
+    // Rejections before any device work: the target must carry every axis `self` has, at
+    // `self`'s own extent -- it can add axes, never drop or resize one.
+    let missing_coord = Shape::new([pixel.of(3), site.of(2)])?; // drops `coord`, which p has
+    assert!(p.broadcast_to(&missing_coord).is_err());
+    let wrong_extent = Shape::new([pixel.of(3), site.of(2), coord.of(5)])?; // coord resized
+    assert!(p.broadcast_to(&wrong_extent).is_err());
+
+    let p_outer = p.broadcast_to(&shape)?;
+    let sites_outer = sites.broadcast_to(&shape)?;
+    let delta = p_outer.sub(&sites_outer)?;
+    let squared_distance = delta.mul(&delta)?.sum(coord)?;
+
+    // Hand-computed: d2[p, s] = (P[p,0]-S[s,0])^2 + (P[p,1]-S[s,1])^2, pixel-major.
+    close(
+        "outer-broadcast pairwise squared distance matches torch.cdist(P, sites) ** 2",
+        &squared_distance.to_vec()?,
+        &[1.0, 13.0, 4.0, 10.0, 5.0, 41.0],
+    );
+
+    squared_distance.mean([pixel, site])?.backward()?;
+    // Broadcast backward sums the upstream gradient over the axis each side added: `p`'s
+    // gradient sums over every `site`, `sites`'s gradient sums over every `pixel`.
+    close(
+        "broadcast backward sums P's gradient over every site",
+        &p.grad().expect("P gradient").to_vec()?,
+        &[
+            1.0 / 3.0,
+            -1.0,
+            1.0,
+            1.0 / 3.0,
+            7.0 / 3.0,
+            -5.0 / 3.0,
+        ],
+    );
+    close(
+        "broadcast backward sums sites's gradient over every pixel",
+        &sites.grad().expect("sites gradient").to_vec()?,
+        &[-1.0 / 3.0, -1.0 / 3.0, -10.0 / 3.0, 8.0 / 3.0],
+    );
+    println!("outer-broadcast pairwise squared distance PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn broadcast_to_matches_hand_computed_pairwise_squared_distance_under_reordered_storage()
+-> Result<()> {
+    // Same outer-broadcast composition as the test above, this time with both operands'
+    // PHYSICAL storage transposed relative to their logical [pixel, coord] / [site, coord]
+    // order (mirroring `stage_a.py`'s `P`/`sites` tensors, which are ordinary row-major
+    // torch tensors but could equally arrive permuted): `broadcast_to` must read through
+    // `self.0.layout`'s permuted strides, not assume either operand is already contiguous
+    // in its declared axis order.
+    let device = Device::cuda(0)?;
+    let (pixel, site, coord) = (Axis::new("pixel"), Axis::new("site"), Axis::new("coord"));
+    // [pixel, coord]: p0=(0,1) p1=(2,-1) p2=(-3,0) p3=(1,1)
+    let p_values = [0.0f32, 1.0, 2.0, -1.0, -3.0, 0.0, 1.0, 1.0];
+    // [site, coord]: s0=(0,0) s1=(2,2) s2=(-1,-1)
+    let s_values = [0.0f32, 0.0, 2.0, 2.0, -1.0, -1.0];
+    let p = Tensor::from_slice(&p_values, [pixel.of(4), coord.of(2)], &device)?
+        .with_layout([coord, pixel])?
+        .with_grad();
+    let sites = Tensor::from_slice(&s_values, [site.of(3), coord.of(2)], &device)?
+        .with_layout([coord, site])?
+        .with_grad();
+    let shape = Shape::new([pixel.of(4), site.of(3), coord.of(2)])?;
+
+    let delta = p.broadcast_to(&shape)?.sub(&sites.broadcast_to(&shape)?)?;
+    let squared_distance = delta.mul(&delta)?.sum(coord)?;
+
+    close(
+        "reordered-storage outer-broadcast forward",
+        &squared_distance.to_vec()?,
+        &[1.0, 5.0, 5.0, 5.0, 9.0, 9.0, 9.0, 29.0, 5.0, 2.0, 2.0, 8.0],
+    );
+
+    squared_distance.mean([pixel, site])?.backward()?;
+    close(
+        "reordered-storage outer-broadcast P gradient",
+        &p.grad().expect("P gradient").to_vec()?,
+        &[
+            -1.0 / 6.0,
+            1.0 / 3.0,
+            5.0 / 6.0,
+            -2.0 / 3.0,
+            -5.0 / 3.0,
+            -1.0 / 6.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+        ],
+    );
+    close(
+        "reordered-storage outer-broadcast sites gradient",
+        &sites.grad().expect("sites gradient").to_vec()?,
+        &[0.0, -1.0 / 6.0, 4.0 / 3.0, 7.0 / 6.0, -2.0 / 3.0, -5.0 / 6.0],
+    );
+    println!("reordered-storage outer-broadcast pairwise squared distance PASS");
+    Ok(())
+}
