@@ -1800,3 +1800,67 @@ layout mapping above, matching evaluation-mode logits and the first conv
 weight's loss gradient to float precision. A `Trainer::step_training` step at
 tiny width commits at least one `BatchNorm` running-statistics update for
 `resnet34`, `resnet50` and `vgg16_bn`.
+
+### DCGAN reference architecture
+
+`axis::architectures` (`src/library/src/architectures/`) holds plain
+`Module` compositions built only from existing library modules: a
+composition witness as well as a convenience. `DcganGenerator` and
+`DcganDiscriminator` (`architectures/gan.rs`) are Radford, Metz and
+Chintala's DCGAN (2015), built exactly as the PyTorch "DCGAN Tutorial"
+defines it for 64x64 images: five `ConvTranspose2d` layers
+(`BatchNorm`+`ReLU` between, `Tanh` output) taking a `[batch, channel(nz),
+1, 1]` latent map to a `[batch, height(64), width(64), channel(nc)]` image,
+and five `Conv2d` layers (`BatchNorm`+`LeakyReLU(0.2)` between, no final
+activation) taking that image to one raw logit per sample. `nz`, the batch
+size, and the input image channel count are all inferred from the input at
+`build`, like every other named-axis module; `ngf`/`ndf` and the output
+image channel count (generator only) are the constructor's only
+hyperparameters, defaulting to the tutorial's own `64`/`64`/`3`
+(`DCGAN_GENERATOR_FEATURES`/`DCGAN_DISCRIMINATOR_FEATURES`/`DCGAN_IMAGE_CHANNELS`).
+The discriminator deliberately never applies `Sigmoid`: pair its raw logits
+with `Tensor::binary_cross_entropy_with_logits` (PyTorch's own
+`BCEWithLogitsLoss`, the numerically stable combined form) rather than the
+tutorial's separate `Sigmoid` + `BCELoss`.
+
+Building this exactly needed one small addition to `Conv2d`/`Conv3d`/
+`ConvTranspose2d`/`ConvTranspose3d` (and their `Conv1d`/`ConvTranspose1d`
+unit-axis wrappers): a `.bias(bool)` builder matching `Linear::bias`,
+disabling the layer's learned bias entirely rather than merely zeroing it.
+The tutorial sets `bias=False` on every convolution (redundant with the
+following BatchNorm's own bias, and `False` on the two layers that have no
+BatchNorm), and without this builder Axis's own convolutions would carry an
+always-present, separately trainable zero-initialized bias the reference
+never has -- silently wrong parameter counts and an extra degree of freedom
+no reference run would exhibit. No new kernel was needed for either the
+architecture or this builder.
+
+`dcgan_tutorial_init` is the paper's own `weights_init`: every convolution
+weight drawn `N(0, 0.02)`, every `BatchNorm` scale drawn `N(1, 0.02)`, every
+bias set to exactly `0`, applied to any already-built `Module` by its own
+`named_parameters` path suffix (`*.weight`, `*.scale`, `*.bias`) using
+`Tensor::normal`'s deterministic host stream. It is an explicit, opt-in
+post-`build` step: Axis's own default convolution initialization stays
+Xavier/Glorot-uniform-shaped (`xavier_uniform_weight`), and `BatchNorm`'s
+own default scale starts at exactly `1.0` with no spread, so a consumer
+that wants the tutorial's exact training dynamics calls this once after
+`build`.
+
+Evidence: parameter counts at the reference's real size (`nz=100`,
+`ngf=ndf=64`, `nc=3`) matching `sum(p.numel() for p in net.parameters())`
+against the tutorial's own `Generator`/`Discriminator` classes exactly
+(3,576,704 and 2,765,568); a tiny-width (`nz=2`, `ngf=ndf=1`, `nc=1`) full
+64x64-spatial-pipeline run with PyTorch reference weights and BatchNorm
+running statistics loaded by explicit name-and-layout mapping (PyTorch's
+`[out,in,kh,kw]`/`[in,out,kh,kw]` weight permuted to Axis's own
+`[patch(other_side, kh, kw), self_side]` flat layout via
+`weight.permute(1, 2, 3, 0).flatten()`, the same formula the `Conv2d`/
+`ConvTranspose2d` scalar-oracle tests already assert directly), matching
+the reference's eval-mode discriminator logits and the generator's first
+`ConvTranspose2d` weight gradient after backpropagating through the whole
+assembled pipeline; and one alternating discriminator-then-generator
+`Trainer::step_training` step on the GPU, asserting both networks'
+parameters and both networks' BatchNorm running statistics change. A
+bounded end-to-end training witness (loss curves and a generated-sample
+grid, explicitly a mechanics witness rather than an image-quality claim) is
+`src/examples/training/dcgan/`.

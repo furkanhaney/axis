@@ -3,6 +3,8 @@
 //! Muon is adapted from Keller Jordan's reference implementation. The pinned
 //! source revision and MIT notice are packaged in
 //! [`THIRD_PARTY.md`](https://github.com/furkanhaney/axis/blob/main/src/library/THIRD_PARTY.md).
+#[path = "architectures/gan.rs"]
+mod architectures_gan;
 #[path = "algebra/axis.rs"]
 mod axis;
 #[cfg(feature = "cuda")]
@@ -107,11 +109,15 @@ pub use residual::{
 pub use tensor::{LinearCrossEntropyOptions, Tensor};
 pub use train::{Optimizer, TrainStep, Trainer, TrainingPass};
 
-/// Reference vision architectures assembled only from public library
-/// modules: composition witnesses as well as convenience constructors.
-/// Equivalence to each architecture's reference implementation is
+/// Reference architectures assembled only from public library modules: composition
+/// witnesses as well as convenience constructors. One file per family under
+/// `src/architectures/`. Equivalence to each architecture's reference implementation is
 /// established by tests in `src/library/src/tests.rs`, never asserted here.
 pub mod architectures {
+    pub use crate::architectures_gan::{
+        DCGAN_DISCRIMINATOR_FEATURES, DCGAN_GENERATOR_FEATURES, DCGAN_IMAGE_CHANNELS, DCGAN_LATENT,
+        DcganDiscriminator, DcganGenerator, dcgan_tutorial_init,
+    };
     pub use crate::resnet::{
         ResNetAxes, resnet34, resnet34_small_input, resnet50, resnet50_small_input,
     };
@@ -139,8 +145,8 @@ mod window_tests;
 
 pub mod prelude {
     pub use crate::architectures::{
-        ResNetAxes, VggAxes, resnet34, resnet34_small_input, resnet50, resnet50_small_input, vgg16,
-        vgg16_bn,
+        DcganDiscriminator, DcganGenerator, ResNetAxes, VggAxes, resnet34, resnet34_small_input,
+        resnet50, resnet50_small_input, vgg16, vgg16_bn,
     };
     pub use crate::{
         Adam, AdamW, AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveAvgPool3d, AdaptiveMaxPool1d,
