@@ -100,7 +100,10 @@ Axis implements 72% of PyTorch 2.14's `torch.nn` catalog, graded class by class
 against its own definition of a finished module, with every operator checked
 against an independent numerical oracle for its values and its gradients
 ([the catalog](https://github.com/furkanhaney/axis/blob/main/docs/nn/catalog.md)).
-The operator reference is on [docs.rs](https://docs.rs/axis).
+`axis::architectures` provides ResNet-34, ResNet-50, VGG16 and DCGAN, each
+matching its reference's parameter count exactly and its outputs within `1e-7`
+when loaded with the reference's weights. The operator reference is on
+[docs.rs](https://docs.rs/axis).
 
 ## Requirements
 
