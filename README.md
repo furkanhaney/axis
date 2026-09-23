@@ -198,6 +198,11 @@ same thing, and that is checked rather than assumed.
   a multiple-instance classifier, a Fourier MLP, an energy fit and a U-Net
   block) each carry a small Axis crate that reproduces a PyTorch forward and
   loss, with observed error below `1e-5` in every case.
+- **Reference architectures.** `axis::architectures` ships ResNet-34, ResNet-50,
+  VGG16 (with and without BatchNorm) and DCGAN, built only from public modules.
+  Each matches its reference's parameter count exactly (ResNet-50: 25,557,032,
+  the same as torchvision) and, at a reduced width loaded with the reference's
+  weights, its logits and first-layer gradient to within `1e-7`.
 - **Known, stated divergences** are named on the operator, for example `gelu`
   is PyTorch's tanh form and `gelu_exact` its default, and a `logsumexp` group of
   all non-finite values returns NaN where PyTorch returns negative infinity.

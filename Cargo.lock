@@ -71,6 +71,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "axis-dcgan-witness"
+version = "0.11.0"
+dependencies = [
+ "axis",
+ "axis-vision-data",
+]
+
+[[package]]
 name = "axis-fashion-mnist"
 version = "0.11.0"
 dependencies = [

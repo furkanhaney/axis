@@ -1746,3 +1746,121 @@ survives when `i < w`, keeping `floor(w) + 1` positions in the generic case,
 so the kept prefix length is uniform over `{1, ..., extent}`. No rescaling
 is applied: unlike `Dropout`'s inverted scaling, this is a hard truncation
 mask, matching `arange(K) < m` in both cited consumers exactly.
+
+### Reference architectures: ResNet and VGG
+
+`architectures/resnet.rs` and `architectures/vgg.rs` (the new
+`src/library/src/architectures/` family, exported as a public
+`axis::architectures` module and, for its constructors and axes types, in
+the prelude) are plain compositions of the public `Conv2d`, `BatchNorm`,
+`MaxPool2d`, `AdaptiveAvgPool2d`, `Linear`, `ReLU`, `Dropout`, `Flatten` and
+`Sequential` a consumer could write by hand: composition witnesses as well
+as convenience constructors, no new kernels. `resnet34`/`resnet50` match
+torchvision 0.26 exactly: a 7x7 stride-2 stem conv (no bias; the following
+`BatchNorm` already carries the shift), `BatchNorm`, `ReLU`, a 3x3 stride-2
+max pool, four stages of `[3, 4, 6, 3]` blocks (`BasicBlock` for
+`resnet34`, `Bottleneck` -- 1x1 reduce, 3x3, 1x1 expand by a factor of 4 --
+for `resnet50`, torchvision's own v1.5 placing the stride on the
+`Bottleneck`'s 3x3 conv rather than its first 1x1), a projection (1x1 conv
+plus `BatchNorm`) shortcut whenever a stage's first block changes channel
+count or stride, adaptive average pool to 1x1, and a `Linear` to
+`num_classes`. `vgg16`/`vgg16_bn` match configuration D exactly: thirteen
+3x3 stride-1 padding-1 convolutions (bias kept, unlike ResNet's pre-BatchNorm
+convs -- torchvision's own `vgg16_bn` does not drop it either) with a 2x2
+stride-2 max pool after each of five blocks, `vgg16_bn` inserting a
+`BatchNorm` after every conv and before its `ReLU`, an adaptive average pool
+to 7x7, and a 25088-4096-4096-`num_classes` classifier with `ReLU` and
+`Dropout(0.5)` between its `Linear` layers. Every constructor takes only a
+channel axis and two spatial axes (`ResNetAxes`/`VggAxes`): no module here
+ever names a batch axis, so a caller's own batch axis, and any other axis it
+adds, simply passes through untouched, exactly like every other Axis module.
+`resnet34_small_input`/`resnet50_small_input` add one Axis-only stem option
+with no torchvision equivalent, default off: a 3x3 stride-1 conv and no max
+pool, so a 64x64-scale input is not collapsed by the standard stem before the
+first stage even runs.
+
+Weight layout is Axis's own, not torch's: `Conv2d`'s weight is `[patch(in,
+kh, kw), output]` (row-major, channel slowest, kernel width fastest) against
+torch's `[out, in, kh, kw]`, so loading a torch conv weight is a reshape to
+`[out, patch]` followed by a transpose; `Linear`'s weight is `[in, output]`
+against torch's `[out, in]`, a plain transpose; `BatchNorm`'s affine scale
+(named `"scale"`, not torch's `"weight"`) and bias are a single named axis
+each, copied as-is.
+
+Evidence is proportional to what Axis can actually check: parameter count
+against torchvision's own count at the real 1000-class size (`resnet34`
+21,797,672; `resnet50` 25,557,032; `vgg16` 138,357,544; `vgg16_bn`
+138,365,992) is exact for all four. A full torchvision `resnet34` carries 21M
+parameters Axis has no checkpoint format to load, so equivalence to the
+reference is instead checked against tiny hand-rolled PyTorch reference
+modules -- "the paper's reference code" at reduced width, following the
+exact same stem/block/shortcut construction `BasicBlock`/`Bottleneck` and the
+plain VGG composition use -- with real random weights loaded through the
+layout mapping above, matching evaluation-mode logits and the first conv
+weight's loss gradient to float precision. A `Trainer::step_training` step at
+tiny width commits at least one `BatchNorm` running-statistics update for
+`resnet34`, `resnet50` and `vgg16_bn`.
+
+### DCGAN reference architecture
+
+`axis::architectures` (`src/library/src/architectures/`) holds plain
+`Module` compositions built only from existing library modules: a
+composition witness as well as a convenience. `DcganGenerator` and
+`DcganDiscriminator` (`architectures/gan.rs`) are Radford, Metz and
+Chintala's DCGAN (2015), built exactly as the PyTorch "DCGAN Tutorial"
+defines it for 64x64 images: five `ConvTranspose2d` layers
+(`BatchNorm`+`ReLU` between, `Tanh` output) taking a `[batch, channel(nz),
+1, 1]` latent map to a `[batch, height(64), width(64), channel(nc)]` image,
+and five `Conv2d` layers (`BatchNorm`+`LeakyReLU(0.2)` between, no final
+activation) taking that image to one raw logit per sample. `nz`, the batch
+size, and the input image channel count are all inferred from the input at
+`build`, like every other named-axis module; `ngf`/`ndf` and the output
+image channel count (generator only) are the constructor's only
+hyperparameters, defaulting to the tutorial's own `64`/`64`/`3`
+(`DCGAN_GENERATOR_FEATURES`/`DCGAN_DISCRIMINATOR_FEATURES`/`DCGAN_IMAGE_CHANNELS`).
+The discriminator deliberately never applies `Sigmoid`: pair its raw logits
+with `Tensor::binary_cross_entropy_with_logits` (PyTorch's own
+`BCEWithLogitsLoss`, the numerically stable combined form) rather than the
+tutorial's separate `Sigmoid` + `BCELoss`.
+
+Building this exactly needed one small addition to `Conv2d`/`Conv3d`/
+`ConvTranspose2d`/`ConvTranspose3d` (and their `Conv1d`/`ConvTranspose1d`
+unit-axis wrappers): a `.bias(bool)` builder matching `Linear::bias`,
+disabling the layer's learned bias entirely rather than merely zeroing it.
+The tutorial sets `bias=False` on every convolution (redundant with the
+following BatchNorm's own bias, and `False` on the two layers that have no
+BatchNorm), and without this builder Axis's own convolutions would carry an
+always-present, separately trainable zero-initialized bias the reference
+never has -- silently wrong parameter counts and an extra degree of freedom
+no reference run would exhibit. No new kernel was needed for either the
+architecture or this builder.
+
+`dcgan_tutorial_init` is the paper's own `weights_init`: every convolution
+weight drawn `N(0, 0.02)`, every `BatchNorm` scale drawn `N(1, 0.02)`, every
+bias set to exactly `0`, applied to any already-built `Module` by its own
+`named_parameters` path suffix (`*.weight`, `*.scale`, `*.bias`) using
+`Tensor::normal`'s deterministic host stream. It is an explicit, opt-in
+post-`build` step: Axis's own default convolution initialization stays
+Xavier/Glorot-uniform-shaped (`xavier_uniform_weight`), and `BatchNorm`'s
+own default scale starts at exactly `1.0` with no spread, so a consumer
+that wants the tutorial's exact training dynamics calls this once after
+`build`.
+
+Evidence: parameter counts at the reference's real size (`nz=100`,
+`ngf=ndf=64`, `nc=3`) matching `sum(p.numel() for p in net.parameters())`
+against the tutorial's own `Generator`/`Discriminator` classes exactly
+(3,576,704 and 2,765,568); a tiny-width (`nz=2`, `ngf=ndf=1`, `nc=1`) full
+64x64-spatial-pipeline run with PyTorch reference weights and BatchNorm
+running statistics loaded by explicit name-and-layout mapping (PyTorch's
+`[out,in,kh,kw]`/`[in,out,kh,kw]` weight permuted to Axis's own
+`[patch(other_side, kh, kw), self_side]` flat layout via
+`weight.permute(1, 2, 3, 0).flatten()`, the same formula the `Conv2d`/
+`ConvTranspose2d` scalar-oracle tests already assert directly), matching
+the reference's eval-mode discriminator logits and the generator's first
+`ConvTranspose2d` weight gradient after backpropagating through the whole
+assembled pipeline; and one alternating discriminator-then-generator
+`Trainer::step_training` step on the GPU, asserting both networks'
+parameters and both networks' BatchNorm running statistics change. A
+bounded end-to-end training witness (loss curves and a generated-sample
+grid, explicitly a mechanics witness rather than an image-quality claim) is
+`src/examples/training/dcgan/`.

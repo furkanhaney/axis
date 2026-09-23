@@ -27,6 +27,16 @@ what order rows should flip; that table says which have.
 
 ## Current surface
 
+`Conv2d`/`Conv3d` gained the same `.bias(false)` option `Linear` already
+had, for a conv immediately followed by a normalization layer that already
+carries its own shift; `src/library/src/architectures/` (`resnet.rs`,
+`vgg.rs`) is a new family of plain compositions of existing public
+modules -- `resnet34`/`resnet50`/`vgg16`/`vgg16_bn`, matching torchvision
+0.26 exactly -- exported as `axis::architectures` and, for its constructors
+and axes types, in the prelude; see
+[../design/library.md](../design/library.md)'s "Reference architectures"
+section.
+
 The torch.nn spec in [../nn/catalog.md](../nn/catalog.md) is the itemized
 inventory: every class with its verdict and the PR and tests behind it. On
 2026-09-22 nine families landed at once (piecewise and smooth activations,
@@ -40,7 +50,9 @@ that wave.
 Axis already has `Linear` (bias on by default; `.bias(false)` before `build`
 omits the bias parameter entirely, so `named_parameters` then has only
 `weight`), `PopulationLinear` (bias always present; not yet given the same
-option), `Conv2d`, `Conv3d`, `MaxPool2d`, `MaxPool3d`,
+option), `Conv1d`/`Conv2d`/`Conv3d`/`ConvTranspose1d`/`ConvTranspose2d`/
+`ConvTranspose3d` (same `.bias(bool)` builder as `Linear`, landed from
+DCGAN's `bias=False` convolutions), `MaxPool2d`, `MaxPool3d`,
 `Tensor::adaptive_avg_pool3d`, named-axis
 `LayerNorm`, `RmsNorm`, `GroupNorm`, stateless `InstanceNorm`, one-hot
 `Embedding`, `PositionEmbedding`, `ReLU`, tanh-form
@@ -120,7 +132,7 @@ dedicated outer-product method.
 | Recurrent foundation | `LstmCell` and `Lstm` correctness are implemented; fused recurrence, direction, and layer composition remain | Independent forward and complete gradient oracles protect the eager IFGO implementation before performance work. |
 | Stateful foundation | persistent non-parameter state (`State`, `Module::named_states`, staged `TrainingPass` updates), named-axis `BatchNorm`, and `InstanceNorm`'s optional `track_running_stats` are implemented | Running statistics could not be represented honestly until `Module` could hold and update them; landed from `vision/morpheus`'s trained-checkpoint BatchNorm. |
 | Common composition | `Conv1d` or rank-general convolution, `ELU`, dropout, prefix (nested) dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. Exact GELU, `SiLU`, and `LeakyReLU` landed from Atlas and vision consumer pressure; `Embedding`, the prefix causal mask, and `SignStraightThrough` landed from the byte autoencoder migration, whose ordered binary code is also the consumer for prefix dropout. `MaxPool2d`/`MaxPool3d` and `Tensor::adaptive_avg_pool3d` landed from `fluid`'s U-Net encoder, `morpheus`'s peak-NMS decode, and `gastric`'s interface-region pooler. |
-| Architecture families | recurrent variants, transpose convolution, reusable transformer encoder/decoder modules | Add them around measured consumers after the lower-level contracts settle. |
+| Architecture families | recurrent variants, reusable transformer encoder/decoder modules | Add them around measured consumers after the lower-level contracts settle. `axis::architectures` (`src/library/src/architectures/`), transpose convolution, and `Conv2d`/`Conv3d`/`ConvTranspose2d`/`ConvTranspose3d`'s `.bias(bool)` builder landed from DCGAN (Radford, Metz and Chintala, 2015; `architectures/gan.rs`), a composition witness at the reference's own parameter counts and a weight-mapped equivalence against PyTorch's tutorial implementation. |
 | Specialized | sparse, quantized, distributed, fractional pooling, lazy initialization | Each needs its own representation or execution contract; names alone would provide false parity. |
 
 Dimensions are expressed by named axes rather than suffixing every concept with

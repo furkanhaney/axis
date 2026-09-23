@@ -11,6 +11,7 @@ struct Convolution<const N: usize> {
     stride: [usize; N],
     padding: [usize; N],
     groups: usize,
+    bias: bool,
     group: Axis,
     patch: Axis,
     output_in_group: Axis,
@@ -24,7 +25,7 @@ struct BoundConvolution {
     patch: usize,
     output_in_group: usize,
     weight: Parameter,
-    bias: Parameter,
+    bias: Option<Parameter>,
 }
 
 struct Geometry {
@@ -44,6 +45,7 @@ impl<const N: usize> Convolution<N> {
             stride: [1; N],
             padding: [0; N],
             groups: 1,
+            bias: true,
             group: input.role("conv_group"),
             patch: input.role("conv_patch_in_group"),
             output_in_group: output.axis.role("conv_output_in_group"),
@@ -184,11 +186,17 @@ impl<const N: usize> Convolution<N> {
             weight_shape.dims().iter().copied(),
             device,
         )?);
-        let bias = Parameter::new(Tensor::from_slice(
-            &vec![0.0; self.output.extent],
-            [self.output_role.of(self.output.extent)],
-            device,
-        )?);
+        let bias = self
+            .bias
+            .then(|| {
+                Tensor::from_slice(
+                    &vec![0.0; self.output.extent],
+                    [self.output_role.of(self.output.extent)],
+                    device,
+                )
+                .map(Parameter::new)
+            })
+            .transpose()?;
         self.bound = Some(BoundConvolution {
             input_channels: geometry.channels,
             groups: self.groups,
@@ -206,7 +214,7 @@ impl<const N: usize> Convolution<N> {
             .bound
             .as_ref()
             .ok_or_else(|| format!("{} must be built before forward", Self::name()))?;
-        input
+        let projected = input
             .unfold_grouped(
                 self.input,
                 self.spatial,
@@ -218,19 +226,23 @@ impl<const N: usize> Convolution<N> {
                 0.0,
             )?
             .contract(&bound.weight.tensor(), self.patch)?
-            .merge([self.group, self.output_in_group], self.output_role)?
-            .add(&bound.bias.tensor())?
-            .rename(self.output_role, self.output.axis)
+            .merge([self.group, self.output_in_group], self.output_role)?;
+        let biased = match &bound.bias {
+            Some(bias) => projected.add(&bias.tensor())?,
+            None => projected,
+        };
+        biased.rename(self.output_role, self.output.axis)
     }
 
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
         self.bound
             .as_ref()
             .map(|bound| {
-                vec![
-                    ("weight".into(), bound.weight.clone()),
-                    ("bias".into(), bound.bias.clone()),
-                ]
+                let mut params = vec![("weight".into(), bound.weight.clone())];
+                if let Some(bias) = &bound.bias {
+                    params.push(("bias".into(), bias.clone()));
+                }
+                params
             })
             .unwrap_or_default()
     }
@@ -266,6 +278,13 @@ impl Conv2d {
     /// Partition input and output channels into independent convolution groups.
     pub fn groups(mut self, groups: usize) -> Self {
         self.0.groups = groups;
+        self
+    }
+
+    /// Disable the learned bias term, matching [`crate::Linear::bias`]. Has no effect once `build`
+    /// has already allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.0.bias = bias;
         self
     }
 }
@@ -318,6 +337,13 @@ impl Conv3d {
     /// Partition input and output channels into independent convolution groups.
     pub fn groups(mut self, groups: usize) -> Self {
         self.0.groups = groups;
+        self
+    }
+
+    /// Disable the learned bias term, matching [`crate::Linear::bias`]. Has no effect once `build`
+    /// has already allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.0.bias = bias;
         self
     }
 }
@@ -392,6 +418,12 @@ impl Conv1d {
         self
     }
 
+    /// Disable the learned bias term, matching [`crate::Linear::bias`]. Has no effect once `build`
+    /// has already allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.inner = self.inner.bias(bias);
+        self
+    }
     fn expanded(&self, input: &Shape) -> Result<Shape> {
         let mut dims = input.dims().to_vec();
         dims.push(self.dummy.of(1));
@@ -448,6 +480,7 @@ struct TransposedConvolution<const N: usize> {
     patch: Axis,
     input_in_group: Axis,
     output_role: Axis,
+    bias: bool,
     bound: Option<BoundConvolution>,
 }
 
@@ -466,6 +499,7 @@ impl<const N: usize> TransposedConvolution<N> {
             patch: output.axis.role("conv_transpose_patch_in_group"),
             input_in_group: input.role("conv_transpose_input_in_group"),
             output_role: output.axis.role("conv_transpose_output"),
+            bias: true,
             bound: None,
         }
     }
@@ -614,11 +648,17 @@ impl<const N: usize> TransposedConvolution<N> {
             weight_shape.dims().iter().copied(),
             device,
         )?);
-        let bias = Parameter::new(Tensor::from_slice(
-            &vec![0.0; self.output.extent],
-            [self.output_role.of(self.output.extent)],
-            device,
-        )?);
+        let bias = self
+            .bias
+            .then(|| {
+                Tensor::from_slice(
+                    &vec![0.0; self.output.extent],
+                    [self.output_role.of(self.output.extent)],
+                    device,
+                )
+                .map(Parameter::new)
+            })
+            .transpose()?;
         self.bound = Some(BoundConvolution {
             input_channels: geometry.input_channels,
             groups: self.groups,
@@ -676,19 +716,22 @@ impl<const N: usize> TransposedConvolution<N> {
                 result = result.pad_zeros(self.spatial[index], 0, self.output_padding[index])?;
             }
         }
-        result
-            .add(&bound.bias.tensor())?
-            .rename(self.output_role, self.output.axis)
+        let biased = match &bound.bias {
+            Some(bias) => result.add(&bias.tensor())?,
+            None => result,
+        };
+        biased.rename(self.output_role, self.output.axis)
     }
 
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
         self.bound
             .as_ref()
             .map(|bound| {
-                vec![
-                    ("weight".into(), bound.weight.clone()),
-                    ("bias".into(), bound.bias.clone()),
-                ]
+                let mut params = vec![("weight".into(), bound.weight.clone())];
+                if let Some(bias) = &bound.bias {
+                    params.push(("bias".into(), bias.clone()));
+                }
+                params
             })
             .unwrap_or_default()
     }
@@ -732,6 +775,13 @@ impl ConvTranspose1d {
     /// Partition input and output channels into independent convolution groups.
     pub fn groups(mut self, groups: usize) -> Self {
         self.inner = self.inner.groups(groups);
+        self
+    }
+
+    /// Disable the learned bias term, matching [`crate::Linear::bias`]. Has no effect once `build`
+    /// has already allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.inner = self.inner.bias(bias);
         self
     }
 
@@ -794,6 +844,13 @@ impl ConvTranspose2d {
         self.0.groups = groups;
         self
     }
+
+    /// Disable the learned bias term, matching [`crate::Linear::bias`]. Has no effect once `build`
+    /// has already allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.0.bias = bias;
+        self
+    }
 }
 
 impl Module for ConvTranspose2d {
@@ -842,6 +899,13 @@ impl ConvTranspose3d {
     /// Partition input and output channels into independent convolution groups.
     pub fn groups(mut self, groups: usize) -> Self {
         self.0.groups = groups;
+        self
+    }
+
+    /// Disable the learned bias term, matching [`crate::Linear::bias`]. Has no effect once `build`
+    /// has already allocated parameters; call it before `build`.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.0.bias = bias;
         self
     }
 }

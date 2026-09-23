@@ -1,0 +1,15 @@
+[package]
+name = "axis-dcgan-witness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+default-run = "axis-dcgan-witness"
+
+[dependencies]
+axis.workspace = true
+axis-vision-data = { path = "../../getting-started/vision-data" }
+
+[[bin]]
+name = "axis-dcgan-witness"
+path = "src/train.rs"
