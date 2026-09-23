@@ -357,10 +357,25 @@ completed_steps)`, and errors before any device work if no seed was set.
 asks for. `Dropout` (`model/nn.rs`, next to the other parameter-free modules)
 is the first consumer: identity in `forward`; in `forward_training`, PyTorch's
 inverted dropout, drawing one `pass.next_seed()` per call regardless of `p`
-and keeping each element whose `Tensor::uniform(..., 0.0, 1.0, ...)` draw at
-that seed is `>= p`, scaled by `1 / (1 - p)`. `p == 0` is the identity and
+and keeping each element whose `Tensor::uniform_device(..., seed, ...)` draw
+at that seed is `>= p`, scaled by `1 / (1 - p)`. `p == 0` is the identity and
 `p == 1` is exact zeros with exactly zero gradient, matching PyTorch's own
 edge cases where that scale factor is undefined.
+
+`Tensor::uniform_device` generates its mask entirely on the device rather
+than drawing host-side and uploading it every step, the way `Tensor::uniform`
+does: `backend::kernels::uniform_device` computes, per output element, the
+element's own flat index `i` and applies the same SplitMix64 mixer and
+golden-ratio constant `TrainingPass::next_seed` already uses to
+`seed ^ i.wrapping_mul(GOLDEN)`, then keeps the top 24 bits of the 64-bit
+result divided by `2^24` for a value in `[0, 1)`. Because each element
+depends only on `(seed, i)`, never on how the launch happens to tile the
+output, the draw is bit-identical regardless of launch configuration, and a
+plain host reimplementation of the same formula is the op's oracle.
+`Tensor::uniform`'s host-side xorshift stream is unchanged and keeps feeding
+recorded initialization baselines; the two generators are deliberately
+different algorithms serving different needs (bit-exact-across-machines
+initialization vs. no-host-round-trip per-step masks).
 
 ### Hosted API documentation
 
