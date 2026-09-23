@@ -48,6 +48,10 @@ impl Device {
         unavailable()
     }
 
+    pub(crate) fn uniform_device(&self, _seed: u64, _len: usize) -> Result<Buffer> {
+        unavailable()
+    }
+
     pub(crate) fn sum_squares(&self, _a: &Buffer) -> Result<Buffer> {
         unavailable()
     }

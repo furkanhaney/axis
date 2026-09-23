@@ -324,6 +324,34 @@ impl Tensor {
         let values = uniform_host_values(seed, shape.len(), low, high);
         Self::from_slice(&values, shape.dims().iter().copied(), device)
     }
+    /// Deterministic uniform draw in `[0, 1)` generated on the device, never uploaded from the
+    /// host: each element `i` (this tensor's own flat index, the same order [`Tensor::to_vec`]
+    /// reads back) is `to_unit_float(splitmix64(seed ^ i.wrapping_mul(GOLDEN)))` -- the SplitMix64
+    /// mixer and golden-ratio constant `TrainingPass::next_seed` already uses, applied to the
+    /// element's index instead of a draw counter (`runtime::train::GOLDEN`,
+    /// `runtime::backend::kernels::GOLDEN`; see `backend::kernels::uniform_device` for the exact
+    /// tile arithmetic). Depending only on `(seed, i)` means the result is bit-identical
+    /// regardless of how the launch happens to tile the output. Crate-internal: unlike
+    /// [`Tensor::uniform`], this draw has no host stream to keep reproducible across machines
+    /// beyond bit-identical GPU integer arithmetic, so it is not offered as public API yet. No
+    /// gradient edge, exactly like [`Tensor::uniform`].
+    pub(crate) fn uniform_device(
+        dims: impl IntoIterator<Item = Dim>,
+        seed: u64,
+        device: &Device,
+    ) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let value = device.uniform_device(seed, shape.len())?;
+        Ok(Self::node(
+            shape.clone(),
+            Layout::contiguous(&shape),
+            value,
+            device,
+            vec![],
+            false,
+            None,
+        ))
+    }
     /// Deterministic normal draw with the given `mean` and standard deviation `std`, from the
     /// same shared xorshift stream as [`Tensor::uniform`] via the Box-Muller transform: two raw
     /// `[0, 1)` stream samples `u1, u2` become one pair `z0 = sqrt(-2 * ln(1 - u1)) *
