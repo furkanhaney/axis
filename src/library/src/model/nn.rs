@@ -1410,15 +1410,18 @@ impl Module for SignStraightThrough {
 /// a copy scaled by 1. `forward_training` consumes exactly one
 /// `pass.next_seed()` draw per call, regardless of `p`, so a downstream
 /// random consumer's draw sequence does not shift when `p` changes; that
-/// seed only feeds an actual `Tensor::uniform` draw when `0 < p < 1`. It
-/// keeps each element whose `Tensor::uniform(shape, seed, 0.0, 1.0, device)`
-/// draw is `>= p`, zeroes the rest, and rescales the kept elements by
-/// `1 / (1 - p)` (PyTorch's inverted dropout), so the output's expectation
-/// matches the input. `p == 0` returns the input unchanged; `p == 1` returns
-/// exact zeros with exactly zero gradient (PyTorch's own `p == 1` behavior),
-/// since `1 / (1 - p)` is undefined there. Elsewhere the gradient is
-/// `mask / (1 - p)` by construction -- a constant `{0, 1}` mask times a
-/// scalar -- so no dedicated backward rule is needed.
+/// seed only feeds an actual `Tensor::uniform_device(shape, seed, device)`
+/// draw when `0 < p < 1`. The mask is generated entirely on the device --
+/// never a host-drawn tensor uploaded over PCIe every step -- from a
+/// counter-based hash of `(seed, element index)` (see
+/// `Tensor::uniform_device`, `backend::kernels::uniform_device`); it keeps
+/// each element whose draw is `>= p`, zeroes the rest, and rescales the kept
+/// elements by `1 / (1 - p)` (PyTorch's inverted dropout), so the output's
+/// expectation matches the input. `p == 0` returns the input unchanged;
+/// `p == 1` returns exact zeros with exactly zero gradient (PyTorch's own
+/// `p == 1` behavior), since `1 / (1 - p)` is undefined there. Elsewhere the
+/// gradient is `mask / (1 - p)` by construction -- a constant `{0, 1}` mask
+/// times a scalar -- so no dedicated backward rule is needed.
 #[derive(Clone, Copy)]
 pub struct Dropout {
     p: f32,
@@ -1451,13 +1454,8 @@ impl Module for Dropout {
         if self.p == 1.0 {
             return input.scale(0.0);
         }
-        let draw = Tensor::uniform(
-            input.shape().dims().iter().copied(),
-            seed,
-            0.0,
-            1.0,
-            input.device(),
-        )?;
+        let draw =
+            Tensor::uniform_device(input.shape().dims().iter().copied(), seed, input.device())?;
         let mask = draw.ge(self.p)?;
         input.mul(&mask)?.scale(1.0 / (1.0 - self.p))
     }
