@@ -3,16 +3,20 @@
 [![Latest version](https://img.shields.io/crates/v/axis.svg)](https://crates.io/crates/axis)
 [![Documentation](https://docs.rs/axis/badge.svg)](https://docs.rs/axis)
 
-Axis is a Rust framework for training neural networks on NVIDIA
-[cuTile](https://github.com/NVlabs/cutile-rs) that lets an experiment crash when
-one of its scientific assumptions stops being true.
-
 Deep-learning programs are unusually good at being wrong while continuing to
-run. A loader wraps around and a "fresh-sample" study quietly repeats its data;
-a test puzzle reappears in training under a different seed; the loss goes down
-while the evaluation metric never moves. Axis turns those assumptions into
-checks that run inside the training loop, fail before the bad step reaches the
-optimizer, and return a receipt that says exactly what was verified.
+run. A loader wraps around, and a fresh-data study silently becomes a repeated
+one. A test example slips into training under a new seed or a new file name. A
+class axis is averaged away by accident. The loss still falls, the job still
+exits zero, and the number that gets reported describes a different experiment
+from the one on paper. No error is raised, because nothing was ever checked.
+
+Axis is a Rust framework for training neural networks on
+[NVIDIA cuTile](https://github.com/NVlabs/cutile-rs) that checks. The
+assumptions a result depends on are executable: when one stops being true, the
+run stops before the bad step reaches the optimizer, and when it holds, the run
+hands back a receipt that says exactly what was verified. Named tensor axes do
+the same for the math, so a `batch` axis can never quietly become a `class`
+axis.
 
 ## Executable research checks
 
