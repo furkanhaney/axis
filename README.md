@@ -13,7 +13,27 @@
 [Why Axis](docs/direction/thesis.md) · [Vision](docs/direction/vision.md) · [Library contract](docs/design/library.md) ·
 [Contributing](CONTRIBUTING.md) · [License](LICENSE.md) · [Trademarks](TRADEMARK.md)
 
-![A generated Sudoku board used by the Axis acceptance test](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_generated_puzzle.png)
+**The same experiment in four frameworks.** One matched Fashion-MNIST MLP:
+byte-identical data, sample order and initial weights, Adam, float32, five
+passes, on one RTX 5060. Each framework runs its default training path.
+
+| | Accuracy | Training time, total | Training time, steady | Lines of code | Catches train/eval overlap | Catches data reuse |
+|---|---:|---:|---:|---:|:---:|:---:|
+| **Axis 0.11** | 0.5918 | 6.58 s | 0.030 s | 155 | **rejects the run** | **rejects the run** |
+| PyTorch 2.11 | 0.5918 | 0.16 s | 0.013 s | 73 | not checked | not checked |
+| Lightning 2.6 | 0.5918 | 0.18 s | 0.066 s | 77 | not checked | not checked |
+| JAX 0.11 | 0.5918 | 2.75 s | 0.038 s | 82 | not checked | not checked |
+
+All four reach the same accuracy bit for bit (0.591796875). Axis is the
+slowest end to end: nearly all of its time is the first step, where kernels are
+planned; per step after that it is faster than Lightning and JAX and slower
+than plain PyTorch. It takes about twice the code, and that count includes the
+checks. It is the only one that stops when an evaluation sample leaks
+into training or a sample repeats within a declared pass. Median of three runs,
+steady time excludes the first step, one bounded run on one host and not a
+framework-wide claim; the receipt is
+[data/evidence/fashion-mnist-four-arms.md](data/evidence/fashion-mnist-four-arms.md)
+(from `axis-benchmarks` 42f9aba).
 
 Axis is an experimental Rust framework for training neural networks on
 [NVIDIA cuTile](https://github.com/NVlabs/cutile-rs). It uses named tensor axes
