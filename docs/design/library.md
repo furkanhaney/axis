@@ -162,10 +162,9 @@ physical storage order does not change the statistic.
 All four modules are stateless: training and evaluation have identical
 behavior, and there are no running estimates. `Tensor::moments` and
 `Tensor::mean_square` provide their reusable population reductions. Batch
-normalization remains deliberately absent until `Module` can represent an
-explicit train/evaluation mode and persistent non-parameter state; silently
-substituting batch-local statistics would give it the wrong experimental
-meaning.
+normalization remains deliberately absent until it has persistent
+non-parameter state (#76); silently substituting batch-local statistics would
+give it the wrong experimental meaning.
 
 `Embedding::new(vocabulary, feature.of(d))` looks up one learned vector per
 vocabulary entry. Axis tensors are floating point, so a token arrives as a
@@ -328,6 +327,55 @@ three-block CNN is an end-to-end API witness. Current convolution still
 materializes patch tensors, so this is not a throughput or ImageNet-accuracy
 claim. The unlabeled RGB byte benchmark in the sibling research repository can
 verify pixels but cannot verify classification.
+
+### Training pass
+
+Mode is which method you call, never a flag on the module. `Module::forward`
+keeps its exact signature and stays evaluation semantics; a provided
+`forward_training(&self, input, pass: &mut TrainingPass)` defaults to calling
+`forward` and ignoring `pass`, which is exactly today's behavior for every
+module that has no train/eval distinction. `Sequential`, and any future
+container holding child modules, overrides `forward_training` to thread the
+one `pass` through every child in call order, so their draws stay distinct
+within a step. There is no `set_training`, no `train()`/`eval()`, and no
+interior-mutable mode bit anywhere in the trait.
+
+`TrainingPass` (`runtime/train.rs`, exported from the crate root and prelude)
+is the explicit per-step context this threads. Its `seed` is a deterministic
+SplitMix64 mix of the run seed and the step index; each random consumer calls
+`pass.next_seed()`, which returns a distinct deterministic seed derived from
+`(seed, a draw counter)` and advances the counter, so the same model, run
+seed, step and forward order give bit-identical draws while two random
+consumers in one step draw different values. `TrainingPass::new(seed)` lets a
+caller drive `forward_training` directly, outside a `Trainer`.
+`Trainer::with_seed(run_seed)` is an additive builder step; `Trainer::step`
+keeps its exact signature and behavior, while the new `Trainer::step_training`
+shares its update ordering exactly, builds its pass from `(run_seed,
+completed_steps)`, and errors before any device work if no seed was set.
+`TrainStep::pass_seed()` records the pass seed used -- `None` for `step`,
+`Some` for `step_training` -- the receipt [next.md](../direction/next.md)
+asks for. `Dropout` (`model/nn.rs`, next to the other parameter-free modules)
+is the first consumer: identity in `forward`; in `forward_training`, PyTorch's
+inverted dropout, drawing one `pass.next_seed()` per call regardless of `p`
+and keeping each element whose `Tensor::uniform_device(..., seed, ...)` draw
+at that seed is `>= p`, scaled by `1 / (1 - p)`. `p == 0` is the identity and
+`p == 1` is exact zeros with exactly zero gradient, matching PyTorch's own
+edge cases where that scale factor is undefined.
+
+`Tensor::uniform_device` generates its mask entirely on the device rather
+than drawing host-side and uploading it every step, the way `Tensor::uniform`
+does: `backend::kernels::uniform_device` computes, per output element, the
+element's own flat index `i` and applies the same SplitMix64 mixer and
+golden-ratio constant `TrainingPass::next_seed` already uses to
+`seed ^ i.wrapping_mul(GOLDEN)`, then keeps the top 24 bits of the 64-bit
+result divided by `2^24` for a value in `[0, 1)`. Because each element
+depends only on `(seed, i)`, never on how the launch happens to tile the
+output, the draw is bit-identical regardless of launch configuration, and a
+plain host reimplementation of the same formula is the op's oracle.
+`Tensor::uniform`'s host-side xorshift stream is unchanged and keeps feeding
+recorded initialization baselines; the two generators are deliberately
+different algorithms serving different needs (bit-exact-across-machines
+initialization vs. no-host-round-trip per-step masks).
 
 ### Hosted API documentation
 

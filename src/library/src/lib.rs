@@ -70,14 +70,14 @@ pub use monotonicity::{
     EmpiricalMonotonicity, EmpiricalMonotonicityReceipt, MonotoneDirection, MonotonicityLimits,
 };
 pub use nn::{
-    AttentionMask, Bilinear, CELU, ChannelShuffle, CircularPad, ConstantPad, ELU, Embedding,
-    EmbeddingBag, EmbeddingBagMode, ExactGELU, Flatten, GELU, GLU, Hardshrink, Hardsigmoid,
-    Hardswish, Hardtanh, Identity, IntoLayers, LeakyReLU, Linear, LogSigmoid, LogSoftmax, Mish,
-    Module, ModuleDict, ModuleList, MultiheadAttention, PReLU, ParamId, Parameter, ParameterDict,
-    ParameterList, PixelShuffle, PixelUnshuffle, PopulationLinear, PositionEmbedding, ReLU, ReLU6,
-    ReflectionPad, ReplicationPad, SELU, Sequential, SiLU, SignStraightThrough, Softmax2d, Softmin,
-    Softplus, Softshrink, Softsign, Tanh, Tanhshrink, Threshold, Unflatten, Upsample, UpsampleMode,
-    ZeroPad,
+    AttentionMask, Bilinear, CELU, ChannelShuffle, CircularPad, ConstantPad, Dropout, ELU,
+    Embedding, EmbeddingBag, EmbeddingBagMode, ExactGELU, Flatten, GELU, GLU, Hardshrink,
+    Hardsigmoid, Hardswish, Hardtanh, Identity, IntoLayers, LeakyReLU, Linear, LogSigmoid,
+    LogSoftmax, Mish, Module, ModuleDict, ModuleList, MultiheadAttention, PReLU, ParamId,
+    Parameter, ParameterDict, ParameterList, PixelShuffle, PixelUnshuffle, PopulationLinear,
+    PositionEmbedding, ReLU, ReLU6, ReflectionPad, ReplicationPad, SELU, Sequential, SiLU,
+    SignStraightThrough, Softmax2d, Softmin, Softplus, Softshrink, Softsign, Tanh, Tanhshrink,
+    Threshold, Unflatten, Upsample, UpsampleMode, ZeroPad,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, LocalResponseNorm, RmsNorm};
 pub use optim::{
@@ -97,7 +97,7 @@ pub use residual::{
     ResidualLimits, ResidualScope,
 };
 pub use tensor::{LinearCrossEntropyOptions, Tensor};
-pub use train::{Optimizer, TrainStep, Trainer};
+pub use train::{Optimizer, TrainStep, Trainer, TrainingPass};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -125,8 +125,8 @@ pub mod prelude {
         AvgPool1d, AvgPool2d, AvgPool3d, Axis, Batch, Bilinear, CELU, CategoricalAccuracy,
         CentralDifference, ChannelShuffle, CircularPad, ConstantPad, Conv1d, Conv2d, Conv3d,
         ConvTranspose1d, ConvTranspose2d, ConvTranspose3d, DataLoader, DataRegimeReceipt,
-        DataSource, Device, Dim, Disjointness, DisjointnessEvidence, DisjointnessReceipt, ELU,
-        Embedding, EmbeddingBag, EmbeddingBagMode, EmpiricalMonotonicity,
+        DataSource, Device, Dim, Disjointness, DisjointnessEvidence, DisjointnessReceipt, Dropout,
+        ELU, Embedding, EmbeddingBag, EmbeddingBagMode, EmpiricalMonotonicity,
         EmpiricalMonotonicityReceipt, EmpiricalResidual, EmpiricalResidualReceipt, ExactGELU,
         FinitePasses, FinitePassesLoader, FinitePassesReceipt, Flatten, Fold, GELU, GLU, GroupNorm,
         Gru, GruCell, GruRun, Hardshrink, Hardsigmoid, Hardswish, Hardtanh, Identity,
@@ -143,7 +143,7 @@ pub mod prelude {
         ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, Rnn, RnnCell,
         RnnNonlinearity, RnnRun, SELU, SGD, Sample, Sequential, Shape, SiLU, SignStraightThrough,
         SinglePass, Softmax2d, Softmin, Softplus, Softshrink, Softsign, Standardizer, Tanh,
-        Tanhshrink, Tensor, Threshold, TrainStep, Trainer, Unflatten, Unfold, Upsample,
-        UpsampleMode, ZeroPad, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        Tanhshrink, Tensor, Threshold, TrainStep, Trainer, TrainingPass, Unflatten, Unfold,
+        Upsample, UpsampleMode, ZeroPad, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
     };
 }

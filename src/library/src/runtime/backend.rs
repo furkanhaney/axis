@@ -115,6 +115,20 @@ impl Device {
         let tensor = self.zeros(len)?;
         Ok(self.track(tensor))
     }
+    /// Deterministic uniform draw in `[0, 1)` generated entirely on the device: each output
+    /// element `i` is `to_unit_float(splitmix64(seed ^ i.wrapping_mul(GOLDEN)))`, the same
+    /// SplitMix64 mixer and golden-ratio constant `TrainingPass::next_seed` already uses (see
+    /// `runtime::train`), applied to `seed` and the element's own flat index rather than to a
+    /// pass seed and a draw counter. Every element depends only on `(seed, i)`, never on tile
+    /// width or launch shape, so the result is bit-identical across any partition. Used by
+    /// [`Tensor::uniform_device`] for training-time random draws (currently `Dropout`) that must
+    /// not round-trip a host-generated mask through PCIe every step; `Tensor::uniform`'s
+    /// host-side xorshift stream is untouched and keeps feeding recorded initialization.
+    pub(crate) fn uniform_device(&self, seed: u64, len: usize) -> Result<Buffer> {
+        let mut out = self.zeros(len)?;
+        kernels::uniform_device((&mut out).partition([128]), seed).enqueue_on(&self.0.stream)?;
+        Ok(self.track(out))
+    }
     /// Reduce a flat FP32 buffer to one device-resident sum of squares.
     ///
     /// This deliberately does not use Axis's general indexed reduction plan:
@@ -2809,5 +2823,79 @@ mod kernels {
             g,
             select(lt_tile(x, zero), zero - g, zero),
         ));
+    }
+
+    /// Counter-based uniform draw in `[0, 1)`, entirely on the device: `out[i] =
+    /// to_unit_float(splitmix64(seed ^ i * GOLDEN))` for the output's own flat index `i`, with no
+    /// input tensor and no host round trip. `GOLDEN` and the mixer's own two multipliers are the
+    /// same three constants `runtime::train::GOLDEN` and its private `splitmix64` use, each
+    /// built here from two `u32`-range halves (see the comment at their construction below --
+    /// `constant()` silently truncates a `u64` literal at or above `2^63` in this cuTile
+    /// version). `i` is `block_id * 128 + local_lane`, computed the same way `unfold2d` computes
+    /// its own output index; elements past the tensor's true length are never stored (the padded
+    /// tail of the last tile), exactly like every other kernel that partitions by `128`.
+    /// `splitmix64` runs in `u64` tiles so `>>` is a logical (unsigned) shift, matching the host
+    /// `u64` mixer bit for bit. `to_unit_float` keeps the top 24 bits of the 64-bit hash
+    /// (`>> 40`) and divides by `2^24`, mirroring the host xorshift stream's own
+    /// `(rng >> 40) as f32 / 2^24` -- an exact float since every value below `2^24` round-trips
+    /// through `f32` without rounding.
+    #[cutile::entry()]
+    fn uniform_device(out: &mut Tensor<f32, { [128] }>, seed: u64) {
+        let block_id = get_tile_block_id().0;
+        let local: Tile<i32, { [128] }> = iota(shape![128]);
+        let index_i32 = local + broadcast_scalar(block_id * 128i32, shape![128]);
+        // cuTile's `convert` lowering does not implement integer-to-integer width changes at all
+        // (only the identity case and a handful of same-width bitcasts), despite the crate's
+        // documented "all conversions supported" matrix -- confirmed against both `i32 -> u64`
+        // and `i32 -> u32`. Integer <-> float conversions have no such restriction, so `i32 ->
+        // f64 -> u64` widens exactly: every index below `2^53` round-trips through `f64` without
+        // rounding, and this kernel's indices never approach that.
+        let index_f64: Tile<f64, { [128] }> = convert_tile(index_i32);
+        let index: Tile<u64, { [128] }> = convert_tile(index_f64);
+
+        // `constant()` silently truncates a `u64` literal at or above `2^63` to `0` in this
+        // cuTile version (its literal-parsing path assumes a signed 64-bit range); confirmed by a
+        // device probe, since the failure is silent, not a compile error. Every constant here
+        // that needs its top bit set -- `GOLDEN` and both SplitMix64 multipliers -- is therefore
+        // built from two `u32`-range halves (each comfortably under `2^63`) combined with a
+        // shift and an or, instead of one `constant()` call with the full 64-bit literal.
+        let shift32: Tile<u64, { [128] }> = constant(32u64, shape![128]);
+        let golden_hi: Tile<u64, { [128] }> = constant(0x9E37_79B9u64, shape![128]);
+        let golden_lo: Tile<u64, { [128] }> = constant(0x7F4A_7C15u64, shape![128]);
+        let golden: Tile<u64, { [128] }> = (golden_hi << shift32) | golden_lo;
+        let mul1_hi: Tile<u64, { [128] }> = constant(0xBF58_476Du64, shape![128]);
+        let mul1_lo: Tile<u64, { [128] }> = constant(0x1CE4_E5B9u64, shape![128]);
+        let mul1: Tile<u64, { [128] }> = (mul1_hi << shift32) | mul1_lo;
+        let mul2_hi: Tile<u64, { [128] }> = constant(0x94D0_49BBu64, shape![128]);
+        let mul2_lo: Tile<u64, { [128] }> = constant(0x1331_11EBu64, shape![128]);
+        let mul2: Tile<u64, { [128] }> = (mul2_hi << shift32) | mul2_lo;
+
+        let seed_tile: Tile<u64, { [128] }> = broadcast_scalar(seed, shape![128]);
+        let shift30: Tile<u64, { [128] }> = constant(30u64, shape![128]);
+        let shift27: Tile<u64, { [128] }> = constant(27u64, shape![128]);
+        let shift31: Tile<u64, { [128] }> = constant(31u64, shape![128]);
+        let shift40: Tile<u64, { [128] }> = constant(40u64, shape![128]);
+
+        // Plain operators (`*`, `^`, `>>`, `<<`, `|`), not `muli`/`xori`/`shri`/`shli`/`ori`: the
+        // explicit functions with an `overflow::None` mode fail to serialize in this cuTile
+        // version ("missing attribute 'overflow' on op MulI"), while the operator overloads --
+        // already exercised by every other kernel's `i32` index arithmetic in this file -- lower
+        // without that attribute at all, giving ordinary two's-complement wraparound (`u64` here,
+        // so `>>` is logical).
+        let mut z = seed_tile ^ (index * golden);
+        z = z ^ (z >> shift30);
+        z = z * mul1;
+        z = z ^ (z >> shift27);
+        z = z * mul2;
+        z = z ^ (z >> shift31);
+
+        // `u64 -> f32` is an integer-to-float conversion, not an integer width change, so it
+        // needs no detour through another integer type; the shifted value is already below
+        // `2^24`, which is exactly representable in `f32`.
+        let top24: Tile<u64, { [128] }> = z >> shift40;
+        let raw: Tile<f32, { [128] }> = convert_tile(top24);
+        // 1.0 / 2^24, exact in f32.
+        let scale: Tile<f32, { [128] }> = constant(5.960464477539063e-8f32, shape![128]);
+        out.store(raw * scale);
     }
 }

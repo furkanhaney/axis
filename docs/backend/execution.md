@@ -136,3 +136,36 @@ from `0.285610` to `0.036525`. The subsequent exact-set run was intentionally
 stopped, so the command has no successful process-exit receipt. This bounded
 observation shows the ordered workload inside 30 minutes; it does not claim a
 completed two-method experiment or an accuracy or throughput frontier.
+
+## cuTile trap: `constant()` silently truncates large `u64` literals
+
+`backend::kernels::uniform_device`'s SplitMix64 mixer needs three 64-bit
+constants with the top bit set (the golden-ratio constant and its own two
+multipliers). Passing one of those literals straight to `cutile::core::constant`
+-- `constant(0x9E37_79B9_7F4A_7C15u64, shape![128])` -- compiles cleanly and
+runs, but every element reads back as exactly `0`, with no error at compile or
+launch time. Any `u64` literal at or above `2^63` hits this in cuTile 0.3.1;
+values below it are unaffected (measured with a throwaway probe kernel: a
+literal one bit under the threshold read back correctly, the same literal
+with that bit set read back as `0`). The fix used here is to split each
+constant into two `u32`-range halves (each `constant()` call now argues a
+value comfortably under `2^63`) and recombine with a shift and an or --
+`(hi << 32) | lo` -- rather than one `constant()` call with the full 64-bit
+literal. `broadcast_scalar` of a runtime kernel argument (this kernel's own
+`seed: u64` parameter) is unaffected; the bug is specific to `constant()`'s
+literal-parsing path, not to `u64` tiles or arithmetic in general.
+
+Also worth knowing for future integer-tile kernels: `cutile::core::convert_tile`
+does not implement integer-to-integer width changes at all in this version
+(only the identity case and a few same-width bitcasts), despite the crate's
+own doc comment claiming "all conversions supported" between every `iN`/`uN`
+pair. `i32 -> u64`, `i32 -> u32`, and `u32 -> u64` all fail with "Unsupported
+conversion" at kernel-compile time (a real compile error, unlike the silent
+`constant()` truncation above). Integer-to-float and float-to-integer
+conversions have no such restriction at any width, so routing an integer
+width change through `f64` (exact for every value below `2^53`) works where a
+direct integer widen does not. And the explicit arithmetic functions
+(`muli`/`addi`/`xori`/`shri`/... with an `overflow::None` mode) fail to
+serialize ("missing attribute 'overflow' on op MulI") where the plain Rust
+operators (`*`, `+`, `^`, `>>`, ...) on the same tiles lower and run
+correctly with ordinary wraparound semantics -- prefer the operators.
