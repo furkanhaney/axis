@@ -77,7 +77,8 @@ pub use nn::{
     Parameter, ParameterDict, ParameterList, PixelShuffle, PixelUnshuffle, PopulationLinear,
     PositionEmbedding, ReLU, ReLU6, ReflectionPad, ReplicationPad, SELU, Sequential, SiLU,
     SignStraightThrough, Softmax2d, Softmin, Softplus, Softshrink, Softsign, Tanh, Tanhshrink,
-    Threshold, Unflatten, Upsample, UpsampleMode, ZeroPad,
+    Threshold, Transformer, TransformerActivation, TransformerDecoder, TransformerDecoderLayer,
+    TransformerEncoder, TransformerEncoderLayer, Unflatten, Upsample, UpsampleMode, ZeroPad,
 };
 pub use normalization::{GroupNorm, InstanceNorm, LayerNorm, LocalResponseNorm, RmsNorm};
 pub use optim::{
@@ -143,7 +144,9 @@ pub mod prelude {
         ResidualEvidence, ResidualLimits, ResidualScope, Result, RmsNorm, Rnn, RnnCell,
         RnnNonlinearity, RnnRun, SELU, SGD, Sample, Sequential, Shape, SiLU, SignStraightThrough,
         SinglePass, Softmax2d, Softmin, Softplus, Softshrink, Softsign, Standardizer, Tanh,
-        Tanhshrink, Tensor, Threshold, TrainStep, Trainer, TrainingPass, Unflatten, Unfold,
-        Upsample, UpsampleMode, ZeroPad, clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
+        Tanhshrink, Tensor, Threshold, TrainStep, Trainer, TrainingPass, Transformer,
+        TransformerActivation, TransformerDecoder, TransformerDecoderLayer, TransformerEncoder,
+        TransformerEncoderLayer, Unflatten, Unfold, Upsample, UpsampleMode, ZeroPad,
+        clip_grad_norm, cosine_annealing_lr, one_cycle_lr,
     };
 }

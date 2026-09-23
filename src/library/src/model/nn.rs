@@ -1,4 +1,4 @@
-use crate::{Axis, Device, Dim, Result, Shape, Tensor, TrainingPass};
+use crate::{Axis, Device, Dim, LayerNorm, Result, Shape, Tensor, TrainingPass};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -440,11 +440,32 @@ pub enum AttentionMask {
 /// (PyTorch's own default `average_attn_weights=True`), indexed by
 /// `query_time` and `key_time`.
 ///
-/// Only `dropout == 0.0`, PyTorch's own default, is supported: nonzero
-/// dropout needs a seeded draw that is reproducible per training step, which
-/// is the not-yet-landed training-pass contract (`Module::forward_training`,
-/// `TrainingPass`, Axis issue #127); `new` rejects a nonzero value
-/// immediately rather than silently ignoring it.
+/// `dropout` (PyTorch's own default `0.0`, meaning off) applies to the
+/// post-softmax attention probabilities, exactly where PyTorch's own
+/// `F.multi_head_attention_forward` applies it: `forward`/`forward_with_weights`
+/// stay evaluation semantics and never draw or drop -- bit-exact with every
+/// `dropout=0.0` result this module produced before the training-pass contract
+/// landed (Axis issue #127, now `TrainingPass`) -- and the new
+/// `forward_training`/`forward_with_weights_training` entry points, driven by
+/// an explicit `&mut TrainingPass`, draw one `pass.next_seed()` per call
+/// (regardless of `p`, matching [`Dropout`]'s own draw-count convention so a
+/// downstream random consumer's position in the pass does not shift when `p`
+/// changes) and keep each attention-probability element whose
+/// `Tensor::uniform_device` draw at that seed is `>= dropout`, scaled by
+/// `1 / (1 - dropout)` -- PyTorch's inverted dropout, applied to the
+/// probabilities that contract with `value` rather than to the module's
+/// output. `need_weights`'s returned weights are always the *pre-dropout*
+/// probabilities (PyTorch's own order: the head-averaged weights are read
+/// before dropout is applied to the copy used for the value contraction).
+/// `dropout == 0.0` and `dropout == 1.0` are the same identity/exact-zero
+/// edge cases [`Dropout`] documents.
+///
+/// `Clone` is provided so a caller (e.g. [`TransformerEncoderLayer`]) can
+/// build one configured, unbuilt instance and clone it before `build`, giving
+/// each clone its own independently allocated parameters; cloning an already
+/// built instance instead shares its `Parameter`s (ties weights), matching
+/// every other `Clone` module in this file.
+#[derive(Clone)]
 pub struct MultiheadAttention {
     feature: Axis,
     time: Axis,
@@ -456,11 +477,20 @@ pub struct MultiheadAttention {
     key_proj: Linear,
     value_proj: Linear,
     out_proj: Linear,
+    dropout: f32,
 }
+fn validate_dropout(owner: &str, dropout: f32) -> Result<()> {
+    if !dropout.is_finite() || !(0.0..=1.0).contains(&dropout) {
+        return Err(format!("{owner} dropout must be finite and in [0, 1], got {dropout}").into());
+    }
+    Ok(())
+}
+
 impl MultiheadAttention {
     /// `feature` and `time` must be distinct axes. `embed_dim` must be a
-    /// nonzero multiple of a nonzero `num_heads`. `dropout` must be exactly
-    /// `0.0`; see the training-pass contract note above.
+    /// nonzero multiple of a nonzero `num_heads`. `dropout` must be finite
+    /// and in `[0, 1]`; see the struct doc comment for exactly where and how
+    /// it applies.
     pub fn new(
         feature: Axis,
         time: Axis,
@@ -471,14 +501,7 @@ impl MultiheadAttention {
         if feature == time {
             return Err("MultiheadAttention requires distinct feature and time axes".into());
         }
-        if dropout != 0.0 {
-            return Err(
-                "MultiheadAttention only supports dropout=0.0 until the seeded, per-step \
-                 training-pass contract lands (Axis issue #127); nonzero dropout is rejected \
-                 rather than silently ignored"
-                    .into(),
-            );
-        }
+        validate_dropout("MultiheadAttention", dropout)?;
         if num_heads == 0 || embed_dim == 0 || !embed_dim.is_multiple_of(num_heads) {
             return Err(
                 "MultiheadAttention requires a positive embed_dim divisible by a positive \
@@ -500,6 +523,7 @@ impl MultiheadAttention {
             key_proj: projection(),
             value_proj: projection(),
             out_proj: projection(),
+            dropout,
         })
     }
     /// Disable every projection's learned bias term. Has no effect once
@@ -510,6 +534,29 @@ impl MultiheadAttention {
         self.value_proj = self.value_proj.bias(bias);
         self.out_proj = self.out_proj.bias(bias);
         self
+    }
+    /// Change the dropout probability applied by `forward_training`/
+    /// `forward_with_weights_training`; `forward`/`forward_with_weights`
+    /// never consult it. Finite and in `[0, 1]`, PyTorch's own domain.
+    pub fn dropout(mut self, dropout: f32) -> Result<Self> {
+        validate_dropout("MultiheadAttention", dropout)?;
+        self.dropout = dropout;
+        Ok(self)
+    }
+    /// A square causal `AttentionMask::Additive` built against this
+    /// attention's own private [`MultiheadAttention::query_time`]/
+    /// [`MultiheadAttention::key_time`] roles: zero where a key is visible,
+    /// `-infinity` where the key position is strictly greater than the query
+    /// position -- PyTorch's `Transformer.generate_square_subsequent_mask`.
+    /// `extent` is the shared query/key sequence length self-attention needs.
+    pub fn causal_mask(&self, extent: usize, device: &Device) -> Result<AttentionMask> {
+        let zeros = Tensor::zeros(
+            [self.query_time.of(extent), self.key_time.of(extent)],
+            device,
+        )?;
+        Ok(AttentionMask::Additive(
+            zeros.causal_mask(self.query_time, self.key_time)?,
+        ))
     }
     /// The private role `time` is renamed to for `query` positions once
     /// projected; build an `attn_mask` tensor against this axis.
@@ -559,12 +606,12 @@ impl MultiheadAttention {
         key_padding_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         Ok(self
-            .forward_with_weights(query, key, value, attn_mask, key_padding_mask, false)?
+            .attend(query, key, value, attn_mask, key_padding_mask, false, None)?
             .0)
     }
-    /// `need_weights` additionally computes and returns the head-averaged
-    /// attention probabilities; pass `false` to skip that reduction entirely
-    /// when only the output is needed.
+    /// `need_weights` additionally computes and returns the head-averaged,
+    /// pre-dropout attention probabilities; pass `false` to skip that
+    /// reduction entirely when only the output is needed.
     pub fn forward_with_weights(
         &self,
         query: &Tensor,
@@ -573,6 +620,79 @@ impl MultiheadAttention {
         attn_mask: Option<&AttentionMask>,
         key_padding_mask: Option<&Tensor>,
         need_weights: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        self.attend(
+            query,
+            key,
+            value,
+            attn_mask,
+            key_padding_mask,
+            need_weights,
+            None,
+        )
+    }
+    /// Training-mode forward: identical to `forward` except attention-weight
+    /// dropout is active (see the struct doc comment). Draws exactly one
+    /// `pass.next_seed()`.
+    pub fn forward_training(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attn_mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        Ok(self
+            .attend(
+                query,
+                key,
+                value,
+                attn_mask,
+                key_padding_mask,
+                false,
+                Some(pass),
+            )?
+            .0)
+    }
+    /// Training-mode forward with the returned pre-dropout weights; see
+    /// `forward_with_weights` and `forward_training`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_weights_training(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attn_mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+        need_weights: bool,
+        pass: &mut TrainingPass,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        self.attend(
+            query,
+            key,
+            value,
+            attn_mask,
+            key_padding_mask,
+            need_weights,
+            Some(pass),
+        )
+    }
+    /// Shared core. `dropout_pass: None` is exactly today's evaluation
+    /// computation (bit-exact with every prior `dropout=0.0` result);
+    /// `Some(pass)` additionally draws one `pass.next_seed()` and applies
+    /// attention-weight dropout to the copy of `probabilities` used for the
+    /// value contraction, never to the returned `weights`.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attn_mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+        need_weights: bool,
+        dropout_pass: Option<&mut TrainingPass>,
     ) -> Result<(Tensor, Option<Tensor>)> {
         self.output_shape(query.shape(), key.shape(), value.shape())?;
         let q = self.split_heads(&self.query_proj.forward(query)?, self.query_time)?;
@@ -599,11 +719,6 @@ impl MultiheadAttention {
             Some(v) => scores.masked_softmax(self.key_time, v)?,
             None => scores.softmax(self.key_time)?,
         };
-        let attended = probabilities
-            .contract(&v, self.key_time)?
-            .merge([self.head.axis, self.head_feature.axis], self.feature)?
-            .rename(self.query_time, self.time)?;
-        let output = self.out_proj.forward(&attended)?;
         let weights = if need_weights {
             Some(
                 probabilities
@@ -613,6 +728,32 @@ impl MultiheadAttention {
         } else {
             None
         };
+        let attention_weights = match dropout_pass {
+            Some(pass) => {
+                let seed = pass.next_seed();
+                if self.dropout == 0.0 {
+                    probabilities
+                } else if self.dropout == 1.0 {
+                    probabilities.scale(0.0)?
+                } else {
+                    let draw = Tensor::uniform_device(
+                        probabilities.shape().dims().iter().copied(),
+                        seed,
+                        probabilities.device(),
+                    )?;
+                    let mask = draw.ge(self.dropout)?;
+                    probabilities
+                        .mul(&mask)?
+                        .scale(1.0 / (1.0 - self.dropout))?
+                }
+            }
+            None => probabilities,
+        };
+        let attended = attention_weights
+            .contract(&v, self.key_time)?
+            .merge([self.head.axis, self.head_feature.axis], self.feature)?
+            .rename(self.query_time, self.time)?;
+        let output = self.out_proj.forward(&attended)?;
         Ok((output, weights))
     }
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
@@ -630,6 +771,950 @@ impl MultiheadAttention {
                 .map(move |(name, parameter)| (format!("{prefix}.{name}"), parameter))
         })
         .collect()
+    }
+}
+
+/// Encoder/decoder feedforward nonlinearity, `torch.nn.TransformerEncoderLayer`'s
+/// `activation` argument restricted to its two string spellings
+/// (`"relu"`/`"gelu"`; a custom callable has no analogue here). PyTorch's own
+/// `_get_activation_fn` maps `"gelu"` to `F.gelu` at its default
+/// `approximate="none"` -- the exact erf form, [`Tensor::gelu_exact`] /
+/// [`ExactGELU`] in this crate, not the tanh-form [`GELU`] module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransformerActivation {
+    Relu,
+    Gelu,
+}
+
+fn transformer_activate(activation: TransformerActivation, x: &Tensor) -> Result<Tensor> {
+    match activation {
+        TransformerActivation::Relu => x.relu(),
+        TransformerActivation::Gelu => x.gelu_exact(),
+    }
+}
+
+/// One post-/pre-norm Transformer encoder block, `torch.nn.TransformerEncoderLayer`
+/// at PyTorch 2.14's exact defaults (`dim_feedforward=2048`, `dropout=0.1`,
+/// `activation="relu"`, `layer_norm_eps=1e-5`, `norm_first=False`,
+/// `bias=True`) and PyTorch's own exact residual/dropout structure --
+/// `_sa_block`/`_ff_block` inlined here as private helpers of the same name:
+///
+/// ```text
+/// _sa_block(x, mask, key_padding_mask) = dropout1(self_attn(x, x, x, mask, key_padding_mask))
+/// _ff_block(x)                         = dropout2(linear2(dropout(activation(linear1(x)))))
+/// norm_first=False: x = norm1(x + _sa_block(x, ..));  x = norm2(x + _ff_block(x))
+/// norm_first=True:  x = x + _sa_block(norm1(x), ..);  x = x + _ff_block(norm2(x))
+/// ```
+///
+/// `forward` is evaluation semantics: every internal [`Dropout`] is the
+/// identity and [`MultiheadAttention::forward`] never drops attention
+/// weights, bit-exact with `dropout=0.0`. `forward_training` threads one
+/// `&mut TrainingPass` through, in call order, the self-attention's own
+/// attention-weight dropout, `dropout1`, the feedforward block's interior
+/// `dropout`, then `dropout2` -- four `pass.next_seed()` draws per call
+/// regardless of `p`, matching [`Dropout`]'s own draw-count convention.
+///
+/// `.bias(false)` omits every [`Linear`]/[`MultiheadAttention`] projection
+/// bias. Axis's [`LayerNorm`] has no separate bias-only toggle (only
+/// `.affine(bool)`, which would also drop the learned scale), so unlike
+/// PyTorch's `bias=False` the two `LayerNorm`s here always keep their own
+/// affine bias -- a documented, deliberate departure.
+#[derive(Clone)]
+pub struct TransformerEncoderLayer {
+    self_attn: MultiheadAttention,
+    linear1: Linear,
+    linear2: Linear,
+    dropout: Dropout,
+    dropout1: Dropout,
+    dropout2: Dropout,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    norm_first: bool,
+    activation: TransformerActivation,
+}
+impl TransformerEncoderLayer {
+    /// `feature`/`time` are the input's embedding/sequence axes; `embed_dim`
+    /// (`d_model`) must equal `feature`'s eventual bound extent and be a
+    /// positive multiple of a positive `num_heads`; `dim_feedforward` must be
+    /// positive. Defaults: `dropout=0.1`, `activation=Relu`,
+    /// `layer_norm_eps=1e-5`, `norm_first=false`, `bias=true`.
+    pub fn new(
+        feature: Axis,
+        time: Axis,
+        embed_dim: usize,
+        num_heads: usize,
+        dim_feedforward: usize,
+    ) -> Result<Self> {
+        if dim_feedforward == 0 {
+            return Err("TransformerEncoderLayer requires a positive dim_feedforward".into());
+        }
+        let hidden = Axis::new("transformer_ff_hidden");
+        const DEFAULT_DROPOUT: f32 = 0.1;
+        Ok(Self {
+            self_attn: MultiheadAttention::new(
+                feature,
+                time,
+                embed_dim,
+                num_heads,
+                DEFAULT_DROPOUT,
+            )?,
+            linear1: Linear::new(feature, hidden.of(dim_feedforward)),
+            linear2: Linear::new(hidden, feature.of(embed_dim)),
+            dropout: Dropout::new(DEFAULT_DROPOUT)?,
+            dropout1: Dropout::new(DEFAULT_DROPOUT)?,
+            dropout2: Dropout::new(DEFAULT_DROPOUT)?,
+            norm1: LayerNorm::new(feature)?,
+            norm2: LayerNorm::new(feature)?,
+            norm_first: false,
+            activation: TransformerActivation::Relu,
+        })
+    }
+    /// Set the one shared `dropout` PyTorch applies to attention weights and
+    /// all three of this layer's own `Dropout` modules alike.
+    pub fn dropout(mut self, dropout: f32) -> Result<Self> {
+        self.self_attn = self.self_attn.dropout(dropout)?;
+        self.dropout = Dropout::new(dropout)?;
+        self.dropout1 = Dropout::new(dropout)?;
+        self.dropout2 = Dropout::new(dropout)?;
+        Ok(self)
+    }
+    pub fn activation(mut self, activation: TransformerActivation) -> Self {
+        self.activation = activation;
+        self
+    }
+    /// `norm1`/`norm2`'s epsilon; see the struct doc comment for why their
+    /// bias cannot be toggled the way PyTorch's `bias=` argument does.
+    pub fn epsilon(mut self, epsilon: f32) -> Result<Self> {
+        self.norm1 = self.norm1.epsilon(epsilon)?;
+        self.norm2 = self.norm2.epsilon(epsilon)?;
+        Ok(self)
+    }
+    pub fn norm_first(mut self, norm_first: bool) -> Self {
+        self.norm_first = norm_first;
+        self
+    }
+    /// Disable the self-attention and feedforward `Linear` biases; does not
+    /// touch `LayerNorm`'s own bias (see the struct doc comment).
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.self_attn = self.self_attn.bias(bias);
+        self.linear1 = self.linear1.bias(bias);
+        self.linear2 = self.linear2.bias(bias);
+        self
+    }
+    pub fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        self.self_attn.output_shape(input, input, input)
+    }
+    pub fn build(&mut self, input: &Shape, device: &Device, seed: u64) -> Result<Shape> {
+        let shape = self.self_attn.build(input, input, input, device, seed)?;
+        let hidden_shape = self.linear1.build(&shape, device, seed.wrapping_add(10))?;
+        self.linear2
+            .build(&hidden_shape, device, seed.wrapping_add(11))?;
+        self.norm1.build(&shape, device, seed.wrapping_add(12))?;
+        self.norm2.build(&shape, device, seed.wrapping_add(13))?;
+        Ok(shape)
+    }
+    fn sa_block(
+        &self,
+        x: &Tensor,
+        mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let attended = self.self_attn.forward(x, x, x, mask, key_padding_mask)?;
+        self.dropout1.forward(&attended)
+    }
+    fn sa_block_training(
+        &self,
+        x: &Tensor,
+        mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        let attended = self
+            .self_attn
+            .forward_training(x, x, x, mask, key_padding_mask, pass)?;
+        self.dropout1.forward_training(&attended, pass)
+    }
+    fn ff_block(&self, x: &Tensor) -> Result<Tensor> {
+        let hidden = transformer_activate(self.activation, &self.linear1.forward(x)?)?;
+        let dropped = self.dropout.forward(&hidden)?;
+        let out = self.linear2.forward(&dropped)?;
+        self.dropout2.forward(&out)
+    }
+    fn ff_block_training(&self, x: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let hidden = transformer_activate(self.activation, &self.linear1.forward(x)?)?;
+        let dropped = self.dropout.forward_training(&hidden, pass)?;
+        let out = self.linear2.forward(&dropped)?;
+        self.dropout2.forward_training(&out, pass)
+    }
+    pub fn forward(
+        &self,
+        src: &Tensor,
+        src_mask: Option<&AttentionMask>,
+        src_key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        if self.norm_first {
+            let x = src.add(&self.sa_block(
+                &self.norm1.forward(src)?,
+                src_mask,
+                src_key_padding_mask,
+            )?)?;
+            x.add(&self.ff_block(&self.norm2.forward(&x)?)?)
+        } else {
+            let x = self.norm1.forward(&src.add(&self.sa_block(
+                src,
+                src_mask,
+                src_key_padding_mask,
+            )?)?)?;
+            self.norm2.forward(&x.add(&self.ff_block(&x)?)?)
+        }
+    }
+    pub fn forward_training(
+        &self,
+        src: &Tensor,
+        src_mask: Option<&AttentionMask>,
+        src_key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        if self.norm_first {
+            let normed = self.norm1.forward(src)?;
+            let x =
+                src.add(&self.sa_block_training(&normed, src_mask, src_key_padding_mask, pass)?)?;
+            let normed2 = self.norm2.forward(&x)?;
+            x.add(&self.ff_block_training(&normed2, pass)?)
+        } else {
+            let sa = self.sa_block_training(src, src_mask, src_key_padding_mask, pass)?;
+            let x = self.norm1.forward(&src.add(&sa)?)?;
+            let ff = self.ff_block_training(&x, pass)?;
+            self.norm2.forward(&x.add(&ff)?)
+        }
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut params = Vec::new();
+        for (name, p) in self.self_attn.named_parameters() {
+            params.push((format!("self_attn.{name}"), p));
+        }
+        for (name, p) in self.linear1.named_parameters() {
+            params.push((format!("linear1.{name}"), p));
+        }
+        for (name, p) in self.linear2.named_parameters() {
+            params.push((format!("linear2.{name}"), p));
+        }
+        for (name, p) in self.norm1.named_parameters() {
+            params.push((format!("norm1.{name}"), p));
+        }
+        for (name, p) in self.norm2.named_parameters() {
+            params.push((format!("norm2.{name}"), p));
+        }
+        params
+    }
+}
+
+/// One post-/pre-norm Transformer decoder block, `torch.nn.TransformerDecoderLayer`
+/// at the same PyTorch 2.14 defaults as [`TransformerEncoderLayer`]. Masked
+/// self-attention over `tgt`, then cross-attention (`multihead_attn`) whose
+/// query is `tgt` and whose key/value are `memory`, then the same feedforward
+/// block, with PyTorch's own `_sa_block`/`_mha_block`/`_ff_block` inlined:
+///
+/// ```text
+/// _sa_block(x, ..)   = dropout1(self_attn(x, x, x, tgt_mask, tgt_key_padding_mask))
+/// _mha_block(x, mem) = dropout2(multihead_attn(x, mem, mem, memory_mask, memory_key_padding_mask))
+/// _ff_block(x)       = dropout3(linear2(dropout(activation(linear1(x)))))
+/// norm_first=False: x=norm1(x+_sa_block(x)); x=norm2(x+_mha_block(x,mem)); x=norm3(x+_ff_block(x))
+/// norm_first=True:  x=x+_sa_block(norm1(x)); x=x+_mha_block(norm2(x),mem); x=x+_ff_block(norm3(x))
+/// ```
+///
+/// `self_attn` and `multihead_attn` are separate [`MultiheadAttention`]
+/// instances built from the same `feature`/`time` axes: `tgt` and `memory`
+/// share the `time` identity (renamed to distinct private roles inside each
+/// attention instance) but may carry different extents -- `memory`'s own
+/// sequence length need not equal `tgt`'s, exactly PyTorch's cross-attention
+/// contract.
+#[derive(Clone)]
+pub struct TransformerDecoderLayer {
+    self_attn: MultiheadAttention,
+    multihead_attn: MultiheadAttention,
+    linear1: Linear,
+    linear2: Linear,
+    dropout: Dropout,
+    dropout1: Dropout,
+    dropout2: Dropout,
+    dropout3: Dropout,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    norm3: LayerNorm,
+    norm_first: bool,
+    activation: TransformerActivation,
+}
+impl TransformerDecoderLayer {
+    /// Same parameters and defaults as [`TransformerEncoderLayer::new`].
+    pub fn new(
+        feature: Axis,
+        time: Axis,
+        embed_dim: usize,
+        num_heads: usize,
+        dim_feedforward: usize,
+    ) -> Result<Self> {
+        if dim_feedforward == 0 {
+            return Err("TransformerDecoderLayer requires a positive dim_feedforward".into());
+        }
+        let hidden = Axis::new("transformer_ff_hidden");
+        const DEFAULT_DROPOUT: f32 = 0.1;
+        Ok(Self {
+            self_attn: MultiheadAttention::new(
+                feature,
+                time,
+                embed_dim,
+                num_heads,
+                DEFAULT_DROPOUT,
+            )?,
+            multihead_attn: MultiheadAttention::new(
+                feature,
+                time,
+                embed_dim,
+                num_heads,
+                DEFAULT_DROPOUT,
+            )?,
+            linear1: Linear::new(feature, hidden.of(dim_feedforward)),
+            linear2: Linear::new(hidden, feature.of(embed_dim)),
+            dropout: Dropout::new(DEFAULT_DROPOUT)?,
+            dropout1: Dropout::new(DEFAULT_DROPOUT)?,
+            dropout2: Dropout::new(DEFAULT_DROPOUT)?,
+            dropout3: Dropout::new(DEFAULT_DROPOUT)?,
+            norm1: LayerNorm::new(feature)?,
+            norm2: LayerNorm::new(feature)?,
+            norm3: LayerNorm::new(feature)?,
+            norm_first: false,
+            activation: TransformerActivation::Relu,
+        })
+    }
+    pub fn dropout(mut self, dropout: f32) -> Result<Self> {
+        self.self_attn = self.self_attn.dropout(dropout)?;
+        self.multihead_attn = self.multihead_attn.dropout(dropout)?;
+        self.dropout = Dropout::new(dropout)?;
+        self.dropout1 = Dropout::new(dropout)?;
+        self.dropout2 = Dropout::new(dropout)?;
+        self.dropout3 = Dropout::new(dropout)?;
+        Ok(self)
+    }
+    pub fn activation(mut self, activation: TransformerActivation) -> Self {
+        self.activation = activation;
+        self
+    }
+    pub fn epsilon(mut self, epsilon: f32) -> Result<Self> {
+        self.norm1 = self.norm1.epsilon(epsilon)?;
+        self.norm2 = self.norm2.epsilon(epsilon)?;
+        self.norm3 = self.norm3.epsilon(epsilon)?;
+        Ok(self)
+    }
+    pub fn norm_first(mut self, norm_first: bool) -> Self {
+        self.norm_first = norm_first;
+        self
+    }
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.self_attn = self.self_attn.bias(bias);
+        self.multihead_attn = self.multihead_attn.bias(bias);
+        self.linear1 = self.linear1.bias(bias);
+        self.linear2 = self.linear2.bias(bias);
+        self
+    }
+    pub fn output_shape(&self, tgt: &Shape) -> Result<Shape> {
+        self.self_attn.output_shape(tgt, tgt, tgt)
+    }
+    pub fn build(
+        &mut self,
+        tgt: &Shape,
+        memory: &Shape,
+        device: &Device,
+        seed: u64,
+    ) -> Result<Shape> {
+        let shape = self.self_attn.build(tgt, tgt, tgt, device, seed)?;
+        self.multihead_attn
+            .build(&shape, memory, memory, device, seed.wrapping_add(4))?;
+        let hidden_shape = self.linear1.build(&shape, device, seed.wrapping_add(10))?;
+        self.linear2
+            .build(&hidden_shape, device, seed.wrapping_add(11))?;
+        self.norm1.build(&shape, device, seed.wrapping_add(12))?;
+        self.norm2.build(&shape, device, seed.wrapping_add(13))?;
+        self.norm3.build(&shape, device, seed.wrapping_add(14))?;
+        Ok(shape)
+    }
+    fn sa_block(
+        &self,
+        x: &Tensor,
+        mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let attended = self.self_attn.forward(x, x, x, mask, key_padding_mask)?;
+        self.dropout1.forward(&attended)
+    }
+    fn sa_block_training(
+        &self,
+        x: &Tensor,
+        mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        let attended = self
+            .self_attn
+            .forward_training(x, x, x, mask, key_padding_mask, pass)?;
+        self.dropout1.forward_training(&attended, pass)
+    }
+    fn mha_block(
+        &self,
+        x: &Tensor,
+        memory: &Tensor,
+        mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let attended = self
+            .multihead_attn
+            .forward(x, memory, memory, mask, key_padding_mask)?;
+        self.dropout2.forward(&attended)
+    }
+    fn mha_block_training(
+        &self,
+        x: &Tensor,
+        memory: &Tensor,
+        mask: Option<&AttentionMask>,
+        key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        let attended = self.multihead_attn.forward_training(
+            x,
+            memory,
+            memory,
+            mask,
+            key_padding_mask,
+            pass,
+        )?;
+        self.dropout2.forward_training(&attended, pass)
+    }
+    fn ff_block(&self, x: &Tensor) -> Result<Tensor> {
+        let hidden = transformer_activate(self.activation, &self.linear1.forward(x)?)?;
+        let dropped = self.dropout.forward(&hidden)?;
+        let out = self.linear2.forward(&dropped)?;
+        self.dropout3.forward(&out)
+    }
+    fn ff_block_training(&self, x: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let hidden = transformer_activate(self.activation, &self.linear1.forward(x)?)?;
+        let dropped = self.dropout.forward_training(&hidden, pass)?;
+        let out = self.linear2.forward(&dropped)?;
+        self.dropout3.forward_training(&out, pass)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        tgt: &Tensor,
+        memory: &Tensor,
+        tgt_mask: Option<&AttentionMask>,
+        memory_mask: Option<&AttentionMask>,
+        tgt_key_padding_mask: Option<&Tensor>,
+        memory_key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        if self.norm_first {
+            let x = tgt.add(&self.sa_block(
+                &self.norm1.forward(tgt)?,
+                tgt_mask,
+                tgt_key_padding_mask,
+            )?)?;
+            let x = x.add(&self.mha_block(
+                &self.norm2.forward(&x)?,
+                memory,
+                memory_mask,
+                memory_key_padding_mask,
+            )?)?;
+            x.add(&self.ff_block(&self.norm3.forward(&x)?)?)
+        } else {
+            let x = self.norm1.forward(&tgt.add(&self.sa_block(
+                tgt,
+                tgt_mask,
+                tgt_key_padding_mask,
+            )?)?)?;
+            let x = self.norm2.forward(&x.add(&self.mha_block(
+                &x,
+                memory,
+                memory_mask,
+                memory_key_padding_mask,
+            )?)?)?;
+            self.norm3.forward(&x.add(&self.ff_block(&x)?)?)
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_training(
+        &self,
+        tgt: &Tensor,
+        memory: &Tensor,
+        tgt_mask: Option<&AttentionMask>,
+        memory_mask: Option<&AttentionMask>,
+        tgt_key_padding_mask: Option<&Tensor>,
+        memory_key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        if self.norm_first {
+            let normed1 = self.norm1.forward(tgt)?;
+            let x = tgt.add(&self.sa_block_training(
+                &normed1,
+                tgt_mask,
+                tgt_key_padding_mask,
+                pass,
+            )?)?;
+            let normed2 = self.norm2.forward(&x)?;
+            let x = x.add(&self.mha_block_training(
+                &normed2,
+                memory,
+                memory_mask,
+                memory_key_padding_mask,
+                pass,
+            )?)?;
+            let normed3 = self.norm3.forward(&x)?;
+            x.add(&self.ff_block_training(&normed3, pass)?)
+        } else {
+            let sa = self.sa_block_training(tgt, tgt_mask, tgt_key_padding_mask, pass)?;
+            let x = self.norm1.forward(&tgt.add(&sa)?)?;
+            let mha =
+                self.mha_block_training(&x, memory, memory_mask, memory_key_padding_mask, pass)?;
+            let x = self.norm2.forward(&x.add(&mha)?)?;
+            let ff = self.ff_block_training(&x, pass)?;
+            self.norm3.forward(&x.add(&ff)?)
+        }
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut params = Vec::new();
+        for (name, p) in self.self_attn.named_parameters() {
+            params.push((format!("self_attn.{name}"), p));
+        }
+        for (name, p) in self.multihead_attn.named_parameters() {
+            params.push((format!("multihead_attn.{name}"), p));
+        }
+        for (name, p) in self.linear1.named_parameters() {
+            params.push((format!("linear1.{name}"), p));
+        }
+        for (name, p) in self.linear2.named_parameters() {
+            params.push((format!("linear2.{name}"), p));
+        }
+        for (name, p) in self.norm1.named_parameters() {
+            params.push((format!("norm1.{name}"), p));
+        }
+        for (name, p) in self.norm2.named_parameters() {
+            params.push((format!("norm2.{name}"), p));
+        }
+        for (name, p) in self.norm3.named_parameters() {
+            params.push((format!("norm3.{name}"), p));
+        }
+        params
+    }
+}
+
+/// `torch.nn.TransformerEncoder`: `num_layers` independently built copies of
+/// one configured, unbuilt [`TransformerEncoderLayer`] (cloned before
+/// `build`, mirroring PyTorch's own `_get_clones`), plus an optional final
+/// [`LayerNorm`]. Each clone gets its own freshly seeded parameters at
+/// `build` time rather than PyTorch's literal deep-copy-of-already-initialized
+/// weights (PyTorch's `_get_clones` runs `copy.deepcopy` on one already-built
+/// layer, so every layer starts from bit-identical initial weights) --
+/// deliberately following Axis's own stacking convention instead (every
+/// index-seeded container in this crate, e.g. `Sequential::build`, gives each
+/// position a distinct seed) and the design doc's "`Repeat` must create
+/// independent blocks unless weight tying is explicit".
+pub struct TransformerEncoder {
+    layers: Vec<TransformerEncoderLayer>,
+    norm: Option<LayerNorm>,
+}
+impl TransformerEncoder {
+    pub fn new(layer: TransformerEncoderLayer, num_layers: usize) -> Result<Self> {
+        if num_layers == 0 {
+            return Err("TransformerEncoder requires at least one layer".into());
+        }
+        Ok(Self {
+            layers: std::iter::repeat_with(|| layer.clone())
+                .take(num_layers)
+                .collect(),
+            norm: None,
+        })
+    }
+    /// Attach a final `LayerNorm`, applied once after every stacked layer.
+    pub fn norm(mut self, norm: LayerNorm) -> Self {
+        self.norm = Some(norm);
+        self
+    }
+    pub fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        self.layers
+            .iter()
+            .try_fold(input.clone(), |shape, layer| layer.output_shape(&shape))
+    }
+    pub fn build(&mut self, input: &Shape, device: &Device, seed: u64) -> Result<Shape> {
+        let mut shape = input.clone();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            shape = layer.build(
+                &shape,
+                device,
+                seed.wrapping_add((i as u64).wrapping_mul(100)),
+            )?;
+        }
+        if let Some(norm) = &mut self.norm {
+            shape = norm.build(&shape, device, seed)?;
+        }
+        Ok(shape)
+    }
+    pub fn forward(
+        &self,
+        src: &Tensor,
+        mask: Option<&AttentionMask>,
+        src_key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let mut x = src.clone();
+        for layer in &self.layers {
+            x = layer.forward(&x, mask, src_key_padding_mask)?;
+        }
+        match &self.norm {
+            Some(norm) => norm.forward(&x),
+            None => Ok(x),
+        }
+    }
+    pub fn forward_training(
+        &self,
+        src: &Tensor,
+        mask: Option<&AttentionMask>,
+        src_key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        let mut x = src.clone();
+        for layer in &self.layers {
+            x = layer.forward_training(&x, mask, src_key_padding_mask, pass)?;
+        }
+        match &self.norm {
+            Some(norm) => norm.forward(&x),
+            None => Ok(x),
+        }
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut params = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            for (name, p) in layer.named_parameters() {
+                params.push((format!("{i}.{name}"), p));
+            }
+        }
+        if let Some(norm) = &self.norm {
+            for (name, p) in norm.named_parameters() {
+                params.push((format!("norm.{name}"), p));
+            }
+        }
+        params
+    }
+}
+
+/// `torch.nn.TransformerDecoder`: the decoder-layer analogue of
+/// [`TransformerEncoder`], sharing its independent-clone stacking
+/// convention and optional final `LayerNorm`.
+pub struct TransformerDecoder {
+    layers: Vec<TransformerDecoderLayer>,
+    norm: Option<LayerNorm>,
+}
+impl TransformerDecoder {
+    pub fn new(layer: TransformerDecoderLayer, num_layers: usize) -> Result<Self> {
+        if num_layers == 0 {
+            return Err("TransformerDecoder requires at least one layer".into());
+        }
+        Ok(Self {
+            layers: std::iter::repeat_with(|| layer.clone())
+                .take(num_layers)
+                .collect(),
+            norm: None,
+        })
+    }
+    pub fn norm(mut self, norm: LayerNorm) -> Self {
+        self.norm = Some(norm);
+        self
+    }
+    pub fn output_shape(&self, tgt: &Shape) -> Result<Shape> {
+        self.layers
+            .iter()
+            .try_fold(tgt.clone(), |shape, layer| layer.output_shape(&shape))
+    }
+    pub fn build(
+        &mut self,
+        tgt: &Shape,
+        memory: &Shape,
+        device: &Device,
+        seed: u64,
+    ) -> Result<Shape> {
+        let mut shape = tgt.clone();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            shape = layer.build(
+                &shape,
+                memory,
+                device,
+                seed.wrapping_add((i as u64).wrapping_mul(100)),
+            )?;
+        }
+        if let Some(norm) = &mut self.norm {
+            shape = norm.build(&shape, device, seed)?;
+        }
+        Ok(shape)
+    }
+    pub fn forward(
+        &self,
+        tgt: &Tensor,
+        memory: &Tensor,
+        tgt_mask: Option<&AttentionMask>,
+        memory_mask: Option<&AttentionMask>,
+        tgt_key_padding_mask: Option<&Tensor>,
+        memory_key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let mut x = tgt.clone();
+        for layer in &self.layers {
+            x = layer.forward(
+                &x,
+                memory,
+                tgt_mask,
+                memory_mask,
+                tgt_key_padding_mask,
+                memory_key_padding_mask,
+            )?;
+        }
+        match &self.norm {
+            Some(norm) => norm.forward(&x),
+            None => Ok(x),
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_training(
+        &self,
+        tgt: &Tensor,
+        memory: &Tensor,
+        tgt_mask: Option<&AttentionMask>,
+        memory_mask: Option<&AttentionMask>,
+        tgt_key_padding_mask: Option<&Tensor>,
+        memory_key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        let mut x = tgt.clone();
+        for layer in &self.layers {
+            x = layer.forward_training(
+                &x,
+                memory,
+                tgt_mask,
+                memory_mask,
+                tgt_key_padding_mask,
+                memory_key_padding_mask,
+                pass,
+            )?;
+        }
+        match &self.norm {
+            Some(norm) => norm.forward(&x),
+            None => Ok(x),
+        }
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut params = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            for (name, p) in layer.named_parameters() {
+                params.push((format!("{i}.{name}"), p));
+            }
+        }
+        if let Some(norm) = &self.norm {
+            for (name, p) in norm.named_parameters() {
+                params.push((format!("norm.{name}"), p));
+            }
+        }
+        params
+    }
+}
+
+/// `torch.nn.Transformer`: one [`TransformerEncoder`] built from
+/// `num_encoder_layers` copies of a [`TransformerEncoderLayer`] plus a final
+/// `LayerNorm`, and one [`TransformerDecoder`] built the same way from
+/// `num_decoder_layers` copies of a [`TransformerDecoderLayer`], sharing
+/// `feature`/`time`/`embed_dim`/`num_heads`/`dim_feedforward` and every
+/// dropout/activation/epsilon/norm_first/bias setting. `forward` encodes
+/// `src` into `memory` then decodes `tgt` against it, PyTorch's own two-call
+/// composition. There is no `custom_encoder`/`custom_decoder` override: Axis
+/// has no `Module`-shaped container that fits a differently-typed
+/// encoder/decoder pair interchangeably here, so a fully custom pair is built
+/// directly from [`TransformerEncoder`]/[`TransformerDecoder`] instead.
+pub struct Transformer {
+    encoder: TransformerEncoder,
+    decoder: TransformerDecoder,
+}
+impl Transformer {
+    /// PyTorch's own defaults: `dim_feedforward=2048`, `dropout=0.1`,
+    /// `activation="relu"`, `layer_norm_eps=1e-5`, `norm_first=False`,
+    /// `bias=True`. `num_encoder_layers`/`num_decoder_layers` default to
+    /// PyTorch's `6` only in the sense that any positive count is accepted;
+    /// callers state it explicitly here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        feature: Axis,
+        time: Axis,
+        embed_dim: usize,
+        num_heads: usize,
+        num_encoder_layers: usize,
+        num_decoder_layers: usize,
+        dim_feedforward: usize,
+    ) -> Result<Self> {
+        let encoder_layer =
+            TransformerEncoderLayer::new(feature, time, embed_dim, num_heads, dim_feedforward)?;
+        let decoder_layer =
+            TransformerDecoderLayer::new(feature, time, embed_dim, num_heads, dim_feedforward)?;
+        Ok(Self {
+            encoder: TransformerEncoder::new(encoder_layer, num_encoder_layers)?
+                .norm(LayerNorm::new(feature)?),
+            decoder: TransformerDecoder::new(decoder_layer, num_decoder_layers)?
+                .norm(LayerNorm::new(feature)?),
+        })
+    }
+    /// Apply to every encoder and decoder layer, matching PyTorch's single
+    /// constructor-wide `dropout=` argument.
+    pub fn dropout(mut self, dropout: f32) -> Result<Self> {
+        self.encoder.layers = self
+            .encoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.dropout(dropout))
+            .collect::<Result<_>>()?;
+        self.decoder.layers = self
+            .decoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.dropout(dropout))
+            .collect::<Result<_>>()?;
+        Ok(self)
+    }
+    pub fn activation(mut self, activation: TransformerActivation) -> Self {
+        self.encoder.layers = self
+            .encoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.activation(activation))
+            .collect();
+        self.decoder.layers = self
+            .decoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.activation(activation))
+            .collect();
+        self
+    }
+    pub fn epsilon(mut self, epsilon: f32) -> Result<Self> {
+        self.encoder.layers = self
+            .encoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.epsilon(epsilon))
+            .collect::<Result<_>>()?;
+        self.decoder.layers = self
+            .decoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.epsilon(epsilon))
+            .collect::<Result<_>>()?;
+        self.encoder.norm = self
+            .encoder
+            .norm
+            .map(|norm| norm.epsilon(epsilon))
+            .transpose()?;
+        self.decoder.norm = self
+            .decoder
+            .norm
+            .map(|norm| norm.epsilon(epsilon))
+            .transpose()?;
+        Ok(self)
+    }
+    pub fn norm_first(mut self, norm_first: bool) -> Self {
+        self.encoder.layers = self
+            .encoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.norm_first(norm_first))
+            .collect();
+        self.decoder.layers = self
+            .decoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.norm_first(norm_first))
+            .collect();
+        self
+    }
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.encoder.layers = self
+            .encoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.bias(bias))
+            .collect();
+        self.decoder.layers = self
+            .decoder
+            .layers
+            .into_iter()
+            .map(|layer| layer.bias(bias))
+            .collect();
+        self
+    }
+    pub fn output_shape(&self, _src: &Shape, tgt: &Shape) -> Result<Shape> {
+        self.decoder.output_shape(tgt)
+    }
+    pub fn build(&mut self, src: &Shape, tgt: &Shape, device: &Device, seed: u64) -> Result<Shape> {
+        let memory_shape = self.encoder.build(src, device, seed)?;
+        self.decoder
+            .build(tgt, &memory_shape, device, seed.wrapping_add(1_000_000))
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        src: &Tensor,
+        tgt: &Tensor,
+        src_mask: Option<&AttentionMask>,
+        tgt_mask: Option<&AttentionMask>,
+        memory_mask: Option<&AttentionMask>,
+        src_key_padding_mask: Option<&Tensor>,
+        tgt_key_padding_mask: Option<&Tensor>,
+        memory_key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let memory = self.encoder.forward(src, src_mask, src_key_padding_mask)?;
+        self.decoder.forward(
+            tgt,
+            &memory,
+            tgt_mask,
+            memory_mask,
+            tgt_key_padding_mask,
+            memory_key_padding_mask,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_training(
+        &self,
+        src: &Tensor,
+        tgt: &Tensor,
+        src_mask: Option<&AttentionMask>,
+        tgt_mask: Option<&AttentionMask>,
+        memory_mask: Option<&AttentionMask>,
+        src_key_padding_mask: Option<&Tensor>,
+        tgt_key_padding_mask: Option<&Tensor>,
+        memory_key_padding_mask: Option<&Tensor>,
+        pass: &mut TrainingPass,
+    ) -> Result<Tensor> {
+        let memory = self
+            .encoder
+            .forward_training(src, src_mask, src_key_padding_mask, pass)?;
+        self.decoder.forward_training(
+            tgt,
+            &memory,
+            tgt_mask,
+            memory_mask,
+            tgt_key_padding_mask,
+            memory_key_padding_mask,
+            pass,
+        )
+    }
+    pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
+        let mut params = Vec::new();
+        for (name, p) in self.encoder.named_parameters() {
+            params.push((format!("encoder.{name}"), p));
+        }
+        for (name, p) in self.decoder.named_parameters() {
+            params.push((format!("decoder.{name}"), p));
+        }
+        params
     }
 }
 
