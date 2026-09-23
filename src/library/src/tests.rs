@@ -26793,3 +26793,78 @@ fn dcgan_forward_training_step_updates_both_networks_and_batch_norm_state() -> R
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cuda_device_creation_enables_the_jit_disk_cache_once() -> Result<()> {
+    let _first = Device::cuda(0)?;
+    assert!(
+        cutile::jit_cache::is_enabled(),
+        "creating a CUDA device must enable cuTile's persistent kernel cache by default"
+    );
+
+    let _second = Device::cuda(0)?;
+    // `ensure_jit_cache_enabled`'s `OnceLock` runs its closure at most once per
+    // process; every `Device::cuda` call after the very first one in this
+    // process -- this test's second device, or any earlier ignored test's
+    // first one -- must be a no-op on the cache switch. cuTile exposes no
+    // public way to inspect *which* store is currently installed, so call the
+    // guard directly to observe the "ran only once" return value itself
+    // rather than an indirect symptom of it.
+    assert!(
+        !crate::backend::ensure_jit_cache_enabled(),
+        "a later Device::cuda call must not re-run cache enablement"
+    );
+
+    let stats = jit_cache_stats();
+    println!(
+        "check jit cache stats after two devices: PASS hits={} misses={}",
+        stats.hits, stats.misses
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn axis_jit_cache_off_leaves_the_cache_disabled() -> Result<()> {
+    // `AXIS_JIT_CACHE` is only ever read once per process (inside the same
+    // `OnceLock` the test above exercises), and every ignored CUDA test in
+    // this binary shares one process (`scripts/check.sh` runs them with
+    // `--test-threads=1`). By the time this test runs, an earlier test has
+    // very likely already created a device with the cache on, so this
+    // process's own switch is already latched. Only a fresh child process,
+    // started with `AXIS_JIT_CACHE=off` before it creates any device, can
+    // observe the opt-out actually apply -- so this test re-execs itself,
+    // selecting only itself, with the marker env var below set to switch to
+    // the child's half of the check.
+    const CHILD_MARKER: &str = "AXIS_JIT_CACHE_OFF_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let _device = Device::cuda(0)?;
+        assert!(
+            !cutile::jit_cache::is_enabled(),
+            "AXIS_JIT_CACHE=off must leave cuTile's persistent kernel cache disabled"
+        );
+        println!("check axis_jit_cache_off_leaves_the_cache_disabled (child): PASS");
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()?;
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "--test-threads=1",
+            "tests::axis_jit_cache_off_leaves_the_cache_disabled",
+        ])
+        .env("AXIS_JIT_CACHE", "off")
+        .env(CHILD_MARKER, "1")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "isolated child process failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    println!("check axis_jit_cache_off_leaves_the_cache_disabled (parent): PASS");
+    Ok(())
+}
