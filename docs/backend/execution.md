@@ -79,6 +79,52 @@ construction still costs about 5.84 seconds per newly bound model in this
 probe, and mean utilization remains low. The result does not establish
 competitive convolution throughput or a general CUDA performance ratio.
 
+## Persistent JIT disk cache
+
+cuTile JIT-compiles every kernel specialization through its `tileiras`
+subprocess on first use with a new shape, at roughly 290 ms per new shape
+(#152); a model with dozens of shape-distinct kernels can spend most of a
+short process's wall time compiling rather than computing. cuTile 0.3.1
+ships a content-addressed persistent cubin cache (`cutile::jit_cache`, keyed
+by SHA-256 of the serialized Tile IR bytecode, target, opt level, and the
+`tileiras` fingerprint) but leaves it off by default with no environment
+switch of its own. `Device::cuda`/`Device::cuda_bf16` enable it the first
+time any CUDA device is created in the process (`ensure_jit_cache_enabled`
+in `runtime/backend.rs`, guarded by a `OnceLock` so later devices are a
+no-op), at cuTile's own default location (`~/.cache/cutile/kernels`, or
+`$XDG_CACHE_HOME/cutile/kernels`). `AXIS_JIT_CACHE=off` opts out for the
+whole process; `AXIS_JIT_CACHE_DIR` points the store at an explicit
+directory instead. Every cuTile store I/O failure is already soft (a miss,
+not an error); enabling the store itself can also fail (an unwritable
+directory, no resolvable per-user cache path), and that failure is logged
+once to stderr and leaves the cache disabled rather than failing device
+creation. `jit_cache_stats()` returns the process's cumulative disk
+hit/miss counts for a receipt to record.
+
+Measured on the desk RTX 5060 with `axis-mlp --steps 1` (context init, model
+build, and one `Trainer::step`), a fresh empty `AXIS_JIT_CACHE_DIR` for the
+cold run and the same populated directory reused unmodified for the warm run:
+
+| | wall clock |
+|---|---:|
+| cold (empty cache, one process) | 5.07 s |
+| warm (same cache directory, next process) | 1.35 s |
+| `AXIS_JIT_CACHE=off`, run 1 | 5.31 s |
+| `AXIS_JIT_CACHE=off`, run 2 | 5.35 s |
+
+`AXIS_PROFILE=1`'s `train_*` stages isolate the first `Trainer::step` alone
+(excluding the two pre-loop loss evaluations, which already warm the
+forward-pass kernels): `train_zero_grad` plus `train_loss` plus the
+loss/backward submission plus `train_backward` plus `train_optimizer` plus
+`synchronize` plus `train_boundary` sum to 3.58 s cold and 0.68 s warm, a
+5.3x reduction, consistent with `train_backward` alone (2.12 s cold, 0.43 s
+warm) compiling several new-shape kernels once and never again.
+`AXIS_JIT_CACHE=off` costs the same roughly 5.3 s on both runs: without the
+cache every process recompiles from nothing, matching Axis's behavior before
+this cache was wired in. The warm run wrote zero new cubins (still the 16
+the cold run wrote), confirming every kernel the step needs was already
+served from disk.
+
 ## Compact layout lowering after the Atlas inference profile
 
 The merge-cache result above is historical. A later two-image MobileSAM ensemble

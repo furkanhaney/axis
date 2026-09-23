@@ -6,7 +6,10 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 fn profile(label: &str, started: Instant) {
@@ -46,6 +49,67 @@ fn chunked_offsets(offsets: &[i32]) -> (Vec<i32>, Vec<i32>) {
     (chunk_offsets, chunk_group)
 }
 
+/// Enables cuTile's persistent on-disk cubin cache the first time any CUDA
+/// `Device` is created in this process. cuTile JIT-compiles every kernel
+/// through its `tileiras` subprocess on first use with a new shape (roughly
+/// 290 ms each, #152); a cache hit skips that recompile on the next process.
+/// cuTile's disk cache is off by default and has no environment
+/// switch of its own (`cutile::jit_cache`), so Axis turns it on here, at
+/// cuTile's own default location (`~/.cache/cutile/kernels`, or
+/// `$XDG_CACHE_HOME/cutile/kernels`). `AXIS_JIT_CACHE=off` opts out entirely;
+/// `AXIS_JIT_CACHE_DIR` redirects the store to an explicit directory instead.
+/// A cache that cannot be enabled -- an unwritable directory, or no
+/// resolvable per-user cache path -- is logged once to stderr and left
+/// disabled; every cuTile store I/O failure afterward is already soft
+/// (`cutile::jit_cache` never turns a working launch into a failing one), and
+/// enabling the store itself must not fail device creation either.
+///
+/// Returns whether this call was the one that ran the check -- `true` at most
+/// once per process, `false` for every call after -- so callers (and tests)
+/// can observe the once-per-process guarantee directly; `Device::cuda`
+/// itself ignores it.
+pub(crate) fn ensure_jit_cache_enabled() -> bool {
+    static ENABLED: OnceLock<()> = OnceLock::new();
+    let mut ran = false;
+    ENABLED.get_or_init(|| {
+        ran = true;
+        if std::env::var("AXIS_JIT_CACHE").ok().as_deref() == Some("off") {
+            return;
+        }
+        let result = match std::env::var_os("AXIS_JIT_CACHE_DIR") {
+            Some(dir) => cutile::jit_cache::FileSystemJitStore::new(dir)
+                .map(|store| cutile::jit_cache::enable(Arc::new(store))),
+            None => cutile::jit_cache::enable_default(),
+        };
+        if let Err(error) = result {
+            eprintln!("axis: cuTile JIT disk cache disabled: {error}");
+        }
+    });
+    ran
+}
+
+/// Cumulative cuTile JIT disk-cache hit/miss counts for this process, zero for
+/// both fields before any CUDA device has compiled a kernel, or when the cache
+/// is disabled (`AXIS_JIT_CACHE=off`) or could not be enabled. See
+/// `Device::cuda`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitCacheStats {
+    /// Kernel compiles served from the on-disk cache instead of `tileiras`.
+    pub hits: u64,
+    /// Kernel compiles that missed the disk cache and ran `tileiras`.
+    pub misses: u64,
+}
+
+/// Snapshot of the cuTile JIT disk cache's cumulative hit/miss counts for
+/// this process, for a receipt or `AXIS_PROFILE` consumer to record.
+pub fn jit_cache_stats() -> JitCacheStats {
+    let stats = cutile::jit_cache::stats();
+    JitCacheStats {
+        hits: stats.hits,
+        misses: stats.misses,
+    }
+}
+
 pub(crate) type Buffer = Arc<cutile::tensor::Tensor<f32>>;
 
 #[derive(Clone)]
@@ -81,15 +145,20 @@ trait Enqueue: DeviceOp + Sized {
 impl<T: DeviceOp> Enqueue for T {}
 
 impl Device {
+    /// The first CUDA `Device` created in a process also enables cuTile's
+    /// persistent on-disk kernel cache; `AXIS_JIT_CACHE=off` opts out and
+    /// `AXIS_JIT_CACHE_DIR` redirects it. See `jit_cache_stats`.
     pub fn cuda(ordinal: usize) -> Result<Self> {
         Self::cuda_with_bf16(ordinal, false)
     }
     /// CUDA device with BF16 inputs and FP32 accumulation inside matrix products.
     /// Parameters, activations outside GEMM, optimizer state, and reductions remain FP32.
+    /// Also enables the JIT disk cache on first use, exactly as [`Device::cuda`] does.
     pub fn cuda_bf16(ordinal: usize) -> Result<Self> {
         Self::cuda_with_bf16(ordinal, true)
     }
     fn cuda_with_bf16(ordinal: usize, bf16_matmul: bool) -> Result<Self> {
+        ensure_jit_cache_enabled();
         let device = cutile::cuda_core::Device::new(ordinal)?;
         Ok(Self(Rc::new(Context {
             stream: device.new_stream()?,

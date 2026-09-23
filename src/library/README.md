@@ -109,7 +109,10 @@ when loaded with the reference's weights. The operator reference is on
 
 Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile, `libclang`, and
 CUDA 13.2 or newer. Axis is early research software: APIs may change as real
-training programs expose better defaults and abstractions.
+training programs expose better defaults and abstractions. The first CUDA
+device also enables cuTile's persistent kernel cache at its default location
+(`~/.cache/cutile/kernels`), overridable with `AXIS_JIT_CACHE=off` or
+`AXIS_JIT_CACHE_DIR`.
 
 ```bash
 cargo add axis@0.11.0
