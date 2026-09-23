@@ -17,6 +17,25 @@ fn unavailable<T>() -> Result<T> {
     Err("the docs.rs build has no CUDA runtime; use Axis with its default `cuda` feature".into())
 }
 
+/// Cumulative cuTile JIT disk-cache hit/miss counts for this process, zero for
+/// both fields before any CUDA device has compiled a kernel, or when the cache
+/// is disabled (`AXIS_JIT_CACHE=off`) or could not be enabled. See
+/// `Device::cuda`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitCacheStats {
+    /// Kernel compiles served from the on-disk cache instead of `tileiras`.
+    pub hits: u64,
+    /// Kernel compiles that missed the disk cache and ran `tileiras`.
+    pub misses: u64,
+}
+
+/// Snapshot of the cuTile JIT disk cache's cumulative hit/miss counts for
+/// this process. Always zero in the docs.rs build, which has no CUDA runtime
+/// and never creates a device.
+pub fn jit_cache_stats() -> JitCacheStats {
+    JitCacheStats::default()
+}
+
 impl Device {
     pub fn cuda(_ordinal: usize) -> Result<Self> {
         unavailable()
