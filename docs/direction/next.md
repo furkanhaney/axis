@@ -144,17 +144,15 @@ items after PR #59, recorded here so the issue tracker can stay empty:
 
 ## Carried past 0.11.0
 
-Released 2026-09-22 with these four consumer issues moved here, so the
-tracker could be empty at publish time. Each is a real need with a named
-consumer; none was dropped.
+Released 2026-09-22 with four consumer issues moved here, so the tracker
+could be empty at publish time. Each is a real need with a named consumer;
+none was dropped. Trained BatchNorm with persistent running statistics (issue
+#76) has since landed: a `State` handle, `Module::named_states`, staged
+updates on `TrainingPass` committed by `Trainer::step_training` after the
+optimizer step, `BatchNorm` over a named feature axis with PyTorch's momentum
+and unbiased running-variance semantics, and InstanceNorm's optional
+`track_running_stats` on the same mechanism.
 
-- **Trained BatchNorm with persistent running statistics** (issue #76,
-  consumer `vision/morpheus`). The training pass (PR #127) reserved the
-  mechanism: a training forward queues its running-statistic update on the
-  `TrainingPass`, and `Trainer::step_training` commits it after the optimizer
-  step. Next: a persistent non-parameter tensor handle, then `BatchNorm` over a
-  named feature axis with PyTorch's momentum and unbiased running variance, and
-  InstanceNorm's optional running statistics on the same handle.
 - **Prefix (nested) dropout as a named-axis module** (issue #90, consumers
   `learning/bae` and `vision/image-encode`). Unblocked by the training pass: its
   `forward_training` draws a per-example width from `pass.next_seed()` and masks

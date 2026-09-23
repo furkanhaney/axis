@@ -1534,3 +1534,75 @@ this because `contract` never fully excludes a term). Graded PARTIAL: all
 rows in one call must share one target length and the time axis's full
 extent is every row's input length; PyTorch's own per-row
 `input_lengths`/`target_lengths` (mixed-length batches) are not implemented.
+
+### Persistent training state and BatchNorm
+
+Lands issue #76 ("Stateful foundation" in `module-backlog.md`): running
+statistics cannot be represented honestly until a module can hold and update
+non-parameter state.
+
+`State` (`model/nn.rs`, next to `Parameter`) is a shared, device-resident
+tensor with no gradient, cloned by reference exactly like `Parameter`. A
+provided `Module::named_states(&self) -> Vec<(String, State)>` reports them
+(default empty); `Sequential`, `ModuleList`, and `ModuleDict` aggregate every
+child's states under the same `"{index}.{name}"`/`"{key}.{name}"` slot-path
+convention `named_parameters` already uses. Nothing ever writes a `State`
+directly. `TrainingPass` (already the per-step context PR #127 introduced for
+`forward_training`) gains a pending list: `pass.stage(state, new_value)`
+queues an update without writing it, so a forward pass stays side-effect
+free. `TrainingPass::commit()` is the only writer, public so a custom
+training loop can call it directly; `Trainer::step_training` calls it once,
+after the whole step (loss, backward, optimizer step) has already succeeded,
+and only then, so an error anywhere earlier leaves every `State` exactly as
+it was. `TrainStep::committed_states()` reports how many updates landed,
+extending the receipt.
+
+`BatchNorm` (`model/normalization.rs`, alongside the other normalization
+modules) covers PyTorch's `BatchNorm1d`/`BatchNorm2d`/`BatchNorm3d` in one
+named-axis module: it declares one feature axis, and every OTHER axis
+present at call time, batch and any spatial axes, normalizes together,
+whatever it happens to be named. Defaults match PyTorch's own: epsilon
+`1e-5`, momentum `Some(0.1)`, a learnable per-feature affine scale and bias,
+and `track_running_stats = true`. `forward_training` normalizes with this
+call's own BIASED batch variance (PyTorch's normalization convention) and,
+when tracking, stages `running = (1 - momentum) * running + momentum *
+batch` using the UNBIASED batch variance for `running_var` (`n / (n - 1)`
+against the same call's biased variance, `n` the element count reduced;
+exactly `1 / 0` when `n == 1`, propagated rather than special-cased, matching
+how the rest of Axis lets domain edges through rather than clamping them).
+`momentum = None` selects PyTorch's cumulative moving average, `1 /
+num_batches_tracked` after incrementing, in place of a fixed factor;
+`num_batches_tracked` itself is always staged as a plain increment, either
+way. `forward` (evaluation) normalizes with the committed running statistics
+when tracking is on, or recomputes this call's own batch statistics when
+`track_running_stats = false`, exactly matching PyTorch's behavior for that
+flag.
+
+`InstanceNorm` gains the same optional `track_running_stats` (PyTorch
+default `false`, so the existing bit-exact path is unchanged when it stays
+off). PyTorch's own InstanceNorm running-statistics update reshapes the
+input so every `(sample, channel)` pair becomes its own single-item "batch",
+runs an ordinary BatchNorm-style momentum update independently for each one
+against the SAME shared running buffer, then averages the resulting
+per-instance estimates back down to one value per channel. Because averaging
+commutes with that update's linear combination, this is exactly `running =
+(1 - factor) * running + factor * pooled`, where `pooled_mean` is the mean of
+every instance's own mean (equivalently, the grand mean over every
+non-channel axis) and `pooled_var` is the mean, over every instance, of that
+instance's own UNBIASED variance: `sample_size / (sample_size - 1)` against
+its own biased variance, `sample_size` the extent product of the declared
+sample axes only, deliberately NOT `BatchNorm`'s pooled variance over the
+whole batch, since each instance unbiases using only its own sample count.
+Evaluation with `track_running_stats = true` uses the committed running
+statistics exactly like `BatchNorm`; the affine scale and bias, and the
+default `false` path, are entirely unchanged.
+
+Evidence: an independent f64 oracle for `BatchNorm` training forward and
+every gradient (input, scale, bias) under reordered storage; a three-step
+trainer test asserting `running_mean`/`running_var`/`num_batches_tracked`
+after each step against hand-computed values, and that every `State` is
+unchanged when a step's loss closure errors after `forward_training` has
+already staged its updates; an evaluation test using the committed running
+statistics; the `momentum = None` cumulative case; `InstanceNorm` with
+`track_running_stats = true` against its own hand-derived per-instance
+oracle; and `named_states` paths threading through `Sequential`.

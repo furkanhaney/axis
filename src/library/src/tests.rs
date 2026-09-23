@@ -14815,7 +14815,11 @@ fn trainer_step_training_commits_batch_norm_running_statistics_and_leaves_them_u
     let mut final_var = vec![0.0; 2];
     for (index, step_values) in steps.iter().enumerate() {
         let values: Vec<f32> = step_values.iter().map(|v| *v as f32).collect();
-        let input = Tensor::from_slice(&values, dims, &device)?;
+        // `with_grad`: with `affine(false)` the model itself has no
+        // parameters, so `backward` needs a tracked leaf somewhere in the
+        // loss graph to run at all; the running-statistics EMA under test
+        // never depends on it.
+        let input = Tensor::from_slice(&values, dims, &device)?.with_grad();
         let step = trainer.step_training(&mut bn, |model, pass| {
             model.forward_training(&input, pass)?.mean([batch, feature])
         })?;
