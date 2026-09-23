@@ -1,4 +1,4 @@
-use crate::{Axis, Device, Dim, Result, Shape, Tensor, TrainingPass};
+use crate::{Axis, Device, Dim, IntoAxes, Result, Shape, Tensor, TrainingPass};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -1514,6 +1514,381 @@ impl Module for Dropout {
             Tensor::uniform_device(input.shape().dims().iter().copied(), seed, input.device())?;
         let mask = draw.ge(self.p)?;
         input.mul(&mask)?.scale(1.0 / (1.0 - self.p))
+    }
+}
+
+fn validate_dropout_probability(name: &str, p: f32) -> Result<()> {
+    if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+        return Err(format!("{name} probability must be finite and in [0, 1], got {p}").into());
+    }
+    Ok(())
+}
+
+/// Shared constructor validation for [`ChannelDropout`] and [`FeatureAlphaDropout`]: `channel`
+/// and every axis in `spatial` must be pairwise distinct, and `spatial` must be non-empty (an
+/// empty spatial list degenerates to ordinary elementwise dropout, which `Dropout` already
+/// covers), all rejected before any device work.
+fn validate_channel_and_spatial(name: &str, channel: Axis, spatial: &[Axis]) -> Result<()> {
+    if spatial.is_empty() {
+        return Err(format!("{name} requires at least one spatial axis").into());
+    }
+    for (index, &axis) in spatial.iter().enumerate() {
+        if axis == channel {
+            return Err(format!("{name} spatial axis {axis:?} duplicates its channel axis").into());
+        }
+        if spatial[..index].contains(&axis) {
+            return Err(format!("{name} lists spatial axis {axis:?} more than once").into());
+        }
+    }
+    Ok(())
+}
+
+/// Every axis of `shape` that is not one of `spatial`, in `shape`'s own order: for
+/// [`ChannelDropout`]/[`FeatureAlphaDropout`] this is the channel axis plus every batch-like
+/// axis, i.e. exactly the dimensions PyTorch's own `nn.Dropout1d/2d/3d` (`make_feature_noise`:
+/// `sizes = [N, C, 1, 1, ...]`) draws one mask value per combination of.
+fn dims_excluding(shape: &Shape, excluded: &[Axis]) -> Vec<Dim> {
+    shape
+        .dims()
+        .iter()
+        .filter(|dim| !excluded.contains(&dim.axis))
+        .copied()
+        .collect()
+}
+
+fn require_axes_present(name: &str, input: &Shape, channel: Axis, spatial: &[Axis]) -> Result<()> {
+    if !input.contains(channel) {
+        return Err(format!("{name} requires its channel axis {channel:?} in the input").into());
+    }
+    for &axis in spatial {
+        if !input.contains(axis) {
+            return Err(format!("{name} requires its spatial axis {axis:?} in the input").into());
+        }
+    }
+    Ok(())
+}
+
+/// Channel (feature-map) dropout: PyTorch's `nn.Dropout1d`, `nn.Dropout2d` and `nn.Dropout3d`
+/// are one type here, since Axis names axes instead of positionally counting spatial
+/// dimensions -- exactly how [`ZeroPad`] already collapses PyTorch's
+/// `ZeroPad1d`/`2d`/`3d` into one axis-list constructor: the "1d"/"2d"/"3d" split is purely how
+/// many axes are named `spatial`, never a different type or contract. Drops one mask value per
+/// combination of `channel` and every axis NOT named `spatial` (so every batch-like axis varies
+/// independently too, matching PyTorch's `make_feature_noise` mask shape `[N, C, 1, 1, ...]`),
+/// broadcasting that one decision over every `spatial` axis: `Conv2d`'s `(batch, channel,
+/// height, width)` output passed through `ChannelDropout::new(p, channel, [height, width])`
+/// zeroes whole feature maps together, the way dropping isolated pixels would not regularize a
+/// convolutional feature. Otherwise identical to [`Dropout`]: `forward` is the identity;
+/// `forward_training` consumes exactly one `pass.next_seed()` draw regardless of `p`, feeds it
+/// to one `Tensor::uniform_device` call over the non-spatial axes alone, keeps each
+/// (channel, batch, ...) combination whose draw is `>= p`, and rescales kept elements by
+/// `1 / (1 - p)`; `p == 0` is the identity and `p == 1` is exact zeros with exactly zero
+/// gradient, the same edge cases `Dropout` documents.
+#[derive(Clone)]
+pub struct ChannelDropout {
+    p: f32,
+    channel: Axis,
+    spatial: Vec<Axis>,
+}
+impl ChannelDropout {
+    pub fn new(p: f32, channel: Axis, spatial: impl IntoAxes) -> Result<Self> {
+        validate_dropout_probability("ChannelDropout", p)?;
+        let spatial = spatial.into_axes();
+        validate_channel_and_spatial("ChannelDropout", channel, &spatial)?;
+        Ok(Self {
+            p,
+            channel,
+            spatial,
+        })
+    }
+}
+impl Module for ChannelDropout {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        require_axes_present("ChannelDropout", input, self.channel, &self.spatial)?;
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        Ok(input.clone())
+    }
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let shape = self.output_shape(input.shape())?;
+        let seed = pass.next_seed();
+        if self.p == 0.0 {
+            return Ok(input.clone());
+        }
+        if self.p == 1.0 {
+            return input.scale(0.0);
+        }
+        let mask_dims = dims_excluding(&shape, &self.spatial);
+        let draw = Tensor::uniform_device(mask_dims, seed, input.device())?;
+        let keep = draw.ge(self.p)?;
+        input.mul(&keep)?.scale(1.0 / (1.0 - self.p))
+    }
+}
+
+/// SELU-preserving alpha dropout: PyTorch's `nn.AlphaDropout`. Ordinary inverted dropout resets
+/// dropped units to zero, which is off-distribution for a SELU network whose self-normalizing
+/// property assumes zero mean and unit variance; alpha dropout instead resets dropped units to
+/// SELU's own saturation value and applies an affine correction that keeps the first two moments
+/// fixed. Formula (bit-for-bit PyTorch's `aten/src/ATen/native/Dropout.cpp`
+/// `_alpha_dropout_impl`, `alpha_dropout=true`): with `alpha = 1.7580993408473766` (SELU's
+/// `-alpha_selu * scale_selu`, negated) and `a = 1 / sqrt((alpha^2 * p + 1) * (1 - p))`, each
+/// element keeps with probability `1 - p` (mask `keep = draw >= p`, the same
+/// `Tensor::uniform_device` convention `Dropout` uses) and the output is `a * input * keep +
+/// alpha * a * keep + alpha * a * (p - 1)` -- algebraically `a * (input + alpha)` where kept,
+/// and the constant `alpha * a * (p - 1)` where dropped, with no dedicated "add a scalar
+/// constant" primitive needed: the three terms above compose from `mul`, `scale` and `add`
+/// alone, and the constant term is built with `Tensor::from_slice` exactly like
+/// `normalization::Affine`'s own constant parameters. `forward` (evaluation) is the identity.
+/// `forward_training` consumes exactly one `pass.next_seed()` draw regardless of `p`; `p == 0`
+/// is the identity and `p == 1` is exact zeros with exactly zero gradient (PyTorch's own
+/// `_dropout_impl` special-cases `p == 1` to `input * 0` before the affine constants -- which are
+/// undefined at `p == 1` -- are ever computed, for every dropout variant including this one).
+#[derive(Clone, Copy)]
+pub struct AlphaDropout {
+    p: f32,
+}
+impl AlphaDropout {
+    pub fn new(p: f32) -> Result<Self> {
+        validate_dropout_probability("AlphaDropout", p)?;
+        Ok(Self { p })
+    }
+}
+
+/// PyTorch's SELU alpha-scale product, negated: `-alpha_selu * scale_selu` where `alpha_selu =
+/// 1.6732632423543772848170429916717` and `scale_selu = 1.0507009873554804934193349852946`.
+const ALPHA_DROPOUT_ALPHA: f32 = 1.758_099_3;
+
+/// Shared by [`AlphaDropout`] and [`FeatureAlphaDropout`]: `mask_dims` is the input's own full
+/// axis list for `AlphaDropout` (one draw per element) or the non-spatial axes for
+/// `FeatureAlphaDropout` (one draw per channel/batch combination, broadcast over the spatial
+/// axes exactly like [`ChannelDropout`]). See [`AlphaDropout`]'s doc comment for the formula.
+fn alpha_dropout_forward_training(
+    input: &Tensor,
+    mask_dims: Vec<Dim>,
+    p: f32,
+    pass: &mut TrainingPass,
+) -> Result<Tensor> {
+    let seed = pass.next_seed();
+    if p == 0.0 {
+        return Ok(input.clone());
+    }
+    if p == 1.0 {
+        return input.scale(0.0);
+    }
+    let a = 1.0 / ((ALPHA_DROPOUT_ALPHA * ALPHA_DROPOUT_ALPHA * p + 1.0) * (1.0 - p)).sqrt();
+    let draw = Tensor::uniform_device(mask_dims, seed, input.device())?;
+    let keep = draw.ge(p)?;
+    let constant_term = Tensor::from_slice(
+        &vec![ALPHA_DROPOUT_ALPHA * a * (p - 1.0); keep.shape().len()],
+        keep.shape().dims().iter().copied(),
+        input.device(),
+    )?;
+    input
+        .mul(&keep)?
+        .scale(a)?
+        .add(&keep.scale(ALPHA_DROPOUT_ALPHA * a)?)?
+        .add(&constant_term)
+}
+
+impl Module for AlphaDropout {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        Ok(input.clone())
+    }
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let mask_dims = input.shape().dims().to_vec();
+        alpha_dropout_forward_training(input, mask_dims, self.p, pass)
+    }
+}
+
+/// Channel-wise alpha dropout: PyTorch's `nn.FeatureAlphaDropout`, [`AlphaDropout`]'s exact
+/// affine formula applied to a [`ChannelDropout`]-shaped mask (one draw per (channel, batch, ...)
+/// combination, broadcast over the named `spatial` axes) instead of one draw per element. See
+/// [`ChannelDropout`] for the axis contract and [`AlphaDropout`] for the formula; this module is
+/// their composition, matching PyTorch's own `_feature_alpha_dropout` (`feature_dropout=true,
+/// alpha_dropout=true` in the same `_dropout_impl`).
+#[derive(Clone)]
+pub struct FeatureAlphaDropout {
+    p: f32,
+    channel: Axis,
+    spatial: Vec<Axis>,
+}
+impl FeatureAlphaDropout {
+    pub fn new(p: f32, channel: Axis, spatial: impl IntoAxes) -> Result<Self> {
+        validate_dropout_probability("FeatureAlphaDropout", p)?;
+        let spatial = spatial.into_axes();
+        validate_channel_and_spatial("FeatureAlphaDropout", channel, &spatial)?;
+        Ok(Self {
+            p,
+            channel,
+            spatial,
+        })
+    }
+}
+impl Module for FeatureAlphaDropout {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        require_axes_present("FeatureAlphaDropout", input, self.channel, &self.spatial)?;
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        Ok(input.clone())
+    }
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let shape = self.output_shape(input.shape())?;
+        let mask_dims = dims_excluding(&shape, &self.spatial);
+        alpha_dropout_forward_training(input, mask_dims, self.p, pass)
+    }
+}
+
+/// PyTorch's `nn.RReLU` (randomized leaky ReLU, Xu et al. "Empirical Evaluation of Rectified
+/// Activations in Convolutional Network"). Defaults `lower = 1 / 8`, `upper = 1 / 3`, PyTorch's
+/// own defaults. `forward` (evaluation) is [`Tensor::leaky_relu`] at the fixed slope
+/// `(lower + upper) / 2`, PyTorch's documented evaluation behavior. `forward_training` draws a
+/// fresh independent slope per element, uniform in `[lower, upper)`, from one
+/// `pass.next_seed()` draw fed to one `Tensor::uniform_device` call scaled into that range
+/// (`lower + (upper - lower) * draw`, the constant `lower` shift built with `Tensor::from_slice`
+/// exactly like [`AlphaDropout`]'s constant term); every element keeps `input` unchanged where
+/// `input > 0` and multiplies by its own per-element slope elsewhere -- `0` itself takes the
+/// scaled branch, matching PyTorch's `x <= 0` test. Both partition masks are built once
+/// (`input.gt(0.0)` and its `logical_not`) and reused, so their probabilities are exactly
+/// complementary by construction rather than by two independent comparisons.
+#[derive(Clone, Copy)]
+pub struct RReLU {
+    lower: f32,
+    upper: f32,
+}
+impl RReLU {
+    pub fn new() -> Self {
+        Self {
+            lower: 1.0 / 8.0,
+            upper: 1.0 / 3.0,
+        }
+    }
+    pub fn lower(mut self, lower: f32) -> Result<Self> {
+        if !lower.is_finite() || lower < 0.0 || lower > self.upper {
+            return Err("RReLU lower must be finite, non-negative, and at most upper".into());
+        }
+        self.lower = lower;
+        Ok(self)
+    }
+    pub fn upper(mut self, upper: f32) -> Result<Self> {
+        if !upper.is_finite() || upper < self.lower {
+            return Err("RReLU upper must be finite and at least lower".into());
+        }
+        self.upper = upper;
+        Ok(self)
+    }
+}
+impl Default for RReLU {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Module for RReLU {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        Ok(input.clone())
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.leaky_relu((self.lower + self.upper) / 2.0)
+    }
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let seed = pass.next_seed();
+        let positive = input.gt(0.0)?;
+        let non_positive = positive.logical_not()?;
+        let range = self.upper - self.lower;
+        let draw =
+            Tensor::uniform_device(input.shape().dims().iter().copied(), seed, input.device())?;
+        let lower_shift = Tensor::from_slice(
+            &vec![self.lower; input.shape().len()],
+            input.shape().dims().iter().copied(),
+            input.device(),
+        )?;
+        let slope = draw.scale(range)?.add(&lower_shift)?;
+        let positive_term = input.mul(&positive)?;
+        let negative_term = input.mul(&slope)?.mul(&non_positive)?;
+        positive_term.add(&negative_term)
+    }
+}
+
+/// Prefix (nested) dropout (Axis issue #90; no PyTorch class -- `docs/direction/next.md`'s
+/// tracked next implementation): truncates a tensor to its first `w` positions along one named
+/// ordered `axis`, with `w` drawn independently per training example, so one trained model
+/// yields a whole width sweep at evaluation time (the consumers' own framing: `learning/bae`'s
+/// ordered sign code and `vision/image-encode`'s ordered latent/site lists, both cited on the
+/// issue). Every axis of the input other than `axis` itself is an "example" axis: each
+/// combination of their coordinates draws its own independent width, exactly like
+/// [`ChannelDropout`]'s non-spatial axes. `forward` (evaluation) is the identity -- the full,
+/// untruncated tensor, matching "evaluation keeps everything." `forward_training` consumes
+/// exactly one `pass.next_seed()` draw, feeding one `Tensor::uniform_device` call over the
+/// example axes alone (so the draw is per example, not per element): `w = draw *
+/// (extent(axis) + 1)`, a real value in `[0, extent + 1)`, compared against a constant `0 ..
+/// extent` position tensor along `axis` (`Tensor::broadcast_to` combines the two disjoint axis
+/// sets -- the per-example width and the per-position index -- onto one shared shape first,
+/// exactly the `torch.cdist`-style outer-combination idiom `broadcast_to`'s own doc comment
+/// describes). Position `i` survives exactly when `i < w`: since `w` is real-valued and `i` is
+/// an integer, this keeps `floor(w) + 1` positions in the generic case (`w` essentially never
+/// lands exactly on an integer), so the kept prefix length is uniform over `{1, ..., extent}`
+/// (`extent` itself when `w` lands in its last unit interval; `0` only at the zero-probability
+/// exact draw `w == 0`) -- the discrete-uniform-width contract `nested.py`'s `sample_k` and
+/// `stage_a.py`'s `arange(width) < m` both draw, restated without a host round trip. No
+/// rescaling is applied: unlike [`Dropout`]'s inverted scaling, this is a hard truncation mask
+/// with expectation `<= 1`, not an expectation-preserving Bernoulli mask, matching `arange(K) <
+/// m` in both cited consumers exactly. The kept gradient passes through unchanged and the
+/// dropped gradient is exactly zero, the same constant-mask construction `Dropout` already uses.
+#[derive(Clone, Copy)]
+pub struct PrefixDropout {
+    axis: Axis,
+}
+impl PrefixDropout {
+    pub fn new(axis: Axis) -> Self {
+        Self { axis }
+    }
+}
+impl Module for PrefixDropout {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        if !input.contains(self.axis) {
+            return Err(format!("PrefixDropout requires axis {:?} in the input", self.axis).into());
+        }
+        Ok(input.clone())
+    }
+    fn build(&mut self, input: &Shape, _: &Device, _: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        Ok(input.clone())
+    }
+    fn forward_training(&self, input: &Tensor, pass: &mut TrainingPass) -> Result<Tensor> {
+        let shape = self.output_shape(input.shape())?;
+        let extent = shape.extent(self.axis)?;
+        let seed = pass.next_seed();
+        let device = input.device();
+        let example_dims = dims_excluding(&shape, &[self.axis]);
+        let width = Tensor::uniform_device(example_dims, seed, device)?
+            .scale((extent + 1) as f32)?
+            .broadcast_to(&shape)?;
+        let position_values: Vec<f32> = (0..extent).map(|i| i as f32).collect();
+        let position = Tensor::from_slice(&position_values, [self.axis.of(extent)], device)?
+            .broadcast_to(&shape)?;
+        let keep = width.sub(&position)?.gt(0.0)?;
+        input.mul(&keep)
     }
 }
 
