@@ -27,6 +27,16 @@ what order rows should flip; that table says which have.
 
 ## Current surface
 
+`Conv2d`/`Conv3d` gained the same `.bias(false)` option `Linear` already
+had, for a conv immediately followed by a normalization layer that already
+carries its own shift; `src/library/src/architectures/` (`resnet.rs`,
+`vgg.rs`) is a new family of plain compositions of existing public
+modules -- `resnet34`/`resnet50`/`vgg16`/`vgg16_bn`, matching torchvision
+0.26 exactly -- exported as `axis::architectures` and, for its constructors
+and axes types, in the prelude; see
+[../design/library.md](../design/library.md)'s "Reference architectures"
+section.
+
 The torch.nn spec in [../nn/catalog.md](../nn/catalog.md) is the itemized
 inventory: every class with its verdict and the PR and tests behind it. On
 2026-09-22 nine families landed at once (piecewise and smooth activations,

@@ -1606,3 +1606,57 @@ already staged its updates; an evaluation test using the committed running
 statistics; the `momentum = None` cumulative case; `InstanceNorm` with
 `track_running_stats = true` against its own hand-derived per-instance
 oracle; and `named_states` paths threading through `Sequential`.
+
+### Reference architectures: ResNet and VGG
+
+`architectures/resnet.rs` and `architectures/vgg.rs` (the new
+`src/library/src/architectures/` family, exported as a public
+`axis::architectures` module and, for its constructors and axes types, in
+the prelude) are plain compositions of the public `Conv2d`, `BatchNorm`,
+`MaxPool2d`, `AdaptiveAvgPool2d`, `Linear`, `ReLU`, `Dropout`, `Flatten` and
+`Sequential` a consumer could write by hand: composition witnesses as well
+as convenience constructors, no new kernels. `resnet34`/`resnet50` match
+torchvision 0.26 exactly: a 7x7 stride-2 stem conv (no bias; the following
+`BatchNorm` already carries the shift), `BatchNorm`, `ReLU`, a 3x3 stride-2
+max pool, four stages of `[3, 4, 6, 3]` blocks (`BasicBlock` for
+`resnet34`, `Bottleneck` -- 1x1 reduce, 3x3, 1x1 expand by a factor of 4 --
+for `resnet50`, torchvision's own v1.5 placing the stride on the
+`Bottleneck`'s 3x3 conv rather than its first 1x1), a projection (1x1 conv
+plus `BatchNorm`) shortcut whenever a stage's first block changes channel
+count or stride, adaptive average pool to 1x1, and a `Linear` to
+`num_classes`. `vgg16`/`vgg16_bn` match configuration D exactly: thirteen
+3x3 stride-1 padding-1 convolutions (bias kept, unlike ResNet's pre-BatchNorm
+convs -- torchvision's own `vgg16_bn` does not drop it either) with a 2x2
+stride-2 max pool after each of five blocks, `vgg16_bn` inserting a
+`BatchNorm` after every conv and before its `ReLU`, an adaptive average pool
+to 7x7, and a 25088-4096-4096-`num_classes` classifier with `ReLU` and
+`Dropout(0.5)` between its `Linear` layers. Every constructor takes only a
+channel axis and two spatial axes (`ResNetAxes`/`VggAxes`): no module here
+ever names a batch axis, so a caller's own batch axis, and any other axis it
+adds, simply passes through untouched, exactly like every other Axis module.
+`resnet34_small_input`/`resnet50_small_input` add one Axis-only stem option
+with no torchvision equivalent, default off: a 3x3 stride-1 conv and no max
+pool, so a 64x64-scale input is not collapsed by the standard stem before the
+first stage even runs.
+
+Weight layout is Axis's own, not torch's: `Conv2d`'s weight is `[patch(in,
+kh, kw), output]` (row-major, channel slowest, kernel width fastest) against
+torch's `[out, in, kh, kw]`, so loading a torch conv weight is a reshape to
+`[out, patch]` followed by a transpose; `Linear`'s weight is `[in, output]`
+against torch's `[out, in]`, a plain transpose; `BatchNorm`'s affine scale
+(named `"scale"`, not torch's `"weight"`) and bias are a single named axis
+each, copied as-is.
+
+Evidence is proportional to what Axis can actually check: parameter count
+against torchvision's own count at the real 1000-class size (`resnet34`
+21,797,672; `resnet50` 25,557,032; `vgg16` 138,357,544; `vgg16_bn`
+138,365,992) is exact for all four. A full torchvision `resnet34` carries 21M
+parameters Axis has no checkpoint format to load, so equivalence to the
+reference is instead checked against tiny hand-rolled PyTorch reference
+modules -- "the paper's reference code" at reduced width, following the
+exact same stem/block/shortcut construction `BasicBlock`/`Bottleneck` and the
+plain VGG composition use -- with real random weights loaded through the
+layout mapping above, matching evaluation-mode logits and the first conv
+weight's loss gradient to float precision. A `Trainer::step_training` step at
+tiny width commits at least one `BatchNorm` running-statistics update for
+`resnet34`, `resnet50` and `vgg16_bn`.
