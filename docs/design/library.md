@@ -69,7 +69,7 @@ overwrite that rate before a step; `cosine_annealing_lr` and `one_cycle_lr`
 are pure functions of the step index that reproduce PyTorch's own
 `CosineAnnealingLR` and default-configuration `OneCycleLR` value sequences
 (`optim.rs` doc comments cite both closed forms) for a consumer's training
-loop to call once per step and feed to the setter — Axis has no stateful
+loop to call once per step and feed to the setter. Axis has no stateful
 scheduler object.
 
 `clip_grad_norm` matches PyTorch's `clip_grad_norm_`: one global L2 norm over
@@ -214,7 +214,7 @@ final pair. Using `1 - u1` rather than `u1` keeps the logarithm defined on
 the shared stream's documented first-sample-exactly-zero seeds, at the cost
 of collapsing that pair's first two normal draws to exactly `mean`. Both
 constructors generate their values host-side, then upload them exactly like
-`Tensor::from_slice` — the simplest honest implementation, and adequate for
+`Tensor::from_slice`. That is the simplest honest implementation, and adequate for
 the small per-epoch draws both consumers need. A random draw has no upstream
 input, so neither constructor produces a gradient edge; it is a constant a
 program can then compose with `mul`/`add` like any other tensor, not a
@@ -488,7 +488,7 @@ provenance contract; reading a file is not itself a research guarantee.
 | `contract(rhs, axes)` | Sum over the specified shared axes. Align remaining shared axes and preserve distinct axes in a deterministic logical order. |
 | `split` / `merge` | Validate extent products and axis uniqueness; preserve the mapping needed to undo the operation during backward. |
 | `select(axis, coordinate)` | Remove one named axis at a checked logical coordinate. Compute offsets from compact rank-sized geometry and scatter its derivative back into the original physical layout. |
-| `gather(axis, index, output)` | Replace one named axis with a new named axis sized by a host-side `&[usize]` index (checked against the axis extent before any device work); every other axis and the physical layout it reads carry through unchanged. Forward and backward reuse the same host-built, CSR-grouped index plan `mean`/`min` already use for reduction and broadcast (`Plan::gather`/`Plan::reverse`), so backward is an exact, deterministic scatter-add — a repeated index accumulates every contribution, an unpicked row gets zero — without `Embedding`'s dense one-hot contraction. Shares that plan's 16,777,216-contribution limit, counted against the gathered output's size, not the table's row count. |
+| `gather(axis, index, output)` | Replace one named axis with a new named axis sized by a host-side `&[usize]` index (checked against the axis extent before any device work); every other axis and the physical layout it reads carry through unchanged. Forward and backward reuse the same host-built, CSR-grouped index plan `mean`/`min` already use for reduction and broadcast (`Plan::gather`/`Plan::reverse`), so backward is an exact, deterministic scatter-add (a repeated index accumulates every contribution, an unpicked row gets zero), without `Embedding`'s dense one-hot contraction. Shares that plan's 16,777,216-contribution limit, counted against the gathered output's size, not the table's row count. |
 | `argmin(axis)` | Host-side `Vec<usize>` of the coordinate `min(axis)` itself picked at each remaining position, in the same first-logical-coordinate-on-ties, finite-only order `min` already documents. Non-differentiable and entirely host-side: it reuses `min`'s own device-computed value as the sole comparison target rather than a second comparator. A group with no finite candidate is an error, since no coordinate names a NaN result. No `argmax`, matching `min`/`max`'s own asymmetry. |
 | `scatter_add(axis, index, bucket, bucket_count)` | Sum values into `bucket_count` buckets named by a host-side `&[usize]` label per position of `axis` (checked against `bucket_count` before any device work); a bucket no position names is an exact zero. The exact transpose of `gather`: same `Plan::gather`/`Plan::reverse` CSR pair, built from the same host index, with forward and backward swapped relative to `gather`'s own use of them. `Tensor::bincount(index, bucket, bucket_count, device)` is its constant-ones case, for `torch.bincount` call sites that have no values tensor to scatter. |
 | `pad_zeros(axis, before, after)` | Preserve logical axis order and add exact zero-valued coordinates independently on each side. Backward crops to the original extent and layout. Zero/zero padding shares storage. |
@@ -1304,7 +1304,7 @@ follows the same per-class-weight convention
 `binary_cross_entropy_with_logits_weighted` already uses for `pos_weight`:
 one value per class, broadcasting like `mul`. Weighting multiplies each
 class's term before the class axis is summed,
-`-sum(class, weight * target * self)` — PyTorch's `weight[c] * log_prob[c]`
+`-sum(class, weight * target * self)`. That is PyTorch's `weight[c] * log_prob[c]`
 at a one-hot target, generalized linearly to a soft one exactly the way
 `nll_loss` itself already generalizes one-hot to soft targets. PyTorch's
 `reduction='mean'` with a `weight` does **not** divide by the row count: it
@@ -1314,7 +1314,7 @@ family, so a caller reproducing PyTorch's mean computes that weight sum
 itself (`targets.mul(weight)?.sum(class)` at a one-hot target) and divides
 by it rather than calling the ordinary axis `mean`. `ignore_index`, given as
 `Some(class_index)`, zeroes a row's contribution in proportion to its target
-mass on that class (`loss_row *= 1 - target[ignore_index]`) — PyTorch's
+mass on that class (`loss_row *= 1 - target[ignore_index]`). That is PyTorch's
 exact all-or-nothing behavior at a one-hot target, and a linear
 generalization at a soft one, the same shape `nll_loss`'s own target
 convention already takes. `nll_loss` itself is unchanged and stays the
@@ -1323,8 +1323,8 @@ convention already takes. `nll_loss` itself is unchanged and stays the
 `Tensor::kl_div_loss_log_target(targets)` is `kl_div_loss` at PyTorch's
 `log_target = true`: `targets` also holds log-probabilities (rather than
 probabilities), and the pointwise loss is `exp(target) * (target - self)`.
-Unlike `log_target = false`, no `xlogy` zero-target substitution is needed —
-`target` never appears inside a logarithm here — so this sibling needs no
+Unlike `log_target = false`, no `xlogy` zero-target substitution is needed:
+`target` never appears inside a logarithm here, so this sibling needs no
 zero-probability special case. `kl_div_loss` itself is unchanged and stays
 the `log_target = false` case.
 
@@ -1336,7 +1336,7 @@ base loss is `self - target * log(self + eps)`, PyTorch's own formula;
 logarithm finite at `self == 0`. At `full = true`, PyTorch's Stirling
 approximation term, `target*log(target) - target + 0.5*log(2*pi*target)`,
 is added where `target > 1` (strictly; PyTorch's own threshold) and `0`
-elsewhere — computed with the same `xlogy`-style safe-substitution
+elsewhere, computed with the same `xlogy`-style safe-substitution
 `kl_div_loss` already uses, so no element's logarithm ever sees a
 non-positive input before the mask zeroes its contribution. The term
 depends only on the (non-differentiable) `target`, so it contributes no
@@ -1363,7 +1363,7 @@ forward floors the *output* of each logarithm at exactly PyTorch's literal
 max((1 - x) * x, eps)` with `eps = 1e-12`, computed directly rather than
 falling out of differentiating the floored `ln`. It matches PyTorch's
 interior gradient formula away from the `eps` floor and, unlike the earlier
-composition, stays finite (not `0`) at a saturated wrong-side prediction —
+composition, stays finite (not `0`) at a saturated wrong-side prediction,
 matching PyTorch's own large-but-finite gradient there instead of Axis's
 previous zero. This is the one row in this wave whose existing output
 changes; every other row above is additive.

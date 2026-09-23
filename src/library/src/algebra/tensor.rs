@@ -806,8 +806,8 @@ impl Tensor {
         ))
     }
     /// Elementwise mean absolute error (PyTorch's unreduced `F.l1_loss`): `(self -
-    /// rhs).abs()`. Same axis-agreement contract as [`Tensor::squared_error`] — identical axis
-    /// sets, equal extents, unreduced shape — leaving the reduction (typically `.mean(axes)`) to
+    /// rhs).abs()`. Same axis-agreement contract as [`Tensor::squared_error`] (identical axis
+    /// sets, equal extents, unreduced shape), leaving the reduction (typically `.mean(axes)`) to
     /// the caller.
     pub fn absolute_error(&self, rhs: &Self) -> Result<Self> {
         if self.shape().rank() != rhs.shape().rank()
@@ -2792,7 +2792,7 @@ impl Tensor {
     /// unchanged. Backward broadcasts the upstream gradient across the reduced axes without
     /// scaling it, since each contributing element has unit local derivative. This runs the
     /// same group-sum kernel `mean` uses, with the constant scale `1.0` in place of `mean`'s
-    /// `1 / extent` — the two are the same primitive, not a division after the fact.
+    /// `1 / extent`; the two are the same primitive, not a division after the fact.
     pub fn sum(&self, axes: impl IntoAxes) -> Result<Self> {
         let axes = self.shape().select_axes(axes)?;
         self.reduce_grouped(2, axes, |_, _| 1.0, "sum")
@@ -5344,7 +5344,7 @@ impl Tensor {
     /// integer scale factor. Composed entirely from `stack` (duplicate the
     /// input `factor` times along a fresh axis) and `merge` (fold that axis
     /// into the named spatial axis, spatial-axis major, so each source
-    /// element becomes `factor` adjacent identical copies) — the composition
+    /// element becomes `factor` adjacent identical copies). This is the composition
     /// wave 1 of the research migration proved bit-exact against a real
     /// `F.interpolate(mode="nearest")` oracle
     /// (`research/src/vision/morpheus/axis/tests/partitioner_trunk_fpn_obj.rs`,

@@ -1,4 +1,4 @@
-# Erf-form GELU witness — 2026-09-20
+# Erf-form GELU witness (2026-09-20)
 
 Issue: https://github.com/furkanhaney/axis/issues/46
 
