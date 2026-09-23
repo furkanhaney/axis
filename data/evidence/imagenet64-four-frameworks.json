@@ -1,0 +1,212 @@
+{
+  "workload": "imagenet64-cnn-v1",
+  "prepared_manifest": {
+    "bytes_per_image": 12288,
+    "classes": 1000,
+    "created": "2026-09-22",
+    "encoding": "64x64 RGB, 8-bit, row-major, HWC (channel-interleaved per pixel)",
+    "files": {
+      "heldout-labels.u16": {
+        "note": "0-indexed class id, little-endian uint16, one per image, same order as heldout.bin",
+        "sha256": "f5350687a5a78da7e645040d352767bc06c1c99d9dfb34f1623b2d1a1d046b76"
+      },
+      "heldout.bin": {
+        "note": "symlink to /srv/exos26/Datasets/training-dynamics/data/benchmarks/imagenet64/heldout.bin, unmodified",
+        "sha256": "119f7dbb549528e25ab512fc9d256147e517b398b5112f20b055365b5b2962f6"
+      },
+      "train-labels.u16": {
+        "note": "0-indexed class id, little-endian uint16, one per image, same order as train.bin",
+        "sha256": "bb71ac880215a5b83c8d8e292c781239a2a49add164a7888b55e32bd78fbd730"
+      },
+      "train.bin": {
+        "note": "symlink to /srv/exos26/Datasets/training-dynamics/data/benchmarks/imagenet64/train.bin, unmodified",
+        "sha256": "37f176c6f1d5b13376e6e1b53201b64f94633b52c122ec45b2dba22a299d4114"
+      }
+    },
+    "generated_files": {
+      "conv1-bias.f32": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+      "conv1-weight.f32": "72700f55c54312d512bdcd599fd209d4962a1fb93f617eb12095f66ea6e14a2e",
+      "conv2-bias.f32": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
+      "conv2-weight.f32": "148610a9bc7d0ffe6f4606b1c503246dd646fc320042b41d4e21d6c75d9a5b21",
+      "conv3-bias.f32": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1",
+      "conv3-weight.f32": "ecdf728c0bbe8a8050fdef5b7d4663e74ea1568669a4b28da5068e0a443b941e",
+      "head-bias.f32": "fc19b1997119425765295aeab72d76faa6927d4f83985d328c26f20468d6cc76",
+      "head-weight.f32": "e65bb3476881c460b1f885c6c811e2791123605b179dda8bd6b83ceb0d78abee",
+      "heldout-identities.u64": "61692c7823cd540d24290cbd424b1cd8151203695bf74409ea68b66966f2b44c",
+      "schedule.u32": "5483320baa8c76f69513e0683c71fae76863ac86b73a99b64f9d329c6eb63ce2",
+      "train-identities.u64": "e359913209925532ed848bcfb9352d07a5e74a1d059aea170ed42306da7835d2"
+    },
+    "image_channels": 3,
+    "image_side": 64,
+    "samples": 1281167,
+    "seed": 0,
+    "sizes": {
+      "heldout_images": 50000,
+      "train_images": 1281167
+    },
+    "source": {
+      "dataset": "benjamin-paine/imagenet-1k-64x64",
+      "revision": "f12246fedf1127d5b34bea760b61ef00e0f3d603",
+      "splits_used": {
+        "heldout": [
+          "data/validation-00000-of-00001.parquet"
+        ],
+        "train": [
+          "data/train-00000-of-00005.parquet",
+          "data/train-00001-of-00005.parquet",
+          "data/train-00002-of-00005.parquet",
+          "data/train-00003-of-00005.parquet",
+          "data/train-00004-of-00005.parquet"
+        ]
+      }
+    },
+    "verification": "labels were pulled from the HF parquet shards at the pinned revision (no image-file modification); image order was verified against train.bin/heldout.bin by decoding the parquet JPEG bytes at 20+ sampled row indices per split (including shard boundaries and endpoints) and comparing the decoded HWC uint8 array byte-for-byte against the corresponding train.bin/heldout.bin record; all sampled rows matched exactly, and image/row counts match exactly (1281167 train, 50000 heldout, 1000 classes covered in both splits)",
+    "workload": "imagenet64-cnn-v1"
+  },
+  "batch_size": 256,
+  "timing_definition": {
+    "train_seconds_total": "wall clock from before the first training step to after the last, device synchronized at both ends; includes framework warmup (JIT trace/compile, CUDA context and kernel planning, first-call allocator costs).",
+    "train_seconds_steady": "same measurement excluding the first training step; the device is synchronized immediately after the first step completes and that timestamp is the steady start.",
+    "repeats": 1,
+    "note": "one run per arm at full budget (not medianed): a repeat run at real ImageNet64 scale costs hours, unlike the Fashion-MNIST smoke workload's three-repeat median."
+  },
+  "environment": {
+    "host": "atlas-ci",
+    "python": "3.14.4",
+    "lightning": "2.6.6",
+    "torch": "2.11.0+cu128",
+    "cuda": "12.8",
+    "jax": "0.11.2",
+    "jaxlib": "0.11.2",
+    "optax": "0.2.8",
+    "jax_backend": "gpu",
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_memory_total": "16303 MiB",
+    "nvidia_driver": "595.84",
+    "axis": "0.11.0",
+    "gpu_lock_held": "/home/furkan/melody-expansion-200/heavy-gpu-0.lock",
+    "gpu_free_mib_before_run": 15839
+  },
+  "implementations": {
+    "lightning": {
+      "framework": "lightning",
+      "samples": 1281167,
+      "initial_top1": 0.0009599999757483602,
+      "initial_top5": 0.00547999981790781,
+      "final_top1": 0.055160000920295715,
+      "final_top5": 0.1504400074481964,
+      "train_seconds_total": 183.30873455002438,
+      "train_seconds_steady": 49.04941501701251,
+      "peak_gpu_memory_mib": 504
+    },
+    "pytorch": {
+      "framework": "pytorch",
+      "samples": 1281167,
+      "initial_top1": 0.00096,
+      "initial_top5": 0.00548,
+      "final_top1": 0.05536,
+      "final_top5": 0.15112,
+      "train_seconds_total": 186.17144204099895,
+      "train_seconds_steady": 42.32636618899414,
+      "peak_gpu_memory_mib": 508
+    },
+    "jax": {
+      "framework": "jax",
+      "backend": "gpu",
+      "samples": 1281167,
+      "initial_top1": 0.00096,
+      "initial_top5": 0.00548,
+      "final_top1": 0.05482,
+      "final_top5": 0.14986,
+      "train_seconds_total": 45.20146918698447,
+      "train_seconds_steady": 40.59568496898282,
+      "peak_gpu_memory_mib": 1304
+    },
+    "axis": {
+      "framework": "axis",
+      "samples": 1281167,
+      "initial_top1": 0.00096,
+      "initial_top5": 0.00548,
+      "final_top1": 0.05404,
+      "final_top5": 0.14852,
+      "train_seconds_total": 1647.198085392,
+      "train_seconds_steady": 1638.166893317,
+      "peak_gpu_memory_mib": 1078
+    }
+  },
+  "code_surface": {
+    "lightning": {
+      "task": {
+        "nonblank_noncomment_lines": 116,
+        "lexical_tokens": 1216
+      },
+      "total": {
+        "nonblank_noncomment_lines": 206,
+        "lexical_tokens": 2285
+      }
+    },
+    "pytorch": {
+      "task": {
+        "nonblank_noncomment_lines": 101,
+        "lexical_tokens": 1122
+      },
+      "total": {
+        "nonblank_noncomment_lines": 105,
+        "lexical_tokens": 1170
+      }
+    },
+    "jax": {
+      "task": {
+        "nonblank_noncomment_lines": 111,
+        "lexical_tokens": 1287
+      },
+      "total": {
+        "nonblank_noncomment_lines": 155,
+        "lexical_tokens": 1960
+      }
+    },
+    "axis": {
+      "task": {
+        "nonblank_noncomment_lines": 173,
+        "lexical_tokens": 1800
+      },
+      "total": {
+        "nonblank_noncomment_lines": 462,
+        "lexical_tokens": 4436
+      }
+    }
+  },
+  "checks": {
+    "identity_overlap": {
+      "lightning": "not_checked",
+      "pytorch": "not_checked",
+      "jax": "not_checked",
+      "axis": "rejects"
+    },
+    "data_reuse": {
+      "lightning": "not_checked",
+      "pytorch": "not_checked",
+      "jax": "not_checked",
+      "axis": "rejects"
+    }
+  },
+  "comparisons": {
+    "top1_delta_axis_vs_lightning": 0.0011200009202957176,
+    "train_seconds_total_ratio_vs_lightning": {
+      "lightning": 1.0,
+      "pytorch": 1.0156168635280898,
+      "jax": 0.2465865540883385,
+      "axis": 8.985922517197263
+    }
+  },
+  "targets": {
+    "axis_rejects_identity_overlap": true,
+    "axis_rejects_data_reuse": true,
+    "lightning_default_accepts_identity_overlap": true,
+    "pytorch_default_accepts_identity_overlap": true,
+    "jax_default_accepts_identity_overlap": true,
+    "lightning_default_accepts_data_reuse": true,
+    "pytorch_default_accepts_data_reuse": true,
+    "jax_default_accepts_data_reuse": true
+  }
+}

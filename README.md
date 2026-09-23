@@ -28,27 +28,45 @@ hands back a receipt that says exactly what was verified. Named tensor axes do
 the same for the math, so a `batch` axis can never quietly become a `class`
 axis.
 
-**The same experiment in four frameworks.** One matched Fashion-MNIST MLP:
-byte-identical data, sample order and initial weights, Adam, float32, five
-passes, on one RTX 5060. Each framework runs its default training path.
+**The same experiment in every framework.** Each table is one matched run:
+byte-identical data, sample order and initial weights, the same optimizer and
+float32 throughout, each framework on its default training path. The losing
+numbers stay in.
+
+ImageNet64, a three-block CNN, one full epoch (1,281,167 images), top-1 and
+top-5 on all 50,000 held-out images, on one RTX 5070 Ti:
+
+| | Top-1 | Top-5 | Images/s, steady | Training time | Lines of code | Catches train/eval overlap | Catches data reuse |
+|---|---:|---:|---:|---:|---:|:---:|:---:|
+| **Axis 0.11** | 0.0540 | 0.1485 | 782 | 1,647 s | 173 | **rejects the run** | **rejects the run** |
+| PyTorch 2.11 | 0.0554 | 0.1511 | 30,269 | 186 s | 101 | not checked | not checked |
+| Lightning 2.6 | 0.0552 | 0.1504 | 26,120 | 183 s | 116 | not checked | not checked |
+| JAX 0.11 | 0.0548 | 0.1499 | 31,559 | 45 s | 111 | not checked | not checked |
+
+Fashion-MNIST, a small MLP, five passes, median of three runs, on one RTX 5060
+(another session shared that GPU during timing, and the receipt says so):
 
 | | Accuracy | Training time, total | Training time, steady | Lines of code | Catches train/eval overlap | Catches data reuse |
 |---|---:|---:|---:|---:|:---:|:---:|
-| **Axis 0.11** | 0.5918 | 6.58 s | 0.030 s | 155 | **rejects the run** | **rejects the run** |
-| PyTorch 2.11 | 0.5918 | 0.16 s | 0.013 s | 73 | not checked | not checked |
-| Lightning 2.6 | 0.5918 | 0.18 s | 0.066 s | 77 | not checked | not checked |
-| JAX 0.11 | 0.5918 | 2.75 s | 0.038 s | 82 | not checked | not checked |
+| **Axis 0.11** | 0.5918 | 7.41 s | 0.035 s | 155 | **rejects the run** | **rejects the run** |
+| PyTorch 2.11 | 0.5918 | 0.17 s | 0.016 s | 73 | not checked | not checked |
+| Lightning 2.6 | 0.5918 | 0.20 s | 0.071 s | 77 | not checked | not checked |
+| JAX 0.11 | 0.5918 | 2.94 s | 0.042 s | 82 | not checked | not checked |
+| Burn (CUDA) | 0.5938 | 2.86 s | 0.082 s | 118 | not checked | not checked |
+| Candle (CUDA) | 0.5918 | 0.03 s | 0.018 s | 114 | not checked | not checked |
 
-All four reach the same accuracy bit for bit (0.591796875). Axis is the
-slowest end to end: nearly all of its time is the first step, where kernels are
-planned; per step after that it is faster than Lightning and JAX and slower
-than plain PyTorch. It takes about twice the code, and that count includes the
-checks. It is the only one that stops when an evaluation sample leaks
-into training or a sample repeats within a declared pass. Median of three runs,
-steady time excludes the first step, one bounded run on one host and not a
-framework-wide claim; the receipt is
-[data/evidence/fashion-mnist-four-arms.md](data/evidence/fashion-mnist-four-arms.md)
-(from `axis-benchmarks` 42f9aba).
+Every framework learns the same thing: the arms start with identical accuracy
+and end within 0.0014 top-1 (ImageNet64) and 0.002 (Fashion-MNIST) of each
+other. Axis is the slowest end to end in both runs, and
+at convolutional scale it is about 39 times slower than PyTorch; on the small
+MLP its steady step is faster than Lightning, JAX and Burn, and slower than
+PyTorch and Candle. Axis also takes the most code, and that count includes the
+checks. It is the only framework that stops when an evaluation sample leaks
+into training or a sample repeats within a declared pass. These are bounded
+runs on single hosts, not framework-wide claims. Receipts:
+[ImageNet64](data/evidence/imagenet64-four-frameworks.md) and
+[Fashion-MNIST](data/evidence/fashion-mnist-six-frameworks.md), from
+`axis-benchmarks` 480e7ee.
 
 > **Project status:** Axis is active experimental research software. It is
 > CUDA-only, and its API can change as new consumer programs expose better

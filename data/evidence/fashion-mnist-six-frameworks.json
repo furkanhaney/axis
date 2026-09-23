@@ -1,0 +1,338 @@
+{
+  "workload": "fashion-mnist-mlp-smoke-v1",
+  "prepared_manifest": {
+    "workload": "fashion-mnist-mlp-smoke-v1",
+    "training_samples": 2048,
+    "evaluation_samples": 512,
+    "features": 49,
+    "hidden": 32,
+    "classes": 10,
+    "epochs": 5,
+    "mean": 0.2840563159135662,
+    "sample_standard_deviation": 0.3042668479449486,
+    "files": {
+      "evaluation-identities.u64": "30c0988c1c04dcb41a6f4196e9bd14b49d8b2565f6268c6175c4433186463efe",
+      "evaluation-inputs.f32": "d38868d4424c2f411ebd596e1198c225d6e4a64f7346984cb421507fc9115053",
+      "evaluation-labels.u8": "7a6ef895d71e2764b141660953d8206df43bb1dacd5570111f1b79b573351acf",
+      "linear1-bias.f32": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
+      "linear1-weight.f32": "d5cc53708541fa468520ee81de7e42029da02ab20593904d3203dd5c5faf35f9",
+      "linear2-bias.f32": "2c34ce1df23b838c5abf2a7f6437cca3d3067ed509ff25f11df6b11b582b51eb",
+      "linear2-weight.f32": "6af75fa9b4b029ff93f6729cc0b652d3009cf817f060f2c0c845825ec90f7f65",
+      "schedule.u32": "13bf733d363d76e3e6731540700ac0c1dd357f7f8f8fcdded0b849331435a634",
+      "train-identities.u64": "5ccf19f4f2c0424bb9636387a42e899d136172cb5e410c08d271cedf5925f25d",
+      "train-inputs.f32": "46902592420edcc4a52987518348e7dabc6ff488aca7c00e329106dc849842ab",
+      "train-labels.u8": "967d798490fb06c58635cfb97da4478e198a8c4a0e7b6a531c06c5c5f5f9ac2d"
+    }
+  },
+  "timing_definition": {
+    "train_seconds_total": "wall-clock from before the first training step to after the last, device synchronized at both ends; includes framework warmup (JIT trace/compile, CUDA context and kernel planning, first-call allocator costs).",
+    "train_seconds_steady": "same measurement excluding the first training step; the device is synchronized immediately after the first step completes and that timestamp is the steady start.",
+    "repeats": 3,
+    "reported": "median across repeats; all repeat values are kept in train_seconds_total_runs / train_seconds_steady_runs"
+  },
+  "environment": {
+    "host": "furkan-linux",
+    "python": "3.13.14",
+    "lightning": "2.6.1",
+    "torch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "jax": "0.11.2",
+    "jaxlib": "0.11.2",
+    "optax": "0.2.8",
+    "jax_backend": "gpu",
+    "gpu": "NVIDIA GeForce RTX 5060",
+    "nvidia_driver": "595.84",
+    "axis": "0.11.0",
+    "burn": "0.21.0",
+    "burn_backend": "cuda (burn-cuda/cubecl)",
+    "candle": "0.11.0",
+    "candle_backend": "cuda (cudarc)",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)"
+  },
+  "implementations": {
+    "lightning": {
+      "framework": "lightning",
+      "initial_accuracy": 0.109375,
+      "final_accuracy": 0.591796875,
+      "train_seconds_total_runs": [
+        0.19820786899072118,
+        0.18723546199908014,
+        0.19964033699943684
+      ],
+      "train_seconds_steady_runs": [
+        0.0777308719989378,
+        0.06741237800451927,
+        0.07131092199415434
+      ],
+      "train_seconds_total": 0.19820786899072118,
+      "train_seconds_steady": 0.07131092199415434,
+      "gpu_compute_apps_before_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB"
+      ],
+      "gpu_compute_apps_after_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB"
+      ],
+      "foreign_gpu_activity_observed": true
+    },
+    "pytorch": {
+      "framework": "pytorch",
+      "initial_accuracy": 0.109375,
+      "final_accuracy": 0.591796875,
+      "train_seconds_total_runs": [
+        0.16419193299952894,
+        0.16704701700655278,
+        0.16733187501085922
+      ],
+      "train_seconds_steady_runs": [
+        0.012520324002252892,
+        0.016101661007269286,
+        0.017521708010463044
+      ],
+      "train_seconds_total": 0.16704701700655278,
+      "train_seconds_steady": 0.016101661007269286,
+      "gpu_compute_apps_before_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB"
+      ],
+      "gpu_compute_apps_after_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB"
+      ],
+      "foreign_gpu_activity_observed": true
+    },
+    "jax": {
+      "framework": "jax",
+      "initial_accuracy": 0.109375,
+      "final_accuracy": 0.591796875,
+      "train_seconds_total_runs": [
+        3.0257300219964236,
+        2.9348498809995363,
+        2.876883505989099
+      ],
+      "train_seconds_steady_runs": [
+        0.04469401799724437,
+        0.03841080599522684,
+        0.04244405799545348
+      ],
+      "train_seconds_total": 2.9348498809995363,
+      "train_seconds_steady": 0.04244405799545348,
+      "gpu_compute_apps_before_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB"
+      ],
+      "gpu_compute_apps_after_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB"
+      ],
+      "foreign_gpu_activity_observed": true
+    },
+    "axis": {
+      "framework": "axis",
+      "initial_accuracy": 0.109375,
+      "final_accuracy": 0.5917969,
+      "train_seconds_total_runs": [
+        7.173438844,
+        7.857669306,
+        7.407402003
+      ],
+      "train_seconds_steady_runs": [
+        0.034634381,
+        0.037450864,
+        0.033762939
+      ],
+      "train_seconds_total": 7.407402003,
+      "train_seconds_steady": 0.034634381,
+      "gpu_compute_apps_before_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB"
+      ],
+      "gpu_compute_apps_after_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 164 MiB"
+      ],
+      "foreign_gpu_activity_observed": true
+    },
+    "burn": {
+      "framework": "burn",
+      "initial_accuracy": 0.109375,
+      "final_accuracy": 0.59375,
+      "train_seconds_total_runs": [
+        3.14821455,
+        2.41189146,
+        2.8549573280000002
+      ],
+      "train_seconds_steady_runs": [
+        0.0822382,
+        0.079395687,
+        0.086052615
+      ],
+      "train_seconds_total": 2.8549573280000002,
+      "train_seconds_steady": 0.0822382,
+      "gpu_compute_apps_before_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 164 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 196 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 230 MiB"
+      ],
+      "gpu_compute_apps_after_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 196 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 230 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 262 MiB"
+      ],
+      "foreign_gpu_activity_observed": true
+    },
+    "candle": {
+      "framework": "candle",
+      "initial_accuracy": 0.109375,
+      "final_accuracy": 0.5917969,
+      "train_seconds_total_runs": [
+        0.029814525,
+        0.025407916,
+        0.030206291
+      ],
+      "train_seconds_steady_runs": [
+        0.017510638,
+        0.014892023,
+        0.018197201
+      ],
+      "train_seconds_total": 0.029814525,
+      "train_seconds_steady": 0.017510638,
+      "gpu_compute_apps_before_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 262 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 262 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 294 MiB"
+      ],
+      "gpu_compute_apps_after_runs": [
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 262 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 294 MiB",
+        "8427, /home/furkan/venv-sam/bin/python, 146 MiB\n10074, /usr/libexec/xdg-desktop-portal-gnome, 38 MiB\n2429724, /mnt/fast980/projects/src/rasat/build/axis-migration-target/release/beat-this-axis, 294 MiB"
+      ],
+      "foreign_gpu_activity_observed": true
+    }
+  },
+  "code_surface": {
+    "lightning": {
+      "task": {
+        "nonblank_noncomment_lines": 77,
+        "lexical_tokens": 695
+      },
+      "total": {
+        "nonblank_noncomment_lines": 120,
+        "lexical_tokens": 1278
+      }
+    },
+    "pytorch": {
+      "task": {
+        "nonblank_noncomment_lines": 73,
+        "lexical_tokens": 704
+      },
+      "total": {
+        "nonblank_noncomment_lines": 90,
+        "lexical_tokens": 1044
+      }
+    },
+    "jax": {
+      "task": {
+        "nonblank_noncomment_lines": 82,
+        "lexical_tokens": 750
+      },
+      "total": {
+        "nonblank_noncomment_lines": 105,
+        "lexical_tokens": 1149
+      }
+    },
+    "axis": {
+      "task": {
+        "nonblank_noncomment_lines": 155,
+        "lexical_tokens": 1510
+      },
+      "total": {
+        "nonblank_noncomment_lines": 229,
+        "lexical_tokens": 2287
+      }
+    },
+    "burn": {
+      "task": {
+        "nonblank_noncomment_lines": 118,
+        "lexical_tokens": 1423
+      },
+      "total": {
+        "nonblank_noncomment_lines": 193,
+        "lexical_tokens": 2229
+      }
+    },
+    "candle": {
+      "task": {
+        "nonblank_noncomment_lines": 114,
+        "lexical_tokens": 1246
+      },
+      "total": {
+        "nonblank_noncomment_lines": 189,
+        "lexical_tokens": 2052
+      }
+    }
+  },
+  "checks": {
+    "identity_overlap": {
+      "lightning": "not_checked",
+      "pytorch": "not_checked",
+      "jax": "not_checked",
+      "axis": "rejects",
+      "burn": "not_checked",
+      "candle": "not_checked"
+    },
+    "data_reuse": {
+      "lightning": "not_checked",
+      "pytorch": "not_checked",
+      "jax": "not_checked",
+      "axis": "rejects",
+      "burn": "not_checked",
+      "candle": "not_checked"
+    }
+  },
+  "comparisons": {
+    "absolute_final_accuracy_delta_vs_lightning": {
+      "lightning": 0.0,
+      "pytorch": 0.0,
+      "jax": 0.0,
+      "axis": 2.4999999959085528e-08,
+      "burn": 0.001953125,
+      "candle": 2.4999999959085528e-08
+    },
+    "train_seconds_total_ratio_vs_lightning": {
+      "lightning": 1.0,
+      "pytorch": 0.8427870086952645,
+      "jax": 14.806929189763537,
+      "axis": 37.371886599248825,
+      "burn": 14.403854612521217,
+      "candle": 0.15042049113295156
+    },
+    "axis_task_lines_over_lightning": 2.012987012987013
+  },
+  "targets": {
+    "accuracy_within_0.02": true,
+    "axis_runtime_at_most_lightning": false,
+    "axis_task_lines_at_most_lightning": false,
+    "axis_rejects_identity_overlap": true,
+    "axis_rejects_data_reuse": true,
+    "lightning_default_accepts_identity_overlap": true,
+    "pytorch_default_accepts_identity_overlap": true,
+    "jax_default_accepts_identity_overlap": true,
+    "lightning_default_accepts_data_reuse": true,
+    "pytorch_default_accepts_data_reuse": true,
+    "jax_default_accepts_data_reuse": true,
+    "burn_default_accepts_identity_overlap": true,
+    "candle_default_accepts_identity_overlap": true,
+    "burn_default_accepts_data_reuse": true,
+    "candle_default_accepts_data_reuse": true
+  }
+}
