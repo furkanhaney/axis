@@ -11,6 +11,7 @@ struct Convolution<const N: usize> {
     stride: [usize; N],
     padding: [usize; N],
     groups: usize,
+    bias: bool,
     group: Axis,
     patch: Axis,
     output_in_group: Axis,
@@ -24,7 +25,7 @@ struct BoundConvolution {
     patch: usize,
     output_in_group: usize,
     weight: Parameter,
-    bias: Parameter,
+    bias: Option<Parameter>,
 }
 
 struct Geometry {
@@ -44,6 +45,7 @@ impl<const N: usize> Convolution<N> {
             stride: [1; N],
             padding: [0; N],
             groups: 1,
+            bias: true,
             group: input.role("conv_group"),
             patch: input.role("conv_patch_in_group"),
             output_in_group: output.axis.role("conv_output_in_group"),
@@ -184,11 +186,16 @@ impl<const N: usize> Convolution<N> {
             weight_shape.dims().iter().copied(),
             device,
         )?);
-        let bias = Parameter::new(Tensor::from_slice(
-            &vec![0.0; self.output.extent],
-            [self.output_role.of(self.output.extent)],
-            device,
-        )?);
+        let bias = self.bias.then(|| {
+            Parameter::new(
+                Tensor::from_slice(
+                    &vec![0.0; self.output.extent],
+                    [self.output_role.of(self.output.extent)],
+                    device,
+                )
+                .expect("zero-filled bias tensor"),
+            )
+        });
         self.bound = Some(BoundConvolution {
             input_channels: geometry.channels,
             groups: self.groups,
@@ -206,7 +213,7 @@ impl<const N: usize> Convolution<N> {
             .bound
             .as_ref()
             .ok_or_else(|| format!("{} must be built before forward", Self::name()))?;
-        input
+        let contracted = input
             .unfold_grouped(
                 self.input,
                 self.spatial,
@@ -218,19 +225,23 @@ impl<const N: usize> Convolution<N> {
                 0.0,
             )?
             .contract(&bound.weight.tensor(), self.patch)?
-            .merge([self.group, self.output_in_group], self.output_role)?
-            .add(&bound.bias.tensor())?
-            .rename(self.output_role, self.output.axis)
+            .merge([self.group, self.output_in_group], self.output_role)?;
+        let biased = match &bound.bias {
+            Some(bias) => contracted.add(&bias.tensor())?,
+            None => contracted,
+        };
+        biased.rename(self.output_role, self.output.axis)
     }
 
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
         self.bound
             .as_ref()
             .map(|bound| {
-                vec![
-                    ("weight".into(), bound.weight.clone()),
-                    ("bias".into(), bound.bias.clone()),
-                ]
+                let mut parameters = vec![("weight".into(), bound.weight.clone())];
+                if let Some(bias) = &bound.bias {
+                    parameters.push(("bias".into(), bias.clone()));
+                }
+                parameters
             })
             .unwrap_or_default()
     }
@@ -266,6 +277,15 @@ impl Conv2d {
     /// Partition input and output channels into independent convolution groups.
     pub fn groups(mut self, groups: usize) -> Self {
         self.0.groups = groups;
+        self
+    }
+
+    /// Disable the learned bias term. Has no effect once `build` has already
+    /// allocated parameters; call it before `build`. Matches PyTorch's
+    /// `bias=False`, the usual choice for a conv immediately followed by a
+    /// normalization layer that already carries its own shift.
+    pub fn bias(mut self, bias: bool) -> Self {
+        self.0.bias = bias;
         self
     }
 }
@@ -614,11 +634,11 @@ impl<const N: usize> TransposedConvolution<N> {
             weight_shape.dims().iter().copied(),
             device,
         )?);
-        let bias = Parameter::new(Tensor::from_slice(
+        let bias = Some(Parameter::new(Tensor::from_slice(
             &vec![0.0; self.output.extent],
             [self.output_role.of(self.output.extent)],
             device,
-        )?);
+        )?));
         self.bound = Some(BoundConvolution {
             input_channels: geometry.input_channels,
             groups: self.groups,
@@ -636,6 +656,10 @@ impl<const N: usize> TransposedConvolution<N> {
             .bound
             .as_ref()
             .ok_or_else(|| format!("{} must be built before forward", Self::name()))?;
+        let bias = bound
+            .bias
+            .as_ref()
+            .expect("ConvTranspose always allocates a bias");
         let split = input.split(
             self.input,
             [
@@ -677,7 +701,7 @@ impl<const N: usize> TransposedConvolution<N> {
             }
         }
         result
-            .add(&bound.bias.tensor())?
+            .add(&bias.tensor())?
             .rename(self.output_role, self.output.axis)
     }
 
@@ -687,7 +711,13 @@ impl<const N: usize> TransposedConvolution<N> {
             .map(|bound| {
                 vec![
                     ("weight".into(), bound.weight.clone()),
-                    ("bias".into(), bound.bias.clone()),
+                    (
+                        "bias".into(),
+                        bound
+                            .bias
+                            .clone()
+                            .expect("ConvTranspose always allocates a bias"),
+                    ),
                 ]
             })
             .unwrap_or_default()
