@@ -21,6 +21,34 @@ fn profile(label: &str, started: Instant) {
     }
 }
 
+/// Contributions per chunk in [`Device::grouped`]'s stage-one launch. A group's contribution
+/// range never crosses into the next group's, so a group of `n` contributions always becomes
+/// `n.div_ceil(GROUPED_CHUNK)` chunks -- exactly one for a group at or under this size.
+const GROUPED_CHUNK: i32 = 512;
+
+/// Splits each CSR group's `[offsets[g], offsets[g + 1])` contribution range into chunks of
+/// at most `GROUPED_CHUNK` so [`Device::grouped`] can launch one block per chunk instead of
+/// one block per group. Returns `(chunk_offsets, chunk_group)`: `chunk_offsets` are absolute
+/// boundaries into the same `left`/`right` arrays `offsets` already indexes, one level finer
+/// (`chunk_offsets[c]..chunk_offsets[c + 1]` is chunk `c`'s own range); `chunk_group` is the
+/// matching per-group index into that chunk list (`chunk_group[g]..chunk_group[g + 1]` are
+/// group `g`'s chunk indices, empty for an empty group). Both are `O(offsets.len() +
+/// total contributions / GROUPED_CHUNK)` to build, not `O(total contributions)`.
+fn chunked_offsets(offsets: &[i32]) -> (Vec<i32>, Vec<i32>) {
+    let mut chunk_offsets = vec![offsets[0]];
+    let mut chunk_group = vec![0i32];
+    for window in offsets.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        let mut cursor = start;
+        while cursor < end {
+            cursor = (cursor + GROUPED_CHUNK).min(end);
+            chunk_offsets.push(cursor);
+        }
+        chunk_group.push(chunk_offsets.len() as i32 - 1);
+    }
+    (chunk_offsets, chunk_group)
+}
+
 /// Enables cuTile's persistent on-disk cubin cache the first time any CUDA
 /// `Device` is created in this process. cuTile JIT-compiles every kernel
 /// through its `tileiras` subprocess on first use with a new shape (roughly
@@ -867,7 +895,19 @@ impl Device {
         .enqueue_on(&self.0.stream)?;
         Ok((self.track(updated), next_first, next_second))
     }
-    /// One group per output; each contribution gathers one or two input elements.
+    /// Each output sums its group's contributions in two stages so a group with many
+    /// contributions still spreads across many CUDA blocks instead of one: stage one
+    /// (`grouped_partial`) launches one block per fixed-size chunk of the plan's flat
+    /// `left`/`right` arrays (`chunked_offsets`, split at group boundaries so a chunk never
+    /// mixes two groups) and writes each chunk's own sequential sum; stage two
+    /// (`grouped_combine`) launches one block per group and sums that group's chunk
+    /// partials, in chunk order, into the final scaled output. Chunk boundaries are fixed
+    /// by the plan alone, and both stages accumulate in a fixed left-to-right order, so the
+    /// result is deterministic and reproducible -- it is a reassociation of the same terms
+    /// the single-block version summed, not a race. A group with at most `GROUPED_CHUNK`
+    /// contributions gets exactly the one chunk it always got, so small plans (most tests,
+    /// most groups outside a broadcast gradient) pay for an unchanged single-block sum plus
+    /// one pass-through combine.
     pub(crate) fn grouped(
         &self,
         a: &Buffer,
@@ -877,18 +917,31 @@ impl Device {
     ) -> Result<Buffer> {
         let started = Instant::now();
         let device_plan = self.device_plan(plan, b.is_some())?;
-        let mut out = self.zeros(plan.offsets.len() - 1)?;
-        kernels::grouped(
-            (&mut out).partition([1]),
+        let group_count = plan.offsets.len() - 1;
+        let (chunk_offsets, chunk_group) = chunked_offsets(&plan.offsets);
+        let chunk_count = chunk_offsets.len() - 1;
+        let chunk_offsets = self.upload_i32(&chunk_offsets)?;
+        let chunk_group = self.upload_i32(&chunk_group)?;
+        let mut partial = self.zeros(chunk_count)?;
+        kernels::grouped_partial(
+            (&mut partial).partition([1]),
             a.as_ref(),
             b.unwrap_or(a).as_ref(),
-            device_plan.offsets.as_ref(),
+            chunk_offsets.as_ref(),
             device_plan.left.as_ref(),
             device_plan.right.as_ref(),
-            scale,
         )
         .generics(vec![i32::from(b.is_some()).to_string()])
         .enqueue_on(&self.0.stream)?;
+        let mut out = self.zeros(group_count)?;
+        kernels::grouped_combine(
+            (&mut out).partition([1]),
+            &partial,
+            chunk_group.as_ref(),
+            scale,
+        )
+        .enqueue_on(&self.0.stream)?;
+        self.track(partial);
         profile("grouped_submit", started);
         Ok(self.track(out))
     }
@@ -2724,18 +2777,22 @@ mod kernels {
         let mask = select(ge_tile(x, lo), within_high, zero);
         out.store(gradient.load_like(out) * mask);
     }
+    /// Stage one of [`crate::backend::Device::grouped`]'s two-stage reduction: one block per
+    /// chunk of a group's contributions (never per group), summing that chunk alone in the
+    /// same sequential order the single-stage kernel this replaces summed a whole group.
+    /// `chunk_offsets` is `offsets` one level finer -- a chunk boundary is always also a
+    /// group boundary, never crossing into another group's contributions.
     #[cutile::entry()]
-    fn grouped<const PRODUCT: i32>(
+    fn grouped_partial<const PRODUCT: i32>(
         out: &mut Tensor<f32, { [1] }>,
         a: &Tensor<f32, { [-1] }>,
         b: &Tensor<f32, { [-1] }>,
-        offsets: &Tensor<i32, { [-1] }>,
+        chunk_offsets: &Tensor<i32, { [-1] }>,
         left: &Tensor<i32, { [-1] }>,
         right: &Tensor<i32, { [-1] }>,
-        scale: f32,
     ) {
         let pid = get_tile_block_id().0;
-        let op = offsets.partition(shape![1]);
+        let op = chunk_offsets.partition(shape![1]);
         let start: i32 = tile_to_scalar(op.load([pid]).reshape(shape![]));
         let end: i32 = tile_to_scalar(op.load([pid + 1i32]).reshape(shape![]));
         let lp = left.partition(shape![1]);
@@ -2752,6 +2809,30 @@ mod kernels {
             } else {
                 sum = sum + value;
             }
+        }
+        out.store(sum);
+    }
+
+    /// Stage two of [`crate::backend::Device::grouped`]'s two-stage reduction: one block per
+    /// group, summing that group's own chunk partials from stage one in a fixed,
+    /// increasing-chunk-index order (deterministic and reproducible, though a reassociation
+    /// of the terms a single stage-one chunk summed on its own), then applying `scale`
+    /// exactly once at the end, matching the single-stage kernel this replaces.
+    #[cutile::entry()]
+    fn grouped_combine(
+        out: &mut Tensor<f32, { [1] }>,
+        partial: &Tensor<f32, { [-1] }>,
+        chunk_group: &Tensor<i32, { [-1] }>,
+        scale: f32,
+    ) {
+        let pid = get_tile_block_id().0;
+        let gp = chunk_group.partition(shape![1]);
+        let start: i32 = tile_to_scalar(gp.load([pid]).reshape(shape![]));
+        let end: i32 = tile_to_scalar(gp.load([pid + 1i32]).reshape(shape![]));
+        let pp = partial.partition(shape![1]);
+        let mut sum = constant(0.0f32, shape![1]);
+        for i in start..end {
+            sum = sum + pp.load([i]);
         }
         out.store(sum * broadcast_scalar(scale, shape![1]));
     }

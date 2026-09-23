@@ -215,3 +215,85 @@ direct integer widen does not. And the explicit arithmetic functions
 serialize ("missing attribute 'overflow' on op MulI") where the plain Rust
 operators (`*`, `+`, `^`, `>>`, ...) on the same tiles lower and run
 correctly with ordinary wraparound semantics -- prefer the operators.
+
+## ImageNet64 profile: the bias-broadcast gradient plan was never cached
+
+A bounded `nsys`/`ncu`/`AXIS_PROFILE=1` pass training a 3-layer CNN on
+ImageNet64 at batch 256 (Axis 0.11.0 against a hand-written PyTorch loop,
+full method and numbers in the axis-benchmarks repo's
+`data/evidence/imagenet64/profile.md`) found 71% of each step (213.6ms) in
+`Tensor::align`'s general (rank-changing) path and another 22% (64.7ms) in
+the `grouped_submit` reduction it feeds, for a combined 92.8% of the whole
+308ms/step gap against PyTorch. Both costs came from the same place: every
+layer's `.add(&bias)` broadcasts a `[channel]` tensor up to the full
+activation shape, and because the bias requires a gradient, `align` built an
+output-sized host index map and a fresh `Plan::reverse` scatter-add plan on
+every training step, even though the shapes never change once a model is
+built. `Plan::reverse` mints a new id on every call (`NEXT_PLAN.fetch_add`),
+so `Device::device_plan`'s own upload cache -- which already exists and
+already works for permutations -- always missed too, and the plan's
+`offsets`/`left` arrays (up to 16.78MB for the first conv layer) were
+re-uploaded every step in addition to being rebuilt every step.
+
+The fix mirrors `Tensor::reduction_plans`'s existing cache (the one behind
+`sum`/`mean`) exactly: a new `align_reverse_plan` method keys a thread-local
+`HashMap<(Shape, Layout, Shape), Rc<Plan>>` by (the broadcasting tensor's own
+shape, its physical layout, the target shape), matching `reduction_plans`'
+`(u8, Shape, Layout, Vec<Axis>)` key one axis-set short (a broadcast target
+is already a full `Shape`, so there is no separate axis list to carry). A
+repeated broadcast now costs one hash lookup instead of an O(output size)
+Rust loop, and because the cached `Plan` keeps the one `id` it was built
+with, `device_plan`'s own cache then also hits on every repeat, for free,
+with no change to `device_plan` itself. A microbenchmark on the desk RTX
+5060 (100 steps of `[256,16,32,32] + [16]` broadcast-add, `mean`, backward,
+matching the profile's first-layer bias shape) moved from 1594.7ms/step to
+410.2ms/step, a 74.3% reduction -- consistent with this being the larger of
+the profile's two findings but not the whole gap, since the reduction
+kernel's own block-per-group launch shape (below) is a separate cost this
+change does not touch.
+
+This is a targeted fix at `align`'s own call site, not a change to
+`Plan::reverse`'s other callers (`merge`, `gather`, `scatter_add`): their
+`map` arguments are index data, not a pure function of shape and layout (an
+embedding lookup's indices differ every call even when the shapes match), so
+caching by signature would be silently wrong there.
+
+## `grouped()`'s one-block-per-group launch, and giving it more blocks
+
+The same ImageNet64 profile's `ncu` trace found the other half of the gap in
+the kernel `Device::grouped` launches, not just how often it ran: the bias
+gradient's plan groups by output channel (16/32/64/1000 for the four
+layers), and `grouped`'s launch used exactly one CUDA block per group, so
+conv1's 4,194,304 contributions ran as 16 blocks on an 84-SM GPU -- 2.08%
+occupancy, 34.5ms for that one kernel alone. The mechanism is not bad in
+general (the same kernel doing a global-average-pool reduction, 1,048,576
+contributions into 16,384 groups, measured at 24.86%/23.60%
+compute/occupancy); it is bad specifically when the group count is tiny,
+which a channel-wise bias gradient always is.
+
+`Device::grouped` now runs in two stages. `chunked_offsets` (top of
+`backend.rs`) splits each CSR group's contribution range into chunks of at
+most `GROUPED_CHUNK` (512) -- a chunk never crosses a group boundary, so a
+group at or under that size still gets exactly the one chunk it always had.
+Stage one (`kernels::grouped_partial`) launches one block per chunk across
+every group at once and writes each chunk's own sequential partial sum;
+stage two (`kernels::grouped_combine`) launches one block per group and
+sums that group's partials, in increasing chunk order, into the final
+scaled output. Both stages sum in a fixed order determined entirely by the
+plan, not by GPU scheduling, so the result is deterministic and
+reproducible -- a reassociation of the same terms the single-block kernel
+summed, not a race; a group of contributions large enough to matter (like
+a bias gradient's, but not most other `grouped` consumers' typical group
+sizes) trades one long serial sum for many short ones plus one short
+combine. `grouped_reduction_spans_multiple_chunks_for_a_large_group`
+exercises the actual multi-chunk path (600 contributions per group, over
+`GROUPED_CHUNK`) for both directions `grouped` is used in: `align`'s
+backward Group plan (the bias gradient) and `reduce_grouped`'s forward
+Group plan (`sum`/`mean`), checking an exact-integer gradient a correct
+reassociation still has to land on exactly.
+
+Chained onto the plan-caching fix above, the same desk RTX 5060
+microbenchmark (100 steps of `[256,16,32,32] + [16]` broadcast-add, mean,
+backward) moved from 410.2ms/step (plan caching alone) to 170.0ms/step, a
+further 58.5% reduction and 89.3% off the original 1594.7ms/step baseline
+(9.4x). Real ImageNet64 numbers on the tower are in the PR.

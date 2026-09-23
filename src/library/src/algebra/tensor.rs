@@ -86,6 +86,10 @@ struct ReductionPlans {
 }
 
 type ReductionPlanKey = (u8, Shape, Layout, Vec<Axis>);
+/// (this tensor's shape, its physical layout, the target shape it broadcasts into): the
+/// exact inputs [`Tensor::align`]'s scatter-add gradient map is a pure function of. See
+/// [`Tensor::align_reverse_plan`].
+type AlignPlanKey = (Shape, Layout, Shape);
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct UnfoldPlanKey {
     input_shape: Shape,
@@ -104,6 +108,7 @@ struct UnfoldPlanKey {
 thread_local! {
     static REDUCTION_PLANS: RefCell<HashMap<ReductionPlanKey, ReductionPlans>> = RefCell::new(HashMap::new());
     static UNFOLD_PLANS: RefCell<HashMap<UnfoldPlanKey, UnfoldPlans>> = RefCell::new(HashMap::new());
+    static ALIGN_PLANS: RefCell<HashMap<AlignPlanKey, Rc<Plan>>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(test)]
@@ -111,6 +116,7 @@ thread_local! {
     static UNFOLD_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
     static UNFOLD_PLAN_METADATA_MAX: Cell<usize> = const { Cell::new(0) };
     static LAYOUT_METADATA_MAX: Cell<usize> = const { Cell::new(0) };
+    static ALIGN_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 static NEXT_NODE: AtomicU64 = AtomicU64::new(1);
@@ -642,6 +648,10 @@ impl Tensor {
         UNFOLD_PLAN_BUILDS.with(Cell::get)
     }
     #[cfg(test)]
+    pub(crate) fn align_plan_build_count() -> usize {
+        ALIGN_PLAN_BUILDS.with(Cell::get)
+    }
+    #[cfg(test)]
     pub(crate) fn unfold_plan_metadata_max() -> usize {
         UNFOLD_PLAN_METADATA_MAX.with(Cell::get)
     }
@@ -657,12 +667,42 @@ impl Tensor {
     pub(crate) fn shares_buffer(&self, other: &Self) -> bool {
         std::ptr::eq(self.0.value.as_ref(), other.0.value.as_ref())
     }
+    /// Cached scatter-add plan for [`Self::align`]'s broadcast gradient: sum each output
+    /// position back into the input position it broadcast from. `map` (and so the `Plan`
+    /// built from it) is a pure function of `(self.shape(), self.0.layout, shape)` --
+    /// broadcasting a bias into the same activation shape every training step recomputes
+    /// nothing from the second call on. Mirrors [`Self::reduction_plans`]'s cache, keyed
+    /// the same way, one axis set short since a broadcast target is already a full `Shape`.
+    /// A repeated signature also reuses the one `Plan::id` it was built with, so
+    /// `Device::device_plan`'s own upload cache then hits too instead of re-uploading the
+    /// plan's index arrays every step.
+    fn align_reverse_plan(&self, shape: &Shape, positions: &[usize]) -> Result<Rc<Plan>> {
+        let key = (self.shape().clone(), self.0.layout.clone(), shape.clone());
+        let cached = ALIGN_PLANS.with(|cache| cache.borrow().get(&key).cloned());
+        if let Some(plan) = cached {
+            return Ok(plan);
+        }
+        let map = (0..shape.len())
+            .map(|i| {
+                let coords = shape.coords(i);
+                self.0
+                    .layout
+                    .offset(&positions.iter().map(|&p| coords[p]).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        let plan = Rc::new(Plan::reverse(&map, self.shape().len())?);
+        #[cfg(test)]
+        ALIGN_PLAN_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        ALIGN_PLANS.with(|cache| cache.borrow_mut().insert(key, plan.clone()));
+        Ok(plan)
+    }
     /// `self` presented in `shape`'s axis order, contiguous. Axes missing from `self`
     /// broadcast. Both cases run the rank-sized compact copier: a permutation is
     /// bijective and keeps the copier's inverse for its gradient; a broadcast reads
-    /// with stride 0 and, only when a gradient is required, builds the scatter-add
-    /// plan that sums over the broadcast axes. No element-sized plan is built or
-    /// uploaded in inference.
+    /// with stride 0 and, only when a gradient is required, looks up or builds (see
+    /// [`Self::align_reverse_plan`]) the scatter-add plan that sums over the broadcast
+    /// axes. No element-sized plan is built or uploaded in inference, and a repeated
+    /// broadcast shape after the first training step costs no more than the lookup.
     fn align(&self, shape: &Shape) -> Result<Self> {
         let started = Instant::now();
         let layout = Layout::contiguous(shape);
@@ -712,19 +752,11 @@ impl Tensor {
         let edges = self
             .requires_grad()
             .then(|| {
-                let map = (0..shape.len())
-                    .map(|i| {
-                        let coords = shape.coords(i);
-                        self.0
-                            .layout
-                            .offset(&positions.iter().map(|&p| coords[p]).collect::<Vec<_>>())
-                    })
-                    .collect::<Vec<_>>();
-                Plan::reverse(&map, self.shape().len()).map(|plan| {
+                self.align_reverse_plan(shape, &positions).map(|plan| {
                     Edge::new(
                         self,
                         Rule::Group {
-                            plan: Rc::new(plan),
+                            plan,
                             rhs: None,
                             factor: 1.0,
                         },
