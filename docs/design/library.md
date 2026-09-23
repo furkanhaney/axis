@@ -738,6 +738,78 @@ existing subset-axis broadcasting, so its own gradient (a per-channel or
 scalar sum over every position it was broadcast into) falls out of the
 existing broadcast-sum backward with no dedicated rule.
 
+### Transformer layers
+
+`MultiheadAttention` now accepts `dropout > 0.0` (previously rejected pending
+the training-pass contract, Axis issue #127, now `TrainingPass`). `forward`
+and `forward_with_weights` stay evaluation semantics, bit-exact with every
+`dropout=0.0` result this module produced before. The new
+`forward_training`/`forward_with_weights_training` entry points, driven by an
+explicit `&mut TrainingPass`, draw one `pass.next_seed()` per call (regardless
+of `p`, matching `Dropout`'s own draw-count convention) and apply PyTorch's
+inverted dropout to the post-softmax attention probabilities before they
+contract with `value`, exactly where PyTorch's own
+`F.multi_head_attention_forward` applies it. `need_weights`'s returned
+weights are always the pre-dropout probabilities, PyTorch's own order.
+`MultiheadAttention::causal_mask(extent, device)` builds a reusable additive
+mask against the attention's own private query/key time roles, matching
+`Transformer.generate_square_subsequent_mask`.
+
+`TransformerEncoderLayer` and `TransformerDecoderLayer` (`model/nn.rs`,
+immediately after `MultiheadAttention`) match `torch.nn.TransformerEncoderLayer`/
+`TransformerDecoderLayer` at PyTorch 2.14's exact defaults (`dim_feedforward=2048`,
+`dropout=0.1`, `activation="relu"`, `layer_norm_eps=1e-5`, `norm_first=False`,
+`bias=True`) and PyTorch's own exact residual and dropout placement,
+`_sa_block`/`_mha_block`/`_ff_block` inlined as private helpers of the same
+name. `activation="gelu"` uses `Tensor::gelu_exact` (PyTorch's own `F.gelu`
+default `approximate="none"`), not the tanh-form `GELU` module. `.bias(false)`
+omits every `Linear`/`MultiheadAttention` projection bias; Axis's `LayerNorm`
+has no separate bias-only toggle (only `.affine(bool)`, which would also drop
+the learned scale), so unlike PyTorch's `bias=False` the layers' internal
+`LayerNorm`s always keep their own affine bias, a documented departure.
+`TransformerDecoderLayer`'s cross-attention (`multihead_attn`) shares the
+`feature`/`time` axes with self-attention: `tgt` and `memory` carry the same
+`time` identity at possibly different extents, matching
+`MultiheadAttention`'s own cross-attention contract.
+
+`TransformerEncoder`/`TransformerDecoder` stack `num_layers` independently
+built copies of one configured, unbuilt layer (cloned before `build`,
+mirroring PyTorch's own `_get_clones`), plus an optional final `LayerNorm`.
+Each clone gets its own freshly seeded parameters at `build` time rather than
+PyTorch's literal deep-copy-of-already-initialized weights (PyTorch's
+`_get_clones` runs `copy.deepcopy` on one already-built layer, so every layer
+starts from bit-identical initial weights), deliberately following Axis's own
+stacking convention instead: every index-seeded container in this crate (for
+example `Sequential::build`) gives each position a distinct seed, and the
+design doc's own rule that `Repeat` must create independent blocks unless
+weight tying is explicit.
+
+`Transformer` combines one `TransformerEncoder` and one `TransformerDecoder`
+built from shared `feature`/`time`/`embed_dim`/`num_heads`/`dim_feedforward`
+and every dropout/activation/epsilon/norm_first/bias setting; `forward`
+encodes `src` into `memory` then decodes `tgt` against it, PyTorch's own
+two-call composition. There is no `custom_encoder`/`custom_decoder` override:
+Axis has no `Module`-shaped container that fits a differently typed
+encoder/decoder pair interchangeably, so a fully custom pair is built
+directly from `TransformerEncoder`/`TransformerDecoder` instead.
+
+Evidence: independent from-scratch f64 references (finite differences against
+this crate's own `central_difference` helper, mirroring `LayerNorm`'s own
+oracle test) for one encoder layer and one decoder layer, in evaluation mode,
+covering forward and every parameter gradient at both `norm_first=false` and
+`norm_first=true`, with the decoder layer's `tgt`/`memory` extents
+deliberately asymmetric. `TransformerEncoder`/`Transformer` are checked as
+compositions: their stacked forward must equal manually chaining
+independently built layers with the same per-layer seeds. Training-mode
+determinism (a fixed pass seed reproduces a bit-identical forward; a
+different step changes it) is checked end to end through `Transformer`.
+`MultiheadAttention`'s attention-weight dropout is checked at its `p=0` and
+`p=1` edges (bit-exact with `forward`, and exact zero with zero gradient) and
+statistically (many independent pass seeds average back to the `p=0` forward,
+inverted dropout's expectation-preserving property) since the post-dropout
+attention probabilities are an internal detail no public entry point exposes
+directly.
+
 `Tensor::log_softmax(axis)`/`LogSoftmax::new(axis)` is the numerically stable
 `x - logsumexp(x, axis)`, composed entirely from the existing `logsumexp`
 (itself `max`-shifted) and `sub`'s broadcast over the axis `logsumexp`

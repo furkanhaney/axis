@@ -52,6 +52,7 @@ fn rms_normalize(input: &Tensor, axes: &[Axis], epsilon: f32) -> Result<Tensor> 
     input.mul(&input.mean_square(axes)?.inverse_sqrt(epsilon)?)
 }
 
+#[derive(Clone)]
 struct Affine {
     scale: Parameter,
     bias: Option<Parameter>,
@@ -196,12 +197,20 @@ impl RunningStats {
     }
 }
 
+#[derive(Clone)]
 struct AxisNormBound {
     dims: Vec<Dim>,
     affine: Option<Affine>,
 }
 
 /// Population layer normalization over one or more declared named axes.
+///
+/// `Clone` is provided so a caller (e.g. `TransformerEncoderLayer`) can
+/// build one configured, unbuilt instance and clone it before `build`; a
+/// clone of an already-built instance instead shares the original's
+/// `Parameter`s (ties weights), matching every other `Clone` module in the
+/// crate.
+#[derive(Clone)]
 pub struct LayerNorm {
     axes: Vec<Axis>,
     epsilon: f32,
