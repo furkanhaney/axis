@@ -39,10 +39,14 @@ mod recurrent;
 mod regime;
 #[path = "research/residual.rs"]
 mod residual;
+#[path = "architectures/resnet.rs"]
+mod resnet;
 #[path = "algebra/tensor.rs"]
 mod tensor;
 #[path = "runtime/train.rs"]
 mod train;
+#[path = "architectures/vgg.rs"]
+mod vgg;
 
 pub use axis::{Axis, Dim, IntoAxes, Shape};
 pub use backend::Device;
@@ -101,6 +105,17 @@ pub use residual::{
 pub use tensor::{LinearCrossEntropyOptions, Tensor};
 pub use train::{Optimizer, TrainStep, Trainer, TrainingPass};
 
+/// Reference vision architectures assembled only from public library
+/// modules: composition witnesses as well as convenience constructors.
+/// Equivalence to each architecture's reference implementation is
+/// established by tests in `src/library/src/tests.rs`, never asserted here.
+pub mod architectures {
+    pub use crate::resnet::{
+        ResNetAxes, resnet34, resnet34_small_input, resnet50, resnet50_small_input,
+    };
+    pub use crate::vgg::{VggAxes, vgg16, vgg16_bn};
+}
+
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[cfg(all(not(feature = "cuda"), not(axis_docs_rs)))]
@@ -121,6 +136,10 @@ mod tests;
 mod window_tests;
 
 pub mod prelude {
+    pub use crate::architectures::{
+        ResNetAxes, VggAxes, resnet34, resnet34_small_input, resnet50, resnet50_small_input, vgg16,
+        vgg16_bn,
+    };
     pub use crate::{
         Adam, AdamW, AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveAvgPool3d, AdaptiveMaxPool1d,
         AdaptiveMaxPool2d, AdaptiveMaxPool3d, AdditionDataset, AdditionSample, AttentionMask,
