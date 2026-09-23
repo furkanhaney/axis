@@ -676,10 +676,6 @@ impl<const N: usize> TransposedConvolution<N> {
             .bound
             .as_ref()
             .ok_or_else(|| format!("{} must be built before forward", Self::name()))?;
-        let bias = bound
-            .bias
-            .as_ref()
-            .expect("ConvTranspose always allocates a bias");
         let split = input.split(
             self.input,
             [
