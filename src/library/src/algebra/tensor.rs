@@ -413,9 +413,32 @@ impl Tensor {
     /// Values in logical Shape order, independent of physical storage order.
     pub fn to_vec(&self) -> Result<Vec<f32>> {
         let physical = self.device().read(&self.0.value)?;
-        Ok((0..self.shape().len())
-            .map(|i| physical[self.0.layout.offset(&self.shape().coords(i))])
-            .collect())
+        let shape = self.shape();
+        let strides = &self.0.layout.strides;
+        let len = shape.len();
+        // Contiguous storage already is logical order: hand the copy back as is.
+        if physical.len() == len && *strides == Layout::contiguous(shape).strides {
+            return Ok(physical);
+        }
+        // Otherwise walk logical coordinates with an in-place odometer,
+        // carrying the physical offset along instead of recomputing it.
+        let extents: Vec<usize> = shape.dims().iter().map(|d| d.extent).collect();
+        let mut coords = vec![0usize; extents.len()];
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(physical[offset]);
+            for axis in (0..extents.len()).rev() {
+                coords[axis] += 1;
+                offset += strides[axis];
+                if coords[axis] < extents[axis] {
+                    break;
+                }
+                offset -= strides[axis] * extents[axis];
+                coords[axis] = 0;
+            }
+        }
+        Ok(out)
     }
     pub fn item(&self) -> Result<f32> {
         if self.shape().rank() != 0 {
