@@ -14332,15 +14332,16 @@ fn dropout_forward_is_the_identity_regardless_of_probability() -> Result<()> {
 #[ignore = "requires CUDA"]
 fn dropout_forward_training_matches_a_hand_derived_mask_oracle_forward_and_gradient() -> Result<()>
 {
-    // Independent oracle, hand-derived via a one-off Python reimplementation of splitmix64 (the
-    // TrainingPass doc comment's formula) composed with the xorshift64 stream (already
-    // oracle-tested in seeded_uniform_and_normal_host_values_match_an_independent_xorshift_oracle,
-    // above): `TrainingPass::new(2026)`'s first `next_seed()` (draw counter 0) is
-    // splitmix64(2026 ^ (0 * GOLDEN)) = 802045514593000271. The first eight raw
-    // Tensor::uniform(..., 0.0, 1.0, ...) draws from that seed are
-    // [0.04527252912521362, 0.05715292692184448, 0.10604757070541382, 0.7913837432861328,
-    //  0.8621623516082764, 0.7058718800544739, 0.26723527908325195, 0.4759710431098938],
-    // so keeping where the draw is >= 0.5 gives the mask [0, 0, 0, 1, 1, 1, 0, 0].
+    // Independent oracle, hand-derived via a one-off Python reimplementation of the device
+    // generator's formula (`backend::kernels::uniform_device`'s doc comment): SplitMix64 (the
+    // same mixer `TrainingPass` uses) applied to `seed ^ i.wrapping_mul(GOLDEN)` for each flat
+    // element index `i`, keeping the top 24 bits of the 64-bit hash divided by 2^24.
+    // `TrainingPass::new(2026)`'s first `next_seed()` (draw counter 0) is
+    // splitmix64(2026 ^ (0 * GOLDEN)) = 802045514593000271. The first eight
+    // `Tensor::uniform_device` draws from that seed (i = 0..8) are
+    // [0.8668110966682434, 0.1507960557937622, 0.4262182116508484, 0.3728508949279785,
+    //  0.9675002098083496, 0.860875129699707, 0.7212669849395752, 0.5788084268569946],
+    // so keeping where the draw is >= 0.5 gives the mask [1, 0, 0, 0, 1, 1, 1, 1].
     let device = Device::cuda(0)?;
     let feature = Axis::new("dropout_oracle_feature");
     let input_values = [1.0_f32, -2.0, 3.0, -4.0, 0.5, -0.5, 2.5, -1.5];
@@ -14350,7 +14351,7 @@ fn dropout_forward_training_matches_a_hand_derived_mask_oracle_forward_and_gradi
     let mut pass = TrainingPass::new(2026);
     let output = dropout.forward_training(&leaf, &mut pass)?;
     // Kept elements are scaled by 1 / (1 - 0.5) = 2; dropped elements are exact zeros.
-    let expected = [0.0, -0.0, 0.0, -8.0, 1.0, -1.0, 0.0, -0.0];
+    let expected = [2.0, -0.0, 0.0, -0.0, 1.0, -1.0, 5.0, -3.0];
     close(
         "Dropout forward_training p=0.5 mask oracle",
         &output.to_vec()?,
@@ -14360,7 +14361,7 @@ fn dropout_forward_training_matches_a_hand_derived_mask_oracle_forward_and_gradi
     output.mean(feature)?.backward()?;
     // Gradient is mask / (1 - p): the mean's 1/8 upstream, times the mask, times the same 1/(1-p)
     // scale -- 0.25 where kept, exactly 0 where dropped.
-    let expected_gradient = [0.0, 0.0, 0.0, 0.25, 0.25, 0.25, 0.0, 0.0];
+    let expected_gradient = [0.25, 0.0, 0.0, 0.0, 0.25, 0.25, 0.25, 0.25];
     close(
         "Dropout forward_training p=0.5 gradient (mask / (1 - p))",
         &leaf.grad().expect("Dropout input gradient").to_vec()?,
@@ -14456,12 +14457,12 @@ fn sequential_threads_one_training_pass_through_two_dropout_layers_with_distinct
 -> Result<()> {
     // Continues the mask oracle above for a second draw: TrainingPass::new(2026)'s SECOND
     // next_seed() (draw counter 1) is splitmix64(2026 ^ (1 * GOLDEN)) = 17653457804415869398,
-    // whose first eight raw Tensor::uniform draws are [0.07973641157150269, 0.04726368188858032,
-    // 0.6211847066879272, 0.15007680654525757, 0.3179355263710022, 0.5745394825935364,
-    // 0.20719337463378906, 0.8916236758232117], giving keep mask [0, 0, 1, 0, 0, 1, 0, 1] --
-    // distinct from the first layer's [0, 0, 0, 1, 1, 1, 0, 0], so composing both (each scaling by
-    // 2) keeps only where BOTH masks are 1: index 5 (0.5 * -0.5 -> only after the first layer's
-    // 1, -0.5*2 = -1.0, times the second layer's 1, -1.0*2 = -2.0) survives at input scale 4.
+    // whose first eight Tensor::uniform_device draws are [0.4116435647010803, 0.811515212059021,
+    // 0.06670206785202026, 0.7735949158668518, 0.19689422845840454, 0.22576063871383667,
+    // 0.5011497735977173, 0.6153182983398438], giving keep mask [0, 1, 0, 1, 0, 0, 1, 1] --
+    // distinct from the first layer's [1, 0, 0, 0, 1, 1, 1, 1], so composing both (each scaling by
+    // 2) keeps only where BOTH masks are 1: indices 6 and 7 (2.5 -> 5.0 -> 10.0, and
+    // -1.5 -> -3.0 -> -6.0) survive at input scale 4.
     let device = Device::cuda(0)?;
     let feature = Axis::new("sequential_dropout_feature");
     let input_values = [1.0_f32, -2.0, 3.0, -4.0, 0.5, -0.5, 2.5, -1.5];
@@ -14472,7 +14473,7 @@ fn sequential_threads_one_training_pass_through_two_dropout_layers_with_distinct
     let mut pass = TrainingPass::new(2026);
     let output = seq.forward_training(&input, &mut pass)?;
 
-    let expected = [0.0, -0.0, 0.0, -0.0, 0.0, -2.0, 0.0, -0.0];
+    let expected = [0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 10.0, -6.0];
     close(
         "Sequential(Dropout, Dropout) threads one pass through both layers with distinct masks",
         &output.to_vec()?,
@@ -14564,5 +14565,95 @@ fn trainer_records_pass_seed_only_for_step_training_and_it_follows_the_documente
         "a different step index must draw a different mask"
     );
     println!("Trainer pass_seed formula and step-to-step mask change PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn uniform_device_matches_an_independent_host_splitmix64_oracle_bit_exact() -> Result<()> {
+    // Independent reimplementation of `backend::kernels::uniform_device`'s doc-commented formula,
+    // written separately from the kernel: plain host `u64` arithmetic, never calling into the
+    // crate's own mixer (`runtime::train`'s private `splitmix64`/`GOLDEN`, which the kernel and
+    // this oracle each independently mirror -- see
+    // `training_pass_seed_and_next_seed_match_the_documented_splitmix64_mix`, above, for the same
+    // pattern applied to `TrainingPass`).
+    const GOLDEN: u64 = 0x9E3779B97F4A7C15;
+    fn splitmix64(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn expected_value(seed: u64, index: u64) -> f32 {
+        let hash = splitmix64(seed ^ index.wrapping_mul(GOLDEN));
+        let top24 = (hash >> 40) as u32;
+        top24 as f32 / (1u32 << 24) as f32
+    }
+
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("uniform_device_oracle_feature");
+    // 300 is not a multiple of the kernel's 128-wide tile, exercising the padded final tile.
+    let count = 300usize;
+    for &seed in &[0u64, 1, 2026, u64::MAX, 0x1234_5678_9abc_def0] {
+        let draw = Tensor::uniform_device([feature.of(count)], seed, &device)?;
+        let actual = draw.to_vec()?;
+        let expected: Vec<f32> = (0..count as u64).map(|i| expected_value(seed, i)).collect();
+        for (index, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "seed={seed} index={index}: device {a} (bits {:x}) != oracle {e} (bits {:x})",
+                a.to_bits(),
+                e.to_bits()
+            );
+        }
+    }
+    println!("Tensor::uniform_device bit-exact host oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn uniform_device_is_deterministic_across_two_launches() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("uniform_device_determinism_feature");
+    let count = 777usize;
+    let first = Tensor::uniform_device([feature.of(count)], 999_u64, &device)?.to_vec()?;
+    let second = Tensor::uniform_device([feature.of(count)], 999_u64, &device)?.to_vec()?;
+    assert_eq!(
+        first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        second.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "two launches with the same seed must be bit-identical"
+    );
+    let different = Tensor::uniform_device([feature.of(count)], 1000_u64, &device)?.to_vec()?;
+    assert_ne!(
+        first, different,
+        "a different seed must draw different values"
+    );
+    println!("Tensor::uniform_device determinism across launches PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn uniform_device_statistical_sanity_over_a_large_draw() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("uniform_device_statistics_feature");
+    let count = 200_000usize;
+    let values = Tensor::uniform_device([feature.of(count)], 424242_u64, &device)?.to_vec()?;
+    let mean = values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|&v| (f64::from(v) - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    // Uniform[0, 1) has mean 0.5 and variance 1/12 ~= 0.08333.
+    assert!((mean - 0.5).abs() < 0.01, "mean {mean} too far from 0.5");
+    assert!(
+        (variance - 1.0 / 12.0).abs() < 0.005,
+        "variance {variance} too far from 1/12"
+    );
+    println!(
+        "Tensor::uniform_device statistical sanity PASS mean={mean:.6} variance={variance:.6}"
+    );
     Ok(())
 }
