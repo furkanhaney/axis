@@ -8,7 +8,7 @@ fall below.
 
 - [catalog.md](catalog.md) — the 161 rows, frozen from PyTorch 2.14 on
   2026-09-22, with the verdict and the evidence for each.
-- `floor` — basis points. **1351 bp (13.51%)** at the freeze: 20 yes,
+- `floor` — basis points; currently **7143 bp** (see Waves). **1351 bp (13.51%)** at the freeze: 20 yes,
   7 partial, 0 refused, 134 no.
 - `scripts/checks/nn_gap.sh --check` — recomputes the number from the table,
   fails when the table disagrees with its summary line or the number is below
@@ -52,3 +52,14 @@ not `refused`. A row becomes `refused` only when a design doc says never.
 ## Waves
 
 - 2026-09-22 — freeze at 1351 bp.
+- 2026-09-22 — first climb to 5916 bp (87 yes, 33 partial, 41 no): nine
+  families landed in parallel (activations, losses, distances, pooling,
+  convolution, padding and pixel shuffles, recurrent, containers). Each row
+  cites its PR and tests; a row graded partial names what is missing. The
+  floor rose to match.
+- 2026-09-22 — second climb to 7143 bp (111 yes, 16 partial, 34 no): six
+  families closed stated gaps (recurrent depth, direction and bias; pooling
+  options and MaxUnpool; likelihood-loss options and BCE's exact -100 floor;
+  general norm orders, CosineSimilarity's joint clamp and signed ELU/CELU alpha;
+  MultiheadAttention; Upsample and the sequence and clustered losses). Rows that
+  take two inputs and so are not a `Module` stay partial, one rule for all.

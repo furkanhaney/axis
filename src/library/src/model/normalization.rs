@@ -494,3 +494,99 @@ impl Module for InstanceNorm {
         self.0.named_parameters()
     }
 }
+
+fn validate_finite(owner: &str, field: &str, value: f32) -> Result<()> {
+    if !value.is_finite() {
+        return Err(format!("{owner} {field} must be finite").into());
+    }
+    Ok(())
+}
+
+/// Response normalization across a fixed-size sliding window of a named
+/// channel axis, PyTorch's `nn.LocalResponseNorm`: each element divides by
+/// `(k + alpha / size * sum(a_c'^2))^beta`, where the sum runs over a window
+/// of `size` channels around `c`, padded with implicit zeros at the
+/// channel-axis boundary (`size / 2` channels before `c`, `(size - 1) / 2`
+/// after, PyTorch's own asymmetric split for an even `size`). No learned
+/// parameters, matching PyTorch's own stateless module.
+///
+/// Composed entirely from existing ops: `mul` (square), `pad_zeros`,
+/// `size - 1` pairs of `narrow`/`add` for the sliding sum, `scale` for the
+/// mean and the `alpha` factor, and `exp(beta * ln(x))` for the fractional
+/// power -- no dedicated kernel. The power composition inherits `Tensor::ln`'s
+/// ordinary IEEE domain: a `k`/`alpha` choice that drives the base
+/// non-positive produces the same `-inf`/`NaN` propagation `Tensor::ln`
+/// documents, rather than a clamp.
+#[derive(Clone, Copy)]
+pub struct LocalResponseNorm {
+    channel: Axis,
+    size: usize,
+    alpha: f32,
+    beta: f32,
+    k: f32,
+}
+
+impl LocalResponseNorm {
+    /// Defaults to `alpha = 1e-4`, `beta = 0.75`, `k = 1.0`, matching PyTorch.
+    pub fn new(channel: Axis, size: usize) -> Result<Self> {
+        if size == 0 {
+            return Err("LocalResponseNorm size must be positive".into());
+        }
+        Ok(Self {
+            channel,
+            size,
+            alpha: 1e-4,
+            beta: 0.75,
+            k: 1.0,
+        })
+    }
+
+    pub fn alpha(mut self, alpha: f32) -> Result<Self> {
+        validate_finite("LocalResponseNorm", "alpha", alpha)?;
+        self.alpha = alpha;
+        Ok(self)
+    }
+
+    pub fn beta(mut self, beta: f32) -> Result<Self> {
+        validate_finite("LocalResponseNorm", "beta", beta)?;
+        self.beta = beta;
+        Ok(self)
+    }
+
+    pub fn k(mut self, k: f32) -> Result<Self> {
+        validate_finite("LocalResponseNorm", "k", k)?;
+        self.k = k;
+        Ok(self)
+    }
+}
+
+impl Module for LocalResponseNorm {
+    fn output_shape(&self, input: &Shape) -> Result<Shape> {
+        input.extent(self.channel)?;
+        Ok(input.clone())
+    }
+
+    fn build(&mut self, input: &Shape, _device: &Device, _seed: u64) -> Result<Shape> {
+        self.output_shape(input)
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.output_shape(input.shape())?;
+        let extent = input.extent(self.channel)?;
+        let before = self.size / 2;
+        let after = (self.size - 1) / 2;
+        let padded = input.mul(input)?.pad_zeros(self.channel, before, after)?;
+        let mut window = padded.narrow(self.channel, 0, extent)?;
+        for offset in 1..self.size {
+            window = window.add(&padded.narrow(self.channel, offset, extent)?)?;
+        }
+        let mean_square = window.scale(1.0 / self.size as f32)?;
+        let base = mean_square.scale(self.alpha)?.add(&Tensor::from_slice(
+            &[self.k],
+            [],
+            input.device(),
+        )?)?;
+        let denominator = base.ln()?.scale(self.beta)?.exp()?;
+        input.div(&denominator)
+    }
+}
