@@ -90,7 +90,16 @@ in order. `TrainingPass` and `Trainer::with_seed`/`step_training` make the
 per-step random-draw context and its seed explicit and recorded
 (`TrainStep::pass_seed`); `Dropout` is its first consumer, identity in
 `forward` and inverted dropout drawn from `pass.next_seed()` in
-`forward_training`.
+`forward_training`. `State` is a persistent, gradient-free tensor handle
+alongside `Parameter`, reported by `Module::named_states` with the same
+slot-path convention `named_parameters` uses; a `forward_training` call
+queues an update with `TrainingPass::stage` rather than writing it, and only
+`Trainer::step_training`'s call to `TrainingPass::commit`, after the whole
+step has already succeeded, ever writes one (`TrainStep::committed_states`).
+`BatchNorm` normalizes a named feature axis over every other axis present,
+with PyTorch's exact momentum and unbiased running-variance semantics, and
+`InstanceNorm` gained the same optional `track_running_stats` on the same
+mechanism.
 This is enough to train the existing MLP, CNN, attention, MNIST, Sudoku, chess,
 and panel acceptances, but it is not yet a comfortable general module library.
 `Tensor::broadcast_to(shape)` explicitly broadcasts a tensor onto a target
@@ -109,7 +118,7 @@ dedicated outer-product method.
 | --- | --- | --- |
 | Active | physics-informed residual consumers and independent numerical oracles | Central differences and empirical residual receipts now provide the first honest path; ODE and pendulum studies must establish defaults and expose missing composition. |
 | Recurrent foundation | `LstmCell` and `Lstm` correctness are implemented; fused recurrence, direction, and layer composition remain | Independent forward and complete gradient oracles protect the eager IFGO implementation before performance work. |
-| Stateful foundation | persistent non-parameter state, then named-axis `BatchNorm` | Running statistics cannot be represented honestly until `Module` can hold and update them (#76). |
+| Stateful foundation | persistent non-parameter state (`State`, `Module::named_states`, staged `TrainingPass` updates), named-axis `BatchNorm`, and `InstanceNorm`'s optional `track_running_stats` are implemented | Running statistics could not be represented honestly until `Module` could hold and update them; landed from `vision/morpheus`'s trained-checkpoint BatchNorm. |
 | Common composition | `Conv1d` or rank-general convolution, `ELU`, dropout, prefix (nested) dropout, common losses | These unlock many ordinary ports once mode and random-state semantics exist. Exact GELU, `SiLU`, and `LeakyReLU` landed from Atlas and vision consumer pressure; `Embedding`, the prefix causal mask, and `SignStraightThrough` landed from the byte autoencoder migration, whose ordered binary code is also the consumer for prefix dropout. `MaxPool2d`/`MaxPool3d` and `Tensor::adaptive_avg_pool3d` landed from `fluid`'s U-Net encoder, `morpheus`'s peak-NMS decode, and `gastric`'s interface-region pooler. |
 | Architecture families | recurrent variants, transpose convolution, reusable transformer encoder/decoder modules | Add them around measured consumers after the lower-level contracts settle. |
 | Specialized | sparse, quantized, distributed, fractional pooling, lazy initialization | Each needs its own representation or execution contract; names alone would provide false parity. |

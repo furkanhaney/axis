@@ -1,6 +1,6 @@
 # The torch.nn catalog, row by row
 
-`classes 161 · yes 112 · partial 16 · refused 0 · no 33`
+`classes 161 · yes 124 · partial 18 · refused 0 · no 19`
 
 The denominator is every class in the layer sections of PyTorch 2.14's
 [`torch.nn` page](https://docs.pytorch.org/docs/2.14/nn.html) on 2026-09-22:
@@ -81,7 +81,7 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Non-linear Activations (weighted sum, nonlinearity) | `PReLU` | yes | #123: shared and per-channel weight, weight-gradient oracle |
 | Non-linear Activations (weighted sum, nonlinearity) | `ReLU` | yes | `ReLU` (`model/nn.rs`); MLP, CNN and MNIST acceptances |
 | Non-linear Activations (weighted sum, nonlinearity) | `ReLU6` | yes | #124: CUDA oracle fwd+grad incl. PyTorch ATen kink conventions |
-| Non-linear Activations (weighted sum, nonlinearity) | `RReLU` | no | absent |
+| Non-linear Activations (weighted sum, nonlinearity) | `RReLU` | yes | #144: per-element slope in training from the pass, midpoint slope in eval |
 | Non-linear Activations (weighted sum, nonlinearity) | `SELU` | yes | #123: CUDA oracle fwd+grad, reordered storage |
 | Non-linear Activations (weighted sum, nonlinearity) | `CELU` | yes | #133: any nonzero finite alpha |
 | Non-linear Activations (weighted sum, nonlinearity) | `GELU` | yes | `GELU` (tanh form) and `ExactGELU` (`model/nn.rs`); open issue asks the docs to say which is PyTorch's default |
@@ -100,17 +100,17 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Non-linear Activations (other) | `Softmax2d` | yes | #123: softmax over named channel axis, oracle |
 | Non-linear Activations (other) | `LogSoftmax` | yes | #123: x - logsumexp, oracle |
 | Non-linear Activations (other) | `AdaptiveLogSoftmaxWithLoss` | partial | #136: loss only; no per-row output, log_prob(), predict() |
-| Normalization Layers | `BatchNorm1d` | no | #open: trained BatchNorm with persistent running statistics |
-| Normalization Layers | `BatchNorm2d` | no | same open issue |
-| Normalization Layers | `BatchNorm3d` | no | same open issue |
+| Normalization Layers | `BatchNorm1d` | yes | #145: named feature axis; PyTorch momentum, unbiased running var, momentum=None cumulative, track_running_stats; staged state committed after the step |
+| Normalization Layers | `BatchNorm2d` | yes | #145: same module |
+| Normalization Layers | `BatchNorm3d` | yes | #145: same module |
 | Normalization Layers | `LazyBatchNorm1d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Normalization Layers | `LazyBatchNorm2d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Normalization Layers | `LazyBatchNorm3d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Normalization Layers | `GroupNorm` | yes | named-axis `GroupNorm` (`model/normalization.rs`) |
 | Normalization Layers | `SyncBatchNorm` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
-| Normalization Layers | `InstanceNorm1d` | partial | stateless named-axis `InstanceNorm`; no running statistics (needs the stateful contract) |
-| Normalization Layers | `InstanceNorm2d` | partial | same stateless `InstanceNorm` |
-| Normalization Layers | `InstanceNorm3d` | partial | same stateless `InstanceNorm` |
+| Normalization Layers | `InstanceNorm1d` | yes | #145: optional track_running_stats replaying PyTorch per-instance EMA |
+| Normalization Layers | `InstanceNorm2d` | yes | #145: same |
+| Normalization Layers | `InstanceNorm3d` | yes | #145: same |
 | Normalization Layers | `LazyInstanceNorm1d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Normalization Layers | `LazyInstanceNorm2d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Normalization Layers | `LazyInstanceNorm3d` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
@@ -124,21 +124,21 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Recurrent Layers | `RNNCell` | yes | #137: standalone reordered-storage asymmetric CUDA test |
 | Recurrent Layers | `LSTMCell` | yes | #137: standalone CUDA test |
 | Recurrent Layers | `GRUCell` | yes | #137: standalone CUDA test |
-| Transformer Layers | `Transformer` | no | absent |
-| Transformer Layers | `TransformerEncoder` | no | absent |
-| Transformer Layers | `TransformerDecoder` | no | absent |
-| Transformer Layers | `TransformerEncoderLayer` | no | absent |
-| Transformer Layers | `TransformerDecoderLayer` | no | absent |
+| Transformer Layers | `Transformer` | partial | #146: end-to-end vs manual composition; not a Module; no custom_encoder/decoder |
+| Transformer Layers | `TransformerEncoder` | partial | #146: stack checked as composition; not a Module |
+| Transformer Layers | `TransformerDecoder` | partial | #146: same; not a Module |
+| Transformer Layers | `TransformerEncoderLayer` | partial | #146: PyTorch _sa_block/_ff_block placement, f64 oracle every grad, post/pre-norm; not a Module (src plus masks); LayerNorm bias not separately toggleable |
+| Transformer Layers | `TransformerDecoderLayer` | partial | #146: same, tgt and memory inputs; not a Module |
 | Linear Layers | `Identity` | yes | #129: oracle |
 | Linear Layers | `Linear` | yes | `Linear` with `.bias(false)`; `PopulationLinear` beside it |
 | Linear Layers | `Bilinear` | partial | #129: oracle fwd+grad incl. weight; not a Module (two inputs), Linear-style init not PyTorch's |
 | Linear Layers | `LazyLinear` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
 | Dropout Layers | `Dropout` | yes | #127: device counter-hash masks bit-exact vs host SplitMix64 oracle; eval identity; seeded, receipted pass |
-| Dropout Layers | `Dropout1d` | no | absent |
-| Dropout Layers | `Dropout2d` | no | absent |
-| Dropout Layers | `Dropout3d` | no | absent |
-| Dropout Layers | `AlphaDropout` | no | absent |
-| Dropout Layers | `FeatureAlphaDropout` | no | absent |
+| Dropout Layers | `Dropout1d` | yes | #144: ChannelDropout: one mask per channel and non-spatial axes, broadcast over spatial, as PyTorch make_feature_noise |
+| Dropout Layers | `Dropout2d` | yes | #144: same module |
+| Dropout Layers | `Dropout3d` | yes | #144: same module |
+| Dropout Layers | `AlphaDropout` | yes | #144: transcribed from PyTorch _alpha_dropout_impl |
+| Dropout Layers | `FeatureAlphaDropout` | yes | #144: same, feature-wise |
 | Sparse Layers | `Embedding` | yes | one-hot `Embedding` (`model/nn.rs`); arbitrary-index `gather` for large tables |
 | Sparse Layers | `EmbeddingBag` | partial | #129: sum/mean/max via gather+scatter_add; not a Module; empty Max bag gives NaN where PyTorch gives 0 |
 | Distance Functions | `CosineSimilarity` | yes | #133: joint clamp on the squared-norm product, as PyTorch; test shows divergence from old clamp |
@@ -177,4 +177,4 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Utilities (modules) | `Flatten` | yes | #129: merge of named axes, oracle |
 | Utilities (modules) | `Unflatten` | yes | #129: split of a named axis, oracle |
 
-Score: mean of strict (112/161) and half-credit ((112+16/2)/161) = 72.05% = 7205 bp.
+Score: mean of strict (124/161) and half-credit ((124+18/2)/161) = 79.81% = 7981 bp.

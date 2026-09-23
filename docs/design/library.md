@@ -738,6 +738,78 @@ existing subset-axis broadcasting, so its own gradient (a per-channel or
 scalar sum over every position it was broadcast into) falls out of the
 existing broadcast-sum backward with no dedicated rule.
 
+### Transformer layers
+
+`MultiheadAttention` now accepts `dropout > 0.0` (previously rejected pending
+the training-pass contract, Axis issue #127, now `TrainingPass`). `forward`
+and `forward_with_weights` stay evaluation semantics, bit-exact with every
+`dropout=0.0` result this module produced before. The new
+`forward_training`/`forward_with_weights_training` entry points, driven by an
+explicit `&mut TrainingPass`, draw one `pass.next_seed()` per call (regardless
+of `p`, matching `Dropout`'s own draw-count convention) and apply PyTorch's
+inverted dropout to the post-softmax attention probabilities before they
+contract with `value`, exactly where PyTorch's own
+`F.multi_head_attention_forward` applies it. `need_weights`'s returned
+weights are always the pre-dropout probabilities, PyTorch's own order.
+`MultiheadAttention::causal_mask(extent, device)` builds a reusable additive
+mask against the attention's own private query/key time roles, matching
+`Transformer.generate_square_subsequent_mask`.
+
+`TransformerEncoderLayer` and `TransformerDecoderLayer` (`model/nn.rs`,
+immediately after `MultiheadAttention`) match `torch.nn.TransformerEncoderLayer`/
+`TransformerDecoderLayer` at PyTorch 2.14's exact defaults (`dim_feedforward=2048`,
+`dropout=0.1`, `activation="relu"`, `layer_norm_eps=1e-5`, `norm_first=False`,
+`bias=True`) and PyTorch's own exact residual and dropout placement,
+`_sa_block`/`_mha_block`/`_ff_block` inlined as private helpers of the same
+name. `activation="gelu"` uses `Tensor::gelu_exact` (PyTorch's own `F.gelu`
+default `approximate="none"`), not the tanh-form `GELU` module. `.bias(false)`
+omits every `Linear`/`MultiheadAttention` projection bias; Axis's `LayerNorm`
+has no separate bias-only toggle (only `.affine(bool)`, which would also drop
+the learned scale), so unlike PyTorch's `bias=False` the layers' internal
+`LayerNorm`s always keep their own affine bias, a documented departure.
+`TransformerDecoderLayer`'s cross-attention (`multihead_attn`) shares the
+`feature`/`time` axes with self-attention: `tgt` and `memory` carry the same
+`time` identity at possibly different extents, matching
+`MultiheadAttention`'s own cross-attention contract.
+
+`TransformerEncoder`/`TransformerDecoder` stack `num_layers` independently
+built copies of one configured, unbuilt layer (cloned before `build`,
+mirroring PyTorch's own `_get_clones`), plus an optional final `LayerNorm`.
+Each clone gets its own freshly seeded parameters at `build` time rather than
+PyTorch's literal deep-copy-of-already-initialized weights (PyTorch's
+`_get_clones` runs `copy.deepcopy` on one already-built layer, so every layer
+starts from bit-identical initial weights), deliberately following Axis's own
+stacking convention instead: every index-seeded container in this crate (for
+example `Sequential::build`) gives each position a distinct seed, and the
+design doc's own rule that `Repeat` must create independent blocks unless
+weight tying is explicit.
+
+`Transformer` combines one `TransformerEncoder` and one `TransformerDecoder`
+built from shared `feature`/`time`/`embed_dim`/`num_heads`/`dim_feedforward`
+and every dropout/activation/epsilon/norm_first/bias setting; `forward`
+encodes `src` into `memory` then decodes `tgt` against it, PyTorch's own
+two-call composition. There is no `custom_encoder`/`custom_decoder` override:
+Axis has no `Module`-shaped container that fits a differently typed
+encoder/decoder pair interchangeably, so a fully custom pair is built
+directly from `TransformerEncoder`/`TransformerDecoder` instead.
+
+Evidence: independent from-scratch f64 references (finite differences against
+this crate's own `central_difference` helper, mirroring `LayerNorm`'s own
+oracle test) for one encoder layer and one decoder layer, in evaluation mode,
+covering forward and every parameter gradient at both `norm_first=false` and
+`norm_first=true`, with the decoder layer's `tgt`/`memory` extents
+deliberately asymmetric. `TransformerEncoder`/`Transformer` are checked as
+compositions: their stacked forward must equal manually chaining
+independently built layers with the same per-layer seeds. Training-mode
+determinism (a fixed pass seed reproduces a bit-identical forward; a
+different step changes it) is checked end to end through `Transformer`.
+`MultiheadAttention`'s attention-weight dropout is checked at its `p=0` and
+`p=1` edges (bit-exact with `forward`, and exact zero with zero gradient) and
+statistically (many independent pass seeds average back to the `p=0` forward,
+inverted dropout's expectation-preserving property) since the post-dropout
+attention probabilities are an internal detail no public entry point exposes
+directly.
+
 `Tensor::log_softmax(axis)`/`LogSoftmax::new(axis)` is the numerically stable
 `x - logsumexp(x, axis)`, composed entirely from the existing `logsumexp`
 (itself `max`-shifted) and `sub`'s broadcast over the axis `logsumexp`
@@ -1534,3 +1606,143 @@ this because `contract` never fully excludes a term). Graded PARTIAL: all
 rows in one call must share one target length and the time axis's full
 extent is every row's input length; PyTorch's own per-row
 `input_lengths`/`target_lengths` (mixed-length batches) are not implemented.
+
+### Persistent training state and BatchNorm
+
+Lands issue #76 ("Stateful foundation" in `module-backlog.md`): running
+statistics cannot be represented honestly until a module can hold and update
+non-parameter state.
+
+`State` (`model/nn.rs`, next to `Parameter`) is a shared, device-resident
+tensor with no gradient, cloned by reference exactly like `Parameter`. A
+provided `Module::named_states(&self) -> Vec<(String, State)>` reports them
+(default empty); `Sequential`, `ModuleList`, and `ModuleDict` aggregate every
+child's states under the same `"{index}.{name}"`/`"{key}.{name}"` slot-path
+convention `named_parameters` already uses. Nothing ever writes a `State`
+directly. `TrainingPass` (already the per-step context PR #127 introduced for
+`forward_training`) gains a pending list: `pass.stage(state, new_value)`
+queues an update without writing it, so a forward pass stays side-effect
+free. `TrainingPass::commit()` is the only writer, public so a custom
+training loop can call it directly; `Trainer::step_training` calls it once,
+after the whole step (loss, backward, optimizer step) has already succeeded,
+and only then, so an error anywhere earlier leaves every `State` exactly as
+it was. `TrainStep::committed_states()` reports how many updates landed,
+extending the receipt.
+
+`BatchNorm` (`model/normalization.rs`, alongside the other normalization
+modules) covers PyTorch's `BatchNorm1d`/`BatchNorm2d`/`BatchNorm3d` in one
+named-axis module: it declares one feature axis, and every OTHER axis
+present at call time, batch and any spatial axes, normalizes together,
+whatever it happens to be named. Defaults match PyTorch's own: epsilon
+`1e-5`, momentum `Some(0.1)`, a learnable per-feature affine scale and bias,
+and `track_running_stats = true`. `forward_training` normalizes with this
+call's own BIASED batch variance (PyTorch's normalization convention) and,
+when tracking, stages `running = (1 - momentum) * running + momentum *
+batch` using the UNBIASED batch variance for `running_var` (`n / (n - 1)`
+against the same call's biased variance, `n` the element count reduced;
+exactly `1 / 0` when `n == 1`, propagated rather than special-cased, matching
+how the rest of Axis lets domain edges through rather than clamping them).
+`momentum = None` selects PyTorch's cumulative moving average, `1 /
+num_batches_tracked` after incrementing, in place of a fixed factor;
+`num_batches_tracked` itself is always staged as a plain increment, either
+way. `forward` (evaluation) normalizes with the committed running statistics
+when tracking is on, or recomputes this call's own batch statistics when
+`track_running_stats = false`, exactly matching PyTorch's behavior for that
+flag.
+
+`InstanceNorm` gains the same optional `track_running_stats` (PyTorch
+default `false`, so the existing bit-exact path is unchanged when it stays
+off). PyTorch's own InstanceNorm running-statistics update reshapes the
+input so every `(sample, channel)` pair becomes its own single-item "batch",
+runs an ordinary BatchNorm-style momentum update independently for each one
+against the SAME shared running buffer, then averages the resulting
+per-instance estimates back down to one value per channel. Because averaging
+commutes with that update's linear combination, this is exactly `running =
+(1 - factor) * running + factor * pooled`, where `pooled_mean` is the mean of
+every instance's own mean (equivalently, the grand mean over every
+non-channel axis) and `pooled_var` is the mean, over every instance, of that
+instance's own UNBIASED variance: `sample_size / (sample_size - 1)` against
+its own biased variance, `sample_size` the extent product of the declared
+sample axes only, deliberately NOT `BatchNorm`'s pooled variance over the
+whole batch, since each instance unbiases using only its own sample count.
+Evaluation with `track_running_stats = true` uses the committed running
+statistics exactly like `BatchNorm`; the affine scale and bias, and the
+default `false` path, are entirely unchanged.
+
+Evidence: an independent f64 oracle for `BatchNorm` training forward and
+every gradient (input, scale, bias) under reordered storage; a three-step
+trainer test asserting `running_mean`/`running_var`/`num_batches_tracked`
+after each step against hand-computed values, and that every `State` is
+unchanged when a step's loss closure errors after `forward_training` has
+already staged its updates; an evaluation test using the committed running
+statistics; the `momentum = None` cumulative case; `InstanceNorm` with
+`track_running_stats = true` against its own hand-derived per-instance
+oracle; and `named_states` paths threading through `Sequential`.
+
+### Dropout variants, RReLU and prefix dropout
+
+Five modules (`model/nn.rs`, immediately after `Dropout`), all built on the
+training pass and `Tensor::uniform_device` `Dropout` already established,
+none adding a device kernel: every draw composes from `mul`, `scale`, `add`,
+comparisons and `broadcast_to`.
+
+`ChannelDropout` is PyTorch's `nn.Dropout1d`/`nn.Dropout2d`/`nn.Dropout3d` as
+one type, since Axis names axes instead of positionally counting spatial
+dimensions (the same collapse `ZeroPad` already applies to
+`ZeroPad1d`/`2d`/`3d`). `ChannelDropout::new(p, channel, spatial)` drops one
+mask value per combination of `channel` and every axis not named `spatial`,
+broadcasting that decision over the `spatial` axes: PyTorch's own
+`make_feature_noise` builds its mask at shape `[N, C, 1, 1, ...]`, which is
+exactly "every non-spatial axis draws independently." Otherwise it is
+`Dropout`'s own contract: `forward` is the identity, `forward_training`
+consumes one `pass.next_seed()` draw regardless of `p`, and `p == 0`/`p ==
+1` are the same identity/zero edge cases.
+
+`AlphaDropout` is PyTorch's `nn.AlphaDropout` (Klambauer et al.,
+"Self-Normalizing Neural Networks"): SELU-preserving dropout that resets
+dropped units to SELU's own saturation value and applies an affine
+correction, instead of zeroing them, so a self-normalizing network's zero
+mean and unit variance survive dropout. The formula is bit-for-bit PyTorch's
+`aten/src/ATen/native/Dropout.cpp` `_alpha_dropout_impl`: with `alpha =
+1.7580993408473766` and `a = 1 / sqrt((alpha^2 * p + 1) * (1 - p))`, each
+element keeps with probability `1 - p` (the same `draw >= p` convention
+`Dropout` uses) and the output is `a * input * keep + alpha * a * keep +
+alpha * a * (p - 1)`, composed from `mul`, `scale` and `add` with no
+dedicated "add a scalar constant" primitive: the constant term is built with
+`Tensor::from_slice`, the way `normalization::Affine` already builds its own
+constant parameters. `p == 1` returns exact zeros, matching PyTorch's own
+special case (the affine constants are undefined there).
+
+`FeatureAlphaDropout` (PyTorch's `nn.FeatureAlphaDropout`) is that same
+affine formula applied to a `ChannelDropout`-shaped mask instead of an
+elementwise one: their composition, matching PyTorch's own
+`_feature_alpha_dropout` (`feature_dropout=true, alpha_dropout=true` in the
+same `_dropout_impl`).
+
+`RReLU` (PyTorch's `nn.RReLU`, Xu et al., "Empirical Evaluation of Rectified
+Activations in Convolutional Network") defaults `lower = 1/8, upper = 1/3`.
+`forward` (evaluation) is `Tensor::leaky_relu` at the fixed slope `(lower +
+upper) / 2`, PyTorch's documented evaluation behavior. `forward_training`
+draws one independent slope per element, uniform in `[lower, upper)`, from
+one `pass.next_seed()` draw: elements with `input > 0` pass through
+unchanged, every other element (including exactly `0`) multiplies by its own
+slope, matching PyTorch's `x <= 0` test.
+
+`PrefixDropout` (Axis issue #90, no PyTorch class) truncates a tensor to its
+first `w` positions along one named ordered axis, with `w` drawn
+independently per training example, so one trained model yields a whole
+width sweep at evaluation time. This is the capability `learning/bae`'s
+ordered sign code and `vision/image-encode`'s ordered latent and site lists
+both need (issue #90 names both consumers). `forward` (evaluation) is the
+identity. `forward_training` consumes one `pass.next_seed()` draw, feeding
+one `Tensor::uniform_device` call over the non-axis "example" axes alone
+(so the draw is per example, not per element): `w = draw * (extent + 1)`, a
+real value in `[0, extent + 1)`, compared against a constant `0..extent`
+position tensor along the ordered axis. `Tensor::broadcast_to` combines the
+two disjoint axis sets, the per-example width and the per-position index,
+onto one shared shape first, exactly the `torch.cdist`-style outer
+combination `broadcast_to`'s own doc comment describes. Position `i`
+survives when `i < w`, keeping `floor(w) + 1` positions in the generic case,
+so the kept prefix length is uniform over `{1, ..., extent}`. No rescaling
+is applied: unlike `Dropout`'s inverted scaling, this is a hard truncation
+mask, matching `arange(K) < m` in both cited consumers exactly.

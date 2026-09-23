@@ -13528,10 +13528,22 @@ fn max_pool3d_indices_and_max_unpool3d_match_hand_computed_under_reordered_stora
 fn multihead_attention_rejects_invalid_configuration_before_allocation() {
     let (feature, time) = (Axis::new("feature"), Axis::new("time"));
     assert!(MultiheadAttention::new(feature, feature, 4, 2, 0.0).is_err());
-    assert!(MultiheadAttention::new(feature, time, 4, 2, 0.1).is_err());
+    assert!(MultiheadAttention::new(feature, time, 4, 2, -0.1).is_err());
+    assert!(MultiheadAttention::new(feature, time, 4, 2, 1.1).is_err());
+    assert!(MultiheadAttention::new(feature, time, 4, 2, f32::NAN).is_err());
     assert!(MultiheadAttention::new(feature, time, 0, 2, 0.0).is_err());
     assert!(MultiheadAttention::new(feature, time, 4, 0, 0.0).is_err());
     assert!(MultiheadAttention::new(feature, time, 5, 2, 0.0).is_err());
+    // dropout=0.1 (PyTorch's own default) is a valid configuration now that the
+    // seeded training-pass contract (`TrainingPass`) has landed; only `forward`/
+    // `forward_with_weights` -- evaluation semantics -- ignore it.
+    assert!(MultiheadAttention::new(feature, time, 4, 2, 0.1).is_ok());
+    assert!(
+        MultiheadAttention::new(feature, time, 4, 2, 0.0)
+            .unwrap()
+            .dropout(1.5)
+            .is_err()
+    );
 
     let mha = MultiheadAttention::new(feature, time, 4, 2, 0.0).unwrap();
     let q = Shape::new([time.of(2), feature.of(4)]).unwrap();
@@ -14655,5 +14667,2315 @@ fn uniform_device_statistical_sanity_over_a_large_draw() -> Result<()> {
     println!(
         "Tensor::uniform_device statistical sanity PASS mean={mean:.6} variance={variance:.6}"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn batch_norm_forward_training_matches_a_scalar_oracle_forward_and_every_gradient() -> Result<()> {
+    // Independent host oracle: BatchNorm's own training-mode normalization,
+    // reduced over every axis but the declared feature axis (here batch and
+    // spatial together), using the BIASED variance -- PyTorch's own
+    // normalization convention -- entirely separate from the crate's own
+    // `Tensor::moments`.
+    fn batch_norm_reference(
+        values: &[f64],
+        scale: &[f64],
+        bias: &[f64],
+        target: &[f64],
+    ) -> (Vec<f64>, f64) {
+        const BATCH: usize = 3;
+        const FEATURE: usize = 2;
+        const SPATIAL: usize = 2;
+        let mut output = vec![0.0; values.len()];
+        for f in 0..FEATURE {
+            let selected: Vec<usize> = (0..BATCH)
+                .flat_map(|b| (0..SPATIAL).map(move |s| (b * FEATURE + f) * SPATIAL + s))
+                .collect();
+            let mean = selected.iter().map(|&i| values[i]).sum::<f64>() / selected.len() as f64;
+            let variance = selected
+                .iter()
+                .map(|&i| (values[i] - mean).powi(2))
+                .sum::<f64>()
+                / selected.len() as f64;
+            let inverse_standard_deviation = (variance + 1e-5).sqrt().recip();
+            for &i in &selected {
+                output[i] = (values[i] - mean) * inverse_standard_deviation * scale[f] + bias[f];
+            }
+        }
+        let loss = mean_squared(&output, target);
+        (output, loss)
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, feature, spatial) = (
+        Axis::new("bn_oracle_batch"),
+        Axis::new("bn_oracle_feature"),
+        Axis::new("bn_oracle_spatial"),
+    );
+    let dims = [batch.of(3), feature.of(2), spatial.of(2)];
+    let values = vec![
+        -1.5_f64, 0.5, 2.0, -0.25, 1.25, -2.0, 0.75, 1.75, -1.0, 0.0, 2.5, -0.5,
+    ];
+    let scale = vec![1.5_f64, -0.75];
+    let bias = vec![0.2_f64, -0.4];
+    let target: Vec<f64> = (0..12).map(|i| (i as f64 * 0.23).cos() * 0.5).collect();
+
+    let input = Tensor::from_slice(
+        &values.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?
+    .with_layout([spatial, feature, batch])?
+    .with_grad();
+    let mut bn = BatchNorm::new(feature);
+    bn.build(input.shape(), &device, 0)?;
+    bn.parameter("scale")?
+        .set_values(&scale.iter().map(|v| *v as f32).collect::<Vec<_>>())?;
+    bn.parameter("bias")?
+        .set_values(&bias.iter().map(|v| *v as f32).collect::<Vec<_>>())?;
+
+    let mut pass = TrainingPass::new(1234);
+    let output = bn.forward_training(&input, &mut pass)?;
+    let (expected_output, _) = batch_norm_reference(&values, &scale, &bias, &target);
+    close(
+        "BatchNorm training forward",
+        &output.to_vec()?,
+        &expected_output,
+    );
+
+    let target_tensor = Tensor::from_slice(
+        &target.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    output
+        .squared_error(&target_tensor)?
+        .mean([batch, feature, spatial])?
+        .backward()?;
+    close(
+        "BatchNorm input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &central_difference(&values, 1e-4, |candidate| {
+            batch_norm_reference(candidate, &scale, &bias, &target).1
+        }),
+    );
+    close(
+        "BatchNorm scale gradient",
+        &bn.parameter("scale")?.grad().unwrap().to_vec()?,
+        &central_difference(&scale, 1e-4, |candidate| {
+            batch_norm_reference(&values, candidate, &bias, &target).1
+        }),
+    );
+    close(
+        "BatchNorm bias gradient",
+        &bn.parameter("bias")?.grad().unwrap().to_vec()?,
+        &central_difference(&bias, 1e-4, |candidate| {
+            batch_norm_reference(&values, &scale, candidate, &target).1
+        }),
+    );
+    println!("BatchNorm forward_training scalar oracle forward+gradient PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn trainer_step_training_commits_batch_norm_running_statistics_and_leaves_them_untouched_on_failure()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("bn_trainer_batch"),
+        Axis::new("bn_trainer_feature"),
+    );
+    let dims = [batch.of(4), feature.of(2)];
+    // `affine(false)` keeps the post-normalization scale/bias fixed at
+    // identity, since the fixed-input eval oracle below assumes them
+    // untouched by the three SGD steps -- the running-statistics EMA under
+    // test is independent of the affine transform either way.
+    let mut bn = BatchNorm::new(feature).momentum(Some(0.5))?.affine(false);
+    bn.build(&Shape::new(dims)?, &device, 0)?;
+
+    // Three fixed steps of input, one 4x2 batch each, chosen so a plain
+    // f64 replay of BatchNorm's documented EMA formula is trivial to
+    // hand-check: momentum=0.5, biased variance for normalization, UNBIASED
+    // running_var (n=4 samples per feature per step -> factor 4/3).
+    let steps: [[f64; 8]; 3] = [
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0],
+        [0.5, 1.5, -0.5, 2.5, 3.5, -1.5, 4.5, -2.5],
+    ];
+    fn expected_after(steps: &[[f64; 8]], momentum: f64) -> (Vec<f64>, Vec<f64>, f64) {
+        let mut running_mean = vec![0.0; 2];
+        let mut running_var = vec![1.0; 2];
+        let mut count = 0.0;
+        for step in steps {
+            count += 1.0;
+            for f in 0..2 {
+                let samples: Vec<f64> = (0..4).map(|b| step[b * 2 + f]).collect();
+                let mean = samples.iter().sum::<f64>() / 4.0;
+                let biased_var = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 4.0;
+                let unbiased_var = biased_var * 4.0 / 3.0;
+                running_mean[f] = (1.0 - momentum) * running_mean[f] + momentum * mean;
+                running_var[f] = (1.0 - momentum) * running_var[f] + momentum * unbiased_var;
+            }
+        }
+        (running_mean, running_var, count)
+    }
+
+    let mut trainer = Trainer::new(SGD::new(0.01)?).with_seed(2026);
+    let mut final_mean = vec![0.0; 2];
+    let mut final_var = vec![0.0; 2];
+    for (index, step_values) in steps.iter().enumerate() {
+        let values: Vec<f32> = step_values.iter().map(|v| *v as f32).collect();
+        // `with_grad`: with `affine(false)` the model itself has no
+        // parameters, so `backward` needs a tracked leaf somewhere in the
+        // loss graph to run at all; the running-statistics EMA under test
+        // never depends on it.
+        let input = Tensor::from_slice(&values, dims, &device)?.with_grad();
+        let step = trainer.step_training(&mut bn, |model, pass| {
+            model.forward_training(&input, pass)?.mean([batch, feature])
+        })?;
+        assert_eq!(
+            step.committed_states(),
+            3,
+            "step {index}: running_mean, running_var, num_batches_tracked"
+        );
+        let (expected_mean, expected_var, expected_count) = expected_after(&steps[..=index], 0.5);
+        close(
+            &format!("BatchNorm running_mean after step {index}"),
+            &bn.state("running_mean")?.tensor().to_vec()?,
+            &expected_mean,
+        );
+        close(
+            &format!("BatchNorm running_var after step {index}"),
+            &bn.state("running_var")?.tensor().to_vec()?,
+            &expected_var,
+        );
+        assert_eq!(
+            bn.state("num_batches_tracked")?.tensor().item()?,
+            expected_count as f32,
+            "step {index}: num_batches_tracked"
+        );
+        final_mean = expected_mean;
+        final_var = expected_var;
+    }
+
+    // Evaluation with the committed running statistics: scale=1, bias=0
+    // (never set, so still their identity default), so the expected output
+    // is the plain per-feature normalization against the last step's
+    // committed running_mean/running_var.
+    let eval_input_values: Vec<f64> = vec![10.0, -5.0, 3.0, 2.0, -1.0, 6.0, 0.0, -2.0];
+    let eval_input = Tensor::from_slice(
+        &eval_input_values
+            .iter()
+            .map(|v| *v as f32)
+            .collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    let eval_output = bn.forward(&eval_input)?.to_vec()?;
+    let mut expected_eval = vec![0.0; 8];
+    for b in 0..4 {
+        for f in 0..2 {
+            let idx = b * 2 + f;
+            expected_eval[idx] =
+                (eval_input_values[idx] - final_mean[f]) / (final_var[f] + 1e-5).sqrt();
+        }
+    }
+    close(
+        "BatchNorm eval uses committed running statistics",
+        &eval_output,
+        &expected_eval,
+    );
+
+    // A step whose loss errors AFTER forward_training has already staged
+    // updates must leave every State untouched: `step_training` only ever
+    // commits once the whole step -- loss, backward, optimizer step -- has
+    // succeeded, so an error from the loss closure itself never reaches
+    // `TrainingPass::commit`.
+    let before_mean = bn
+        .state("running_mean")?
+        .tensor()
+        .to_vec()?
+        .into_iter()
+        .map(f64::from)
+        .collect::<Vec<_>>();
+    let before_var = bn
+        .state("running_var")?
+        .tensor()
+        .to_vec()?
+        .into_iter()
+        .map(f64::from)
+        .collect::<Vec<_>>();
+    let before_count = bn.state("num_batches_tracked")?.tensor().item()?;
+    let failing_input = Tensor::from_slice(&[9.0; 8], dims, &device)?;
+    let failed = trainer.step_training(&mut bn, |model, pass| {
+        let _ = model.forward_training(&failing_input, pass)?;
+        Err::<Tensor, _>("injected failure after forward".into())
+    });
+    assert!(failed.is_err(), "the injected failure must propagate");
+    close(
+        "BatchNorm running_mean unchanged after a failed step",
+        &bn.state("running_mean")?.tensor().to_vec()?,
+        &before_mean,
+    );
+    close(
+        "BatchNorm running_var unchanged after a failed step",
+        &bn.state("running_var")?.tensor().to_vec()?,
+        &before_var,
+    );
+    assert_eq!(
+        bn.state("num_batches_tracked")?.tensor().item()?,
+        before_count,
+        "num_batches_tracked unchanged after a failed step"
+    );
+    println!("Trainer::step_training BatchNorm running-statistics commit-on-success PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn batch_norm_without_tracking_uses_batch_statistics_in_eval_too() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("bn_no_track_batch"),
+        Axis::new("bn_no_track_feature"),
+    );
+    let dims = [batch.of(4), feature.of(2)];
+    let values: Vec<f64> = vec![1.0, 5.0, 2.0, -3.0, 0.0, 4.0, -1.0, 2.0];
+    let input = Tensor::from_slice(
+        &values.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    let mut bn = BatchNorm::new(feature)
+        .track_running_stats(false)
+        .affine(false);
+    bn.build(input.shape(), &device, 0)?;
+    assert!(
+        bn.states().is_empty(),
+        "track_running_stats(false) must allocate no State"
+    );
+
+    fn batch_stats_reference(values: &[f64]) -> Vec<f64> {
+        const BATCH: usize = 4;
+        const FEATURE: usize = 2;
+        let mut output = vec![0.0; values.len()];
+        for f in 0..FEATURE {
+            let samples: Vec<f64> = (0..BATCH).map(|b| values[b * FEATURE + f]).collect();
+            let mean = samples.iter().sum::<f64>() / BATCH as f64;
+            let variance = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / BATCH as f64;
+            let inverse_standard_deviation = (variance + 1e-5).sqrt().recip();
+            for b in 0..BATCH {
+                output[b * FEATURE + f] =
+                    (values[b * FEATURE + f] - mean) * inverse_standard_deviation;
+            }
+        }
+        output
+    }
+
+    let expected = batch_stats_reference(&values);
+    close(
+        "BatchNorm eval batch statistics (forward)",
+        &bn.forward(&input)?.to_vec()?,
+        &expected,
+    );
+    let mut pass = TrainingPass::new(1);
+    close(
+        "BatchNorm eval batch statistics (forward_training)",
+        &bn.forward_training(&input, &mut pass)?.to_vec()?,
+        &expected,
+    );
+    assert_eq!(
+        pass.commit(),
+        0,
+        "no state to commit when track_running_stats is false"
+    );
+    println!("BatchNorm track_running_stats=false eval-uses-batch-statistics PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn batch_norm_momentum_none_uses_the_cumulative_moving_average() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("bn_cumulative_batch"),
+        Axis::new("bn_cumulative_feature"),
+    );
+    let dims = [batch.of(2), feature.of(1)];
+    let mut bn = BatchNorm::new(feature).momentum(None)?.affine(false);
+    bn.build(&Shape::new(dims)?, &device, 0)?;
+
+    let steps: [[f32; 2]; 3] = [[1.0, 3.0], [10.0, 20.0], [-4.0, 4.0]];
+    // Cumulative average with running_mean starting at 0.0: after step k
+    // (1-indexed), factor_k = 1/k, so this is an ordinary online mean/EMA
+    // update against that factor -- independently replayed here in f64.
+    let mut expected_mean = 0.0_f64;
+    let mut expected_var = 1.0_f64;
+    for (index, step) in steps.iter().enumerate() {
+        let batch_mean = (f64::from(step[0]) + f64::from(step[1])) / 2.0;
+        let biased_var = ((f64::from(step[0]) - batch_mean).powi(2)
+            + (f64::from(step[1]) - batch_mean).powi(2))
+            / 2.0;
+        let unbiased_var = biased_var * 2.0; // n=2 -> n / (n - 1) = 2
+        let factor = 1.0 / (index as f64 + 1.0);
+        expected_mean = (1.0 - factor) * expected_mean + factor * batch_mean;
+        expected_var = (1.0 - factor) * expected_var + factor * unbiased_var;
+
+        let input = Tensor::from_slice(step, dims, &device)?;
+        let mut pass = TrainingPass::new(index as u64);
+        let _ = bn.forward_training(&input, &mut pass)?;
+        assert_eq!(pass.commit(), 3);
+        close(
+            &format!("cumulative running_mean after step {index}"),
+            &bn.state("running_mean")?.tensor().to_vec()?,
+            &[expected_mean],
+        );
+        close(
+            &format!("cumulative running_var after step {index}"),
+            &bn.state("running_var")?.tensor().to_vec()?,
+            &[expected_var],
+        );
+        assert_eq!(
+            bn.state("num_batches_tracked")?.tensor().item()?,
+            (index + 1) as f32
+        );
+    }
+    println!("BatchNorm momentum=None cumulative moving average PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn instance_norm_track_running_stats_matches_a_hand_derived_running_statistics_oracle() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let (batch, channel, spatial) = (
+        Axis::new("in_running_batch"),
+        Axis::new("in_running_channel"),
+        Axis::new("in_running_spatial"),
+    );
+    let dims = [batch.of(2), channel.of(2), spatial.of(2)];
+    let values: Vec<f32> = vec![
+        1.0, 3.0, 5.0, 7.0, // batch 0: channel 0 = [1, 3], channel 1 = [5, 7]
+        2.0, 0.0, -1.0, 3.0, // batch 1: channel 0 = [2, 0], channel 1 = [-1, 3]
+    ];
+    let input = Tensor::from_slice(&values, dims, &device)?;
+    let mut instance = InstanceNorm::new(channel, [spatial])?
+        .affine(false)
+        .track_running_stats(true)
+        .momentum(Some(0.5))?;
+    instance.build(input.shape(), &device, 0)?;
+
+    // Independent host replay of InstanceNorm's documented running-statistics
+    // formula (see its own doc comment): per-instance (batch, channel)
+    // mean/var over the spatial axis only, the variance unbiased with the
+    // spatial sample size ALONE (n=2 -> n / (n - 1) = 2, not the whole
+    // batch's count), then averaged over batch before the momentum EMA.
+    fn instance_stats(pair: [f64; 2]) -> (f64, f64) {
+        let mean = (pair[0] + pair[1]) / 2.0;
+        let biased = ((pair[0] - mean).powi(2) + (pair[1] - mean).powi(2)) / 2.0;
+        (mean, biased * 2.0)
+    }
+    let (mean_b0_c0, var_b0_c0) = instance_stats([1.0, 3.0]);
+    let (mean_b0_c1, var_b0_c1) = instance_stats([5.0, 7.0]);
+    let (mean_b1_c0, var_b1_c0) = instance_stats([2.0, 0.0]);
+    let (mean_b1_c1, var_b1_c1) = instance_stats([-1.0, 3.0]);
+    let pooled_mean = [
+        (mean_b0_c0 + mean_b1_c0) / 2.0,
+        (mean_b0_c1 + mean_b1_c1) / 2.0,
+    ];
+    let pooled_var = [(var_b0_c0 + var_b1_c0) / 2.0, (var_b0_c1 + var_b1_c1) / 2.0];
+    let momentum = 0.5_f64;
+    let expected_mean = [momentum * pooled_mean[0], momentum * pooled_mean[1]];
+    let expected_var = [
+        0.5 * 1.0 + momentum * pooled_var[0],
+        0.5 * 1.0 + momentum * pooled_var[1],
+    ];
+
+    let mut pass = TrainingPass::new(99);
+    let _ = instance.forward_training(&input, &mut pass)?;
+    assert_eq!(pass.commit(), 3);
+    close(
+        "InstanceNorm running_mean",
+        &instance.state("running_mean")?.tensor().to_vec()?,
+        &expected_mean,
+    );
+    close(
+        "InstanceNorm running_var",
+        &instance.state("running_var")?.tensor().to_vec()?,
+        &expected_var,
+    );
+    assert_eq!(instance.state("num_batches_tracked")?.tensor().item()?, 1.0);
+    println!("InstanceNorm track_running_stats running-statistics oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_states_thread_batch_norm_through_sequential_slot_paths() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("seq_states_feature");
+    let dims = [feature.of(3)];
+    let mut sequential = Sequential::new((
+        BatchNorm::new(feature),
+        BatchNorm::new(feature).track_running_stats(false),
+    ));
+    sequential.build(&Shape::new(dims)?, &device, 0)?;
+    let mut paths: Vec<String> = sequential
+        .named_states()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        ["0.num_batches_tracked", "0.running_mean", "0.running_var"]
+    );
+    println!("named_states thread through Sequential slot paths PASS");
+    Ok(())
+}
+
+// --- ChannelDropout ------------------------------------------------------------------------
+
+#[test]
+fn channel_dropout_constructor_rejects_invalid_configurations() {
+    let channel = Axis::new("cd_ctor_channel");
+    let spatial = Axis::new("cd_ctor_spatial");
+    let other_spatial = Axis::new("cd_ctor_spatial_2");
+    assert!(ChannelDropout::new(0.5, channel, [spatial]).is_ok());
+    assert!(ChannelDropout::new(0.5, channel, [spatial, other_spatial]).is_ok());
+    assert!(ChannelDropout::new(-0.01, channel, [spatial]).is_err());
+    assert!(ChannelDropout::new(1.01, channel, [spatial]).is_err());
+    assert!(ChannelDropout::new(f32::NAN, channel, [spatial]).is_err());
+    // Empty spatial list.
+    assert!(ChannelDropout::new(0.5, channel, Vec::<Axis>::new()).is_err());
+    // Channel duplicated into the spatial list.
+    assert!(ChannelDropout::new(0.5, channel, [channel]).is_err());
+    // Spatial axis listed twice.
+    assert!(ChannelDropout::new(0.5, channel, [spatial, spatial]).is_err());
+    println!("ChannelDropout constructor validation PASS");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_rejects_missing_axes_before_any_device_work() -> Result<()> {
+    let channel = Axis::new("cd_missing_channel");
+    let spatial = Axis::new("cd_missing_spatial");
+    let unrelated = Axis::new("cd_missing_unrelated");
+    let device = Device::cuda(0)?;
+    let input = Tensor::from_slice(&[1.0, 2.0], [unrelated.of(2)], &device)?;
+    let dropout = ChannelDropout::new(0.5, channel, [spatial])?;
+    assert!(dropout.output_shape(input.shape()).is_err());
+    assert!(dropout.forward(&input).is_err());
+    println!("ChannelDropout missing-axis rejection PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_eval_batch");
+    let channel = Axis::new("cd_eval_channel");
+    let spatial = Axis::new("cd_eval_spatial");
+    let values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(2), spatial.of(2)],
+        &device,
+    )?;
+    let output = ChannelDropout::new(0.5, channel, [spatial])?.forward(&input)?;
+    close(
+        "ChannelDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("ChannelDropout eval-mode identity PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_forward_training_matches_a_broadcast_mask_oracle_forward_and_gradient()
+-> Result<()> {
+    // Independent oracle: `TrainingPass::new(5050)`'s first `next_seed()` is
+    // 13144240536140775429. Its first four `Tensor::uniform_device` draws (one per (batch,
+    // channel) combination, since `spatial` is excluded from the mask draw) are
+    // [0.0789562463760376, 0.3713812828063965, 0.6667241454124451, 0.11031758785247803], so
+    // keeping where the draw is >= 0.5 gives keep_small = [0, 0, 1, 0] -- only (batch=1,
+    // channel=0) survives -- broadcast over the two `spatial` positions of that combination.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_oracle_batch");
+    let channel = Axis::new("cd_oracle_channel");
+    let spatial = Axis::new("cd_oracle_spatial");
+    let input_values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let leaf = Tensor::from_slice(
+        &input_values,
+        [batch.of(2), channel.of(2), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+
+    let dropout = ChannelDropout::new(0.5, channel, [spatial])?;
+    let mut pass = TrainingPass::new(5050);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [0.0, 0.0, 0.0, 0.0, 10.0, 12.0, 0.0, 0.0];
+    close(
+        "ChannelDropout forward_training p=0.5 broadcast mask oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean([batch, channel, spatial])?.backward()?;
+    let expected_gradient = [0.0, 0.0, 0.0, 0.0, 0.25, 0.25, 0.0, 0.0];
+    close(
+        "ChannelDropout forward_training gradient (mask / (1 - p), broadcast over spatial)",
+        &leaf
+            .grad()
+            .expect("ChannelDropout input gradient")
+            .to_vec()?,
+        &expected_gradient,
+    );
+
+    let mut repeat_pass = TrainingPass::new(5050);
+    let repeat = dropout.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "ChannelDropout forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+    println!("ChannelDropout forward_training broadcast mask oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_forward_training_handles_p_zero_identity_and_p_one_zero_gradient() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_edge_batch");
+    let channel = Axis::new("cd_edge_channel");
+    let spatial = Axis::new("cd_edge_spatial");
+    let values: Vec<f32> = vec![2.0, -3.0, 5.5, -0.25];
+    let mut pass = TrainingPass::new(1234);
+
+    let identity_leaf = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(1), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let identity = ChannelDropout::new(0.0, channel, [spatial])?
+        .forward_training(&identity_leaf, &mut pass)?;
+    close(
+        "ChannelDropout forward_training p=0 is the identity",
+        &identity.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+
+    let zero_leaf = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(1), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let zeros =
+        ChannelDropout::new(1.0, channel, [spatial])?.forward_training(&zero_leaf, &mut pass)?;
+    close(
+        "ChannelDropout forward_training p=1 is exact zeros",
+        &zeros.to_vec()?,
+        &[0.0; 4],
+    );
+    zeros.mean([batch, channel, spatial])?.backward()?;
+    close(
+        "ChannelDropout forward_training p=1 gradient is exactly zero",
+        &zero_leaf.grad().expect("p=1 input gradient").to_vec()?,
+        &[0.0; 4],
+    );
+    println!("ChannelDropout forward_training p=0/p=1 edge cases PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_statistical_sanity_kept_fraction_is_per_channel_not_per_element() -> Result<()> {
+    // A whole (batch, channel) combination is kept or dropped together: the fraction of kept
+    // COMBINATIONS should track (1 - p), and every combination's `spatial` positions must agree.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_stat_batch");
+    let channel = Axis::new("cd_stat_channel");
+    let spatial = Axis::new("cd_stat_spatial");
+    let combinations = 2048;
+    let spatial_extent = 4;
+    let values: Vec<f32> = (0..combinations * spatial_extent)
+        .map(|i| 1.0 + (i as f32) * 0.0001)
+        .collect();
+    let leaf = Tensor::from_slice(
+        &values,
+        [
+            batch.of(combinations),
+            channel.of(1),
+            spatial.of(spatial_extent),
+        ],
+        &device,
+    )?;
+    let mut pass = TrainingPass::new(999);
+    let output = ChannelDropout::new(0.25, channel, [spatial])?
+        .forward_training(&leaf, &mut pass)?
+        .to_vec()?;
+
+    let mut agreeing = 0;
+    let mut kept_combinations = 0;
+    for combination in 0..combinations {
+        let row = &output[combination * spatial_extent..(combination + 1) * spatial_extent];
+        let all_kept = row.iter().all(|&v| v != 0.0);
+        let all_dropped = row.iter().all(|&v| v == 0.0);
+        if all_kept || all_dropped {
+            agreeing += 1;
+        }
+        if all_kept {
+            kept_combinations += 1;
+        }
+    }
+    assert_eq!(
+        agreeing, combinations,
+        "every spatial position of one (batch, channel) combination must share one decision"
+    );
+    let kept_fraction = kept_combinations as f64 / combinations as f64;
+    assert!(
+        (kept_fraction - 0.75).abs() < 0.03,
+        "kept combination fraction {kept_fraction} too far from 0.75"
+    );
+    println!(
+        "ChannelDropout statistical sanity PASS kept_fraction={kept_fraction:.4} (broadcast agreement 100%)"
+    );
+    Ok(())
+}
+
+// --- AlphaDropout ----------------------------------------------------------------------------
+
+#[test]
+fn alpha_dropout_constructor_rejects_invalid_probabilities() {
+    assert!(AlphaDropout::new(0.0).is_ok());
+    assert!(AlphaDropout::new(1.0).is_ok());
+    assert!(AlphaDropout::new(0.3).is_ok());
+    assert!(AlphaDropout::new(-0.01).is_err());
+    assert!(AlphaDropout::new(1.01).is_err());
+    assert!(AlphaDropout::new(f32::NAN).is_err());
+    assert!(AlphaDropout::new(f32::INFINITY).is_err());
+    println!("AlphaDropout constructor validation PASS");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_eval_feature");
+    let values = [3.0_f32, -1.5, 0.0, 42.25];
+    let input = Tensor::from_slice(&values, [feature.of(values.len())], &device)?;
+    let output = AlphaDropout::new(0.4)?.forward(&input)?;
+    close(
+        "AlphaDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("AlphaDropout eval-mode identity PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_forward_training_matches_pytorch_affine_formula_forward_and_gradient() -> Result<()>
+{
+    // Independent oracle, bit-for-bit PyTorch's `_alpha_dropout_impl` (`aten/src/ATen/native/
+    // Dropout.cpp`): `alpha = 1.7580993408473766` (its f32 rounding, matching
+    // `ALPHA_DROPOUT_ALPHA`, is 1.7580993175506592), `a = 1 / sqrt((alpha^2 * p + 1) * (1 -
+    // p))`. `TrainingPass::new(90210)`'s first `next_seed()` is 8618671413115748481; its first
+    // four `Tensor::uniform_device` draws feed `keep = draw >= p` at `p = 0.3`, giving `keep =
+    // [0, 1, 0, 1]`. At `p = 0.3`, `a = 0.8609525561332703` and the dropped-element constant
+    // `alpha * a * (p - 1) = -1.059548020362854`.
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_oracle_feature");
+    let input_values = [1.0_f32, -2.0, 0.5, -0.5];
+    let leaf = Tensor::from_slice(&input_values, [feature.of(4)], &device)?.with_grad();
+
+    let dropout = AlphaDropout::new(0.3)?;
+    let mut pass = TrainingPass::new(90210);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [
+        -1.059548020362854,
+        -1.2678130865097046,
+        -1.059548020362854,
+        0.023615717887878418,
+    ];
+    close(
+        "AlphaDropout forward_training p=0.3 affine oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean(feature)?.backward()?;
+    let expected_gradient = [0.0, 0.21523813903331757, 0.0, 0.21523813903331757];
+    close(
+        "AlphaDropout forward_training gradient (a * keep / count)",
+        &leaf.grad().expect("AlphaDropout input gradient").to_vec()?,
+        &expected_gradient,
+    );
+
+    let mut repeat_pass = TrainingPass::new(90210);
+    let repeat = dropout.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "AlphaDropout forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+    println!("AlphaDropout forward_training affine oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_forward_training_handles_p_zero_identity_and_p_one_zero_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_edge_feature");
+    let values = [2.0_f32, -3.0, 5.5, -0.25];
+    let mut pass = TrainingPass::new(4321);
+
+    let identity_leaf =
+        Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let identity = AlphaDropout::new(0.0)?.forward_training(&identity_leaf, &mut pass)?;
+    close(
+        "AlphaDropout forward_training p=0 is the identity",
+        &identity.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+
+    let zero_leaf = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let zeros = AlphaDropout::new(1.0)?.forward_training(&zero_leaf, &mut pass)?;
+    close(
+        "AlphaDropout forward_training p=1 is exact zeros",
+        &zeros.to_vec()?,
+        &[0.0; 4],
+    );
+    zeros.mean(feature)?.backward()?;
+    close(
+        "AlphaDropout forward_training p=1 gradient is exactly zero",
+        &zero_leaf.grad().expect("p=1 input gradient").to_vec()?,
+        &[0.0; 4],
+    );
+    println!("AlphaDropout forward_training p=0/p=1 edge cases PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_statistical_sanity_preserves_mean_and_variance() -> Result<()> {
+    // Self-normalizing networks assume zero mean, unit variance activations; alpha dropout's
+    // whole point is preserving both through training. Starting from `Tensor::normal(..., 0.0,
+    // 1.0, ...)` (its own oracle: `docs/design/library.md`'s Box-Muller construction over the
+    // host xorshift stream), the output mean and variance should stay close to 0 and 1.
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_stat_feature");
+    let count = 200_000;
+    let leaf = Tensor::normal([feature.of(count)], 13, 0.0, 1.0, &device)?;
+    let mut pass = TrainingPass::new(55);
+    let output = AlphaDropout::new(0.2)?
+        .forward_training(&leaf, &mut pass)?
+        .to_vec()?;
+    let mean = output.iter().map(|&v| f64::from(v)).sum::<f64>() / output.len() as f64;
+    let variance = output
+        .iter()
+        .map(|&v| (f64::from(v) - mean).powi(2))
+        .sum::<f64>()
+        / output.len() as f64;
+    assert!(mean.abs() < 0.05, "output mean {mean} too far from 0");
+    assert!(
+        (variance - 1.0).abs() < 0.1,
+        "output variance {variance} too far from 1"
+    );
+    println!("AlphaDropout statistical sanity PASS mean={mean:.4} variance={variance:.4}");
+    Ok(())
+}
+
+// --- FeatureAlphaDropout ----------------------------------------------------------------------
+
+#[test]
+fn feature_alpha_dropout_constructor_rejects_invalid_configurations() {
+    let channel = Axis::new("fad_ctor_channel");
+    let spatial = Axis::new("fad_ctor_spatial");
+    assert!(FeatureAlphaDropout::new(0.4, channel, [spatial]).is_ok());
+    assert!(FeatureAlphaDropout::new(-0.01, channel, [spatial]).is_err());
+    assert!(FeatureAlphaDropout::new(1.01, channel, [spatial]).is_err());
+    assert!(FeatureAlphaDropout::new(0.4, channel, Vec::<Axis>::new()).is_err());
+    assert!(FeatureAlphaDropout::new(0.4, channel, [channel]).is_err());
+    println!("FeatureAlphaDropout constructor validation PASS");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn feature_alpha_dropout_forward_training_matches_a_broadcast_affine_oracle_forward_and_gradient()
+-> Result<()> {
+    // Same construction as `channel_dropout_forward_training_matches_a_broadcast_mask_oracle_
+    // forward_and_gradient`, with `AlphaDropout`'s affine formula in place of the inverted-
+    // dropout scale. `TrainingPass::new(31415)`'s first `next_seed()` is 1944086767984051203;
+    // its first four `Tensor::uniform_device` draws feed `keep = draw >= p` at `p = 0.4`, giving
+    // keep_small = [1, 1, 0, 1] -- every (batch, channel) combination except (batch=1,
+    // channel=0) survives, broadcast over `spatial`. `a = 0.8632826209068298`, constant term
+    // `alpha * a * (p - 1) = -0.9106419682502747`.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("fad_oracle_batch");
+    let channel = Axis::new("fad_oracle_channel");
+    let spatial = Axis::new("fad_oracle_spatial");
+    let input_values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let leaf = Tensor::from_slice(
+        &input_values,
+        [batch.of(2), channel.of(2), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+
+    let dropout = FeatureAlphaDropout::new(0.4, channel, [spatial])?;
+    let mut pass = TrainingPass::new(31415);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [
+        1.4703772068023682,
+        2.3336598873138428,
+        3.1969425678253174,
+        4.060225009918213,
+        -0.9106419682502747,
+        -0.9106419682502747,
+        6.6500725746154785,
+        7.513355731964111,
+    ];
+    close(
+        "FeatureAlphaDropout forward_training p=0.4 broadcast affine oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean([batch, channel, spatial])?.backward()?;
+    let expected_gradient = [
+        0.10791032761335373,
+        0.10791032761335373,
+        0.10791032761335373,
+        0.10791032761335373,
+        0.0,
+        0.0,
+        0.10791032761335373,
+        0.10791032761335373,
+    ];
+    close(
+        "FeatureAlphaDropout forward_training gradient (a * keep / count, broadcast over spatial)",
+        &leaf
+            .grad()
+            .expect("FeatureAlphaDropout input gradient")
+            .to_vec()?,
+        &expected_gradient,
+    );
+    println!("FeatureAlphaDropout forward_training broadcast affine oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn feature_alpha_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("fad_eval_batch");
+    let channel = Axis::new("fad_eval_channel");
+    let spatial = Axis::new("fad_eval_spatial");
+    let values: Vec<f32> = (1..=4).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(1), spatial.of(2)],
+        &device,
+    )?;
+    let output = FeatureAlphaDropout::new(0.4, channel, [spatial])?.forward(&input)?;
+    close(
+        "FeatureAlphaDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("FeatureAlphaDropout eval-mode identity PASS");
+    Ok(())
+}
+
+// --- RReLU -------------------------------------------------------------------------------------
+
+#[test]
+fn rrelu_builder_rejects_invalid_bounds() -> Result<()> {
+    assert!(RReLU::new().lower(-0.01).is_err());
+    assert!(RReLU::new().lower(f32::NAN).is_err());
+    assert!(RReLU::new().upper(f32::NAN).is_err());
+    // Default upper is 1/3: raising lower past it is rejected immediately, before `upper` is
+    // ever touched.
+    assert!(RReLU::new().lower(0.5).is_err());
+    // Default lower is 1/8: lowering upper below it is rejected too.
+    assert!(RReLU::new().upper(0.05).is_err());
+    // Raise lower first (still under the default upper), then raise upper past the new lower.
+    assert!(RReLU::new().lower(0.1)?.upper(0.4).is_ok());
+    println!("RReLU builder validation PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rrelu_forward_is_a_fixed_leaky_relu_at_the_mean_slope() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("rrelu_eval_feature");
+    let values = [2.0_f32, -3.0, 0.0, 5.0, -1.5, -0.25];
+    let input = Tensor::from_slice(&values, [feature.of(values.len())], &device)?;
+    // Default lower = 1/8, upper = 1/3: fixed eval slope (1/8 + 1/3) / 2 = 0.2291666...
+    let output = RReLU::new().forward(&input)?;
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&v| {
+            if v > 0.0 {
+                v as f64
+            } else {
+                v as f64 * (1.0 / 8.0 + 1.0 / 3.0) / 2.0
+            }
+        })
+        .collect();
+    close(
+        "RReLU::forward at PyTorch defaults",
+        &output.to_vec()?,
+        &expected,
+    );
+    close(
+        "RReLU::default() matches RReLU::new()",
+        &RReLU::default().forward(&input)?.to_vec()?,
+        &expected,
+    );
+
+    let custom = RReLU::new().lower(0.1)?.upper(0.4)?;
+    let custom_output = custom.forward(&input)?;
+    let custom_expected = [2.0, -0.75, 0.0, 5.0, -0.375, -0.0625];
+    close(
+        "RReLU::forward at custom lower/upper is leaky_relu((lower + upper) / 2)",
+        &custom_output.to_vec()?,
+        &custom_expected,
+    );
+    println!("RReLU eval-mode fixed-slope PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rrelu_forward_training_matches_a_per_element_slope_oracle_forward_and_gradient() -> Result<()> {
+    // Independent oracle: `TrainingPass::new(2718)`'s first `next_seed()` is
+    // 11642600825927962904. Its first six `Tensor::uniform_device` draws feed `slope = lower +
+    // (upper - lower) * draw` at `lower = 0.1, upper = 0.4`: slope = [0.13487684726715088,
+    // 0.24346089363098145, 0.12079253792762756, 0.2371707558631897, 0.19090664386749268,
+    // 0.2531281113624573]. Positive elements (including none here at exactly zero) pass
+    // through; non-positive elements (`x <= 0`, so the zero element too) scale by their slope.
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("rrelu_oracle_feature");
+    let input_values = [2.0_f32, -3.0, 0.0, 5.0, -1.5, -0.25];
+    let leaf = Tensor::from_slice(&input_values, [feature.of(6)], &device)?.with_grad();
+
+    let rrelu = RReLU::new().lower(0.1)?.upper(0.4)?;
+    let mut pass = TrainingPass::new(2718);
+    let output = rrelu.forward_training(&leaf, &mut pass)?;
+    let expected = [
+        2.0,
+        -0.7303826808929443,
+        0.0,
+        5.0,
+        -0.286359965801239,
+        -0.06328202784061432,
+    ];
+    close(
+        "RReLU forward_training per-element slope oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean(feature)?.backward()?;
+    let expected_gradient = [
+        0.1666666716337204,
+        0.040576815605163574,
+        0.020132089033722878,
+        0.1666666716337204,
+        0.03181777521967888,
+        0.042188018560409546,
+    ];
+    close(
+        "RReLU forward_training gradient (1 where kept, slope where scaled)",
+        &leaf.grad().expect("RReLU input gradient").to_vec()?,
+        &expected_gradient,
+    );
+
+    let mut repeat_pass = TrainingPass::new(2718);
+    let repeat = rrelu.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "RReLU forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+    println!("RReLU forward_training per-element slope oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rrelu_forward_training_statistical_sanity_slopes_stay_in_bounds() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("rrelu_stat_feature");
+    let count = 100_000;
+    // All-negative input isolates the scaled branch: output / input is exactly the drawn slope.
+    let values: Vec<f32> = (0..count).map(|_| -1.0).collect();
+    let leaf = Tensor::from_slice(&values, [feature.of(count)], &device)?;
+    let mut pass = TrainingPass::new(31);
+    let rrelu = RReLU::new().lower(0.1)?.upper(0.4)?;
+    let output = rrelu.forward_training(&leaf, &mut pass)?.to_vec()?;
+    let mut min_slope = f64::INFINITY;
+    let mut max_slope: f64 = 0.0;
+    let mut sum = 0.0_f64;
+    for &v in &output {
+        let slope = f64::from(-v); // output = -1 * slope, so slope = -output
+        assert!(
+            (0.1..0.4).contains(&slope),
+            "slope {slope} outside [lower, upper)"
+        );
+        min_slope = min_slope.min(slope);
+        max_slope = max_slope.max(slope);
+        sum += slope;
+    }
+    let mean_slope = sum / output.len() as f64;
+    assert!(
+        (mean_slope - 0.25).abs() < 0.01,
+        "mean slope {mean_slope} too far from the midpoint 0.25"
+    );
+    println!(
+        "RReLU statistical sanity PASS mean_slope={mean_slope:.4} range=[{min_slope:.4}, {max_slope:.4}]"
+    );
+    Ok(())
+}
+
+// --- PrefixDropout -------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_rejects_a_missing_axis_before_any_device_work() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let axis = Axis::new("pd_missing_axis");
+    let unrelated = Axis::new("pd_missing_unrelated");
+    let input = Tensor::from_slice(&[1.0, 2.0], [unrelated.of(2)], &device)?;
+    let dropout = PrefixDropout::new(axis);
+    assert!(dropout.output_shape(input.shape()).is_err());
+    assert!(dropout.forward(&input).is_err());
+    println!("PrefixDropout missing-axis rejection PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let code = Axis::new("pd_eval_code");
+    let values: Vec<f32> = (1..=6).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(&values, [code.of(6)], &device)?;
+    let output = PrefixDropout::new(code).forward(&input)?;
+    close(
+        "PrefixDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("PrefixDropout eval-mode identity PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_forward_training_matches_a_per_example_width_oracle_forward_and_gradient()
+-> Result<()> {
+    // Independent oracle: `TrainingPass::new(6060)`'s first `next_seed()` is
+    // 5621291624497032630. Its first two `Tensor::uniform_device` draws (one per `batch`
+    // example, `code` excluded from the draw) are [0.068539559841156, 0.5928589701652527],
+    // scaled by `extent(code) + 1 = 5` into `w = [0.3426978, 2.964295]`. Position `i` (0..3)
+    // survives when `i < w`: batch 0 keeps only position 0 (`floor(w) + 1 = 1`); batch 1 keeps
+    // positions 0..2 (`floor(w) + 1 = 3`).
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("pd_oracle_batch");
+    let code = Axis::new("pd_oracle_code");
+    let input_values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let leaf = Tensor::from_slice(&input_values, [batch.of(2), code.of(4)], &device)?.with_grad();
+
+    let dropout = PrefixDropout::new(code);
+    let mut pass = TrainingPass::new(6060);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [1.0, 0.0, 0.0, 0.0, 5.0, 6.0, 7.0, 0.0];
+    close(
+        "PrefixDropout forward_training per-example width oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean([batch, code])?.backward()?;
+    let expected_gradient = [0.125, 0.0, 0.0, 0.0, 0.125, 0.125, 0.125, 0.0];
+    close(
+        "PrefixDropout forward_training gradient (1 kept, 0 dropped, no rescale)",
+        &leaf
+            .grad()
+            .expect("PrefixDropout input gradient")
+            .to_vec()?,
+        &expected_gradient,
+    );
+
+    // Same pass seed, same forward order: bit-identical.
+    let mut repeat_pass = TrainingPass::new(6060);
+    let repeat = dropout.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "PrefixDropout forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+
+    // A second call on the SAME pass (draw counter 1) draws a different per-example width,
+    // mirroring `sequential_threads_one_training_pass_through_two_dropout_layers_with_distinct_
+    // masks`'s use of `next_seed`'s second draw. `next_seed(6060, 1)`'s first two
+    // `Tensor::uniform_device` draws are [0.6250380873680115, 0.228529155254364], scaled by
+    // `extent + 1 = 5` into `w = [3.125190496444702, 1.1426458358764648]`, so batch 0 now keeps
+    // all 4 positions (`floor(3.125) + 1 = 4`) and batch 1 keeps 2 (`floor(1.1426) + 1 = 2`).
+    let mut second_pass = TrainingPass::new(6060);
+    second_pass.next_seed(); // consume the same first draw the oracle above used
+    let second_output = dropout.forward_training(&leaf, &mut second_pass)?;
+    let second_expected = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0];
+    close(
+        "PrefixDropout second draw on one pass keeps a different per-example width",
+        &second_output.to_vec()?,
+        &second_expected,
+    );
+    println!("PrefixDropout forward_training per-example width oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_statistical_sanity_kept_fraction_matches_the_closed_form_mean() -> Result<()> {
+    // Kept count is `floor(w) + 1` for `w = draw * (extent + 1)` uniform on `[0, extent + 1)`,
+    // so `floor(w)` is discrete-uniform over `{0, ..., extent}` with mean `extent / 2`: the
+    // expected kept fraction is `(extent / 2 + 1) / extent = 0.5 + 1 / extent`.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("pd_stat_batch");
+    let code = Axis::new("pd_stat_code");
+    let extent = 64;
+    let examples = 4096;
+    let values: Vec<f32> = vec![1.0; examples * extent];
+    let leaf = Tensor::from_slice(&values, [batch.of(examples), code.of(extent)], &device)?;
+    let mut pass = TrainingPass::new(20260922);
+    let output = PrefixDropout::new(code)
+        .forward_training(&leaf, &mut pass)?
+        .to_vec()?;
+    let kept = output.iter().filter(|&&v| v != 0.0).count();
+    let kept_fraction = kept as f64 / output.len() as f64;
+    let expected_fraction = 0.5 + 1.0 / extent as f64;
+    assert!(
+        (kept_fraction - expected_fraction).abs() < 0.02,
+        "kept fraction {kept_fraction} too far from the closed-form mean {expected_fraction}"
+    );
+    println!(
+        "PrefixDropout statistical sanity PASS kept_fraction={kept_fraction:.4} expected={expected_fraction:.4}"
+    );
+    Ok(())
+}
+
+// --- Dropout family composition (shared consumer evidence) --------------------------------
+
+#[test]
+#[ignore = "requires CUDA"]
+fn dropout_family_composes_in_one_training_pass_with_distinct_draws_per_layer() -> Result<()> {
+    // The six-point module definition's "a consumer" bar, for one composed pipeline shared by
+    // every row landed in this PR: a `Sequential` threading one `TrainingPass` through
+    // `ChannelDropout`, `AlphaDropout`, `RReLU`, and `PrefixDropout` in order, the way a real
+    // convolutional-then-dense model would. Each layer must consume its own draw (so the whole
+    // pipeline is reproducible from one pass seed) and the composition must run end to end
+    // without error on both `forward` and `forward_training`.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("family_batch");
+    let channel = Axis::new("family_channel");
+    let spatial = Axis::new("family_spatial");
+    let values: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 * 0.25).collect();
+    let input = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(2), spatial.of(4)],
+        &device,
+    )?;
+
+    let mut seq = Sequential::new((
+        ChannelDropout::new(0.3, channel, [spatial])?,
+        AlphaDropout::new(0.2)?,
+        RReLU::new(),
+    ));
+    seq.build(input.shape(), &device, 0)?;
+
+    // All-positive input: ChannelDropout/AlphaDropout's eval is the identity, and RReLU's eval
+    // (leaky_relu at the fixed midpoint slope) is also the identity on strictly positive values,
+    // so the whole pipeline reduces to the identity here without special-casing RReLU.
+    let eval_output = seq.forward(&input)?;
+    close(
+        "Dropout-family Sequential eval forward is the identity on all-positive input",
+        &eval_output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+
+    let mut pass = TrainingPass::new(2468);
+    let train_output = seq.forward_training(&input, &mut pass)?;
+    assert_eq!(train_output.shape().len(), input.shape().len());
+    // Three draws consumed: one per layer, in call order.
+    assert_eq!(pass.next_seed(), {
+        let mut fresh = TrainingPass::new(2468);
+        fresh.next_seed();
+        fresh.next_seed();
+        fresh.next_seed();
+        fresh.next_seed()
+    });
+
+    // PrefixDropout composed separately over a fourth axis, sharing one pass with a plain
+    // Dropout layer, to also exercise the new module inside the existing Dropout consumer test
+    // shape (two draws, distinct masks/widths).
+    let code = Axis::new("family_code");
+    let code_input = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0], [code.of(5)], &device)?;
+    let mut mixed = Sequential::new((Dropout::new(0.5)?, PrefixDropout::new(code)));
+    mixed.build(code_input.shape(), &device, 0)?;
+    let mut mixed_pass = TrainingPass::new(13579);
+    let mixed_output = mixed
+        .forward_training(&code_input, &mut mixed_pass)?
+        .to_vec()?;
+    assert_eq!(mixed_output.len(), 5);
+    println!("Dropout-family Sequential composition PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multihead_attention_forward_training_dropout_zero_is_bit_exact_and_consumes_one_draw()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("mha_dropout_zero_feature"),
+        Axis::new("mha_dropout_zero_time"),
+    );
+    let x_values = [0.3_f32, -0.6, 0.9, 0.2, -0.4, 0.7, -0.1, 0.5];
+    let x = Tensor::from_slice(&x_values, [time.of(2), feature.of(4)], &device)?.with_grad();
+
+    let mut mha = MultiheadAttention::new(feature, time, 4, 2, 0.0)?;
+    mha.build(x.shape(), x.shape(), x.shape(), &device, 7)?;
+    let eval_output = mha.forward(&x, &x, &x, None, None)?.to_vec()?;
+    let mut pass = TrainingPass::new(11);
+    let train_output = mha.forward_training(&x, &x, &x, None, None, &mut pass)?;
+    close(
+        "MultiheadAttention forward_training p=0 is bit-exact with forward",
+        &train_output.to_vec()?,
+        &eval_output
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    // forward_training must consume exactly one pass.next_seed() draw even when p=0.0 does not
+    // feed it into an actual random tensor -- Dropout's own draw-count convention, so a
+    // downstream random consumer's position in the pass does not shift when p changes.
+    let mut reference_pass = TrainingPass::new(11);
+    let consumed = reference_pass.next_seed();
+    let next_expected = reference_pass.next_seed();
+    let mut fresh_pass = TrainingPass::new(11);
+    let _ = mha.forward_training(&x, &x, &x, None, None, &mut fresh_pass)?;
+    let _ = consumed;
+    assert_eq!(
+        fresh_pass.next_seed(),
+        next_expected,
+        "forward_training must consume exactly one draw at p=0"
+    );
+    println!("MultiheadAttention forward_training p=0 edge case PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multihead_attention_forward_training_dropout_one_is_exact_zero_with_zero_gradient() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("mha_dropout_one_feature"),
+        Axis::new("mha_dropout_one_time"),
+    );
+    let x_values = [0.3_f32, -0.6, 0.9, 0.2, -0.4, 0.7, -0.1, 0.5];
+    let x = Tensor::from_slice(&x_values, [time.of(2), feature.of(4)], &device)?.with_grad();
+
+    // No output bias: with the attention weights forced to exact zero, `attended` is exact
+    // zero, so the final output (and every gradient) is exact zero too.
+    let mut mha = MultiheadAttention::new(feature, time, 4, 2, 1.0)?.bias(false);
+    mha.build(x.shape(), x.shape(), x.shape(), &device, 13)?;
+    let mut pass = TrainingPass::new(23);
+    let output = mha.forward_training(&x, &x, &x, None, None, &mut pass)?;
+    close(
+        "MultiheadAttention forward_training p=1 (no output bias) is exact zero",
+        &output.to_vec()?,
+        &[0.0; 8],
+    );
+    output.mean([time, feature])?.backward()?;
+    close(
+        "MultiheadAttention forward_training p=1 input gradient is exact zero",
+        &x.grad().unwrap().to_vec()?,
+        &[0.0; 8],
+    );
+    for (name, parameter) in mha.named_parameters() {
+        let grad = parameter
+            .grad()
+            .unwrap_or_else(|| panic!("missing gradient for {name}"))
+            .to_vec()
+            .unwrap();
+        close(
+            &format!("MultiheadAttention forward_training p=1 {name} gradient is exact zero"),
+            &grad,
+            &vec![0.0; grad.len()],
+        );
+    }
+    println!("MultiheadAttention forward_training p=1 edge case PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multihead_attention_forward_training_dropout_preserves_expectation_statistically() -> Result<()>
+{
+    // Inverted dropout scales survivors by 1/(1-p) so its expectation matches the undropped
+    // value; average many independent pass seeds and compare against the p=0 forward, mirroring
+    // Dropout's own statistical-sanity test but through the whole attention module (query/key/
+    // value/output projections included), where the exact physical order of the dropped
+    // probability elements is an internal detail this test does not need to know.
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("mha_dropout_stat_feature"),
+        Axis::new("mha_dropout_stat_time"),
+    );
+    let extent = 6usize;
+    let x_values: Vec<f32> = (0..extent * 4).map(|i| ((i as f32) * 0.37).sin()).collect();
+    let x = Tensor::from_slice(&x_values, [time.of(extent), feature.of(4)], &device)?;
+
+    let mut eval_mha = MultiheadAttention::new(feature, time, 4, 2, 0.0)?;
+    eval_mha.build(x.shape(), x.shape(), x.shape(), &device, 41)?;
+    let expected = eval_mha.forward(&x, &x, &x, None, None)?.to_vec()?;
+
+    // Cloning an already-built MultiheadAttention shares its Parameters (see the struct doc
+    // comment), so train_mha scores identically to eval_mha; only its own dropout differs.
+    let train_mha = eval_mha.clone().dropout(0.3)?;
+    let trials = 96;
+    let mut sum = vec![0.0_f64; expected.len()];
+    for trial in 0..trials {
+        let mut pass = TrainingPass::new(9000 + trial as u64);
+        let output = train_mha
+            .forward_training(&x, &x, &x, None, None, &mut pass)?
+            .to_vec()?;
+        for (s, &v) in sum.iter_mut().zip(&output) {
+            *s += f64::from(v);
+        }
+    }
+    for (index, (&s, &e)) in sum.iter().zip(&expected).enumerate() {
+        let mean = s / trials as f64;
+        let error = (mean - f64::from(e)).abs();
+        assert!(
+            error < 0.15,
+            "MultiheadAttention dropout=0.3 trial-mean[{index}] {mean} too far from p=0 forward {e}"
+        );
+    }
+    println!(
+        "MultiheadAttention forward_training dropout expectation-preservation PASS trials={trials}"
+    );
+    Ok(())
+}
+
+#[test]
+fn transformer_encoder_decoder_layer_constructors_reject_invalid_configuration() -> Result<()> {
+    let (feature, time) = (
+        Axis::new("transformer_layer_reject_feature"),
+        Axis::new("transformer_layer_reject_time"),
+    );
+    assert!(TransformerEncoderLayer::new(feature, time, 4, 2, 0).is_err());
+    assert!(TransformerEncoderLayer::new(feature, time, 5, 2, 8).is_err());
+    assert!(TransformerDecoderLayer::new(feature, time, 4, 2, 0).is_err());
+    assert!(TransformerDecoderLayer::new(feature, time, 4, 0, 8).is_err());
+
+    let layer = TransformerEncoderLayer::new(feature, time, 4, 2, 8)?;
+    assert!(layer.dropout(-0.1).is_err());
+    assert!(
+        TransformerEncoderLayer::new(feature, time, 4, 2, 8)?
+            .dropout(1.0)
+            .is_ok()
+    );
+
+    assert!(
+        TransformerEncoder::new(TransformerEncoderLayer::new(feature, time, 4, 2, 8)?, 0).is_err()
+    );
+    assert!(
+        TransformerDecoder::new(TransformerDecoderLayer::new(feature, time, 4, 2, 8)?, 0).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn transformer_encoder_layer_matches_independent_f64_oracle_post_and_pre_norm() -> Result<()> {
+    // Independent from-scratch f64 reference for one TransformerEncoderLayer, following PyTorch
+    // 2.14's own _sa_block/_ff_block composition and norm_first branch (transformer.py). Every
+    // gradient is checked by central difference against this reference, never against Axis's own
+    // analytic backward.
+    fn linear(x: &[f64], w: &[f64], b: &[f64], t: usize, din: usize, dout: usize) -> Vec<f64> {
+        let mut out = vec![0.0; t * dout];
+        for i in 0..t {
+            for o in 0..dout {
+                let mut sum = b[o];
+                for k in 0..din {
+                    sum += x[i * din + k] * w[k * dout + o];
+                }
+                out[i * dout + o] = sum;
+            }
+        }
+        out
+    }
+    fn layer_norm(x: &[f64], scale: &[f64], bias: &[f64], t: usize, d: usize) -> Vec<f64> {
+        let eps = 1e-5_f64;
+        let mut out = vec![0.0; t * d];
+        for i in 0..t {
+            let row = &x[i * d..(i + 1) * d];
+            let mean = row.iter().sum::<f64>() / d as f64;
+            let variance = row.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / d as f64;
+            let inv = (variance + eps).sqrt().recip();
+            for k in 0..d {
+                out[i * d + k] = (row[k] - mean) * inv * scale[k] + bias[k];
+            }
+        }
+        out
+    }
+    fn add(a: &[f64], b: &[f64]) -> Vec<f64> {
+        a.iter().zip(b).map(|(x, y)| x + y).collect()
+    }
+    fn relu(x: &[f64]) -> Vec<f64> {
+        x.iter().map(|&v| v.max(0.0)).collect()
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn sa_block(
+        x: &[f64],
+        wq: &[f64],
+        bq: &[f64],
+        wk: &[f64],
+        bk: &[f64],
+        wv: &[f64],
+        bv: &[f64],
+        wo: &[f64],
+        bo: &[f64],
+        t: usize,
+        d: usize,
+        h: usize,
+    ) -> Vec<f64> {
+        let dh = d / h;
+        let q = linear(x, wq, bq, t, d, d);
+        let k = linear(x, wk, bk, t, d, d);
+        let v = linear(x, wv, bv, t, d, d);
+        let mut attn = vec![0.0; t * d];
+        for head in 0..h {
+            for i in 0..t {
+                let mut scores = vec![0.0; t];
+                for (j, score) in scores.iter_mut().enumerate() {
+                    let mut s = 0.0;
+                    for dd in 0..dh {
+                        s += q[i * d + head * dh + dd] * k[j * d + head * dh + dd];
+                    }
+                    *score = s / (dh as f64).sqrt();
+                }
+                let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f64 = exps.iter().sum();
+                let probs: Vec<f64> = exps.iter().map(|e| e / sum).collect();
+                for dd in 0..dh {
+                    let mut acc = 0.0;
+                    for j in 0..t {
+                        acc += probs[j] * v[j * d + head * dh + dd];
+                    }
+                    attn[i * d + head * dh + dd] = acc;
+                }
+            }
+        }
+        linear(&attn, wo, bo, t, d, d)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn ff_block(
+        x: &[f64],
+        w1: &[f64],
+        b1: &[f64],
+        w2: &[f64],
+        b2: &[f64],
+        t: usize,
+        d: usize,
+        ff: usize,
+    ) -> Vec<f64> {
+        let hidden = relu(&linear(x, w1, b1, t, d, ff));
+        linear(&hidden, w2, b2, t, ff, d)
+    }
+    #[allow(clippy::too_many_arguments, unused_assignments)]
+    fn encoder_layer_forward(
+        x: &[f64],
+        p: &[f64],
+        t: usize,
+        d: usize,
+        h: usize,
+        ff: usize,
+        norm_first: bool,
+    ) -> Vec<f64> {
+        let mut o = 0usize;
+        macro_rules! take {
+            ($n:expr) => {{
+                let s = &p[o..o + $n];
+                o += $n;
+                s
+            }};
+        }
+        let wq = take!(d * d);
+        let bq = take!(d);
+        let wk = take!(d * d);
+        let bk = take!(d);
+        let wv = take!(d * d);
+        let bv = take!(d);
+        let wo = take!(d * d);
+        let bo = take!(d);
+        let w1 = take!(d * ff);
+        let b1 = take!(ff);
+        let w2 = take!(ff * d);
+        let b2 = take!(d);
+        let n1s = take!(d);
+        let n1b = take!(d);
+        let n2s = take!(d);
+        let n2b = take!(d);
+        if norm_first {
+            let n1 = layer_norm(x, n1s, n1b, t, d);
+            let sa = sa_block(&n1, wq, bq, wk, bk, wv, bv, wo, bo, t, d, h);
+            let x1 = add(x, &sa);
+            let n2 = layer_norm(&x1, n2s, n2b, t, d);
+            let ff_out = ff_block(&n2, w1, b1, w2, b2, t, d, ff);
+            add(&x1, &ff_out)
+        } else {
+            let sa = sa_block(x, wq, bq, wk, bk, wv, bv, wo, bo, t, d, h);
+            let x1 = layer_norm(&add(x, &sa), n1s, n1b, t, d);
+            let ff_out = ff_block(&x1, w1, b1, w2, b2, t, d, ff);
+            layer_norm(&add(&x1, &ff_out), n2s, n2b, t, d)
+        }
+    }
+    fn encoder_layer_loss(
+        x: &[f64],
+        p: &[f64],
+        t: usize,
+        d: usize,
+        h: usize,
+        ff: usize,
+        norm_first: bool,
+    ) -> f64 {
+        let output = encoder_layer_forward(x, p, t, d, h, ff, norm_first);
+        output.iter().sum::<f64>() / output.len() as f64
+    }
+
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("transformer_encoder_layer_feature"),
+        Axis::new("transformer_encoder_layer_time"),
+    );
+    let (t, d, h, ff) = (2usize, 4usize, 2usize, 3usize);
+    let x_values: Vec<f64> = (0..t * d)
+        .map(|i| ((i as f64 + 1.0) * 0.41).sin() * 0.7)
+        .collect();
+    let param_count = 4 * (d * d + d) + (d * ff + ff) + (ff * d + d) + 4 * d;
+    let p_values: Vec<f64> = (0..param_count)
+        .map(|i| ((i as f64 + 3.0) * 0.27).sin() * 0.5)
+        .collect();
+    let expected_names = [
+        "self_attn.query.weight",
+        "self_attn.query.bias",
+        "self_attn.key.weight",
+        "self_attn.key.bias",
+        "self_attn.value.weight",
+        "self_attn.value.bias",
+        "self_attn.output.weight",
+        "self_attn.output.bias",
+        "linear1.weight",
+        "linear1.bias",
+        "linear2.weight",
+        "linear2.bias",
+        "norm1.scale",
+        "norm1.bias",
+        "norm2.scale",
+        "norm2.bias",
+    ];
+
+    for &norm_first in &[false, true] {
+        let mut layer = TransformerEncoderLayer::new(feature, time, d, h, ff)?
+            .dropout(0.0)?
+            .norm_first(norm_first);
+        let x_tensor = Tensor::from_slice(
+            &x_values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+            [time.of(t), feature.of(d)],
+            &device,
+        )?
+        .with_grad();
+        let shape = layer.build(x_tensor.shape(), &device, 0)?;
+        assert_eq!(shape, *x_tensor.shape());
+        let params = layer.named_parameters();
+        assert_eq!(
+            params.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            expected_names
+        );
+        let mut offset = 0;
+        for (_, parameter) in &params {
+            let len = parameter.tensor().shape().len();
+            let slice: Vec<f32> = p_values[offset..offset + len]
+                .iter()
+                .map(|&v| v as f32)
+                .collect();
+            parameter.set_values(&slice)?;
+            offset += len;
+        }
+        assert_eq!(offset, p_values.len());
+
+        let output = layer.forward(&x_tensor, None, None)?;
+        close(
+            &format!("TransformerEncoderLayer forward (norm_first={norm_first})"),
+            &output.to_vec()?,
+            &encoder_layer_forward(&x_values, &p_values, t, d, h, ff, norm_first),
+        );
+
+        output.mean([time, feature])?.backward()?;
+        close(
+            &format!("TransformerEncoderLayer input gradient (norm_first={norm_first})"),
+            &x_tensor.grad().unwrap().to_vec()?,
+            &central_difference(&x_values, 1e-4, |candidate| {
+                encoder_layer_loss(candidate, &p_values, t, d, h, ff, norm_first)
+            }),
+        );
+        let expected_grad = central_difference(&p_values, 1e-4, |candidate| {
+            encoder_layer_loss(&x_values, candidate, t, d, h, ff, norm_first)
+        });
+        let mut offset = 0;
+        for (name, parameter) in &params {
+            let len = parameter.tensor().shape().len();
+            close(
+                &format!("TransformerEncoderLayer {name} gradient (norm_first={norm_first})"),
+                &parameter.grad().unwrap().to_vec()?,
+                &expected_grad[offset..offset + len],
+            );
+            offset += len;
+        }
+
+        // Reordered physical input storage must not change the forward value (post-norm case
+        // only, matching MultiheadAttention's own reordered-storage witness).
+        if !norm_first {
+            let x_reordered = Tensor::from_slice(
+                &x_values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                [time.of(t), feature.of(d)],
+                &device,
+            )?
+            .with_layout([feature, time])?;
+            close(
+                "TransformerEncoderLayer forward is unaffected by reordered input storage",
+                &layer.forward(&x_reordered, None, None)?.to_vec()?,
+                &encoder_layer_forward(&x_values, &p_values, t, d, h, ff, norm_first),
+            );
+        }
+    }
+    println!("TransformerEncoderLayer forward/gradient oracle PASS (post-norm and pre-norm)");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn transformer_decoder_layer_matches_independent_f64_oracle_post_and_pre_norm_with_asymmetric_extents()
+-> Result<()> {
+    // Same independent from-scratch f64 method as the encoder-layer oracle above, extended with
+    // PyTorch's _mha_block cross-attention. tgt_len != mem_len exercises the asymmetric-extent
+    // cross-attention contract MultiheadAttention's own doc comment describes.
+    fn linear(x: &[f64], w: &[f64], b: &[f64], t: usize, din: usize, dout: usize) -> Vec<f64> {
+        let mut out = vec![0.0; t * dout];
+        for i in 0..t {
+            for o in 0..dout {
+                let mut sum = b[o];
+                for k in 0..din {
+                    sum += x[i * din + k] * w[k * dout + o];
+                }
+                out[i * dout + o] = sum;
+            }
+        }
+        out
+    }
+    fn layer_norm(x: &[f64], scale: &[f64], bias: &[f64], t: usize, d: usize) -> Vec<f64> {
+        let eps = 1e-5_f64;
+        let mut out = vec![0.0; t * d];
+        for i in 0..t {
+            let row = &x[i * d..(i + 1) * d];
+            let mean = row.iter().sum::<f64>() / d as f64;
+            let variance = row.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / d as f64;
+            let inv = (variance + eps).sqrt().recip();
+            for k in 0..d {
+                out[i * d + k] = (row[k] - mean) * inv * scale[k] + bias[k];
+            }
+        }
+        out
+    }
+    fn add(a: &[f64], b: &[f64]) -> Vec<f64> {
+        a.iter().zip(b).map(|(x, y)| x + y).collect()
+    }
+    fn relu(x: &[f64]) -> Vec<f64> {
+        x.iter().map(|&v| v.max(0.0)).collect()
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn cross_attention(
+        query_x: &[f64],
+        key_value_x: &[f64],
+        wq: &[f64],
+        bq: &[f64],
+        wk: &[f64],
+        bk: &[f64],
+        wv: &[f64],
+        bv: &[f64],
+        wo: &[f64],
+        bo: &[f64],
+        tq: usize,
+        tk: usize,
+        d: usize,
+        h: usize,
+    ) -> Vec<f64> {
+        let dh = d / h;
+        let q = linear(query_x, wq, bq, tq, d, d);
+        let k = linear(key_value_x, wk, bk, tk, d, d);
+        let v = linear(key_value_x, wv, bv, tk, d, d);
+        let mut attn = vec![0.0; tq * d];
+        for head in 0..h {
+            for i in 0..tq {
+                let mut scores = vec![0.0; tk];
+                for (j, score) in scores.iter_mut().enumerate() {
+                    let mut s = 0.0;
+                    for dd in 0..dh {
+                        s += q[i * d + head * dh + dd] * k[j * d + head * dh + dd];
+                    }
+                    *score = s / (dh as f64).sqrt();
+                }
+                let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f64 = exps.iter().sum();
+                let probs: Vec<f64> = exps.iter().map(|e| e / sum).collect();
+                for dd in 0..dh {
+                    let mut acc = 0.0;
+                    for j in 0..tk {
+                        acc += probs[j] * v[j * d + head * dh + dd];
+                    }
+                    attn[i * d + head * dh + dd] = acc;
+                }
+            }
+        }
+        linear(&attn, wo, bo, tq, d, d)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn ff_block(
+        x: &[f64],
+        w1: &[f64],
+        b1: &[f64],
+        w2: &[f64],
+        b2: &[f64],
+        t: usize,
+        d: usize,
+        ff: usize,
+    ) -> Vec<f64> {
+        let hidden = relu(&linear(x, w1, b1, t, d, ff));
+        linear(&hidden, w2, b2, t, ff, d)
+    }
+    #[allow(clippy::too_many_arguments, unused_assignments)]
+    fn decoder_layer_forward(
+        tgt: &[f64],
+        memory: &[f64],
+        p: &[f64],
+        tq: usize,
+        tk: usize,
+        d: usize,
+        h: usize,
+        ff: usize,
+        norm_first: bool,
+    ) -> Vec<f64> {
+        let mut o = 0usize;
+        macro_rules! take {
+            ($n:expr) => {{
+                let s = &p[o..o + $n];
+                o += $n;
+                s
+            }};
+        }
+        let sa_wq = take!(d * d);
+        let sa_bq = take!(d);
+        let sa_wk = take!(d * d);
+        let sa_bk = take!(d);
+        let sa_wv = take!(d * d);
+        let sa_bv = take!(d);
+        let sa_wo = take!(d * d);
+        let sa_bo = take!(d);
+        let ca_wq = take!(d * d);
+        let ca_bq = take!(d);
+        let ca_wk = take!(d * d);
+        let ca_bk = take!(d);
+        let ca_wv = take!(d * d);
+        let ca_bv = take!(d);
+        let ca_wo = take!(d * d);
+        let ca_bo = take!(d);
+        let w1 = take!(d * ff);
+        let b1 = take!(ff);
+        let w2 = take!(ff * d);
+        let b2 = take!(d);
+        let n1s = take!(d);
+        let n1b = take!(d);
+        let n2s = take!(d);
+        let n2b = take!(d);
+        let n3s = take!(d);
+        let n3b = take!(d);
+        if norm_first {
+            let n1 = layer_norm(tgt, n1s, n1b, tq, d);
+            let sa = cross_attention(
+                &n1, &n1, sa_wq, sa_bq, sa_wk, sa_bk, sa_wv, sa_bv, sa_wo, sa_bo, tq, tq, d, h,
+            );
+            let x1 = add(tgt, &sa);
+            let n2 = layer_norm(&x1, n2s, n2b, tq, d);
+            let ca = cross_attention(
+                &n2, memory, ca_wq, ca_bq, ca_wk, ca_bk, ca_wv, ca_bv, ca_wo, ca_bo, tq, tk, d, h,
+            );
+            let x2 = add(&x1, &ca);
+            let n3 = layer_norm(&x2, n3s, n3b, tq, d);
+            let ff_out = ff_block(&n3, w1, b1, w2, b2, tq, d, ff);
+            add(&x2, &ff_out)
+        } else {
+            let sa = cross_attention(
+                tgt, tgt, sa_wq, sa_bq, sa_wk, sa_bk, sa_wv, sa_bv, sa_wo, sa_bo, tq, tq, d, h,
+            );
+            let x1 = layer_norm(&add(tgt, &sa), n1s, n1b, tq, d);
+            let ca = cross_attention(
+                &x1, memory, ca_wq, ca_bq, ca_wk, ca_bk, ca_wv, ca_bv, ca_wo, ca_bo, tq, tk, d, h,
+            );
+            let x2 = layer_norm(&add(&x1, &ca), n2s, n2b, tq, d);
+            let ff_out = ff_block(&x2, w1, b1, w2, b2, tq, d, ff);
+            layer_norm(&add(&x2, &ff_out), n3s, n3b, tq, d)
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn decoder_layer_loss(
+        tgt: &[f64],
+        memory: &[f64],
+        p: &[f64],
+        tq: usize,
+        tk: usize,
+        d: usize,
+        h: usize,
+        ff: usize,
+        norm_first: bool,
+    ) -> f64 {
+        let output = decoder_layer_forward(tgt, memory, p, tq, tk, d, h, ff, norm_first);
+        output.iter().sum::<f64>() / output.len() as f64
+    }
+
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("transformer_decoder_layer_feature"),
+        Axis::new("transformer_decoder_layer_time"),
+    );
+    let (tq, tk, d, h, ff) = (2usize, 3usize, 4usize, 2usize, 3usize);
+    let tgt_values: Vec<f64> = (0..tq * d)
+        .map(|i| ((i as f64 + 1.0) * 0.41).sin() * 0.7)
+        .collect();
+    let memory_values: Vec<f64> = (0..tk * d)
+        .map(|i| ((i as f64 + 1.0) * 0.53).cos() * 0.6)
+        .collect();
+    let param_count = 8 * (d * d + d) + (d * ff + ff) + (ff * d + d) + 6 * d;
+    let p_values: Vec<f64> = (0..param_count)
+        .map(|i| ((i as f64 + 5.0) * 0.19).sin() * 0.5)
+        .collect();
+    let expected_names = [
+        "self_attn.query.weight",
+        "self_attn.query.bias",
+        "self_attn.key.weight",
+        "self_attn.key.bias",
+        "self_attn.value.weight",
+        "self_attn.value.bias",
+        "self_attn.output.weight",
+        "self_attn.output.bias",
+        "multihead_attn.query.weight",
+        "multihead_attn.query.bias",
+        "multihead_attn.key.weight",
+        "multihead_attn.key.bias",
+        "multihead_attn.value.weight",
+        "multihead_attn.value.bias",
+        "multihead_attn.output.weight",
+        "multihead_attn.output.bias",
+        "linear1.weight",
+        "linear1.bias",
+        "linear2.weight",
+        "linear2.bias",
+        "norm1.scale",
+        "norm1.bias",
+        "norm2.scale",
+        "norm2.bias",
+        "norm3.scale",
+        "norm3.bias",
+    ];
+
+    for &norm_first in &[false, true] {
+        let mut layer = TransformerDecoderLayer::new(feature, time, d, h, ff)?
+            .dropout(0.0)?
+            .norm_first(norm_first);
+        let tgt_tensor = Tensor::from_slice(
+            &tgt_values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+            [time.of(tq), feature.of(d)],
+            &device,
+        )?
+        .with_grad();
+        let memory_tensor = Tensor::from_slice(
+            &memory_values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+            [time.of(tk), feature.of(d)],
+            &device,
+        )?
+        .with_grad();
+        let shape = layer.build(tgt_tensor.shape(), memory_tensor.shape(), &device, 0)?;
+        assert_eq!(shape, *tgt_tensor.shape());
+        let params = layer.named_parameters();
+        assert_eq!(
+            params.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            expected_names
+        );
+        let mut offset = 0;
+        for (_, parameter) in &params {
+            let len = parameter.tensor().shape().len();
+            let slice: Vec<f32> = p_values[offset..offset + len]
+                .iter()
+                .map(|&v| v as f32)
+                .collect();
+            parameter.set_values(&slice)?;
+            offset += len;
+        }
+        assert_eq!(offset, p_values.len());
+
+        let output = layer.forward(&tgt_tensor, &memory_tensor, None, None, None, None)?;
+        close(
+            &format!("TransformerDecoderLayer forward (norm_first={norm_first})"),
+            &output.to_vec()?,
+            &decoder_layer_forward(
+                &tgt_values,
+                &memory_values,
+                &p_values,
+                tq,
+                tk,
+                d,
+                h,
+                ff,
+                norm_first,
+            ),
+        );
+
+        output.mean([time, feature])?.backward()?;
+        close(
+            &format!("TransformerDecoderLayer tgt gradient (norm_first={norm_first})"),
+            &tgt_tensor.grad().unwrap().to_vec()?,
+            &central_difference(&tgt_values, 1e-4, |candidate| {
+                decoder_layer_loss(
+                    candidate,
+                    &memory_values,
+                    &p_values,
+                    tq,
+                    tk,
+                    d,
+                    h,
+                    ff,
+                    norm_first,
+                )
+            }),
+        );
+        close(
+            &format!("TransformerDecoderLayer memory gradient (norm_first={norm_first})"),
+            &memory_tensor.grad().unwrap().to_vec()?,
+            &central_difference(&memory_values, 1e-4, |candidate| {
+                decoder_layer_loss(
+                    &tgt_values,
+                    candidate,
+                    &p_values,
+                    tq,
+                    tk,
+                    d,
+                    h,
+                    ff,
+                    norm_first,
+                )
+            }),
+        );
+        let expected_grad = central_difference(&p_values, 1e-4, |candidate| {
+            decoder_layer_loss(
+                &tgt_values,
+                &memory_values,
+                candidate,
+                tq,
+                tk,
+                d,
+                h,
+                ff,
+                norm_first,
+            )
+        });
+        let mut offset = 0;
+        for (name, parameter) in &params {
+            let len = parameter.tensor().shape().len();
+            close(
+                &format!("TransformerDecoderLayer {name} gradient (norm_first={norm_first})"),
+                &parameter.grad().unwrap().to_vec()?,
+                &expected_grad[offset..offset + len],
+            );
+            offset += len;
+        }
+    }
+    println!(
+        "TransformerDecoderLayer forward/gradient oracle PASS (post-norm, pre-norm, asymmetric tgt/memory extents)"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn transformer_encoder_stacks_independently_built_layers_matching_manual_composition() -> Result<()>
+{
+    // TransformerEncoder must be exactly the composition of its own stacked layers plus the
+    // final norm: build two standalone layers with the SAME per-layer seeds TransformerEncoder
+    // itself would use, chain them by hand, and compare against the stack's own forward.
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("transformer_encoder_stack_feature"),
+        Axis::new("transformer_encoder_stack_time"),
+    );
+    let x_values: [f32; 8] = [0.2, -0.5, 0.8, 0.1, -0.3, 0.6, -0.7, 0.4];
+    let x = Tensor::from_slice(&x_values, [time.of(2), feature.of(4)], &device)?;
+
+    let mut stack = TransformerEncoder::new(
+        TransformerEncoderLayer::new(feature, time, 4, 2, 6)?.dropout(0.0)?,
+        2,
+    )?
+    .norm(LayerNorm::new(feature)?);
+    stack.build(x.shape(), &device, 100)?;
+    let stacked_output = stack.forward(&x, None, None)?.to_vec()?;
+
+    let mut manual_first = TransformerEncoderLayer::new(feature, time, 4, 2, 6)?.dropout(0.0)?;
+    manual_first.build(x.shape(), &device, 100)?;
+    let mut manual_second = TransformerEncoderLayer::new(feature, time, 4, 2, 6)?.dropout(0.0)?;
+    let after_first = manual_first.output_shape(x.shape())?;
+    manual_second.build(&after_first, &device, 200)?;
+    let mut manual_norm = LayerNorm::new(feature)?;
+    manual_norm.build(&after_first, &device, 100)?;
+    let manual_output = manual_norm
+        .forward(&manual_second.forward(&manual_first.forward(&x, None, None)?, None, None)?)?
+        .to_vec()?;
+
+    close(
+        "TransformerEncoder stacked forward equals manual layer-by-layer composition",
+        &stacked_output,
+        &manual_output
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+    println!("TransformerEncoder stacking composition PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn transformer_end_to_end_encode_then_decode_matches_manual_encoder_decoder_composition()
+-> Result<()> {
+    // Transformer::forward must equal calling its own encoder then its own decoder by hand.
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("transformer_e2e_feature"),
+        Axis::new("transformer_e2e_time"),
+    );
+    let src_values: [f32; 8] = [0.1, 0.4, -0.2, 0.6, -0.5, 0.3, 0.2, -0.1];
+    let tgt_values: [f32; 12] = [
+        0.05, -0.2, 0.3, 0.1, -0.4, 0.25, 0.15, -0.05, 0.2, -0.3, 0.1, 0.4,
+    ];
+    let src = Tensor::from_slice(&src_values, [time.of(2), feature.of(4)], &device)?;
+    let tgt = Tensor::from_slice(&tgt_values, [time.of(3), feature.of(4)], &device)?.with_grad();
+
+    let mut model = Transformer::new(feature, time, 4, 2, 2, 2, 6)?.dropout(0.0)?;
+    model.build(src.shape(), tgt.shape(), &device, 500)?;
+    let output = model.forward(&src, &tgt, None, None, None, None, None, None)?;
+
+    let manual_memory = {
+        let mut encoder = TransformerEncoder::new(
+            TransformerEncoderLayer::new(feature, time, 4, 2, 6)?.dropout(0.0)?,
+            2,
+        )?
+        .norm(LayerNorm::new(feature)?);
+        encoder.build(src.shape(), &device, 500)?;
+        encoder.forward(&src, None, None)?
+    };
+    let manual_output = {
+        let mut decoder = TransformerDecoder::new(
+            TransformerDecoderLayer::new(feature, time, 4, 2, 6)?.dropout(0.0)?,
+            2,
+        )?
+        .norm(LayerNorm::new(feature)?);
+        // Must match Transformer::build's own decoder seed exactly:
+        // `seed.wrapping_add(1_000_000)`.
+        decoder.build(tgt.shape(), manual_memory.shape(), &device, 500 + 1_000_000)?;
+        decoder.forward(&tgt, &manual_memory, None, None, None, None)?
+    };
+
+    // Transformer's own encoder/decoder seeds (`build`'s `seed`/`seed.wrapping_add(1_000_000)`)
+    // must line up with these manually constructed stacks for the comparison to be meaningful;
+    // assert equal shapes first, then bit-exact values.
+    assert_eq!(output.shape(), manual_output.shape());
+    close(
+        "Transformer forward equals manual encoder-then-decoder composition",
+        &output.to_vec()?,
+        &manual_output
+            .to_vec()?
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+
+    output.mean([time, feature])?.backward()?;
+    assert!(
+        tgt.grad().is_some(),
+        "Transformer end-to-end backward must reach the tgt input"
+    );
+
+    // Training-mode determinism: the same pass seed reproduces the identical output; a different
+    // step index changes it (dropout is active here).
+    let mut trained_model = Transformer::new(feature, time, 4, 2, 1, 1, 6)?.dropout(0.2)?;
+    trained_model.build(src.shape(), tgt.shape(), &device, 900)?;
+    let mut pass_a = TrainingPass::new(4242);
+    let out_a = trained_model
+        .forward_training(&src, &tgt, None, None, None, None, None, None, &mut pass_a)?
+        .to_vec()?;
+    let mut pass_b = TrainingPass::new(4242);
+    let out_b = trained_model
+        .forward_training(&src, &tgt, None, None, None, None, None, None, &mut pass_b)?
+        .to_vec()?;
+    assert_eq!(
+        out_a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        out_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "same pass seed must give a bit-identical Transformer training forward"
+    );
+    let mut pass_c = TrainingPass::new(777);
+    let out_c = trained_model
+        .forward_training(&src, &tgt, None, None, None, None, None, None, &mut pass_c)?
+        .to_vec()?;
+    assert_ne!(
+        out_a, out_c,
+        "a different pass seed must change the dropout-active Transformer training forward"
+    );
+    println!("Transformer end-to-end composition and training-mode determinism PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn multihead_attention_causal_mask_matches_hand_computed_zero_and_neg_infinity_pattern()
+-> Result<()> {
+    // `MultiheadAttention::causal_mask` builds a reusable additive mask against the attention's
+    // own private query_time/key_time roles: zero where a key is visible, -infinity where the key
+    // position is strictly greater than the query position (PyTorch's
+    // `generate_square_subsequent_mask`). `close` requires finite values, so compare the pattern
+    // directly rather than through it.
+    let device = Device::cuda(0)?;
+    let (feature, time) = (
+        Axis::new("mha_causal_mask_feature"),
+        Axis::new("mha_causal_mask_time"),
+    );
+    let probe = MultiheadAttention::new(feature, time, 4, 1, 0.0)?;
+    let causal = probe.causal_mask(3, &device)?;
+    let AttentionMask::Additive(mask_tensor) = &causal else {
+        panic!("causal_mask must return an Additive mask");
+    };
+    let values = mask_tensor.to_vec()?;
+    // Row-major [query, key]: query i sees key j exactly when j <= i.
+    let expected_visible = [
+        true, false, false, // query 0
+        true, true, false, // query 1
+        true, true, true, // query 2
+    ];
+    assert_eq!(values.len(), expected_visible.len());
+    for (index, (&value, &visible)) in values.iter().zip(&expected_visible).enumerate() {
+        if visible {
+            assert_eq!(value, 0.0, "mask[{index}] should be exactly 0.0 (visible)");
+        } else {
+            assert!(
+                value.is_infinite() && value.is_sign_negative(),
+                "mask[{index}] should be -infinity (forbidden), got {value}"
+            );
+        }
+    }
+
+    // Applied to real, distinguishable scores, the causal mask actually blocks future keys: a
+    // uniform-logit self-attention layer restricted causally must only look at query <= key
+    // positions, so query 0's attended value equals value[0] alone (no key 1/2 contribution).
+    let mut layer = MultiheadAttention::new(feature, time, 4, 1, 0.0)?;
+    layer.build(
+        &Shape::new([time.of(3), feature.of(4)])?,
+        &Shape::new([time.of(3), feature.of(4)])?,
+        &Shape::new([time.of(3), feature.of(4)])?,
+        &device,
+        5,
+    )?;
+    // Zero query/key weights and bias: every score is identical, so softmax without a mask would
+    // be exactly uniform; causal masking must instead give query 0 all its weight on key 0.
+    for name in ["query.weight", "query.bias", "key.weight", "key.bias"] {
+        let parameter = layer
+            .named_parameters()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap()
+            .1;
+        let len = parameter.tensor().shape().len();
+        parameter.set_values(&vec![0.0; len])?;
+    }
+    for name in ["value.weight", "output.weight"] {
+        let parameter = layer
+            .named_parameters()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap()
+            .1;
+        let len = parameter.tensor().shape().len();
+        let identity_like: Vec<f32> = (0..len)
+            .map(|i| if i % 5 == 0 { 1.0 } else { 0.0 })
+            .collect();
+        parameter.set_values(&identity_like)?;
+    }
+    for name in ["value.bias", "output.bias"] {
+        let parameter = layer
+            .named_parameters()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap()
+            .1;
+        let len = parameter.tensor().shape().len();
+        parameter.set_values(&vec![0.0; len])?;
+    }
+    let x_values: [f32; 12] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+    ];
+    let x = Tensor::from_slice(&x_values, [time.of(3), feature.of(4)], &device)?;
+    let mask = layer.causal_mask(3, &device)?;
+    let output = layer.forward(&x, &x, &x, Some(&mask), None)?.to_vec()?;
+    // value.weight/output.weight are both the "identity-like" pattern (1.0 on the stride-5
+    // diagonal of a row-major [4,4] matrix, i.e. the true 4x4 identity), so value == x and
+    // output projection == identity: query 0's causally-masked output must equal x's own row 0.
+    close(
+        "MultiheadAttention causal mask restricts query 0 to key 0 alone",
+        &output[0..4],
+        &x_values[0..4]
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+    );
+    println!("MultiheadAttention::causal_mask PASS");
     Ok(())
 }

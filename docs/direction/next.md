@@ -144,21 +144,17 @@ items after PR #59, recorded here so the issue tracker can stay empty:
 
 ## Carried past 0.11.0
 
-Released 2026-09-22 with these four consumer issues moved here, so the
-tracker could be empty at publish time. Each is a real need with a named
-consumer; none was dropped.
+Released 2026-09-22 with four consumer issues moved here, so the tracker
+could be empty at publish time. Each is a real need with a named consumer;
+none was dropped. Two have since landed. Trained BatchNorm with persistent
+running statistics (issue #76): a `State` handle, `Module::named_states`,
+staged updates on `TrainingPass` committed by `Trainer::step_training` after
+the optimizer step, `BatchNorm` over a named feature axis with PyTorch's
+momentum and unbiased running-variance semantics, and InstanceNorm's optional
+`track_running_stats` on the same mechanism. Prefix (nested) dropout (issue
+#90): see "Dropout variants, RReLU and prefix dropout" in
+[../design/library.md](../design/library.md).
 
-- **Trained BatchNorm with persistent running statistics** (issue #76,
-  consumer `vision/morpheus`). The training pass (PR #127) reserved the
-  mechanism: a training forward queues its running-statistic update on the
-  `TrainingPass`, and `Trainer::step_training` commits it after the optimizer
-  step. Next: a persistent non-parameter tensor handle, then `BatchNorm` over a
-  named feature axis with PyTorch's momentum and unbiased running variance, and
-  InstanceNorm's optional running statistics on the same handle.
-- **Prefix (nested) dropout as a named-axis module** (issue #90, consumers
-  `learning/bae` and `vision/image-encode`). Unblocked by the training pass: its
-  `forward_training` draws a per-example width from `pass.next_seed()` and masks
-  with the prefix mask; the horizon-weighted loss stays in the consumer.
 - **Public per-op BF16 autocast** (issue #81, consumer `world/energy-output`).
   Deferred on purpose: it touches every kernel's precision path, and bit-exact
   receipts depend on FP32 today. It needs its own design, likely a per-call
