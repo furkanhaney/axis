@@ -13,6 +13,21 @@
 [Why Axis](docs/direction/thesis.md) · [Vision](docs/direction/vision.md) · [Library contract](docs/design/library.md) ·
 [Contributing](CONTRIBUTING.md) · [License](LICENSE.md) · [Trademarks](TRADEMARK.md)
 
+Deep-learning programs are unusually good at being wrong while continuing to
+run. A loader wraps around, and a fresh-data study silently becomes a repeated
+one. A test example slips into training under a new seed or a new file name. A
+class axis is averaged away by accident. The loss still falls, the job still
+exits zero, and the number that gets reported describes a different experiment
+from the one on paper. No error is raised, because nothing was ever checked.
+
+Axis is a Rust framework for training neural networks on
+[NVIDIA cuTile](https://github.com/NVlabs/cutile-rs) that checks. The
+assumptions a result depends on are executable: when one stops being true, the
+run stops before the bad step reaches the optimizer, and when it holds, the run
+hands back a receipt that says exactly what was verified. Named tensor axes do
+the same for the math, so a `batch` axis can never quietly become a `class`
+axis.
+
 **The same experiment in four frameworks.** One matched Fashion-MNIST MLP:
 byte-identical data, sample order and initial weights, Adam, float32, five
 passes, on one RTX 5060. Each framework runs its default training path.
@@ -34,16 +49,6 @@ steady time excludes the first step, one bounded run on one host and not a
 framework-wide claim; the receipt is
 [data/evidence/fashion-mnist-four-arms.md](data/evidence/fashion-mnist-four-arms.md)
 (from `axis-benchmarks` 42f9aba).
-
-Axis is an experimental Rust framework for training neural networks on
-[NVIDIA cuTile](https://github.com/NVlabs/cutile-rs). It uses named tensor axes
-to make the math visible in code, and it lets an experiment crash when one of
-its scientific assumptions stops being true.
-
-Deep-learning programs are unusually good at being wrong while continuing to
-run. A loader wraps around, train and evaluation samples overlap, a class axis
-is reduced by accident, or a population of models quietly shares one set of
-weights—and the loss still goes down. Axis treats those as executable contracts.
 
 > **Project status:** Axis is active experimental research software. It is
 > CUDA-only, and its API can change as new consumer programs expose better
