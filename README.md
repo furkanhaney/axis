@@ -13,7 +13,27 @@
 [Why Axis](docs/direction/thesis.md) · [Vision](docs/direction/vision.md) · [Library contract](docs/design/library.md) ·
 [Contributing](CONTRIBUTING.md) · [License](LICENSE.md) · [Trademarks](TRADEMARK.md)
 
-![A generated Sudoku board used by the Axis acceptance test](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_generated_puzzle.png)
+**The same experiment in four frameworks.** One matched Fashion-MNIST MLP:
+byte-identical data, sample order and initial weights, Adam, float32, five
+passes, on one RTX 5060. Each framework runs its default training path.
+
+| | Accuracy | Training time, total | Training time, steady | Lines of code | Catches train/eval overlap | Catches data reuse |
+|---|---:|---:|---:|---:|:---:|:---:|
+| **Axis 0.11** | 0.5918 | 6.58 s | 0.030 s | 155 | **rejects the run** | **rejects the run** |
+| PyTorch 2.11 | 0.5918 | 0.16 s | 0.013 s | 73 | not checked | not checked |
+| Lightning 2.6 | 0.5918 | 0.18 s | 0.066 s | 77 | not checked | not checked |
+| JAX 0.11 | 0.5918 | 2.75 s | 0.038 s | 82 | not checked | not checked |
+
+All four reach the same accuracy bit for bit (0.591796875). Axis is the
+slowest end to end: nearly all of its time is the first step, where kernels are
+planned; per step after that it is faster than Lightning and JAX and slower
+than plain PyTorch. It takes about twice the code, and that count includes the
+checks. It is the only one that stops when an evaluation sample leaks
+into training or a sample repeats within a declared pass. Median of three runs,
+steady time excludes the first step, one bounded run on one host and not a
+framework-wide claim; the receipt is
+[data/evidence/fashion-mnist-four-arms.md](data/evidence/fashion-mnist-four-arms.md)
+(from `axis-benchmarks` 42f9aba).
 
 Axis is an experimental Rust framework for training neural networks on
 [NVIDIA cuTile](https://github.com/NVlabs/cutile-rs). It uses named tensor axes
@@ -35,6 +55,45 @@ Add the current crates.io release to a Rust project:
 ```bash
 cargo add axis@0.11.0
 ```
+
+## Executable research checks
+
+These are what Axis is for. Each one guards an assumption a result depends on,
+runs inside the training loop, fails before the offending step reaches the
+optimizer, and returns a receipt that says exactly what was verified.
+
+| Assumption | Check | What it catches |
+|---|---|---|
+| Every sample is new | `SinglePass`, `FinitePasses` | a step-count edit that turns a fresh-sample run into repeated passes over a finite corpus |
+| Repetition stays within a declared rate | `Idr` with `IdrLimits` | a generator or loader that repeats examples more than the experiment allows |
+| Train and evaluation never share an example | `Disjointness` over an `IdentityScheme` | overlap by *meaning*, not by file or seed: the same puzzle after relabeling, the same document through two shards |
+| The model actually learned | `LearningProgress` | a loop that runs every forward, backward and step while one declared metric on one declared evaluation population never improves |
+| A property holds on ordered inputs | `EmpiricalMonotonicity` | violations of a claimed monotone relation, recorded as sampled evidence rather than a global guarantee |
+| A physical law is satisfied | `EmpiricalResidual` | a model whose residual against a named law, region and evaluator exceeds its declared limit |
+| The run can be reproduced | `Trainer::step_training` with a `TrainingPass` | nondeterministic randomness: every random layer draws from a seed derived from the run seed and the step, and the step receipt names it |
+
+Axis distinguishes data claims that ordinary loaders collapse into one:
+
+```text
+single pass                 no finite example is intentionally reused
+finite passes               reuse is explicit and counted
+no exact sample reuse       observed stable identities do not repeat
+IDR approximation           declared coverage and repeat limits still hold
+semantic disjointness       canonical identities do not cross populations
+```
+
+A receipt never claims more than was checked. Passing `assert_idr()` does not
+prove independent samples or a rich underlying distribution; it proves the
+declared operational conditions. A sampled monotonicity check says "sampled",
+and learning progress says "improved by this much on this population", not
+"converged". Receipts (`IdrReceipt`, `DisjointnessReceipt`,
+`LearningProgressReceipt`, ...) are the fragments a
+[run certificate](docs/contracts/run-certificates.md) is built from. The
+contracts are in [data regimes](docs/contracts/data-regimes.md),
+[semantic disjointness](docs/contracts/disjointness.md),
+[learning progress](docs/contracts/learning-progress.md),
+[static guarantees](docs/design/static-guarantees.md) and the
+[library design](docs/design/library.md).
 
 ## A training loop
 
@@ -108,33 +167,37 @@ throughput success claim.
 
 ![Loss from the first bounded Axis Sudoku run](https://raw.githubusercontent.com/furkanhaney/sudoku-transformer/main/img/axis_acceptance_25.png)
 
-## What works
+## Conformance with PyTorch
 
-- Named axes, explicit contraction, broadcasting, splitting, merging, masking,
-  softmax, differentiable finite minimum, categorical and binary cross-entropy,
-  and squared error.
-- Reverse-mode differentiation with parameter version checks and explicit
-  scalar loss reduction.
-- `Linear`, `PopulationLinear`, `Conv2d`, and `Conv3d` with stride, symmetric
-  padding, and grouped/depthwise channels; named-axis `LayerNorm`, `RmsNorm`,
-  `GroupNorm`, and stateless `InstanceNorm`; `ReLU`, `GELU`, `Tanh`, and
-  `Sequential`.
-- Compact implicit 2D/3D patch extraction and deterministic col2im, including
-  patch tensors larger than the generic 16,777,216-contribution ceiling.
-- Device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon. Adam
-  can assign one learning rate to each member of a named population axis; Muon
-  partitions are explicit and send the exact remainder to AdamW.
-- Finite datasets, generated streams, exact shuffled passes, single-pass and
-  IDR guards, and train/evaluation identity separation.
-- Empirical increasing/decreasing checks over explicitly ordered input pairs,
-  with declared tolerance and violation-rate limits and scoped receipts.
-- Empirical learning-progress checks for one named metric and evaluation
-  population, with explicit budget and `VerifiedObservations` receipts.
-- Differentiable central first/second stencils, elementwise sine, and empirical
-  residual-law receipts with named equations, regions, evaluators, and explicit
-  sampled-evidence limits.
-- A `Trainer` that fixes update order: clear gradients, construct a fresh loss,
-  backpropagate, then update once.
+Axis is not a PyTorch clone, but a model ported from PyTorch should compute the
+same thing, and that is checked rather than assumed.
+
+- **Feature parity.** PyTorch 2.14's `torch.nn` layer catalog is frozen as a
+  161-row spec and each class is graded against Axis's own definition of a
+  finished module: a named-axis contract, explicit state, an independent oracle
+  for forward and every gradient, CUDA coverage including reordered storage, and
+  documented defaults. Today **112 yes, 16 partial, 33 no: 72.05%**
+  ([catalog](docs/nn/catalog.md)). `scripts/checks/nn_gap.sh --check` recomputes
+  the number on every gate and fails if it drops below its floor; the rows still
+  `no` are the ones the backlog defers on purpose (lazy modules, data-parallel
+  wrappers, fractional pooling) and the ones waiting on persistent training
+  state (BatchNorm).
+- **Numerical conformance.** Every operator is tested forward and backward
+  against an independent oracle written as literals or reimplemented from
+  PyTorch's documented formula, never computed by the code under test. The full
+  gate runs 226 CUDA tests and 67 host tests.
+- **Against PyTorch itself.** `pytorch_activation_forward_and_gradient_parity`
+  runs PyTorch alongside Axis (set `AXIS_PYTHON` to an interpreter with torch)
+  and compares values and gradients. Eight research studies ported from PyTorch
+  (a byte language model, a Voronoi bottleneck, an upscaler, a cell partitioner,
+  a multiple-instance classifier, a Fourier MLP, an energy fit and a U-Net
+  block) each carry a small Axis crate that reproduces a PyTorch forward and
+  loss, with observed error below `1e-5` in every case.
+- **Known, stated divergences** are named on the operator, for example `gelu`
+  is PyTorch's tanh form and `gelu_exact` its default, and a `logsumexp` group of
+  all non-finite values returns NaN where PyTorch returns negative infinity.
+
+### Execution
 
 The backend enqueues each eager training step on one CUDA stream and
 synchronizes once at the step boundary. Single-axis contractions use batched
@@ -281,22 +344,7 @@ bash src/studies/physics/damped-pendulum/scripts/train.sh --smoke
 ignored test suite needs an NVIDIA device and is intentionally driven by the
 script.
 
-## Research invariants
-
-Axis distinguishes related claims that ordinary loaders often collapse:
-
-```text
-single pass                 no finite example is intentionally reused
-finite passes               reuse is explicit and counted
-no exact sample reuse       observed stable identities do not repeat
-IDR approximation           declared coverage and repeat limits still hold
-semantic disjointness       canonical identities do not cross populations
-```
-
-Passing `assert_idr()` does not prove independent samples or a rich underlying
-distribution. It proves the declared operational conditions and produces a
-receipt. The broader rule is that an experimental assumption should fail in the
-program when the run stops satisfying it.
+## Where Axis is going
 
 The [project thesis](docs/direction/thesis.md) is to give coordinates to the whole
 experiment, not only its tensors. It grows against an [acceptance
@@ -304,10 +352,7 @@ ladder](docs/contracts/acceptance.md): the
 Sudoku and Chess transformers are current, and running the sub-30B model behind
 `ask_second_opinion` is the long-range systems test.
 
-The detailed contracts are in [library design](docs/design/library.md),
-[data regimes](docs/contracts/data-regimes.md), [semantic disjointness](docs/contracts/disjointness.md),
-[static guarantees](docs/design/static-guarantees.md), and [run certificates](docs/contracts/run-certificates.md). The current implementation
-frontier is recorded in [next work](docs/direction/next.md).
+The current implementation frontier is recorded in [next work](docs/direction/next.md).
 
 ## Contributing and license
 
