@@ -64,6 +64,35 @@ impl Parameter {
     }
 }
 
+/// A persistent non-parameter tensor a module owns across training steps --
+/// `BatchNorm`-style running statistics, reported by [`Module::named_states`].
+/// Cloning explicitly shares the same storage, like [`Parameter`], but a
+/// `State` carries no gradient and is never touched by an optimizer: the only
+/// writer is [`TrainingPass::commit`], which applies every update a
+/// `forward_training` call queued with [`TrainingPass::stage`]. Nothing ever
+/// writes a `State` outside that commit, so a forward pass alone -- training
+/// or not -- is side-effect free, and a failed training step (a panicking or
+/// error-returning loss, a failed backward or optimizer step) leaves every
+/// `State` exactly as it was.
+#[derive(Clone)]
+pub struct State(Rc<RefCell<Tensor>>);
+impl State {
+    /// Owns `tensor` from now on; stores it detached, since a `State` never
+    /// carries a gradient of its own.
+    pub fn new(tensor: Tensor) -> Self {
+        Self(Rc::new(RefCell::new(tensor.detach())))
+    }
+    pub fn tensor(&self) -> Tensor {
+        self.0.borrow().clone()
+    }
+    /// Only [`TrainingPass::commit`] calls this; forward code queues an
+    /// update with [`TrainingPass::stage`] instead of ever reaching here
+    /// directly.
+    pub(crate) fn replace(&self, tensor: Tensor) {
+        *self.0.borrow_mut() = tensor.detach();
+    }
+}
+
 /// Deterministic uniform values in `[-scale, scale)` from the shared xorshift stream
 /// (`crate::tensor::xorshift_unit_stream`, also used by `Tensor::uniform`/`Tensor::normal`).
 /// Every parameter initializer shares this generator so a seed is reproducible.
@@ -125,6 +154,33 @@ pub trait Module {
         for parameter in self.parameters() {
             parameter.zero_grad();
         }
+    }
+    /// Persistent non-parameter tensors this module owns across training
+    /// steps -- `BatchNorm`-style running statistics. Same slot-path
+    /// convention as [`Module::named_parameters`]: a container (`Sequential`
+    /// or any future one) aggregates every child's own states under
+    /// `"{index}.{name}"`. Defaults empty, exactly like `named_parameters`,
+    /// since most modules have no persistent state. A `State` here is never
+    /// written directly; only [`TrainingPass::commit`] writes one, after
+    /// staging in `forward_training`.
+    fn named_states(&self) -> Vec<(String, State)> {
+        vec![]
+    }
+    fn state(&self, name: &str) -> Result<State> {
+        let mut matches = self
+            .named_states()
+            .into_iter()
+            .filter(|(path, _)| path == name);
+        let (_, state) = matches.next().ok_or_else(|| {
+            format!("unknown state {name:?}; build the model before accessing state")
+        })?;
+        if matches.next().is_some() {
+            return Err(format!("ambiguous state path {name:?}").into());
+        }
+        Ok(state)
+    }
+    fn states(&self) -> Vec<State> {
+        self.named_states().into_iter().map(|(_, s)| s).collect()
     }
 }
 
@@ -2260,6 +2316,18 @@ impl Module for Sequential {
             })
             .collect()
     }
+    fn named_states(&self) -> Vec<(String, State)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .flat_map(|(i, layer)| {
+                layer
+                    .named_states()
+                    .into_iter()
+                    .map(move |(name, state)| (format!("{i}.{name}"), state))
+            })
+            .collect()
+    }
 }
 
 /// Ordered collection of modules with no forward of its own, PyTorch's
@@ -2324,6 +2392,18 @@ impl Module for ModuleList {
                     .named_parameters()
                     .into_iter()
                     .map(move |(name, parameter)| (format!("{i}.{name}"), parameter))
+            })
+            .collect()
+    }
+    fn named_states(&self) -> Vec<(String, State)> {
+        self.modules
+            .iter()
+            .enumerate()
+            .flat_map(|(i, module)| {
+                module
+                    .named_states()
+                    .into_iter()
+                    .map(move |(name, state)| (format!("{i}.{name}"), state))
             })
             .collect()
     }
@@ -2392,6 +2472,17 @@ impl Module for ModuleDict {
                     .named_parameters()
                     .into_iter()
                     .map(move |(sub, parameter)| (format!("{name}.{sub}"), parameter))
+            })
+            .collect()
+    }
+    fn named_states(&self) -> Vec<(String, State)> {
+        self.entries
+            .iter()
+            .flat_map(|(name, module)| {
+                module
+                    .named_states()
+                    .into_iter()
+                    .map(move |(sub, state)| (format!("{name}.{sub}"), state))
             })
             .collect()
     }
