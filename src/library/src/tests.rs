@@ -26875,3 +26875,61 @@ fn broadcast_bias_gradient_plan_is_cached_by_shape_and_layout_signature() -> Res
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn grouped_reduction_spans_multiple_chunks_for_a_large_group() -> Result<()> {
+    // GROUPED_CHUNK (runtime/backend.rs) splits a CSR group's contributions across many
+    // blocks once a group exceeds 512 entries, combining the per-chunk partials back
+    // together in a second kernel; every other test in this suite stays well under that
+    // per-group count, so this specifically exercises the multi-chunk combine path (both
+    // directions: align's backward Group plan for the bias gradient, and reduce_grouped's
+    // forward Group plan for the sum itself) with a group large enough to span several
+    // chunks (600 > 512, so two chunks per channel).
+    let device = Device::cuda(0)?;
+    let (batch, channel) = (Axis::new("batch"), Axis::new("channel"));
+    let (batch_extent, channel_extent) = (600usize, 2usize);
+    let field_values: Vec<f32> = (0..batch_extent * channel_extent)
+        .map(|i| (i % 97) as f32 * 0.01 - 0.3)
+        .collect();
+    let bias_values = [0.25f32, -0.75];
+    let field = Tensor::from_slice(
+        &field_values,
+        [batch.of(batch_extent), channel.of(channel_extent)],
+        &device,
+    )?
+    .with_grad();
+    let bias = Tensor::from_slice(&bias_values, [channel.of(channel_extent)], &device)?.with_grad();
+    let biased = field.add(&bias)?;
+    let out = biased.shape().clone();
+    let mut expected = Vec::with_capacity(out.len());
+    for index in 0..out.len() {
+        let coords = out.coords(index);
+        let (b, c) = (coords[out.index(batch)?], coords[out.index(channel)?]);
+        expected.push(f64::from(
+            field_values[b * channel_extent + c] + bias_values[c],
+        ));
+    }
+    close("large-group broadcast values", &biased.to_vec()?, &expected);
+
+    let summed = biased.sum(batch)?;
+    let mut expected_sum = vec![0.0f64; channel_extent];
+    for b in 0..batch_extent {
+        for c in 0..channel_extent {
+            expected_sum[c] += f64::from(field_values[b * channel_extent + c] + bias_values[c]);
+        }
+    }
+    close("large-group forward sum", &summed.to_vec()?, &expected_sum);
+
+    summed.sum(channel)?.backward()?;
+    // sum's gradient is exactly 1 per contributing element, so the bias gradient -- summed
+    // over every batch position a bias broadcasts across -- is exactly the batch extent: a
+    // large exact integer that a correct per-chunk-partial reassociation still hits exactly
+    // (summing many 1.0s stays exact in f32 far past 600).
+    close(
+        "large-group broadcast bias gradient",
+        &bias.grad().expect("bias gradient").to_vec()?,
+        &[batch_extent as f64; 2],
+    );
+    Ok(())
+}
