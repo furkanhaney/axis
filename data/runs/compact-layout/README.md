@@ -1,4 +1,4 @@
-# Compact layout/split/merge — 2026-09-21
+# Compact layout/split/merge (2026-09-21)
 
 Issue: https://github.com/furkanhaney/axis/issues/56.
 The consumer is the Atlas RBC five-decoder migration, not a changed model or

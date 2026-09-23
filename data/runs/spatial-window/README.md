@@ -1,4 +1,4 @@
-# Device-side spatial windows — 2026-09-20
+# Device-side spatial windows (2026-09-20)
 
 Issue: https://github.com/furkanhaney/axis/issues/52
 Base: `948f9ca` (Axis 0.9.0). New API: `Tensor::pad_zeros(axis, before, after)`

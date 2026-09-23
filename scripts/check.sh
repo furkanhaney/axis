@@ -2,6 +2,7 @@
 set -euo pipefail
 workspace_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 bash "$workspace_root/scripts/checks/structure.sh"
+bash "$workspace_root/scripts/checks/prose.sh"
 bash "$workspace_root/scripts/checks/nn_gap.sh" --check
 bash "$workspace_root/tests/setup_cuda.sh"
 bash "$workspace_root/tests/release_readiness.sh"

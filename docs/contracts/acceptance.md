@@ -4,7 +4,7 @@ Axis grows against outside programs that force several abstractions to compose.
 A small isolated operator is a unit witness; these programs are framework
 acceptance tests.
 
-## Paired Muon training — current
+## Paired Muon training (current)
 
 The in-repository [Muon acceptance](../../src/examples/training/muon/README.md) trains
 identically initialized MLPs on the same deterministic regression populations.
@@ -14,7 +14,7 @@ held-out `LearningProgress` receipts. This is a composition and learning
 witness, not an optimizer ranking. In the recorded 100-step run, each arm
 reduced held-out MSE by more than 99% from the shared initialization.
 
-## Sudoku transformer — current
+## Sudoku transformer (current)
 
 The sibling [`sudoku-transformer`](https://github.com/furkanhaney/sudoku-transformer) repo is the first complete transformer acceptance.
 It requires generated structured data, an executable IDR declaration, learned
@@ -35,7 +35,7 @@ or evaluation overlap. Loss moved from `2.873419` to `2.170745`, while blank
 accuracy reached only `14.93%` and exact solves remained zero. This is a scaled
 mechanics witness, not yet the second acceptance level.
 
-## Chess transformer — current
+## Chess transformer (current)
 
 The sibling [`chess-transformer`](https://gitlab.com/furkanhaney/chess-transformer)
 repo exercises a different regime: a finite corpus split by whole game before
@@ -49,7 +49,7 @@ only. A future ability claim requires the versioned Lichess recipe and an
 independent game-level evaluation corpus; the migration explicitly rejects the
 old Python run's overlapping validation recipe.
 
-## ask_second_opinion — long-range
+## ask_second_opinion (long-range)
 
 `ask_second_opinion` deliberately means the useful sub-30B model, not a particular host or
 vendor. Running its model through Axis would require the production transformer
