@@ -26793,3 +26793,85 @@ fn dcgan_forward_training_step_updates_both_networks_and_batch_norm_state() -> R
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn broadcast_bias_gradient_plan_is_cached_by_shape_and_layout_signature() -> Result<()> {
+    // The ImageNet64 profile (data/evidence/imagenet64/profile.md in axis-benchmarks)
+    // found align()'s broadcast scatter-add plan for a bias rebuilt from scratch, and
+    // re-uploaded to the device, on every training step even though a bias's shape and
+    // layout never change once a model is built. align_reverse_plan now caches that plan
+    // by (source shape, source layout, target shape); this checks that repeating the same
+    // broadcast reuses one plan, a distinct broadcast shape builds and caches its own, and
+    // every call -- cached or not -- still produces the hand-computed forward value and
+    // gradient.
+    let device = Device::cuda(0)?;
+    let (batch, channel) = (Axis::new("batch"), Axis::new("channel"));
+    let bias_values = [0.5f32, -1.5, 2.0];
+    let bias = Tensor::from_slice(&bias_values, [channel.of(3)], &device)?.with_grad();
+    let field_values: Vec<_> = (0..12).map(|v| v as f32 * 0.25).collect();
+    let field =
+        Tensor::from_slice(&field_values, [batch.of(4), channel.of(3)], &device)?.with_grad();
+
+    let check_biased =
+        |field: &Tensor, bias: &Tensor, field_values: &[f32], step: usize| -> Result<()> {
+            // Gradients accumulate onto an existing leaf grad, so each check starts clean.
+            bias.zero_grad();
+            field.zero_grad();
+            let biased = field.add(bias)?;
+            let out = biased.shape().clone();
+            let channel_extent = out.extent(channel)?;
+            let mut expected = Vec::with_capacity(out.len());
+            for index in 0..out.len() {
+                let coords = out.coords(index);
+                let (b, c) = (coords[out.index(batch)?], coords[out.index(channel)?]);
+                expected.push(f64::from(field_values[b * 3 + c] + bias_values[c]));
+            }
+            close(
+                &format!("cached broadcast values, step {step}"),
+                &biased.to_vec()?,
+                &expected,
+            );
+            // mean() divides by every reduced element (batch * channel); summing that
+            // constant back over the batch axis a bias broadcasts across always leaves
+            // exactly 1 / channel_extent, independent of the batch extent -- so the same
+            // expected gradient holds for both the original and the "wide" batch below.
+            biased.mean([batch, channel])?.backward()?;
+            close(
+                &format!("cached broadcast bias gradient, step {step}"),
+                &bias.grad().expect("bias gradient").to_vec()?,
+                &[1.0 / channel_extent as f64; 3],
+            );
+            Ok(())
+        };
+
+    let builds = Tensor::align_plan_build_count();
+    for step in 0..3 {
+        check_biased(&field, &bias, &field_values, step)?;
+    }
+    assert_eq!(
+        Tensor::align_plan_build_count(),
+        builds + 1,
+        "repeated broadcasts of the same shape and layout must reuse one plan"
+    );
+
+    // A distinct target shape (a different batch extent) must build and cache its own plan
+    // rather than reusing the first one.
+    let wide_values: Vec<_> = (0..15).map(|v| v as f32 * 0.1).collect();
+    let wide = Tensor::from_slice(&wide_values, [batch.of(5), channel.of(3)], &device)?.with_grad();
+    check_biased(&wide, &bias, &wide_values, 3)?;
+    assert_eq!(
+        Tensor::align_plan_build_count(),
+        builds + 2,
+        "a distinct broadcast target shape must build its own plan"
+    );
+
+    // The original signature is still cached after a different one was built in between.
+    check_biased(&field, &bias, &field_values, 4)?;
+    assert_eq!(
+        Tensor::align_plan_build_count(),
+        builds + 2,
+        "the first signature must still be cached after a different signature was built"
+    );
+    Ok(())
+}

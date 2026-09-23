@@ -169,3 +169,45 @@ direct integer widen does not. And the explicit arithmetic functions
 serialize ("missing attribute 'overflow' on op MulI") where the plain Rust
 operators (`*`, `+`, `^`, `>>`, ...) on the same tiles lower and run
 correctly with ordinary wraparound semantics -- prefer the operators.
+
+## ImageNet64 profile: the bias-broadcast gradient plan was never cached
+
+A bounded `nsys`/`ncu`/`AXIS_PROFILE=1` pass training a 3-layer CNN on
+ImageNet64 at batch 256 (Axis 0.11.0 against a hand-written PyTorch loop,
+full method and numbers in the axis-benchmarks repo's
+`data/evidence/imagenet64/profile.md`) found 71% of each step (213.6ms) in
+`Tensor::align`'s general (rank-changing) path and another 22% (64.7ms) in
+the `grouped_submit` reduction it feeds, for a combined 92.8% of the whole
+308ms/step gap against PyTorch. Both costs came from the same place: every
+layer's `.add(&bias)` broadcasts a `[channel]` tensor up to the full
+activation shape, and because the bias requires a gradient, `align` built an
+output-sized host index map and a fresh `Plan::reverse` scatter-add plan on
+every training step, even though the shapes never change once a model is
+built. `Plan::reverse` mints a new id on every call (`NEXT_PLAN.fetch_add`),
+so `Device::device_plan`'s own upload cache -- which already exists and
+already works for permutations -- always missed too, and the plan's
+`offsets`/`left` arrays (up to 16.78MB for the first conv layer) were
+re-uploaded every step in addition to being rebuilt every step.
+
+The fix mirrors `Tensor::reduction_plans`'s existing cache (the one behind
+`sum`/`mean`) exactly: a new `align_reverse_plan` method keys a thread-local
+`HashMap<(Shape, Layout, Shape), Rc<Plan>>` by (the broadcasting tensor's own
+shape, its physical layout, the target shape), matching `reduction_plans`'
+`(u8, Shape, Layout, Vec<Axis>)` key one axis-set short (a broadcast target
+is already a full `Shape`, so there is no separate axis list to carry). A
+repeated broadcast now costs one hash lookup instead of an O(output size)
+Rust loop, and because the cached `Plan` keeps the one `id` it was built
+with, `device_plan`'s own cache then also hits on every repeat, for free,
+with no change to `device_plan` itself. A microbenchmark on the desk RTX
+5060 (100 steps of `[256,16,32,32] + [16]` broadcast-add, `mean`, backward,
+matching the profile's first-layer bias shape) moved from 1594.7ms/step to
+410.2ms/step, a 74.3% reduction -- consistent with this being the larger of
+the profile's two findings but not the whole gap, since the reduction
+kernel's own block-per-group launch shape (below) is a separate cost this
+change does not touch.
+
+This is a targeted fix at `align`'s own call site, not a change to
+`Plan::reverse`'s other callers (`merge`, `gather`, `scatter_add`): their
+`map` arguments are index data, not a pure function of shape and layout (an
+embedding lookup's indices differ every call even when the shapes match), so
+caching by signature would be silently wrong there.
