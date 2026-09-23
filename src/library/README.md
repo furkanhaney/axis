@@ -3,38 +3,72 @@
 [![Latest version](https://img.shields.io/crates/v/axis.svg)](https://crates.io/crates/axis)
 [![Documentation](https://docs.rs/axis/badge.svg)](https://docs.rs/axis)
 
-Axis is an experimental Rust machine-learning library built on NVIDIA
-[cuTile Rust](https://github.com/NVlabs/cutile-rs). Tensor dimensions have
-identities, not positions: a `batch` axis cannot silently become a `class`
-axis because both happen to have the same extent.
+Axis is a Rust framework for training neural networks on NVIDIA
+[cuTile](https://github.com/NVlabs/cutile-rs) that lets an experiment crash when
+one of its scientific assumptions stops being true.
 
-The crate currently provides:
+Deep-learning programs are unusually good at being wrong while continuing to
+run. A loader wraps around and a "fresh-sample" study quietly repeats its data;
+a test puzzle reappears in training under a different seed; the loss goes down
+while the evaluation metric never moves. Axis turns those assumptions into
+checks that run inside the training loop, fail before the bad step reaches the
+optimizer, and return a receipt that says exactly what was verified.
 
-- named-axis tensor algebra and reverse-mode differentiation, including
-  deterministic finite minimum reductions, asymmetric zero-padding, contiguous
-  slicing, compact device copies for layout, merge, and alignment, and
-  integer-factor nearest and half-pixel bilinear resampling along a named
-  axis;
-- `Linear`, `Conv1d`/`Conv2d`/`Conv3d`, `ConvTranspose1d`/`2d`/`3d`, and
-  named-axis `Unfold`/`Fold`, all with stride, symmetric padding, and
-  grouped/depthwise channels where they apply, `MaxPool2d`/`MaxPool3d` and
-  `Tensor::adaptive_avg_pool3d`, named-axis `LayerNorm`, `RmsNorm`,
-  `GroupNorm`, and stateless `InstanceNorm`, one-hot `Embedding` and
-  `PositionEmbedding`, explicit-state `LstmCell`/`Lstm`, activations,
-  attention primitives with causal and prefix-causal masks, and sequential
-  composition;
-- device-resident SGD, Adam, AdamW, and explicitly oriented rank-2 Muon with an
-  exact AdamW remainder;
-- generated and finite data loaders with executable single-pass, finite-pass,
-  and IDR assertions;
-- versioned semantic identities with exact retained-population and
-  bounded-memory streaming disjointness;
-- exact, batch-composable categorical accuracy counts;
-- train-fitted standardization with an explicit variance correction; and
-- empirical monotonicity checks over explicitly ordered input pairs, with
-  receipts that distinguish sampled evidence from a global guarantee; and
-- empirical learning-progress checks that bind a metric and evaluation
-  population to ordered budget observations without claiming convergence.
+## Executable research checks
+
+| Assumption | Check | What it catches |
+|---|---|---|
+| Every sample is new | `SinglePass`, `FinitePasses` | a step-count edit that turns a fresh-sample run into repeated passes over a finite corpus |
+| Repetition stays within a declared rate | `Idr` with `IdrLimits` | a generator or loader that repeats examples more than the experiment allows, caught before the optimizer step |
+| Train and evaluation never share an example | `Disjointness` over an `IdentityScheme` | overlap by *meaning*, not by file or seed: the same puzzle after relabeling, the same document through two shards |
+| The model actually learned | `LearningProgress` | a loop that runs every forward, backward and step while one declared metric on one declared evaluation population never improves |
+| A property holds on ordered inputs | `EmpiricalMonotonicity` | violations of a claimed monotone relation, recorded as sampled evidence rather than a global guarantee |
+| A physical law is satisfied | `EmpiricalResidual` | a model whose residual against a stated law exceeds its declared limit |
+| The run can be reproduced | `Trainer::step_training` with a `TrainingPass` | nondeterministic randomness: every random layer draws from a seed derived from the run seed and the step, and the step receipt names it |
+
+Each check is narrow on purpose. It returns a receipt (`IdrReceipt`,
+`DisjointnessReceipt`, `LearningProgressReceipt`, ...) naming the population,
+the identity scheme or metric, and the limits it was held to, and receipts are
+the fragments a run certificate is built from. A receipt says what was
+checked, never more: a sampled monotonicity check says "sampled", and learning
+progress says "improved by this much on this population", not "converged".
+
+```rust,ignore
+use axis::prelude::*;
+
+// Train, tuning and audit populations must not share a puzzle, where "the same
+// puzzle" is defined by the experiment, not by a file path or a seed.
+let scheme = IdentityScheme::new(
+    "sudoku-puzzle",
+    "1",
+    "81 cells after first-occurrence digit relabeling; positions retained",
+)?;
+let mut split = Disjointness::new(
+    scheme,
+    [
+        PopulationSpec::streaming("training"),
+        PopulationSpec::retained("tuning"),
+        PopulationSpec::retained("audit"),
+    ],
+)?;
+split.observe("tuning", tuning.iter().map(canonical_puzzle))?;
+split.observe("audit", audit.iter().map(canonical_puzzle))?;
+split.observe("training", batch.iter().map(canonical_puzzle))?;
+let receipt = split.assert_disjoint()?; // fails the run on the first shared puzzle
+```
+
+These checks are used by programs outside this repository that pin the
+published crate: a generated-data Sudoku transformer that asserts zero
+repeated training puzzles (`IdrLimits::generated(0.0)`) and no puzzle shared
+with evaluation, and a chess policy-and-value transformer that asserts its
+train and evaluation positions come from disjoint games and that training ran
+the declared number of passes.
+
+## Named axes
+
+Tensor dimensions have identities, not positions: a `batch` axis cannot
+silently become a `class` axis because both happen to have the same extent,
+and a reduction names the axis it removes.
 
 ```rust,no_run
 use axis::prelude::*;
@@ -56,95 +90,28 @@ fn main() -> Result<()> {
 }
 ```
 
-Axis requires Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile,
-`libclang`, and CUDA 13.2 or newer. It is early research software: APIs may
-change as real training programs expose better defaults and abstractions.
+## Compatibility
 
-`Tensor::gelu_exact()` and `ExactGELU` provide erf-form GELU for pretrained-model
-parity; `Tensor::gelu()` and `GELU` retain their tanh formulation. `SiLU` and
-configurable `LeakyReLU` compose existing differentiable tensor primitives.
-The exact-form operation uses FP32 normal-CDF evaluation and its analytic
-derivative, not bitwise libm equivalence. `gelu` is the tanh form; a model
-ported from PyTorch's default `nn.GELU` wants `gelu_exact`. `ELU`, `CELU`,
-`SELU`, `Softplus`, `LogSigmoid`, `Mish`, `GLU`, `PReLU`, `LogSoftmax`,
-`Softmin`, and `Softmax2d` compose the same way from `exp`/`ln`/`softplus`/
-`logsumexp`/`softmax`/`tanh`/`sigmoid`; `PReLU` is the one with a learnable
-weight, shared or one per named channel.
+Axis implements 72% of PyTorch 2.14's `torch.nn` catalog, graded class by class
+against its own definition of a finished module, with every operator checked
+against an independent numerical oracle for its values and its gradients
+([the catalog](https://github.com/furkanhaney/axis/blob/main/docs/nn/catalog.md)).
+The operator reference is on [docs.rs](https://docs.rs/axis).
 
-The Muon implementation's pinned upstream revision and MIT attribution are in
-[THIRD_PARTY.md](THIRD_PARTY.md), which is included in every published crate.
+## Requirements
 
-`Conv2d::new` and `Conv3d::new` default to stride one, no padding, and one
-group. Configure a depthwise layer by setting `groups` to the input channel
-count; both input and output channel extents must be divisible by that value.
-Kernel, stride, and padding entries correspond positionally to the supplied
-named spatial axes. Built-in padding is symmetric per axis. Dilation and built-in
-asymmetric convolution padding are not implemented. Both paths materialize FP32 patches before
-contraction; 3D kernel volumes can make that intermediate large, while later
-generic layout and broadcast operations retain their index-plan limits.
-
-`tensor.pad_zeros(axis, before, after)` and `tensor.narrow(axis, start, length)`
-give asymmetric zero-padding and contiguous nonempty slicing. Both preserve
-named axes, keep values and gradients on-device, and use rank-sized metadata
-instead of element-sized index tables; padding, slicing, layout changes, merge,
-and alignment run as compact device copies. Identity operations share storage.
-
-`tensor.gather(axis, index, output)` replaces a named axis with a new named
-axis sized by a host-side `&[usize]` index, checked against the axis extent
-before any device work. It is a row copy, not `Embedding`'s one-hot
-contraction, so it stays affordable at table sizes a one-hot vector could
-never reach; backward scatter-adds the upstream gradient into the picked
-rows, so a repeated index accumulates deterministically.
-
-`tensor.argmin(axis)` returns a host-side index of `min`'s own winning
-coordinate per remaining position, with no gradient of its own.
-`tensor.scatter_add(axis, index, bucket, bucket_count)` is `gather`'s exact
-transpose: it sums values into host-index-named buckets with an exact
-gradient, and its constant-ones case `Tensor::bincount` gives per-bucket
-counts. Together they turn a discrete nearest-neighbour assignment into
-per-bucket sums and counts without leaving the tensor graph.
-
-`Embedding` looks a one-hot `vocabulary` axis up in a learned
-`[vocabulary, feature]` table, so a token is a coordinate rather than an integer
-index; `PositionEmbedding` adds a learned `[position, feature]` table.
-`Tensor::prefix_causal_mask` masks attention so a prefix attends freely and the
-remainder attends causally. `Tensor::masked_softmax(axis, mask)` instead
-takes a variable-length `{0.0, 1.0}` validity mask: masked positions get
-exactly zero probability and gradient, and a group whose mask is entirely
-zero returns all zeros rather than `NaN`.
-
-`Lstm` names its time, input, and hidden axes and preserves every unrelated
-stream axis. `run` starts from device-resident zero state; `run_from` accepts an
-explicit `LstmState` and returns both the complete sequence and terminal hidden
-and cell state. Returned states stay connected to reverse mode until the caller
-uses `LstmState::detach`. The current implementation projects the full input
-sequence once, then submits one eager recurrent transition per time coordinate
-and retains its activations. It is a numerical-correctness path, not a fused scan
-or a sequence-throughput claim.
-
-Axis 0.11.0 covers 72% of PyTorch 2.14's `torch.nn` catalog by a frozen,
-row-by-row grading against Axis's own definition of a finished module
-([docs/nn/catalog.md](https://github.com/furkanhaney/axis/blob/main/docs/nn/catalog.md)):
-the activation, loss, distance, pooling, padding, convolution (including
-transposed, `Fold` and `Unfold`), recurrent (stacked and bidirectional RNN,
-GRU and LSTM), container, `MultiheadAttention` and `Upsample` families. Training
-and evaluation are separate methods, `forward` and `forward_training`; a
-`TrainingPass` hands each random layer a seed derived from the run seed and the
-step, and `Dropout` draws its mask on the device from a counter-based hash, so
-a run is reproducible bit for bit and its receipt names the seed.
+Linux, Rust 1.89 or newer, an NVIDIA GPU supported by cuTile, `libclang`, and
+CUDA 13.2 or newer. Axis is early research software: APIs may change as real
+training programs expose better defaults and abstractions.
 
 ```bash
 cargo add axis@0.11.0
 ```
 
-The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
-CNN, attention, generated-data, paired Muon, MNIST, and research-script
-migrations with independent numerical oracles. Outside consumers pin the
-published crate: a generated-data Sudoku transformer, a game-disjoint chess
-policy-and-value transformer, an in-process cell-segmentation click in the Atlas
-labeler, and a set of research studies each carrying a small Axis port checked
-against a PyTorch oracle. What those consumers still lack is tracked as issues
-and in `docs/direction/next.md`. Contributions from humans and agents are both
-welcome under the repository's contribution contract. The project name and
+The Muon implementation's pinned upstream revision and MIT attribution are in
+[THIRD_PARTY.md](THIRD_PARTY.md), which is included in every published crate.
+The [repository](https://github.com/furkanhaney/axis) holds the contracts
+behind each check, the acceptance programs, and the contribution contract;
+contributions from humans and agents are both welcome. The project name and
 branding are covered by its
 [trademark policy](https://github.com/furkanhaney/axis/blob/main/TRADEMARK.md).
