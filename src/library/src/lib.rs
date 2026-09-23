@@ -3,6 +3,8 @@
 //! Muon is adapted from Keller Jordan's reference implementation. The pinned
 //! source revision and MIT notice are packaged in
 //! [`THIRD_PARTY.md`](https://github.com/furkanhaney/axis/blob/main/src/library/THIRD_PARTY.md).
+#[path = "architectures/gan.rs"]
+mod architectures_gan;
 #[path = "algebra/axis.rs"]
 mod axis;
 #[cfg(feature = "cuda")]
@@ -101,6 +103,17 @@ pub use residual::{
 pub use tensor::{LinearCrossEntropyOptions, Tensor};
 pub use train::{Optimizer, TrainStep, Trainer, TrainingPass};
 
+/// Reference architectures: plain [`Module`] compositions of existing library modules, built
+/// only for named-axis composition and reference-equivalence witnesses. One file per family
+/// under `src/architectures/`; see each family's own module docs for its exact reference and
+/// tolerances.
+pub mod architectures {
+    pub use crate::architectures_gan::{
+        DCGAN_DISCRIMINATOR_FEATURES, DCGAN_GENERATOR_FEATURES, DCGAN_IMAGE_CHANNELS, DCGAN_LATENT,
+        DcganDiscriminator, DcganGenerator, dcgan_tutorial_init,
+    };
+}
+
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[cfg(all(not(feature = "cuda"), not(axis_docs_rs)))]
@@ -121,6 +134,7 @@ mod tests;
 mod window_tests;
 
 pub mod prelude {
+    pub use crate::architectures::{DcganDiscriminator, DcganGenerator};
     pub use crate::{
         Adam, AdamW, AdaptiveAvgPool1d, AdaptiveAvgPool2d, AdaptiveAvgPool3d, AdaptiveMaxPool1d,
         AdaptiveMaxPool2d, AdaptiveMaxPool3d, AdditionDataset, AdditionSample, AttentionMask,
