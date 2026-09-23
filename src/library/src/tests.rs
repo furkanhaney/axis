@@ -14657,3 +14657,815 @@ fn uniform_device_statistical_sanity_over_a_large_draw() -> Result<()> {
     );
     Ok(())
 }
+
+// --- ChannelDropout ------------------------------------------------------------------------
+
+#[test]
+fn channel_dropout_constructor_rejects_invalid_configurations() {
+    let channel = Axis::new("cd_ctor_channel");
+    let spatial = Axis::new("cd_ctor_spatial");
+    let other_spatial = Axis::new("cd_ctor_spatial_2");
+    assert!(ChannelDropout::new(0.5, channel, [spatial]).is_ok());
+    assert!(ChannelDropout::new(0.5, channel, [spatial, other_spatial]).is_ok());
+    assert!(ChannelDropout::new(-0.01, channel, [spatial]).is_err());
+    assert!(ChannelDropout::new(1.01, channel, [spatial]).is_err());
+    assert!(ChannelDropout::new(f32::NAN, channel, [spatial]).is_err());
+    // Empty spatial list.
+    assert!(ChannelDropout::new(0.5, channel, Vec::<Axis>::new()).is_err());
+    // Channel duplicated into the spatial list.
+    assert!(ChannelDropout::new(0.5, channel, [channel]).is_err());
+    // Spatial axis listed twice.
+    assert!(ChannelDropout::new(0.5, channel, [spatial, spatial]).is_err());
+    println!("ChannelDropout constructor validation PASS");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_rejects_missing_axes_before_any_device_work() -> Result<()> {
+    let channel = Axis::new("cd_missing_channel");
+    let spatial = Axis::new("cd_missing_spatial");
+    let unrelated = Axis::new("cd_missing_unrelated");
+    let device = Device::cuda(0)?;
+    let input = Tensor::from_slice(&[1.0, 2.0], [unrelated.of(2)], &device)?;
+    let dropout = ChannelDropout::new(0.5, channel, [spatial])?;
+    assert!(dropout.output_shape(input.shape()).is_err());
+    assert!(dropout.forward(&input).is_err());
+    println!("ChannelDropout missing-axis rejection PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_eval_batch");
+    let channel = Axis::new("cd_eval_channel");
+    let spatial = Axis::new("cd_eval_spatial");
+    let values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(2), spatial.of(2)],
+        &device,
+    )?;
+    let output = ChannelDropout::new(0.5, channel, [spatial])?.forward(&input)?;
+    close(
+        "ChannelDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("ChannelDropout eval-mode identity PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_forward_training_matches_a_broadcast_mask_oracle_forward_and_gradient()
+-> Result<()> {
+    // Independent oracle: `TrainingPass::new(5050)`'s first `next_seed()` is
+    // 13144240536140775429. Its first four `Tensor::uniform_device` draws (one per (batch,
+    // channel) combination, since `spatial` is excluded from the mask draw) are
+    // [0.0789562463760376, 0.3713812828063965, 0.6667241454124451, 0.11031758785247803], so
+    // keeping where the draw is >= 0.5 gives keep_small = [0, 0, 1, 0] -- only (batch=1,
+    // channel=0) survives -- broadcast over the two `spatial` positions of that combination.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_oracle_batch");
+    let channel = Axis::new("cd_oracle_channel");
+    let spatial = Axis::new("cd_oracle_spatial");
+    let input_values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let leaf = Tensor::from_slice(
+        &input_values,
+        [batch.of(2), channel.of(2), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+
+    let dropout = ChannelDropout::new(0.5, channel, [spatial])?;
+    let mut pass = TrainingPass::new(5050);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [0.0, 0.0, 0.0, 0.0, 10.0, 12.0, 0.0, 0.0];
+    close(
+        "ChannelDropout forward_training p=0.5 broadcast mask oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean([batch, channel, spatial])?.backward()?;
+    let expected_gradient = [0.0, 0.0, 0.0, 0.0, 0.25, 0.25, 0.0, 0.0];
+    close(
+        "ChannelDropout forward_training gradient (mask / (1 - p), broadcast over spatial)",
+        &leaf
+            .grad()
+            .expect("ChannelDropout input gradient")
+            .to_vec()?,
+        &expected_gradient,
+    );
+
+    let mut repeat_pass = TrainingPass::new(5050);
+    let repeat = dropout.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "ChannelDropout forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+    println!("ChannelDropout forward_training broadcast mask oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_forward_training_handles_p_zero_identity_and_p_one_zero_gradient() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_edge_batch");
+    let channel = Axis::new("cd_edge_channel");
+    let spatial = Axis::new("cd_edge_spatial");
+    let values: Vec<f32> = vec![2.0, -3.0, 5.5, -0.25];
+    let mut pass = TrainingPass::new(1234);
+
+    let identity_leaf = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(1), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let identity = ChannelDropout::new(0.0, channel, [spatial])?
+        .forward_training(&identity_leaf, &mut pass)?;
+    close(
+        "ChannelDropout forward_training p=0 is the identity",
+        &identity.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+
+    let zero_leaf = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(1), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+    let zeros =
+        ChannelDropout::new(1.0, channel, [spatial])?.forward_training(&zero_leaf, &mut pass)?;
+    close(
+        "ChannelDropout forward_training p=1 is exact zeros",
+        &zeros.to_vec()?,
+        &[0.0; 4],
+    );
+    zeros.mean([batch, channel, spatial])?.backward()?;
+    close(
+        "ChannelDropout forward_training p=1 gradient is exactly zero",
+        &zero_leaf.grad().expect("p=1 input gradient").to_vec()?,
+        &[0.0; 4],
+    );
+    println!("ChannelDropout forward_training p=0/p=1 edge cases PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn channel_dropout_statistical_sanity_kept_fraction_is_per_channel_not_per_element() -> Result<()> {
+    // A whole (batch, channel) combination is kept or dropped together: the fraction of kept
+    // COMBINATIONS should track (1 - p), and every combination's `spatial` positions must agree.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("cd_stat_batch");
+    let channel = Axis::new("cd_stat_channel");
+    let spatial = Axis::new("cd_stat_spatial");
+    let combinations = 2048;
+    let spatial_extent = 4;
+    let values: Vec<f32> = (0..combinations * spatial_extent)
+        .map(|i| 1.0 + (i as f32) * 0.0001)
+        .collect();
+    let leaf = Tensor::from_slice(
+        &values,
+        [
+            batch.of(combinations),
+            channel.of(1),
+            spatial.of(spatial_extent),
+        ],
+        &device,
+    )?;
+    let mut pass = TrainingPass::new(999);
+    let output = ChannelDropout::new(0.25, channel, [spatial])?
+        .forward_training(&leaf, &mut pass)?
+        .to_vec()?;
+
+    let mut agreeing = 0;
+    let mut kept_combinations = 0;
+    for combination in 0..combinations {
+        let row = &output[combination * spatial_extent..(combination + 1) * spatial_extent];
+        let all_kept = row.iter().all(|&v| v != 0.0);
+        let all_dropped = row.iter().all(|&v| v == 0.0);
+        if all_kept || all_dropped {
+            agreeing += 1;
+        }
+        if all_kept {
+            kept_combinations += 1;
+        }
+    }
+    assert_eq!(
+        agreeing, combinations,
+        "every spatial position of one (batch, channel) combination must share one decision"
+    );
+    let kept_fraction = kept_combinations as f64 / combinations as f64;
+    assert!(
+        (kept_fraction - 0.75).abs() < 0.03,
+        "kept combination fraction {kept_fraction} too far from 0.75"
+    );
+    println!(
+        "ChannelDropout statistical sanity PASS kept_fraction={kept_fraction:.4} (broadcast agreement 100%)"
+    );
+    Ok(())
+}
+
+// --- AlphaDropout ----------------------------------------------------------------------------
+
+#[test]
+fn alpha_dropout_constructor_rejects_invalid_probabilities() {
+    assert!(AlphaDropout::new(0.0).is_ok());
+    assert!(AlphaDropout::new(1.0).is_ok());
+    assert!(AlphaDropout::new(0.3).is_ok());
+    assert!(AlphaDropout::new(-0.01).is_err());
+    assert!(AlphaDropout::new(1.01).is_err());
+    assert!(AlphaDropout::new(f32::NAN).is_err());
+    assert!(AlphaDropout::new(f32::INFINITY).is_err());
+    println!("AlphaDropout constructor validation PASS");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_eval_feature");
+    let values = [3.0_f32, -1.5, 0.0, 42.25];
+    let input = Tensor::from_slice(&values, [feature.of(values.len())], &device)?;
+    let output = AlphaDropout::new(0.4)?.forward(&input)?;
+    close(
+        "AlphaDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("AlphaDropout eval-mode identity PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_forward_training_matches_pytorch_affine_formula_forward_and_gradient() -> Result<()>
+{
+    // Independent oracle, bit-for-bit PyTorch's `_alpha_dropout_impl` (`aten/src/ATen/native/
+    // Dropout.cpp`): `alpha = 1.7580993408473766` (its f32 rounding, matching
+    // `ALPHA_DROPOUT_ALPHA`, is 1.7580993175506592), `a = 1 / sqrt((alpha^2 * p + 1) * (1 -
+    // p))`. `TrainingPass::new(90210)`'s first `next_seed()` is 8618671413115748481; its first
+    // four `Tensor::uniform_device` draws feed `keep = draw >= p` at `p = 0.3`, giving `keep =
+    // [0, 1, 0, 1]`. At `p = 0.3`, `a = 0.8609525561332703` and the dropped-element constant
+    // `alpha * a * (p - 1) = -1.059548020362854`.
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_oracle_feature");
+    let input_values = [1.0_f32, -2.0, 0.5, -0.5];
+    let leaf = Tensor::from_slice(&input_values, [feature.of(4)], &device)?.with_grad();
+
+    let dropout = AlphaDropout::new(0.3)?;
+    let mut pass = TrainingPass::new(90210);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [
+        -1.059548020362854,
+        -1.2678130865097046,
+        -1.059548020362854,
+        0.023615717887878418,
+    ];
+    close(
+        "AlphaDropout forward_training p=0.3 affine oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean(feature)?.backward()?;
+    let expected_gradient = [0.0, 0.21523813903331757, 0.0, 0.21523813903331757];
+    close(
+        "AlphaDropout forward_training gradient (a * keep / count)",
+        &leaf.grad().expect("AlphaDropout input gradient").to_vec()?,
+        &expected_gradient,
+    );
+
+    let mut repeat_pass = TrainingPass::new(90210);
+    let repeat = dropout.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "AlphaDropout forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+    println!("AlphaDropout forward_training affine oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_forward_training_handles_p_zero_identity_and_p_one_zero_gradient() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_edge_feature");
+    let values = [2.0_f32, -3.0, 5.5, -0.25];
+    let mut pass = TrainingPass::new(4321);
+
+    let identity_leaf =
+        Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let identity = AlphaDropout::new(0.0)?.forward_training(&identity_leaf, &mut pass)?;
+    close(
+        "AlphaDropout forward_training p=0 is the identity",
+        &identity.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+
+    let zero_leaf = Tensor::from_slice(&values, [feature.of(values.len())], &device)?.with_grad();
+    let zeros = AlphaDropout::new(1.0)?.forward_training(&zero_leaf, &mut pass)?;
+    close(
+        "AlphaDropout forward_training p=1 is exact zeros",
+        &zeros.to_vec()?,
+        &[0.0; 4],
+    );
+    zeros.mean(feature)?.backward()?;
+    close(
+        "AlphaDropout forward_training p=1 gradient is exactly zero",
+        &zero_leaf.grad().expect("p=1 input gradient").to_vec()?,
+        &[0.0; 4],
+    );
+    println!("AlphaDropout forward_training p=0/p=1 edge cases PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn alpha_dropout_statistical_sanity_preserves_mean_and_variance() -> Result<()> {
+    // Self-normalizing networks assume zero mean, unit variance activations; alpha dropout's
+    // whole point is preserving both through training. Starting from `Tensor::normal(..., 0.0,
+    // 1.0, ...)` (its own oracle: `docs/design/library.md`'s Box-Muller construction over the
+    // host xorshift stream), the output mean and variance should stay close to 0 and 1.
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("ad_stat_feature");
+    let count = 200_000;
+    let leaf = Tensor::normal([feature.of(count)], 13, 0.0, 1.0, &device)?;
+    let mut pass = TrainingPass::new(55);
+    let output = AlphaDropout::new(0.2)?
+        .forward_training(&leaf, &mut pass)?
+        .to_vec()?;
+    let mean = output.iter().map(|&v| f64::from(v)).sum::<f64>() / output.len() as f64;
+    let variance = output
+        .iter()
+        .map(|&v| (f64::from(v) - mean).powi(2))
+        .sum::<f64>()
+        / output.len() as f64;
+    assert!(mean.abs() < 0.05, "output mean {mean} too far from 0");
+    assert!(
+        (variance - 1.0).abs() < 0.1,
+        "output variance {variance} too far from 1"
+    );
+    println!("AlphaDropout statistical sanity PASS mean={mean:.4} variance={variance:.4}");
+    Ok(())
+}
+
+// --- FeatureAlphaDropout ----------------------------------------------------------------------
+
+#[test]
+fn feature_alpha_dropout_constructor_rejects_invalid_configurations() {
+    let channel = Axis::new("fad_ctor_channel");
+    let spatial = Axis::new("fad_ctor_spatial");
+    assert!(FeatureAlphaDropout::new(0.4, channel, [spatial]).is_ok());
+    assert!(FeatureAlphaDropout::new(-0.01, channel, [spatial]).is_err());
+    assert!(FeatureAlphaDropout::new(1.01, channel, [spatial]).is_err());
+    assert!(FeatureAlphaDropout::new(0.4, channel, Vec::<Axis>::new()).is_err());
+    assert!(FeatureAlphaDropout::new(0.4, channel, [channel]).is_err());
+    println!("FeatureAlphaDropout constructor validation PASS");
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn feature_alpha_dropout_forward_training_matches_a_broadcast_affine_oracle_forward_and_gradient()
+-> Result<()> {
+    // Same construction as `channel_dropout_forward_training_matches_a_broadcast_mask_oracle_
+    // forward_and_gradient`, with `AlphaDropout`'s affine formula in place of the inverted-
+    // dropout scale. `TrainingPass::new(31415)`'s first `next_seed()` is 1944086767984051203;
+    // its first four `Tensor::uniform_device` draws feed `keep = draw >= p` at `p = 0.4`, giving
+    // keep_small = [1, 1, 0, 1] -- every (batch, channel) combination except (batch=1,
+    // channel=0) survives, broadcast over `spatial`. `a = 0.8632826209068298`, constant term
+    // `alpha * a * (p - 1) = -0.9106419682502747`.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("fad_oracle_batch");
+    let channel = Axis::new("fad_oracle_channel");
+    let spatial = Axis::new("fad_oracle_spatial");
+    let input_values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let leaf = Tensor::from_slice(
+        &input_values,
+        [batch.of(2), channel.of(2), spatial.of(2)],
+        &device,
+    )?
+    .with_grad();
+
+    let dropout = FeatureAlphaDropout::new(0.4, channel, [spatial])?;
+    let mut pass = TrainingPass::new(31415);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [
+        1.4703772068023682,
+        2.3336598873138428,
+        3.1969425678253174,
+        4.060225009918213,
+        -0.9106419682502747,
+        -0.9106419682502747,
+        6.6500725746154785,
+        7.513355731964111,
+    ];
+    close(
+        "FeatureAlphaDropout forward_training p=0.4 broadcast affine oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean([batch, channel, spatial])?.backward()?;
+    let expected_gradient = [
+        0.10791032761335373,
+        0.10791032761335373,
+        0.10791032761335373,
+        0.10791032761335373,
+        0.0,
+        0.0,
+        0.10791032761335373,
+        0.10791032761335373,
+    ];
+    close(
+        "FeatureAlphaDropout forward_training gradient (a * keep / count, broadcast over spatial)",
+        &leaf
+            .grad()
+            .expect("FeatureAlphaDropout input gradient")
+            .to_vec()?,
+        &expected_gradient,
+    );
+    println!("FeatureAlphaDropout forward_training broadcast affine oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn feature_alpha_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("fad_eval_batch");
+    let channel = Axis::new("fad_eval_channel");
+    let spatial = Axis::new("fad_eval_spatial");
+    let values: Vec<f32> = (1..=4).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(1), spatial.of(2)],
+        &device,
+    )?;
+    let output = FeatureAlphaDropout::new(0.4, channel, [spatial])?.forward(&input)?;
+    close(
+        "FeatureAlphaDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("FeatureAlphaDropout eval-mode identity PASS");
+    Ok(())
+}
+
+// --- RReLU -------------------------------------------------------------------------------------
+
+#[test]
+fn rrelu_builder_rejects_invalid_bounds() -> Result<()> {
+    assert!(RReLU::new().lower(-0.01).is_err());
+    assert!(RReLU::new().lower(f32::NAN).is_err());
+    assert!(RReLU::new().upper(f32::NAN).is_err());
+    // Default upper is 1/3: raising lower past it is rejected immediately, before `upper` is
+    // ever touched.
+    assert!(RReLU::new().lower(0.5).is_err());
+    // Default lower is 1/8: lowering upper below it is rejected too.
+    assert!(RReLU::new().upper(0.05).is_err());
+    // Raise lower first (still under the default upper), then raise upper past the new lower.
+    assert!(RReLU::new().lower(0.1)?.upper(0.4).is_ok());
+    println!("RReLU builder validation PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rrelu_forward_is_a_fixed_leaky_relu_at_the_mean_slope() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("rrelu_eval_feature");
+    let values = [2.0_f32, -3.0, 0.0, 5.0, -1.5, -0.25];
+    let input = Tensor::from_slice(&values, [feature.of(values.len())], &device)?;
+    // Default lower = 1/8, upper = 1/3: fixed eval slope (1/8 + 1/3) / 2 = 0.2291666...
+    let output = RReLU::new().forward(&input)?;
+    let expected: Vec<f64> = values
+        .iter()
+        .map(|&v| {
+            if v > 0.0 {
+                v as f64
+            } else {
+                v as f64 * (1.0 / 8.0 + 1.0 / 3.0) / 2.0
+            }
+        })
+        .collect();
+    close(
+        "RReLU::forward at PyTorch defaults",
+        &output.to_vec()?,
+        &expected,
+    );
+    close(
+        "RReLU::default() matches RReLU::new()",
+        &RReLU::default().forward(&input)?.to_vec()?,
+        &expected,
+    );
+
+    let custom = RReLU::new().lower(0.1)?.upper(0.4)?;
+    let custom_output = custom.forward(&input)?;
+    let custom_expected = [2.0, -0.75, 0.0, 5.0, -0.375, -0.0625];
+    close(
+        "RReLU::forward at custom lower/upper is leaky_relu((lower + upper) / 2)",
+        &custom_output.to_vec()?,
+        &custom_expected,
+    );
+    println!("RReLU eval-mode fixed-slope PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rrelu_forward_training_matches_a_per_element_slope_oracle_forward_and_gradient() -> Result<()> {
+    // Independent oracle: `TrainingPass::new(2718)`'s first `next_seed()` is
+    // 11642600825927962904. Its first six `Tensor::uniform_device` draws feed `slope = lower +
+    // (upper - lower) * draw` at `lower = 0.1, upper = 0.4`: slope = [0.13487684726715088,
+    // 0.24346089363098145, 0.12079253792762756, 0.2371707558631897, 0.19090664386749268,
+    // 0.2531281113624573]. Positive elements (including none here at exactly zero) pass
+    // through; non-positive elements (`x <= 0`, so the zero element too) scale by their slope.
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("rrelu_oracle_feature");
+    let input_values = [2.0_f32, -3.0, 0.0, 5.0, -1.5, -0.25];
+    let leaf = Tensor::from_slice(&input_values, [feature.of(6)], &device)?.with_grad();
+
+    let rrelu = RReLU::new().lower(0.1)?.upper(0.4)?;
+    let mut pass = TrainingPass::new(2718);
+    let output = rrelu.forward_training(&leaf, &mut pass)?;
+    let expected = [
+        2.0,
+        -0.7303826808929443,
+        0.0,
+        5.0,
+        -0.286359965801239,
+        -0.06328202784061432,
+    ];
+    close(
+        "RReLU forward_training per-element slope oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean(feature)?.backward()?;
+    let expected_gradient = [
+        0.1666666716337204,
+        0.040576815605163574,
+        0.020132089033722878,
+        0.1666666716337204,
+        0.03181777521967888,
+        0.042188018560409546,
+    ];
+    close(
+        "RReLU forward_training gradient (1 where kept, slope where scaled)",
+        &leaf.grad().expect("RReLU input gradient").to_vec()?,
+        &expected_gradient,
+    );
+
+    let mut repeat_pass = TrainingPass::new(2718);
+    let repeat = rrelu.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "RReLU forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+    println!("RReLU forward_training per-element slope oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn rrelu_forward_training_statistical_sanity_slopes_stay_in_bounds() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("rrelu_stat_feature");
+    let count = 100_000;
+    // All-negative input isolates the scaled branch: output / input is exactly the drawn slope.
+    let values: Vec<f32> = (0..count).map(|_| -1.0).collect();
+    let leaf = Tensor::from_slice(&values, [feature.of(count)], &device)?;
+    let mut pass = TrainingPass::new(31);
+    let rrelu = RReLU::new().lower(0.1)?.upper(0.4)?;
+    let output = rrelu.forward_training(&leaf, &mut pass)?.to_vec()?;
+    let mut min_slope = f64::INFINITY;
+    let mut max_slope: f64 = 0.0;
+    let mut sum = 0.0_f64;
+    for &v in &output {
+        let slope = f64::from(-v); // output = -1 * slope, so slope = -output
+        assert!(
+            (0.1..0.4).contains(&slope),
+            "slope {slope} outside [lower, upper)"
+        );
+        min_slope = min_slope.min(slope);
+        max_slope = max_slope.max(slope);
+        sum += slope;
+    }
+    let mean_slope = sum / output.len() as f64;
+    assert!(
+        (mean_slope - 0.25).abs() < 0.01,
+        "mean slope {mean_slope} too far from the midpoint 0.25"
+    );
+    println!(
+        "RReLU statistical sanity PASS mean_slope={mean_slope:.4} range=[{min_slope:.4}, {max_slope:.4}]"
+    );
+    Ok(())
+}
+
+// --- PrefixDropout -------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_rejects_a_missing_axis_before_any_device_work() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let axis = Axis::new("pd_missing_axis");
+    let unrelated = Axis::new("pd_missing_unrelated");
+    let input = Tensor::from_slice(&[1.0, 2.0], [unrelated.of(2)], &device)?;
+    let dropout = PrefixDropout::new(axis);
+    assert!(dropout.output_shape(input.shape()).is_err());
+    assert!(dropout.forward(&input).is_err());
+    println!("PrefixDropout missing-axis rejection PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_forward_is_the_identity() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let code = Axis::new("pd_eval_code");
+    let values: Vec<f32> = (1..=6).map(|v| v as f32).collect();
+    let input = Tensor::from_slice(&values, [code.of(6)], &device)?;
+    let output = PrefixDropout::new(code).forward(&input)?;
+    close(
+        "PrefixDropout::forward is the identity",
+        &output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+    println!("PrefixDropout eval-mode identity PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_forward_training_matches_a_per_example_width_oracle_forward_and_gradient()
+-> Result<()> {
+    // Independent oracle: `TrainingPass::new(6060)`'s first `next_seed()` is
+    // 5621291624497032630. Its first two `Tensor::uniform_device` draws (one per `batch`
+    // example, `code` excluded from the draw) are [0.068539559841156, 0.5928589701652527],
+    // scaled by `extent(code) + 1 = 5` into `w = [0.3426978, 2.964295]`. Position `i` (0..3)
+    // survives when `i < w`: batch 0 keeps only position 0 (`floor(w) + 1 = 1`); batch 1 keeps
+    // positions 0..2 (`floor(w) + 1 = 3`).
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("pd_oracle_batch");
+    let code = Axis::new("pd_oracle_code");
+    let input_values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let leaf = Tensor::from_slice(&input_values, [batch.of(2), code.of(4)], &device)?.with_grad();
+
+    let dropout = PrefixDropout::new(code);
+    let mut pass = TrainingPass::new(6060);
+    let output = dropout.forward_training(&leaf, &mut pass)?;
+    let expected = [1.0, 0.0, 0.0, 0.0, 5.0, 6.0, 7.0, 0.0];
+    close(
+        "PrefixDropout forward_training per-example width oracle",
+        &output.to_vec()?,
+        &expected,
+    );
+
+    output.mean([batch, code])?.backward()?;
+    let expected_gradient = [0.125, 0.0, 0.0, 0.0, 0.125, 0.125, 0.125, 0.0];
+    close(
+        "PrefixDropout forward_training gradient (1 kept, 0 dropped, no rescale)",
+        &leaf
+            .grad()
+            .expect("PrefixDropout input gradient")
+            .to_vec()?,
+        &expected_gradient,
+    );
+
+    // Same pass seed, same forward order: bit-identical.
+    let mut repeat_pass = TrainingPass::new(6060);
+    let repeat = dropout.forward_training(&leaf, &mut repeat_pass)?;
+    close(
+        "PrefixDropout forward_training is bit-identical across two runs of the same pass seed",
+        &repeat.to_vec()?,
+        &expected,
+    );
+
+    // A second call on the SAME pass (draw counter 1) draws a different per-example width,
+    // mirroring `sequential_threads_one_training_pass_through_two_dropout_layers_with_distinct_
+    // masks`'s use of `next_seed`'s second draw. `next_seed(6060, 1)`'s first two
+    // `Tensor::uniform_device` draws are [0.6250380873680115, 0.228529155254364], scaled by
+    // `extent + 1 = 5` into `w = [3.125190496444702, 1.1426458358764648]`, so batch 0 now keeps
+    // all 4 positions (`floor(3.125) + 1 = 4`) and batch 1 keeps 2 (`floor(1.1426) + 1 = 2`).
+    let mut second_pass = TrainingPass::new(6060);
+    second_pass.next_seed(); // consume the same first draw the oracle above used
+    let second_output = dropout.forward_training(&leaf, &mut second_pass)?;
+    let second_expected = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0];
+    close(
+        "PrefixDropout second draw on one pass keeps a different per-example width",
+        &second_output.to_vec()?,
+        &second_expected,
+    );
+    println!("PrefixDropout forward_training per-example width oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn prefix_dropout_statistical_sanity_kept_fraction_matches_the_closed_form_mean() -> Result<()> {
+    // Kept count is `floor(w) + 1` for `w = draw * (extent + 1)` uniform on `[0, extent + 1)`,
+    // so `floor(w)` is discrete-uniform over `{0, ..., extent}` with mean `extent / 2`: the
+    // expected kept fraction is `(extent / 2 + 1) / extent = 0.5 + 1 / extent`.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("pd_stat_batch");
+    let code = Axis::new("pd_stat_code");
+    let extent = 64;
+    let examples = 4096;
+    let values: Vec<f32> = vec![1.0; examples * extent];
+    let leaf = Tensor::from_slice(&values, [batch.of(examples), code.of(extent)], &device)?;
+    let mut pass = TrainingPass::new(20260922);
+    let output = PrefixDropout::new(code)
+        .forward_training(&leaf, &mut pass)?
+        .to_vec()?;
+    let kept = output.iter().filter(|&&v| v != 0.0).count();
+    let kept_fraction = kept as f64 / output.len() as f64;
+    let expected_fraction = 0.5 + 1.0 / extent as f64;
+    assert!(
+        (kept_fraction - expected_fraction).abs() < 0.02,
+        "kept fraction {kept_fraction} too far from the closed-form mean {expected_fraction}"
+    );
+    println!(
+        "PrefixDropout statistical sanity PASS kept_fraction={kept_fraction:.4} expected={expected_fraction:.4}"
+    );
+    Ok(())
+}
+
+// --- Dropout family composition (shared consumer evidence) --------------------------------
+
+#[test]
+#[ignore = "requires CUDA"]
+fn dropout_family_composes_in_one_training_pass_with_distinct_draws_per_layer() -> Result<()> {
+    // The six-point module definition's "a consumer" bar, for one composed pipeline shared by
+    // every row landed in this PR: a `Sequential` threading one `TrainingPass` through
+    // `ChannelDropout`, `AlphaDropout`, `RReLU`, and `PrefixDropout` in order, the way a real
+    // convolutional-then-dense model would. Each layer must consume its own draw (so the whole
+    // pipeline is reproducible from one pass seed) and the composition must run end to end
+    // without error on both `forward` and `forward_training`.
+    let device = Device::cuda(0)?;
+    let batch = Axis::new("family_batch");
+    let channel = Axis::new("family_channel");
+    let spatial = Axis::new("family_spatial");
+    let values: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 * 0.25).collect();
+    let input = Tensor::from_slice(
+        &values,
+        [batch.of(2), channel.of(2), spatial.of(4)],
+        &device,
+    )?;
+
+    let mut seq = Sequential::new((
+        ChannelDropout::new(0.3, channel, [spatial])?,
+        AlphaDropout::new(0.2)?,
+        RReLU::new(),
+    ));
+    seq.build(input.shape(), &device, 0)?;
+
+    // All-positive input: ChannelDropout/AlphaDropout's eval is the identity, and RReLU's eval
+    // (leaky_relu at the fixed midpoint slope) is also the identity on strictly positive values,
+    // so the whole pipeline reduces to the identity here without special-casing RReLU.
+    let eval_output = seq.forward(&input)?;
+    close(
+        "Dropout-family Sequential eval forward is the identity on all-positive input",
+        &eval_output.to_vec()?,
+        &values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+    );
+
+    let mut pass = TrainingPass::new(2468);
+    let train_output = seq.forward_training(&input, &mut pass)?;
+    assert_eq!(train_output.shape().len(), input.shape().len());
+    // Three draws consumed: one per layer, in call order.
+    assert_eq!(pass.next_seed(), {
+        let mut fresh = TrainingPass::new(2468);
+        fresh.next_seed();
+        fresh.next_seed();
+        fresh.next_seed();
+        fresh.next_seed()
+    });
+
+    // PrefixDropout composed separately over a fourth axis, sharing one pass with a plain
+    // Dropout layer, to also exercise the new module inside the existing Dropout consumer test
+    // shape (two draws, distinct masks/widths).
+    let code = Axis::new("family_code");
+    let code_input = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0], [code.of(5)], &device)?;
+    let mut mixed = Sequential::new((Dropout::new(0.5)?, PrefixDropout::new(code)));
+    mixed.build(code_input.shape(), &device, 0)?;
+    let mut mixed_pass = TrainingPass::new(13579);
+    let mixed_output = mixed
+        .forward_training(&code_input, &mut mixed_pass)?
+        .to_vec()?;
+    assert_eq!(mixed_output.len(), 5);
+    println!("Dropout-family Sequential composition PASS");
+    Ok(())
+}

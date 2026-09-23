@@ -1534,3 +1534,71 @@ this because `contract` never fully excludes a term). Graded PARTIAL: all
 rows in one call must share one target length and the time axis's full
 extent is every row's input length; PyTorch's own per-row
 `input_lengths`/`target_lengths` (mixed-length batches) are not implemented.
+
+### Dropout variants, RReLU and prefix dropout
+
+Five modules (`model/nn.rs`, immediately after `Dropout`), all built on the
+training pass and `Tensor::uniform_device` `Dropout` already established,
+none adding a device kernel: every draw composes from `mul`, `scale`, `add`,
+comparisons and `broadcast_to`.
+
+`ChannelDropout` is PyTorch's `nn.Dropout1d`/`nn.Dropout2d`/`nn.Dropout3d` as
+one type, since Axis names axes instead of positionally counting spatial
+dimensions (the same collapse `ZeroPad` already applies to
+`ZeroPad1d`/`2d`/`3d`). `ChannelDropout::new(p, channel, spatial)` drops one
+mask value per combination of `channel` and every axis not named `spatial`,
+broadcasting that decision over the `spatial` axes: PyTorch's own
+`make_feature_noise` builds its mask at shape `[N, C, 1, 1, ...]`, which is
+exactly "every non-spatial axis draws independently." Otherwise it is
+`Dropout`'s own contract: `forward` is the identity, `forward_training`
+consumes one `pass.next_seed()` draw regardless of `p`, and `p == 0`/`p ==
+1` are the same identity/zero edge cases.
+
+`AlphaDropout` is PyTorch's `nn.AlphaDropout` (Klambauer et al.,
+"Self-Normalizing Neural Networks"): SELU-preserving dropout that resets
+dropped units to SELU's own saturation value and applies an affine
+correction, instead of zeroing them, so a self-normalizing network's zero
+mean and unit variance survive dropout. The formula is bit-for-bit PyTorch's
+`aten/src/ATen/native/Dropout.cpp` `_alpha_dropout_impl`: with `alpha =
+1.7580993408473766` and `a = 1 / sqrt((alpha^2 * p + 1) * (1 - p))`, each
+element keeps with probability `1 - p` (the same `draw >= p` convention
+`Dropout` uses) and the output is `a * input * keep + alpha * a * keep +
+alpha * a * (p - 1)`, composed from `mul`, `scale` and `add` with no
+dedicated "add a scalar constant" primitive: the constant term is built with
+`Tensor::from_slice`, the way `normalization::Affine` already builds its own
+constant parameters. `p == 1` returns exact zeros, matching PyTorch's own
+special case (the affine constants are undefined there).
+
+`FeatureAlphaDropout` (PyTorch's `nn.FeatureAlphaDropout`) is that same
+affine formula applied to a `ChannelDropout`-shaped mask instead of an
+elementwise one: their composition, matching PyTorch's own
+`_feature_alpha_dropout` (`feature_dropout=true, alpha_dropout=true` in the
+same `_dropout_impl`).
+
+`RReLU` (PyTorch's `nn.RReLU`, Xu et al., "Empirical Evaluation of Rectified
+Activations in Convolutional Network") defaults `lower = 1/8, upper = 1/3`.
+`forward` (evaluation) is `Tensor::leaky_relu` at the fixed slope `(lower +
+upper) / 2`, PyTorch's documented evaluation behavior. `forward_training`
+draws one independent slope per element, uniform in `[lower, upper)`, from
+one `pass.next_seed()` draw: elements with `input > 0` pass through
+unchanged, every other element (including exactly `0`) multiplies by its own
+slope, matching PyTorch's `x <= 0` test.
+
+`PrefixDropout` (Axis issue #90, no PyTorch class) truncates a tensor to its
+first `w` positions along one named ordered axis, with `w` drawn
+independently per training example, so one trained model yields a whole
+width sweep at evaluation time. This is the capability `learning/bae`'s
+ordered sign code and `vision/image-encode`'s ordered latent and site lists
+both need (issue #90 names both consumers). `forward` (evaluation) is the
+identity. `forward_training` consumes one `pass.next_seed()` draw, feeding
+one `Tensor::uniform_device` call over the non-axis "example" axes alone
+(so the draw is per example, not per element): `w = draw * (extent + 1)`, a
+real value in `[0, extent + 1)`, compared against a constant `0..extent`
+position tensor along the ordered axis. `Tensor::broadcast_to` combines the
+two disjoint axis sets, the per-example width and the per-position index,
+onto one shared shape first, exactly the `torch.cdist`-style outer
+combination `broadcast_to`'s own doc comment describes. Position `i`
+survives when `i < w`, keeping `floor(w) + 1` positions in the generic case,
+so the kept prefix length is uniform over `{1, ..., extent}`. No rescaling
+is applied: unlike `Dropout`'s inverted scaling, this is a hard truncation
+mask, matching `arange(K) < m` in both cited consumers exactly.

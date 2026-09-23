@@ -146,7 +146,9 @@ items after PR #59, recorded here so the issue tracker can stay empty:
 
 Released 2026-09-22 with these four consumer issues moved here, so the
 tracker could be empty at publish time. Each is a real need with a named
-consumer; none was dropped.
+consumer; none was dropped. Issue #90 (prefix/nested dropout) landed in the
+dropout-variants PR and is no longer carried here; see "Dropout variants,
+RReLU and prefix dropout" in [../design/library.md](../design/library.md).
 
 - **Trained BatchNorm with persistent running statistics** (issue #76,
   consumer `vision/morpheus`). The training pass (PR #127) reserved the
@@ -155,10 +157,6 @@ consumer; none was dropped.
   step. Next: a persistent non-parameter tensor handle, then `BatchNorm` over a
   named feature axis with PyTorch's momentum and unbiased running variance, and
   InstanceNorm's optional running statistics on the same handle.
-- **Prefix (nested) dropout as a named-axis module** (issue #90, consumers
-  `learning/bae` and `vision/image-encode`). Unblocked by the training pass: its
-  `forward_training` draws a per-example width from `pass.next_seed()` and masks
-  with the prefix mask; the horizon-weighted loss stays in the consumer.
 - **Public per-op BF16 autocast** (issue #81, consumer `world/energy-output`).
   Deferred on purpose: it touches every kernel's precision path, and bit-exact
   receipts depend on FP32 today. It needs its own design, likely a per-call
