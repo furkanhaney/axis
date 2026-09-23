@@ -14657,3 +14657,470 @@ fn uniform_device_statistical_sanity_over_a_large_draw() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA"]
+fn batch_norm_forward_training_matches_a_scalar_oracle_forward_and_every_gradient() -> Result<()> {
+    // Independent host oracle: BatchNorm's own training-mode normalization,
+    // reduced over every axis but the declared feature axis (here batch and
+    // spatial together), using the BIASED variance -- PyTorch's own
+    // normalization convention -- entirely separate from the crate's own
+    // `Tensor::moments`.
+    fn batch_norm_reference(
+        values: &[f64],
+        scale: &[f64],
+        bias: &[f64],
+        target: &[f64],
+    ) -> (Vec<f64>, f64) {
+        const BATCH: usize = 3;
+        const FEATURE: usize = 2;
+        const SPATIAL: usize = 2;
+        let mut output = vec![0.0; values.len()];
+        for f in 0..FEATURE {
+            let selected: Vec<usize> = (0..BATCH)
+                .flat_map(|b| (0..SPATIAL).map(move |s| (b * FEATURE + f) * SPATIAL + s))
+                .collect();
+            let mean = selected.iter().map(|&i| values[i]).sum::<f64>() / selected.len() as f64;
+            let variance = selected
+                .iter()
+                .map(|&i| (values[i] - mean).powi(2))
+                .sum::<f64>()
+                / selected.len() as f64;
+            let inverse_standard_deviation = (variance + 1e-5).sqrt().recip();
+            for &i in &selected {
+                output[i] = (values[i] - mean) * inverse_standard_deviation * scale[f] + bias[f];
+            }
+        }
+        let loss = mean_squared(&output, target);
+        (output, loss)
+    }
+
+    let device = Device::cuda(0)?;
+    let (batch, feature, spatial) = (
+        Axis::new("bn_oracle_batch"),
+        Axis::new("bn_oracle_feature"),
+        Axis::new("bn_oracle_spatial"),
+    );
+    let dims = [batch.of(3), feature.of(2), spatial.of(2)];
+    let values = vec![
+        -1.5_f64, 0.5, 2.0, -0.25, 1.25, -2.0, 0.75, 1.75, -1.0, 0.0, 2.5, -0.5,
+    ];
+    let scale = vec![1.5_f64, -0.75];
+    let bias = vec![0.2_f64, -0.4];
+    let target: Vec<f64> = (0..12).map(|i| (i as f64 * 0.23).cos() * 0.5).collect();
+
+    let input = Tensor::from_slice(
+        &values.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?
+    .with_layout([spatial, feature, batch])?
+    .with_grad();
+    let mut bn = BatchNorm::new(feature);
+    bn.build(input.shape(), &device, 0)?;
+    bn.parameter("scale")?
+        .set_values(&scale.iter().map(|v| *v as f32).collect::<Vec<_>>())?;
+    bn.parameter("bias")?
+        .set_values(&bias.iter().map(|v| *v as f32).collect::<Vec<_>>())?;
+
+    let mut pass = TrainingPass::new(1234);
+    let output = bn.forward_training(&input, &mut pass)?;
+    let (expected_output, _) = batch_norm_reference(&values, &scale, &bias, &target);
+    close(
+        "BatchNorm training forward",
+        &output.to_vec()?,
+        &expected_output,
+    );
+
+    let target_tensor = Tensor::from_slice(
+        &target.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    output
+        .squared_error(&target_tensor)?
+        .mean([batch, feature, spatial])?
+        .backward()?;
+    close(
+        "BatchNorm input gradient",
+        &input.grad().unwrap().to_vec()?,
+        &central_difference(&values, 1e-4, |candidate| {
+            batch_norm_reference(candidate, &scale, &bias, &target).1
+        }),
+    );
+    close(
+        "BatchNorm scale gradient",
+        &bn.parameter("scale")?.grad().unwrap().to_vec()?,
+        &central_difference(&scale, 1e-4, |candidate| {
+            batch_norm_reference(&values, candidate, &bias, &target).1
+        }),
+    );
+    close(
+        "BatchNorm bias gradient",
+        &bn.parameter("bias")?.grad().unwrap().to_vec()?,
+        &central_difference(&bias, 1e-4, |candidate| {
+            batch_norm_reference(&values, &scale, candidate, &target).1
+        }),
+    );
+    println!("BatchNorm forward_training scalar oracle forward+gradient PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn trainer_step_training_commits_batch_norm_running_statistics_and_leaves_them_untouched_on_failure()
+-> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("bn_trainer_batch"),
+        Axis::new("bn_trainer_feature"),
+    );
+    let dims = [batch.of(4), feature.of(2)];
+    // `affine(false)` keeps the post-normalization scale/bias fixed at
+    // identity, since the fixed-input eval oracle below assumes them
+    // untouched by the three SGD steps -- the running-statistics EMA under
+    // test is independent of the affine transform either way.
+    let mut bn = BatchNorm::new(feature).momentum(Some(0.5))?.affine(false);
+    bn.build(&Shape::new(dims)?, &device, 0)?;
+
+    // Three fixed steps of input, one 4x2 batch each, chosen so a plain
+    // f64 replay of BatchNorm's documented EMA formula is trivial to
+    // hand-check: momentum=0.5, biased variance for normalization, UNBIASED
+    // running_var (n=4 samples per feature per step -> factor 4/3).
+    let steps: [[f64; 8]; 3] = [
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        [2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0],
+        [0.5, 1.5, -0.5, 2.5, 3.5, -1.5, 4.5, -2.5],
+    ];
+    fn expected_after(steps: &[[f64; 8]], momentum: f64) -> (Vec<f64>, Vec<f64>, f64) {
+        let mut running_mean = vec![0.0; 2];
+        let mut running_var = vec![1.0; 2];
+        let mut count = 0.0;
+        for step in steps {
+            count += 1.0;
+            for f in 0..2 {
+                let samples: Vec<f64> = (0..4).map(|b| step[b * 2 + f]).collect();
+                let mean = samples.iter().sum::<f64>() / 4.0;
+                let biased_var = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 4.0;
+                let unbiased_var = biased_var * 4.0 / 3.0;
+                running_mean[f] = (1.0 - momentum) * running_mean[f] + momentum * mean;
+                running_var[f] = (1.0 - momentum) * running_var[f] + momentum * unbiased_var;
+            }
+        }
+        (running_mean, running_var, count)
+    }
+
+    let mut trainer = Trainer::new(SGD::new(0.01)?).with_seed(2026);
+    let mut final_mean = vec![0.0; 2];
+    let mut final_var = vec![0.0; 2];
+    for (index, step_values) in steps.iter().enumerate() {
+        let values: Vec<f32> = step_values.iter().map(|v| *v as f32).collect();
+        // `with_grad`: with `affine(false)` the model itself has no
+        // parameters, so `backward` needs a tracked leaf somewhere in the
+        // loss graph to run at all; the running-statistics EMA under test
+        // never depends on it.
+        let input = Tensor::from_slice(&values, dims, &device)?.with_grad();
+        let step = trainer.step_training(&mut bn, |model, pass| {
+            model.forward_training(&input, pass)?.mean([batch, feature])
+        })?;
+        assert_eq!(
+            step.committed_states(),
+            3,
+            "step {index}: running_mean, running_var, num_batches_tracked"
+        );
+        let (expected_mean, expected_var, expected_count) = expected_after(&steps[..=index], 0.5);
+        close(
+            &format!("BatchNorm running_mean after step {index}"),
+            &bn.state("running_mean")?.tensor().to_vec()?,
+            &expected_mean,
+        );
+        close(
+            &format!("BatchNorm running_var after step {index}"),
+            &bn.state("running_var")?.tensor().to_vec()?,
+            &expected_var,
+        );
+        assert_eq!(
+            bn.state("num_batches_tracked")?.tensor().item()?,
+            expected_count as f32,
+            "step {index}: num_batches_tracked"
+        );
+        final_mean = expected_mean;
+        final_var = expected_var;
+    }
+
+    // Evaluation with the committed running statistics: scale=1, bias=0
+    // (never set, so still their identity default), so the expected output
+    // is the plain per-feature normalization against the last step's
+    // committed running_mean/running_var.
+    let eval_input_values: Vec<f64> = vec![10.0, -5.0, 3.0, 2.0, -1.0, 6.0, 0.0, -2.0];
+    let eval_input = Tensor::from_slice(
+        &eval_input_values
+            .iter()
+            .map(|v| *v as f32)
+            .collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    let eval_output = bn.forward(&eval_input)?.to_vec()?;
+    let mut expected_eval = vec![0.0; 8];
+    for b in 0..4 {
+        for f in 0..2 {
+            let idx = b * 2 + f;
+            expected_eval[idx] =
+                (eval_input_values[idx] - final_mean[f]) / (final_var[f] + 1e-5).sqrt();
+        }
+    }
+    close(
+        "BatchNorm eval uses committed running statistics",
+        &eval_output,
+        &expected_eval,
+    );
+
+    // A step whose loss errors AFTER forward_training has already staged
+    // updates must leave every State untouched: `step_training` only ever
+    // commits once the whole step -- loss, backward, optimizer step -- has
+    // succeeded, so an error from the loss closure itself never reaches
+    // `TrainingPass::commit`.
+    let before_mean = bn
+        .state("running_mean")?
+        .tensor()
+        .to_vec()?
+        .into_iter()
+        .map(f64::from)
+        .collect::<Vec<_>>();
+    let before_var = bn
+        .state("running_var")?
+        .tensor()
+        .to_vec()?
+        .into_iter()
+        .map(f64::from)
+        .collect::<Vec<_>>();
+    let before_count = bn.state("num_batches_tracked")?.tensor().item()?;
+    let failing_input = Tensor::from_slice(&[9.0; 8], dims, &device)?;
+    let failed = trainer.step_training(&mut bn, |model, pass| {
+        let _ = model.forward_training(&failing_input, pass)?;
+        Err::<Tensor, _>("injected failure after forward".into())
+    });
+    assert!(failed.is_err(), "the injected failure must propagate");
+    close(
+        "BatchNorm running_mean unchanged after a failed step",
+        &bn.state("running_mean")?.tensor().to_vec()?,
+        &before_mean,
+    );
+    close(
+        "BatchNorm running_var unchanged after a failed step",
+        &bn.state("running_var")?.tensor().to_vec()?,
+        &before_var,
+    );
+    assert_eq!(
+        bn.state("num_batches_tracked")?.tensor().item()?,
+        before_count,
+        "num_batches_tracked unchanged after a failed step"
+    );
+    println!("Trainer::step_training BatchNorm running-statistics commit-on-success PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn batch_norm_without_tracking_uses_batch_statistics_in_eval_too() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("bn_no_track_batch"),
+        Axis::new("bn_no_track_feature"),
+    );
+    let dims = [batch.of(4), feature.of(2)];
+    let values: Vec<f64> = vec![1.0, 5.0, 2.0, -3.0, 0.0, 4.0, -1.0, 2.0];
+    let input = Tensor::from_slice(
+        &values.iter().map(|v| *v as f32).collect::<Vec<_>>(),
+        dims,
+        &device,
+    )?;
+    let mut bn = BatchNorm::new(feature)
+        .track_running_stats(false)
+        .affine(false);
+    bn.build(input.shape(), &device, 0)?;
+    assert!(
+        bn.states().is_empty(),
+        "track_running_stats(false) must allocate no State"
+    );
+
+    fn batch_stats_reference(values: &[f64]) -> Vec<f64> {
+        const BATCH: usize = 4;
+        const FEATURE: usize = 2;
+        let mut output = vec![0.0; values.len()];
+        for f in 0..FEATURE {
+            let samples: Vec<f64> = (0..BATCH).map(|b| values[b * FEATURE + f]).collect();
+            let mean = samples.iter().sum::<f64>() / BATCH as f64;
+            let variance = samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / BATCH as f64;
+            let inverse_standard_deviation = (variance + 1e-5).sqrt().recip();
+            for b in 0..BATCH {
+                output[b * FEATURE + f] =
+                    (values[b * FEATURE + f] - mean) * inverse_standard_deviation;
+            }
+        }
+        output
+    }
+
+    let expected = batch_stats_reference(&values);
+    close(
+        "BatchNorm eval batch statistics (forward)",
+        &bn.forward(&input)?.to_vec()?,
+        &expected,
+    );
+    let mut pass = TrainingPass::new(1);
+    close(
+        "BatchNorm eval batch statistics (forward_training)",
+        &bn.forward_training(&input, &mut pass)?.to_vec()?,
+        &expected,
+    );
+    assert_eq!(
+        pass.commit(),
+        0,
+        "no state to commit when track_running_stats is false"
+    );
+    println!("BatchNorm track_running_stats=false eval-uses-batch-statistics PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn batch_norm_momentum_none_uses_the_cumulative_moving_average() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, feature) = (
+        Axis::new("bn_cumulative_batch"),
+        Axis::new("bn_cumulative_feature"),
+    );
+    let dims = [batch.of(2), feature.of(1)];
+    let mut bn = BatchNorm::new(feature).momentum(None)?.affine(false);
+    bn.build(&Shape::new(dims)?, &device, 0)?;
+
+    let steps: [[f32; 2]; 3] = [[1.0, 3.0], [10.0, 20.0], [-4.0, 4.0]];
+    // Cumulative average with running_mean starting at 0.0: after step k
+    // (1-indexed), factor_k = 1/k, so this is an ordinary online mean/EMA
+    // update against that factor -- independently replayed here in f64.
+    let mut expected_mean = 0.0_f64;
+    let mut expected_var = 1.0_f64;
+    for (index, step) in steps.iter().enumerate() {
+        let batch_mean = (f64::from(step[0]) + f64::from(step[1])) / 2.0;
+        let biased_var = ((f64::from(step[0]) - batch_mean).powi(2)
+            + (f64::from(step[1]) - batch_mean).powi(2))
+            / 2.0;
+        let unbiased_var = biased_var * 2.0; // n=2 -> n / (n - 1) = 2
+        let factor = 1.0 / (index as f64 + 1.0);
+        expected_mean = (1.0 - factor) * expected_mean + factor * batch_mean;
+        expected_var = (1.0 - factor) * expected_var + factor * unbiased_var;
+
+        let input = Tensor::from_slice(step, dims, &device)?;
+        let mut pass = TrainingPass::new(index as u64);
+        let _ = bn.forward_training(&input, &mut pass)?;
+        assert_eq!(pass.commit(), 3);
+        close(
+            &format!("cumulative running_mean after step {index}"),
+            &bn.state("running_mean")?.tensor().to_vec()?,
+            &[expected_mean],
+        );
+        close(
+            &format!("cumulative running_var after step {index}"),
+            &bn.state("running_var")?.tensor().to_vec()?,
+            &[expected_var],
+        );
+        assert_eq!(
+            bn.state("num_batches_tracked")?.tensor().item()?,
+            (index + 1) as f32
+        );
+    }
+    println!("BatchNorm momentum=None cumulative moving average PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn instance_norm_track_running_stats_matches_a_hand_derived_running_statistics_oracle() -> Result<()>
+{
+    let device = Device::cuda(0)?;
+    let (batch, channel, spatial) = (
+        Axis::new("in_running_batch"),
+        Axis::new("in_running_channel"),
+        Axis::new("in_running_spatial"),
+    );
+    let dims = [batch.of(2), channel.of(2), spatial.of(2)];
+    let values: Vec<f32> = vec![
+        1.0, 3.0, 5.0, 7.0, // batch 0: channel 0 = [1, 3], channel 1 = [5, 7]
+        2.0, 0.0, -1.0, 3.0, // batch 1: channel 0 = [2, 0], channel 1 = [-1, 3]
+    ];
+    let input = Tensor::from_slice(&values, dims, &device)?;
+    let mut instance = InstanceNorm::new(channel, [spatial])?
+        .affine(false)
+        .track_running_stats(true)
+        .momentum(Some(0.5))?;
+    instance.build(input.shape(), &device, 0)?;
+
+    // Independent host replay of InstanceNorm's documented running-statistics
+    // formula (see its own doc comment): per-instance (batch, channel)
+    // mean/var over the spatial axis only, the variance unbiased with the
+    // spatial sample size ALONE (n=2 -> n / (n - 1) = 2, not the whole
+    // batch's count), then averaged over batch before the momentum EMA.
+    fn instance_stats(pair: [f64; 2]) -> (f64, f64) {
+        let mean = (pair[0] + pair[1]) / 2.0;
+        let biased = ((pair[0] - mean).powi(2) + (pair[1] - mean).powi(2)) / 2.0;
+        (mean, biased * 2.0)
+    }
+    let (mean_b0_c0, var_b0_c0) = instance_stats([1.0, 3.0]);
+    let (mean_b0_c1, var_b0_c1) = instance_stats([5.0, 7.0]);
+    let (mean_b1_c0, var_b1_c0) = instance_stats([2.0, 0.0]);
+    let (mean_b1_c1, var_b1_c1) = instance_stats([-1.0, 3.0]);
+    let pooled_mean = [
+        (mean_b0_c0 + mean_b1_c0) / 2.0,
+        (mean_b0_c1 + mean_b1_c1) / 2.0,
+    ];
+    let pooled_var = [(var_b0_c0 + var_b1_c0) / 2.0, (var_b0_c1 + var_b1_c1) / 2.0];
+    let momentum = 0.5_f64;
+    let expected_mean = [momentum * pooled_mean[0], momentum * pooled_mean[1]];
+    let expected_var = [
+        0.5 * 1.0 + momentum * pooled_var[0],
+        0.5 * 1.0 + momentum * pooled_var[1],
+    ];
+
+    let mut pass = TrainingPass::new(99);
+    let _ = instance.forward_training(&input, &mut pass)?;
+    assert_eq!(pass.commit(), 3);
+    close(
+        "InstanceNorm running_mean",
+        &instance.state("running_mean")?.tensor().to_vec()?,
+        &expected_mean,
+    );
+    close(
+        "InstanceNorm running_var",
+        &instance.state("running_var")?.tensor().to_vec()?,
+        &expected_var,
+    );
+    assert_eq!(instance.state("num_batches_tracked")?.tensor().item()?, 1.0);
+    println!("InstanceNorm track_running_stats running-statistics oracle PASS");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn named_states_thread_batch_norm_through_sequential_slot_paths() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let feature = Axis::new("seq_states_feature");
+    let dims = [feature.of(3)];
+    let mut sequential = Sequential::new((
+        BatchNorm::new(feature),
+        BatchNorm::new(feature).track_running_stats(false),
+    ));
+    sequential.build(&Shape::new(dims)?, &device, 0)?;
+    let mut paths: Vec<String> = sequential
+        .named_states()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        ["0.num_batches_tracked", "0.running_mean", "0.running_var"]
+    );
+    println!("named_states thread through Sequential slot paths PASS");
+    Ok(())
+}

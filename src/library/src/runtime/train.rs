@@ -1,6 +1,6 @@
 //! Minimal step ordering shared by concrete training programs.
-use crate::{Adam, AdamW, Module, Muon, MuonWithAuxAdamW, Result, SGD, Tensor};
-use std::time::Instant;
+use crate::{Adam, AdamW, Module, Muon, MuonWithAuxAdamW, Result, SGD, State, Tensor};
+use std::{cell::RefCell, rc::Rc, time::Instant};
 
 fn profile(label: &str, started: Instant) {
     if std::env::var_os("AXIS_PROFILE").is_some() {
@@ -72,19 +72,28 @@ fn splitmix64(mut z: u64) -> u64 {
 /// seed, step and forward order give bit-identical draws, and two random
 /// consumers in one step draw different values.
 ///
-/// A follow-up (#76) adds a list of pending persistent-state updates here for
-/// `BatchNorm`-style running statistics; this PR leaves no unused field for
-/// that, since the crate denies dead code.
+/// Also carries the pending list of persistent-state updates a
+/// `forward_training` call queues with [`TrainingPass::stage`] --
+/// `BatchNorm`-style running statistics. Nothing writes a [`State`] during
+/// forward: [`TrainingPass::commit`] is the only writer, called by
+/// `Trainer::step_training` after the optimizer step succeeds, so a forward
+/// pass stays side-effect free and a failed step leaves every `State`
+/// untouched.
 pub struct TrainingPass {
     seed: u64,
     draws: u64,
+    pending: Vec<(State, Tensor)>,
 }
 
 impl TrainingPass {
     /// Build a pass directly from its seed, for driving `forward_training`
     /// outside the `Trainer` -- a test or a custom loop.
     pub fn new(seed: u64) -> Self {
-        Self { seed, draws: 0 }
+        Self {
+            seed,
+            draws: 0,
+            pending: Vec::new(),
+        }
     }
 
     fn from_run(run_seed: u64, step_index: u64) -> Self {
@@ -104,6 +113,27 @@ impl TrainingPass {
         let draw = self.draws;
         self.draws = self.draws.wrapping_add(1);
         splitmix64(self.seed ^ draw.wrapping_mul(GOLDEN))
+    }
+
+    /// Queue a persistent-state update for `state` without writing it: a
+    /// `forward_training` implementation (`BatchNorm`'s running statistics)
+    /// calls this instead of ever mutating a [`State`] directly. Updates
+    /// commit in staging order.
+    pub fn stage(&mut self, state: State, value: Tensor) {
+        self.pending.push((state, value));
+    }
+
+    /// Write every staged update to its `State`, in staging order, detaching
+    /// each new value first. `Trainer::step_training` calls this once, after
+    /// its optimizer step succeeds; public so a custom training loop driving
+    /// `forward_training` directly can do the same. Returns how many updates
+    /// were committed.
+    pub fn commit(&mut self) -> usize {
+        let count = self.pending.len();
+        for (state, value) in self.pending.drain(..) {
+            state.replace(value);
+        }
+        count
     }
 }
 
@@ -142,6 +172,12 @@ impl<O: Optimizer> Trainer<O> {
     /// this trainer's run seed and completed-step count, threaded to `loss`
     /// so it can drive `Module::forward_training`. Errors before any device
     /// work if `with_seed` was never called.
+    ///
+    /// Commits the pass's staged persistent-state updates
+    /// (`TrainStep::committed_states`) once the whole step -- loss, backward,
+    /// optimizer step -- has succeeded, and only then: an error anywhere
+    /// before that point returns early and never commits, leaving every
+    /// [`State`] exactly as it was.
     pub fn step_training<M, F>(&mut self, model: &mut M, loss: F) -> Result<TrainStep>
     where
         M: Module,
@@ -150,9 +186,17 @@ impl<O: Optimizer> Trainer<O> {
         let run_seed = self
             .run_seed
             .ok_or("Trainer::step_training requires with_seed before use")?;
-        let mut pass = TrainingPass::from_run(run_seed, self.completed_steps as u64);
-        let pass_seed = pass.seed();
-        self.run_step(model, Some(pass_seed), move |model| loss(model, &mut pass))
+        let pass = Rc::new(RefCell::new(TrainingPass::from_run(
+            run_seed,
+            self.completed_steps as u64,
+        )));
+        let pass_seed = pass.borrow().seed();
+        let closure_pass = pass.clone();
+        let mut step = self.run_step(model, Some(pass_seed), move |model| {
+            loss(model, &mut closure_pass.borrow_mut())
+        })?;
+        step.committed_states = pass.borrow_mut().commit();
+        Ok(step)
     }
 
     /// The update ordering both `step` and `step_training` share: zero
@@ -199,6 +243,7 @@ impl<O: Optimizer> Trainer<O> {
             step: next,
             pre_update_loss: loss,
             pass_seed,
+            committed_states: 0,
         })
     }
 
@@ -219,6 +264,7 @@ pub struct TrainStep {
     step: usize,
     pre_update_loss: Tensor,
     pass_seed: Option<u64>,
+    committed_states: usize,
 }
 
 impl TrainStep {
@@ -235,5 +281,12 @@ impl TrainStep {
     /// `step_training`. The receipt `docs/direction/next.md` asks for.
     pub fn pass_seed(&self) -> Option<u64> {
         self.pass_seed
+    }
+
+    /// How many staged persistent-state updates `step_training` committed
+    /// after this step's optimizer step succeeded. Always `0` for `step`,
+    /// which never builds a `TrainingPass`.
+    pub fn committed_states(&self) -> usize {
+        self.committed_states
     }
 }
