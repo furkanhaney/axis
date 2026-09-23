@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "addition"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
 ]
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "attention"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
 ]
@@ -57,14 +57,14 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "axis"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "cutile",
 ]
 
 [[package]]
 name = "axis-cifar100"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
  "axis-vision-data",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "axis-fashion-mnist"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
  "axis-vision-data",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "axis-imagenet64"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
  "axis-vision-data",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "axis-mnist"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
  "axis-vision-data",
@@ -97,21 +97,21 @@ dependencies = [
 
 [[package]]
 name = "axis-mnist-population"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
 ]
 
 [[package]]
 name = "axis-muon-acceptance"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
 ]
 
 [[package]]
 name = "axis-panel"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
  "csv",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "axis-vision-data"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
 ]
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "cnn"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
  "cutile",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "damped-pendulum"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
 ]
@@ -779,7 +779,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "mlp"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "axis",
  "cutile",
