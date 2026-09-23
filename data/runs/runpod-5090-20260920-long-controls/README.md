@@ -1,4 +1,4 @@
-# RTX 5090 long controls — 2026-09-20
+# RTX 5090 long controls (2026-09-20)
 
 These controls ran on public Axis commit `542b4f6` on one NVIDIA RTX 5090.
 They establish longer generated-data training behavior before the later
