@@ -1,6 +1,6 @@
 # The torch.nn catalog, row by row
 
-`classes 161 · yes 111 · partial 16 · refused 0 · no 34`
+`classes 161 · yes 112 · partial 16 · refused 0 · no 33`
 
 The denominator is every class in the layer sections of PyTorch 2.14's
 [`torch.nn` page](https://docs.pytorch.org/docs/2.14/nn.html) on 2026-09-22:
@@ -133,7 +133,7 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Linear Layers | `Linear` | yes | `Linear` with `.bias(false)`; `PopulationLinear` beside it |
 | Linear Layers | `Bilinear` | partial | #129: oracle fwd+grad incl. weight; not a Module (two inputs), Linear-style init not PyTorch's |
 | Linear Layers | `LazyLinear` | no | specialized stage of the backlog: needs its own representation or execution contract; a name alone would be false parity |
-| Dropout Layers | `Dropout` | no | #open: dropout and explicit train/eval mode |
+| Dropout Layers | `Dropout` | yes | #127: device counter-hash masks bit-exact vs host SplitMix64 oracle; eval identity; seeded, receipted pass |
 | Dropout Layers | `Dropout1d` | no | absent |
 | Dropout Layers | `Dropout2d` | no | absent |
 | Dropout Layers | `Dropout3d` | no | absent |
@@ -177,4 +177,4 @@ it does not refuse); **no** = absent. `#open` names an open Axis issue.
 | Utilities (modules) | `Flatten` | yes | #129: merge of named axes, oracle |
 | Utilities (modules) | `Unflatten` | yes | #129: split of a named axis, oracle |
 
-Score: mean of strict (111/161) and half-credit ((111+16/2)/161) = 71.43% = 7143 bp.
+Score: mean of strict (112/161) and half-credit ((112+16/2)/161) = 72.05% = 7205 bp.

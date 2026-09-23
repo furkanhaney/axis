@@ -122,8 +122,19 @@ sequence once, then submits one eager recurrent transition per time coordinate
 and retains its activations. It is a numerical-correctness path, not a fused scan
 or a sequence-throughput claim.
 
+Axis 0.11.0 covers 72% of PyTorch 2.14's `torch.nn` catalog by a frozen,
+row-by-row grading against Axis's own definition of a finished module
+([docs/nn/catalog.md](https://github.com/furkanhaney/axis/blob/main/docs/nn/catalog.md)):
+the activation, loss, distance, pooling, padding, convolution (including
+transposed, `Fold` and `Unfold`), recurrent (stacked and bidirectional RNN,
+GRU and LSTM), container, `MultiheadAttention` and `Upsample` families. Training
+and evaluation are separate methods, `forward` and `forward_training`; a
+`TrainingPass` hands each random layer a seed derived from the run seed and the
+step, and `Dropout` draws its mask on the device from a counter-based hash, so
+a run is reproducible bit for bit and its receipt names the seed.
+
 ```bash
-cargo add axis@0.10.0
+cargo add axis@0.11.0
 ```
 
 The [repository](https://github.com/furkanhaney/axis) contains complete MLP,
