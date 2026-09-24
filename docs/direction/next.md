@@ -7,6 +7,10 @@ owner's larger, partially unimplemented API sketch. The
 ordinary layer families from being forgotten while retaining Axis's named-axis
 contracts and evidence bar.
 
+The next consumer class, exact programs (tables at `±1000`, audited over
+their whole finite domain, still differentiable), and what Axis is missing
+for it are specified in [exact-programs.md](exact-programs.md).
+
 ## What exists and why
 
 - `src/library/` is the reusable crate. Introductory programs live under
