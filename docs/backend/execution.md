@@ -297,3 +297,31 @@ microbenchmark (100 steps of `[256,16,32,32] + [16]` broadcast-add, mean,
 backward) moved from 410.2ms/step (plan caching alone) to 170.0ms/step, a
 further 58.5% reduction and 89.3% off the original 1594.7ms/step baseline
 (9.4x). Real ImageNet64 numbers on the tower are in the PR.
+
+## Inference buffer retirement
+
+Outside `Trainer`, the backend checks completion every 32 allocations and
+moves buffers whose only remaining owner is its pending list into an event
+batch. Recording after the last submitted use matters: recording only at
+allocation would permit a later use to race a free. Live tensor/gradient/plan
+owners keep their references. Host upload arrays and temporary integer buffers
+follow the same rule. Completed batches are freed; if uncompleted batches exceed
+256 MiB, inference waits for the oldest event. The allocation interval and live
+buffers are additional to this backlog budget. Live autograd graphs cannot be
+reclaimed until their owners release them.
+
+The Trainer step uses an unwind-safe thread-local scope to skip this maintenance,
+so it neither polls nor records/waits for retirement events during its existing
+single-boundary execution. Reads and explicit synchronization still clear all
+pending batches. No API change or consumer synchronization is required.
+
+The RTX 5060 synthetic witness repeats a 1 MiB FP32 operation. Retaining every
+intermediate (the prior policy) held 512 MiB after 512 steps; automatic retirement
+held at most 97 MiB over 8,192 steps, with exact outputs and no caller-inserted
+synchronization in either loop. Driver-used memory increased by 480 MiB in the
+baseline and about 1.7 MiB during the subsequent automatic-retirement run; the
+allocator reused the baseline's pool, so these are incremental observations,
+not comparable absolute process peaks. Live aliases and later gradient inputs
+also pass. See [the raw receipt](../../data/evidence/buffer-retirement.log).
+This witnesses bounded unused-intermediate retention, not a measured beat_this
+transformer speedup or a bound on caller-owned activations.

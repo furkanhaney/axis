@@ -4,7 +4,7 @@ use cutile::prelude::*;
 use std::time::Instant;
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{
         OnceLock,
@@ -123,6 +123,61 @@ struct Context {
     pending_device_i32: RefCell<Vec<Arc<cutile::tensor::Tensor<i32>>>>,
     plans: RefCell<HashMap<u64, DevicePlan>>,
     plan_bytes: Cell<usize>,
+    allocations_since_poll: Cell<usize>,
+    retired: RefCell<VecDeque<RetiredBuffers>>,
+}
+
+// Only buffers with no remaining caller are moved here. The event is recorded
+// after their last submitted use, not merely after their allocation.
+struct RetiredBuffers {
+    event: cutile::cuda_core::Event,
+    _values: Vec<Buffer>,
+    _host_f32: Vec<Arc<Vec<f32>>>,
+    _host_i32: Vec<Arc<Vec<i32>>>,
+    _device_i32: Vec<Arc<cutile::tensor::Tensor<i32>>>,
+}
+
+impl RetiredBuffers {
+    fn device_bytes(&self) -> usize {
+        let values: usize = self
+            ._values
+            .iter()
+            .map(|buffer| {
+                buffer
+                    .shape()
+                    .iter()
+                    .map(|&d| d as usize)
+                    .product::<usize>()
+                    * 4
+            })
+            .sum();
+        values
+            + self
+                ._device_i32
+                .iter()
+                .map(|buffer| {
+                    buffer
+                        .shape()
+                        .iter()
+                        .map(|&d| d as usize)
+                        .product::<usize>()
+                        * 4
+                })
+                .sum::<usize>()
+    }
+}
+
+fn take_unowned<T>(pending: &RefCell<Vec<Arc<T>>>) -> Vec<Arc<T>> {
+    let mut retired = Vec::new();
+    pending.borrow_mut().retain(|buffer| {
+        if Arc::strong_count(buffer) == 1 {
+            retired.push(buffer.clone());
+            false
+        } else {
+            true
+        }
+    });
+    retired
 }
 
 #[derive(Clone)]
@@ -137,8 +192,8 @@ trait Enqueue: DeviceOp + Sized {
         self,
         stream: &Arc<cutile::cuda_core::Stream>,
     ) -> std::result::Result<<Self as DeviceOp>::Output, DeviceError> {
-        // Axis owns every buffer until `Device::synchronize`; all work is
-        // submitted to this one stream, so dependency order is preserved.
+        // Axis retains submitted buffers through their last use, using either
+        // completed retirement events or the explicit synchronization boundary.
         unsafe { self.async_on(stream) }
     }
 }
@@ -169,6 +224,8 @@ impl Device {
             pending_device_i32: RefCell::new(Vec::new()),
             plans: RefCell::new(HashMap::new()),
             plan_bytes: Cell::new(0),
+            allocations_since_poll: Cell::new(0),
+            retired: RefCell::new(VecDeque::new()),
         })))
     }
     pub(crate) fn same(&self, other: &Self) -> bool {
@@ -179,10 +236,54 @@ impl Device {
         self.0.pending.borrow_mut().push(buffer.clone());
         buffer
     }
+    fn retire_completed(&self) -> Result<()> {
+        // Trainer already has one completion boundary. Avoid scanning its live
+        // backward graph or adding events/synchronizations within the step.
+        if crate::train::in_training_step() {
+            return Ok(());
+        }
+        let count = self.0.allocations_since_poll.get() + 1;
+        self.0.allocations_since_poll.set(count % 32);
+        if count < 32 {
+            return Ok(());
+        }
+        let mut retired = self.0.retired.borrow_mut();
+        while let Some(front) = retired.front() {
+            if !front.event.query()? {
+                break;
+            }
+            retired.pop_front();
+        }
+        // A host can enqueue faster than the GPU consumes. Bound that backlog
+        // outside Trainer by waiting only for the oldest retirement event.
+        // This never waits for newer work or adds a Trainer step boundary.
+        let mut bytes: usize = retired.iter().map(RetiredBuffers::device_bytes).sum();
+        while bytes > 256 * 1024 * 1024 {
+            let front = retired.front().expect("nonempty retirement backlog");
+            front.event.synchronize()?;
+            bytes -= front.device_bytes();
+            retired.pop_front();
+        }
+        // Record before moving ownership: if recording fails, all buffers stay
+        // retained. No device work is submitted between this event and the scan.
+        let event = self.0.stream.device().new_event()?;
+        event.record(&self.0.stream)?;
+        let batch = RetiredBuffers {
+            event,
+            _values: take_unowned(&self.0.pending),
+            _host_f32: take_unowned(&self.0.pending_f32),
+            _host_i32: take_unowned(&self.0.pending_host_i32),
+            _device_i32: take_unowned(&self.0.pending_device_i32),
+        };
+        retired.push_back(batch);
+        Ok(())
+    }
     pub fn synchronize(&self) -> Result<()> {
         let started = Instant::now();
         unsafe { self.0.stream.synchronize()? };
         profile("synchronize", started);
+        self.0.allocations_since_poll.set(0);
+        self.0.retired.borrow_mut().clear();
         self.0.pending.borrow_mut().clear();
         self.0.pending_f32.borrow_mut().clear();
         self.0.pending_host_i32.borrow_mut().clear();
@@ -190,6 +291,7 @@ impl Device {
         Ok(())
     }
     pub(crate) fn upload(&self, values: Vec<f32>) -> Result<Buffer> {
+        self.retire_completed()?;
         let values = Arc::new(values);
         let tensor = api::copy_host_vec_to_device(&values).enqueue_on(&self.0.stream)?;
         self.0.pending_f32.borrow_mut().push(values);
@@ -199,6 +301,8 @@ impl Device {
         let started = Instant::now();
         let values = buffer.to_host_vec().sync_on(&self.0.stream)?;
         profile("read", started);
+        self.0.allocations_since_poll.set(0);
+        self.0.retired.borrow_mut().clear();
         self.0.pending.borrow_mut().clear();
         self.0.pending_f32.borrow_mut().clear();
         self.0.pending_host_i32.borrow_mut().clear();
@@ -206,6 +310,7 @@ impl Device {
         Ok(values)
     }
     fn zeros(&self, len: usize) -> Result<cutile::tensor::Tensor<f32>> {
+        self.retire_completed()?;
         Ok(api::zeros(&[len]).enqueue_on(&self.0.stream)?)
     }
     pub(crate) fn zeros_buffer(&self, len: usize) -> Result<Buffer> {
@@ -3047,5 +3152,106 @@ mod kernels {
         // 1.0 / 2^24, exact in f32.
         let scale: Tile<f32, { [128] }> = constant(5.960464477539063e-8f32, shape![128]);
         out.store(raw * scale);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::{Axis, Tensor};
+
+    fn retained_bytes(device: &Device) -> usize {
+        let bytes = |buffers: &[Buffer]| {
+            buffers
+                .iter()
+                .map(|b| b.shape().iter().map(|&d| d as usize).product::<usize>() * 4)
+                .sum::<usize>()
+        };
+        bytes(&device.0.pending.borrow())
+            + device
+                .0
+                .retired
+                .borrow()
+                .iter()
+                .map(|batch| bytes(&batch._values))
+                .sum::<usize>()
+    }
+
+    fn used_device_bytes() -> usize {
+        let (mut free, mut total) = (0, 0);
+        // Test-only observation of the active CUDA context; no stream wait.
+        let status = unsafe { cutile::cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
+        assert_eq!(status, cutile::cuda_core::sys::cudaError_enum_CUDA_SUCCESS);
+        total - free
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn long_inference_retires_intermediates_without_a_caller_synchronize() -> Result<()> {
+        let device = Device::cuda(0)?;
+        let axis = Axis::new("value");
+        const LEN: usize = 262_144;
+        // Warm the exact shape before either measurement.
+        Tensor::zeros([axis.of(LEN)], &device)?
+            .scale(-1.0)?
+            .to_vec()?;
+        let mut baselines = Vec::new();
+        for retain in [true, false] {
+            let guard = retain.then(crate::train::StepRetention::enter);
+            let mut value = Tensor::from_slice(&vec![1.0; LEN], [axis.of(LEN)], &device)?;
+            device.synchronize()?;
+            let initial = used_device_bytes();
+            let mut peak = initial;
+            let mut held = 0;
+            let steps = if retain { 512 } else { 8192 };
+            let started = Instant::now();
+            for step in 0..steps {
+                value = value.scale(-1.0)?;
+                held = held.max(retained_bytes(&device));
+                if step % 32 == 31 {
+                    peak = peak.max(used_device_bytes());
+                }
+            }
+            if retain {
+                assert!(device.0.retired.borrow().is_empty());
+                assert_eq!(device.0.allocations_since_poll.get(), 0);
+            }
+            // First caller-requested completion boundary after the entire loop.
+            assert!(value.to_vec()?.iter().all(|&x| x == 1.0));
+            println!(
+                "retention={retain} steps={steps} peak_retained_bytes={held} device_memory_delta={} elapsed_ms={:.3}",
+                peak.saturating_sub(initial),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            if retain {
+                assert!(device.0.retired.borrow().is_empty());
+                baselines.push(held);
+            } else {
+                assert!(
+                    held < baselines[0],
+                    "sixteen times as many steps must retain less than the baseline"
+                );
+            }
+            drop(guard);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn retirement_preserves_live_aliases_and_gradient_inputs() -> Result<()> {
+        let device = Device::cuda(0)?;
+        let axis = Axis::new("value");
+        let input = Tensor::from_slice(&[1.0, 2.0, 3.0], [axis.of(3)], &device)?.with_grad();
+        let alias = input.clone();
+        let mut temporary = Tensor::from_slice(&[3.0; 3], [axis.of(3)], &device)?;
+        for _ in 0..512 {
+            temporary = temporary.scale(-1.0)?;
+        }
+        input.mul(&alias)?.sum(axis)?.backward()?;
+        assert_eq!(input.grad().unwrap().to_vec()?, [2.0, 4.0, 6.0]);
+        assert_eq!(alias.to_vec()?, [1.0, 2.0, 3.0]);
+        assert_eq!(temporary.to_vec()?, [3.0; 3]);
+        Ok(())
     }
 }
