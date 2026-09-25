@@ -331,3 +331,38 @@ observations, not an isolated throughput comparison. BF16 and all-declarations-
 validated-before-compilation tests pass separately. These numbers do not claim
 a complete beat_this preparation recipe or its two-second song target. Raw
 receipt: [kernel preparation](../../data/evidence/kernel-preparation.log).
+
+## Inference buffer retirement
+
+Outside `Trainer`, the backend checks completion every 32 allocations and
+moves buffers whose only remaining owner is its pending list into an event
+batch. Recording after the last submitted use matters: recording only at
+allocation would permit a later use to race a free. Live tensor/gradient/plan
+owners keep their references. Host upload arrays and temporary integer buffers
+follow the same rule. Completed batches are freed; if uncompleted batches exceed
+256 MiB, inference waits for the oldest event. The allocation interval and live
+buffers are additional to this backlog budget. Live autograd graphs cannot be
+reclaimed until their owners release them.
+
+The Trainer step uses an unwind-safe thread-local scope to skip this maintenance,
+so it neither polls nor records/waits for retirement events during its existing
+single-boundary execution. Reads and explicit synchronization still clear all
+pending batches. No API change or consumer synchronization is required.
+
+The RTX 5060 synthetic witness repeats a 1 MiB FP32 operation. Retaining every
+intermediate (the prior policy) held 512 MiB after 512 steps; automatic retirement
+held at most 97 MiB over 8,192 steps, with exact outputs and no caller-inserted
+synchronization in either loop. Driver-used memory increased by 480 MiB in the
+baseline and about 1.7 MiB during the subsequent automatic-retirement run; the
+allocator reused the baseline's pool, so these are incremental observations,
+not comparable absolute process peaks. Live aliases and later gradient inputs
+also pass. See [the raw receipt](../../data/evidence/buffer-retirement.log).
+This witnesses bounded unused-intermediate retention, not a measured beat_this
+transformer speedup or a bound on caller-owned activations.
+
+A warmed MLP Trainer comparison (500 steps, seed/data/model/SGD unchanged)
+reported 0.73 and 0.81 seconds before retirement, and 0.78 and 0.73 seconds
+after it, in before/after/after/before order. Every final loss was identical
+at printed precision. This short probe shows no observed regression; it is
+not a general throughput guarantee. Binary hashes and full outputs are in
+[the training receipt](../../data/evidence/retirement-training.log).

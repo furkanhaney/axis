@@ -1,6 +1,32 @@
 //! Minimal step ordering shared by concrete training programs.
 use crate::{Adam, AdamW, Module, Muon, MuonWithAuxAdamW, Result, SGD, State, Tensor};
-use std::{cell::RefCell, rc::Rc, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Instant,
+};
+
+thread_local! {
+    static STEP_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn in_training_step() -> bool {
+    STEP_DEPTH.with(|depth| depth.get() != 0)
+}
+
+pub(crate) struct StepRetention;
+impl StepRetention {
+    pub(crate) fn enter() -> Self {
+        STEP_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+impl Drop for StepRetention {
+    fn drop(&mut self) {
+        STEP_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
 
 fn profile(label: &str, started: Instant) {
     if std::env::var_os("AXIS_PROFILE").is_some() {
@@ -212,6 +238,7 @@ impl<O: Optimizer> Trainer<O> {
         M: Module,
         F: FnOnce(&M) -> Result<Tensor>,
     {
+        let _retention = StepRetention::enter();
         let next = self
             .completed_steps
             .checked_add(1)

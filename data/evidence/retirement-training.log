@@ -1,0 +1,181 @@
+before sha256=8ab0988c848567db2efe886854981ddf83ac5aebdc5163fe147b9648564145ec
+after sha256=20fbfd3f2fe0ee469b2e0fd56c735c161523414ac164ea34cb8a1c283590b1e2
+before --steps 500
+initial train_mse=0.75104362 validation_mse=0.69325829
+step=1 pre_update_train_mse=0.75104362
+step=100 pre_update_train_mse=0.09959201
+step=200 pre_update_train_mse=0.06743258
+step=300 pre_update_train_mse=0.05397579
+step=400 pre_update_train_mse=0.04617639
+step=500 pre_update_train_mse=0.04102742
+final train_mse=0.04098371 validation_mse=0.05743696 elapsed_s=0.73
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed training set
+direction:                    decrease
+observations:                 2
+baseline:                     0.75104362 at 0 optimizer steps
+terminal:                     0.04098371 at 500 optimizer steps
+absolute improvement:         0.71005990
+relative improvement:         94.5431%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed validation set
+direction:                    decrease
+observations:                 2
+baseline:                     0.69325829 at 0 optimizer steps
+terminal:                     0.05743696 at 500 optimizer steps
+absolute improvement:         0.63582132
+relative improvement:         91.7149%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+PASS: named-axis MLP learned on cuTile
+
+after --steps 500
+initial train_mse=0.75104362 validation_mse=0.69325829
+step=1 pre_update_train_mse=0.75104362
+step=100 pre_update_train_mse=0.09959201
+step=200 pre_update_train_mse=0.06743258
+step=300 pre_update_train_mse=0.05397579
+step=400 pre_update_train_mse=0.04617639
+step=500 pre_update_train_mse=0.04102742
+final train_mse=0.04098371 validation_mse=0.05743696 elapsed_s=0.78
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed training set
+direction:                    decrease
+observations:                 2
+baseline:                     0.75104362 at 0 optimizer steps
+terminal:                     0.04098371 at 500 optimizer steps
+absolute improvement:         0.71005990
+relative improvement:         94.5431%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed validation set
+direction:                    decrease
+observations:                 2
+baseline:                     0.69325829 at 0 optimizer steps
+terminal:                     0.05743696 at 500 optimizer steps
+absolute improvement:         0.63582132
+relative improvement:         91.7149%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+PASS: named-axis MLP learned on cuTile
+
+after --steps 500
+initial train_mse=0.75104362 validation_mse=0.69325829
+step=1 pre_update_train_mse=0.75104362
+step=100 pre_update_train_mse=0.09959201
+step=200 pre_update_train_mse=0.06743258
+step=300 pre_update_train_mse=0.05397579
+step=400 pre_update_train_mse=0.04617639
+step=500 pre_update_train_mse=0.04102742
+final train_mse=0.04098371 validation_mse=0.05743696 elapsed_s=0.73
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed training set
+direction:                    decrease
+observations:                 2
+baseline:                     0.75104362 at 0 optimizer steps
+terminal:                     0.04098371 at 500 optimizer steps
+absolute improvement:         0.71005990
+relative improvement:         94.5431%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed validation set
+direction:                    decrease
+observations:                 2
+baseline:                     0.69325829 at 0 optimizer steps
+terminal:                     0.05743696 at 500 optimizer steps
+absolute improvement:         0.63582132
+relative improvement:         91.7149%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+PASS: named-axis MLP learned on cuTile
+
+before --steps 500
+initial train_mse=0.75104362 validation_mse=0.69325829
+step=1 pre_update_train_mse=0.75104362
+step=100 pre_update_train_mse=0.09959201
+step=200 pre_update_train_mse=0.06743258
+step=300 pre_update_train_mse=0.05397579
+step=400 pre_update_train_mse=0.04617639
+step=500 pre_update_train_mse=0.04102742
+final train_mse=0.04098371 validation_mse=0.05743696 elapsed_s=0.81
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed training set
+direction:                    decrease
+observations:                 2
+baseline:                     0.75104362 at 0 optimizer steps
+terminal:                     0.04098371 at 500 optimizer steps
+absolute improvement:         0.71005990
+relative improvement:         94.5431%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+EMPIRICAL LEARNING PROGRESS
+
+metric:                       mean squared error
+evaluation population:        fixed validation set
+direction:                    decrease
+observations:                 2
+baseline:                     0.69325829 at 0 optimizer steps
+terminal:                     0.05743696 at 500 optimizer steps
+absolute improvement:         0.63582132
+relative improvement:         91.7149%
+minimum absolute improvement: 0.00000000
+minimum relative improvement: none
+budget delta:                 500 optimizer steps
+evidence:                     verified observations
+scope:                        supplied evaluations; not generalization or convergence
+
+PASS
+PASS: named-axis MLP learned on cuTile
