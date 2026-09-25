@@ -1,0 +1,20 @@
+   Compiling crc32fast v1.5.2
+   Compiling serde_core v1.0.229
+   Compiling object v0.36.7
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling oxide-artifacts v0.2.1
+   Compiling cuda-core v0.3.1
+   Compiling cuda-async v0.3.1
+   Compiling cutile-compiler v0.3.1
+   Compiling cutile v0.3.1
+   Compiling axis v0.11.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-kernel-preparation/src/library)
+    Finished `release` profile [optimized] target(s) in 44.45s
+     Running unittests src/lib.rs (build/target/release/deps/axis-65034e3d45b06cb1)
+
+running 1 test
+large-intermediate retention: 80 x 128 MiB, peak_retained_bytes=671088640, exact outputs
+test backend::retention_tests::large_intermediates_poll_before_the_allocation_count_interval ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 355 filtered out; finished in 0.64s
+

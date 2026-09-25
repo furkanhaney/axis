@@ -334,7 +334,8 @@ receipt: [kernel preparation](../../data/evidence/kernel-preparation.log).
 
 ## Inference buffer retirement
 
-Outside `Trainer`, the backend checks completion every 32 allocations and
+Outside `Trainer`, the backend checks completion every 32 allocations or 32 MiB of requested
+allocation, whichever comes first, and
 moves buffers whose only remaining owner is its pending list into an event
 batch. Recording after the last submitted use matters: recording only at
 allocation would permit a later use to race a free. Live tensor/gradient/plan
@@ -366,3 +367,10 @@ after it, in before/after/after/before order. Every final loss was identical
 at printed precision. This short probe shows no observed regression; it is
 not a general throughput guarantee. Binary hashes and full outputs are in
 [the training receipt](../../data/evidence/retirement-training.log).
+
+A separate large-intermediate witness runs 80 operations with 128 MiB outputs
+(10 GiB allocated over the loop), with exact final values and at most 640 MiB
+retained. The byte-triggered poll prevents waiting for 32 such allocations
+before beginning retirement. The event backlog budget excludes the current
+batch and caller-owned inputs/outputs. See
+[the large-buffer receipt](../../data/evidence/large-buffer-retirement.log).

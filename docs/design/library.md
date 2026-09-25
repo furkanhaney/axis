@@ -241,7 +241,8 @@ step enqueues allocations, forward arithmetic, derivatives, and optimizer
 updates without per-operation synchronization, retains every device/host buffer
 until the work completes, then synchronizes once at the Trainer step boundary.
 Explicit host reads also synchronize.
-Outside Trainer, every 32 allocations the backend records a CUDA event and
+Outside Trainer, every 32 allocations or 32 MiB of requested allocation, the
+backend records a CUDA event and
 retires buffers with no remaining tensor/plan owner after that event completes.
 If uncompleted retirement batches exceed 256 MiB, inference waits for the oldest
 event to bound the submission backlog. This is not a bound on live tensors or
