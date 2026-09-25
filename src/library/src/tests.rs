@@ -652,7 +652,7 @@ fn multiple_axis_contraction_exceeds_plan_limit_with_both_gradients() -> Result<
     const A: usize = 16;
     const K: usize = 16;
     const N: usize = 257;
-    assert!(B * M * A * K * N > 16_777_216);
+    const { assert!(B * M * A * K * N > 16_777_216) };
     let lv: Vec<f32> = (0..B * M * A * K).map(|i| (i % 19) as f32 - 9.0).collect();
     let rv: Vec<f32> = (0..B * A * K * N).map(|i| (i % 17) as f32 - 8.0).collect();
     let weights: Vec<f32> = (0..B * M * N).map(|i| (i % 5) as f32 - 2.0).collect();
