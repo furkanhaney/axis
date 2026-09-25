@@ -1,39 +1,51 @@
 # Exact programs: what Axis needs next
 
 Updated 2026-09-24. This spec lists what Axis is missing for its next class
-of consumer: programs whose tensors are exact, audited over their whole
-finite domain, and still differentiable. Each item names its evidence, what
+of consumer: programs with exact discrete state and audits over declared
+finite domains. Differentiability depends on the construction. Each item names its evidence, what
 "done" means, and its status against `main`.
 
 ## The consumer
 
 Three outside studies built this class of program on Axis 0.11.0 in
 September 2026: a calculator, a text editor, and an app router over 100 small
-apps. The shared construction:
+apps. They share finite-domain cells and tensor wiring, but differ in how
+they produce exact discrete outputs:
 
-- **Tables, not trained weights.** Each cell is a table of logits over a
+- **The app router's hand-set tables.** Each cell is a table of logits over a
   finite input domain, set by hand to `±1000` (one winner per row). A step is
   `contract` (a one-hot input selects its row exactly) followed by `softmax`,
   which at that scale returns an exact one-hot in f32 because `e^-2000`
-  underflows to zero. Every operation is differentiable; every value is
-  exactly 0 or 1.
+  underflows to zero. The state outputs are exactly 0 or 1; logits and
+  frame values are not restricted to those values. This path uses
+  differentiable operations, but saturated softmax has zero gradients in
+  f32; exact forward execution does not establish useful learning gradients.
+- **The calculator and editor's trained cells and hard decisions.** The
+  calculator uses trained cells followed by `max` and `ge(0.0)` to produce
+  exact one-hots. The editor also uses hard comparisons, including `eq(0.0)`
+  for cursor searches. Their audits support exact discrete behavior within
+  their declared domains, not an end-to-end differentiable construction.
 - **Fixed wiring.** Tables compose through `contract`, `select`-by-one-hot,
   shifts (`narrow` plus `pad_zeros`), masks and scans, written inside
   `forward` as ordinary tensor algebra.
-- **Exhaustive audit.** Every table row is checked for its margin (winner
+- **The app router's exhaustive audit.** Every table row is checked for its margin (winner
   beats every loser by 2000), every cell is run on every member of its
   domain against a plain-Rust spec, and frames are compared byte for byte.
   When the joint state space is too large (about 10^35 at 100 apps), the
   audit is compositional: a step touches the router state and at most one
-  expert, so exhaustive router and per-expert audits cover every joint state.
-- **Sparse dispatch.** A router over apps (a mixture-of-experts gate with
-  hand-set weights) selects one expert; because the margin is asserted,
-  running only the winner provably equals running all of them.
+  expert. Composition also requires that inactive experts preserve their
+  state and that rendering depends only on the router and selected expert;
+  local audits alone do not prove those wiring properties.
+- **Sparse dispatch.** The app router selects one expert. Exact gating,
+  delivery only to the selected expert, and identity transitions for every
+  inactive expert together justify equivalence to dense execution.
 
-Measured on the desk RTX 5060: the calculator matched the real engine on
+The consumer studies report: the calculator matched the real engine on
 1,317,308 key presses; the text editor on 1,000,000 of 1,000,000 edit
 events; the router audits 20,800 routing cases, 1,142 expert transitions,
-153,600 clicks and 1,142 frames at 100 apps in 15.2s.
+153,600 clicks and 1,142 frames at 100 apps in 15.2s on the desk RTX 5060.
+The calculator and editor event counts are sampled sequence checks, not
+exhaustive enumeration of their joint state spaces.
 
 Every gap below was hit by that work or is required by the next step:
 `axis compile`, which takes a model graph and emits a certified executable.
@@ -156,10 +168,14 @@ Every gap below was hit by that work or is required by the next step:
 - **Receipt key.** The router's receipt cache (a pass is reused only when
   its key matches) hashes every uploaded constant, the composing and
   checking code, and the lock file. The Axis version should key on the
-  captured graph (X4) plus constants, and record rows checked, minimum
+  captured graph (X4), constants, reference spec and checker identities,
+  declared audit domain and configuration, and execution dependencies
+  (Axis, backend/compiler versions, precision and relevant target settings).
+  A change to any of these must invalidate reuse. Record rows checked, minimum
   margin, and failures (always zero, since failures are never stored).
 - **Done when.** A consumer's audit is a declaration plus a spec function,
-  and its receipt composes into a run certificate.
+  and its receipt composes into a run certificate. Changing only the spec,
+  checker, domain or execution dependencies must force a fresh audit.
 
 ### X3. A step module
 
@@ -181,15 +197,22 @@ Every gap below was hit by that work or is required by the next step:
 
 ### X5. Max-plus contraction
 
-- **Need.** `contract` in the log semiring: `logsumexp` in place of the sum
-  (and, at the limit, `max`).
+- **Need.** `contract` in the log semiring: addition in place of multiplication
+  and `logsumexp` in place of summation. Max-plus uses `max` instead of
+  `logsumexp` and is a distinct operation.
 - **Why.** "Contract then softmax" is exact only because the consumers'
   inputs are exact one-hots. Soft inputs, and cells trained at a lower logit
-  scale, need contraction in log space. At scale 1000, log-sum-exp equals max
-  in f32: the program becomes max-plus, exact in the forward pass, with the
-  gradient flowing along the winning path (as through ReLU or Viterbi).
+  scale, can use contraction in log space. Scale 1000 alone does not make
+  log-sum-exp equal max: `logsumexp(1000, 1000)` is about `1000.6932` in f32.
+  Replacing it with max requires a verified unique-winner gap sufficient
+  for the actual term count, precision and reduction implementation to
+  eliminate the correction. Log-sum-exp gradients distribute over terms;
+  max-plus follows a unique winning path and needs an explicit tie-gradient
+  policy. Forward equality alone does not certify backward equivalence.
 - **Done when.** A log-semiring `contract` with gradients, equal to its
-  reference on the consumers' tables at scale 1 and scale 1000.
+  reference on the consumers' tables at scale 1 and scale 1000, including
+  tied and near-tied inputs. Any max-plus lowering separately verifies its
+  margin precondition and states its forward and backward guarantees.
 
 ### X6. Compiler passes
 
