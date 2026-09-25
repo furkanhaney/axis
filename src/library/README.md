@@ -115,7 +115,7 @@ device also enables cuTile's persistent kernel cache at its default location
 `AXIS_JIT_CACHE_DIR`.
 
 ```bash
-cargo add axis@0.11.0
+cargo add axis@0.12.0
 ```
 
 The Muon implementation's pinned upstream revision and MIT attribution are in
