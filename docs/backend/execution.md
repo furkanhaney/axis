@@ -298,9 +298,44 @@ backward) moved from 410.2ms/step (plan caching alone) to 170.0ms/step, a
 further 58.5% reduction and 89.3% off the original 1594.7ms/step baseline
 (9.4x). Real ImageNet64 numbers on the tower are in the PR.
 
+## Declared forward-kernel preparation
+
+`Device::prepare_kernels(&[KernelSpec])` compiles a declared list of contiguous
+matrix-product and softmax shapes, including their output zero-fill kernels,
+without allocating tensor storage or executing those kernels. Metadata-only
+cuTile tensors produce the same specialization keys as the actual execution
+path. Matrix preparation follows the device's FP32/BF16 mode. Every declaration
+is validated before any compilation; zero or overflowing dimensions are errors.
+
+Use this synchronous API during startup, before the latency-sensitive first
+step. It front-loads compilation and warm-cache module loading; it does not
+reduce total startup time or compile in parallel. Layout copies, other operators
+and backward kernels remain lazy. Consumers must declare their actual lowered
+shapes; this is not graph capture or automatic whole-model discovery.
+
+The RTX 5060 synthetic witness evaluates 30 matrix-product/softmax pairs (47
+unique kernel specializations, including zero-fill). Independent scalar outputs
+pass, and exact output fingerprints agree across all four fresh-process runs:
+
+| Process cache state | Preparation | First step | Cache hits / misses |
+| --- | ---: | ---: | ---: |
+| Cold, lazy | 0 ms | 17,712.551 ms | 0 / 47 |
+| Cold, prepared | 17,632.633 ms | 10.917 ms | 0 / 47 |
+| Warm, lazy | 0 ms | 3,637.746 ms | 47 / 0 |
+| Warm, prepared | 3,485.925 ms | 10.299 ms | 47 / 0 |
+
+Prepared first steps invoke no further cache lookup or compilation; warm
+processes still use the same disk cache and compile nothing. The witness ran
+on a shared workstation while another CUDA suite was running, so timings are
+observations, not an isolated throughput comparison. BF16 and all-declarations-
+validated-before-compilation tests pass separately. These numbers do not claim
+a complete beat_this preparation recipe or its two-second song target. Raw
+receipt: [kernel preparation](../../data/evidence/kernel-preparation.log).
+
 ## Inference buffer retirement
 
-Outside `Trainer`, the backend checks completion every 32 allocations and
+Outside `Trainer`, the backend checks completion every 32 allocations or 32 MiB of requested
+allocation, whichever comes first, and
 moves buffers whose only remaining owner is its pending list into an event
 batch. Recording after the last submitted use matters: recording only at
 allocation would permit a later use to race a free. Live tensor/gradient/plan
@@ -325,3 +360,17 @@ not comparable absolute process peaks. Live aliases and later gradient inputs
 also pass. See [the raw receipt](../../data/evidence/buffer-retirement.log).
 This witnesses bounded unused-intermediate retention, not a measured beat_this
 transformer speedup or a bound on caller-owned activations.
+
+A warmed MLP Trainer comparison (500 steps, seed/data/model/SGD unchanged)
+reported 0.73 and 0.81 seconds before retirement, and 0.78 and 0.73 seconds
+after it, in before/after/after/before order. Every final loss was identical
+at printed precision. This short probe shows no observed regression; it is
+not a general throughput guarantee. Binary hashes and full outputs are in
+[the training receipt](../../data/evidence/retirement-training.log).
+
+A separate large-intermediate witness runs 80 operations with 128 MiB outputs
+(10 GiB allocated over the loop), with exact final values and at most 640 MiB
+retained. The byte-triggered poll prevents waiting for 32 such allocations
+before beginning retirement. The event backlog budget excludes the current
+batch and caller-owned inputs/outputs. See
+[the large-buffer receipt](../../data/evidence/large-buffer-retirement.log).

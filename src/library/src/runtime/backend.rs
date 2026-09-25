@@ -124,6 +124,7 @@ struct Context {
     plans: RefCell<HashMap<u64, DevicePlan>>,
     plan_bytes: Cell<usize>,
     allocations_since_poll: Cell<usize>,
+    bytes_since_poll: Cell<usize>,
     retired: RefCell<VecDeque<RetiredBuffers>>,
 }
 
@@ -200,6 +201,67 @@ trait Enqueue: DeviceOp + Sized {
 impl<T: DeviceOp> Enqueue for T {}
 
 impl Device {
+    /// Compile declared forward kernels before the first step, without allocating
+    /// tensor storage or executing those kernels. Uses this device's FP32/BF16
+    /// matrix mode and the same specialization keys as ordinary execution.
+    ///
+    /// Call during startup: preparation is synchronous and front-loads compilation;
+    /// it does not promise lower total startup time. Only the listed matrix and
+    /// softmax kernels are covered; layout copies, other operators and backward
+    /// remain lazy. Every declaration is validated before any is compiled.
+    pub fn prepare_kernels(&self, specs: &[crate::KernelSpec]) -> Result<()> {
+        use crate::KernelSpec;
+        for spec in specs {
+            spec.validate()?;
+        }
+        for &spec in specs {
+            // Ordinary execution zero-fills each flat output before reshaping.
+            // Prepare that upstream kernel too, using its real launch geometry.
+            let output_len = match spec {
+                KernelSpec::Matmul {
+                    batch,
+                    rows,
+                    columns,
+                    ..
+                } => batch * rows * columns,
+                KernelSpec::Softmax { rows, width } => rows * width,
+            };
+            let mut flat = api::meta::<f32>(&[output_len]).sync_on(&self.0.stream)?;
+            cutile::kernels::creation::full(0.0_f32, (&mut flat).partition([128]))
+                .compile_on(&self.0.stream)?;
+            match spec {
+                KernelSpec::Matmul {
+                    batch,
+                    rows: m,
+                    inner: k,
+                    columns: n,
+                } => {
+                    let left = api::meta::<f32>(&[batch, m, k]).sync_on(&self.0.stream)?;
+                    let right = api::meta::<f32>(&[batch, k, n]).sync_on(&self.0.stream)?;
+                    let mut out = api::meta::<f32>(&[batch, m, n]).sync_on(&self.0.stream)?;
+                    let generics = vec![contraction_tile(k).to_string(), k.to_string()];
+                    if self.0.bf16_matmul {
+                        kernels::matmul_bf16((&mut out).partition([1, 64, 64]), &left, &right)
+                            .generics(generics)
+                            .compile_on(&self.0.stream)?;
+                    } else {
+                        kernels::matmul((&mut out).partition([1, 64, 64]), &left, &right)
+                            .generics(generics)
+                            .compile_on(&self.0.stream)?;
+                    }
+                }
+                KernelSpec::Softmax { rows, width } => {
+                    let input = api::meta::<f32>(&[rows, width]).sync_on(&self.0.stream)?;
+                    let mut out = api::meta::<f32>(&[rows, width]).sync_on(&self.0.stream)?;
+                    let tile = width.next_power_of_two();
+                    kernels::softmax((&mut out).partition([1, tile]), &input, width as i32)
+                        .generics(vec![tile.to_string()])
+                        .compile_on(&self.0.stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
     /// The first CUDA `Device` created in a process also enables cuTile's
     /// persistent on-disk kernel cache; `AXIS_JIT_CACHE=off` opts out and
     /// `AXIS_JIT_CACHE_DIR` redirects it. See `jit_cache_stats`.
@@ -225,6 +287,7 @@ impl Device {
             plans: RefCell::new(HashMap::new()),
             plan_bytes: Cell::new(0),
             allocations_since_poll: Cell::new(0),
+            bytes_since_poll: Cell::new(0),
             retired: RefCell::new(VecDeque::new()),
         })))
     }
@@ -236,17 +299,25 @@ impl Device {
         self.0.pending.borrow_mut().push(buffer.clone());
         buffer
     }
-    fn retire_completed(&self) -> Result<()> {
+    fn retire_completed(&self, allocation_bytes: usize) -> Result<()> {
         // Trainer already has one completion boundary. Avoid scanning its live
         // backward graph or adding events/synchronizations within the step.
         if crate::train::in_training_step() {
             return Ok(());
         }
         let count = self.0.allocations_since_poll.get() + 1;
-        self.0.allocations_since_poll.set(count % 32);
-        if count < 32 {
+        let bytes = self
+            .0
+            .bytes_since_poll
+            .get()
+            .saturating_add(allocation_bytes);
+        if count < 32 && bytes < 32 * 1024 * 1024 {
+            self.0.allocations_since_poll.set(count);
+            self.0.bytes_since_poll.set(bytes);
             return Ok(());
         }
+        self.0.allocations_since_poll.set(0);
+        self.0.bytes_since_poll.set(0);
         let mut retired = self.0.retired.borrow_mut();
         while let Some(front) = retired.front() {
             if !front.event.query()? {
@@ -283,6 +354,7 @@ impl Device {
         unsafe { self.0.stream.synchronize()? };
         profile("synchronize", started);
         self.0.allocations_since_poll.set(0);
+        self.0.bytes_since_poll.set(0);
         self.0.retired.borrow_mut().clear();
         self.0.pending.borrow_mut().clear();
         self.0.pending_f32.borrow_mut().clear();
@@ -291,7 +363,7 @@ impl Device {
         Ok(())
     }
     pub(crate) fn upload(&self, values: Vec<f32>) -> Result<Buffer> {
-        self.retire_completed()?;
+        self.retire_completed(values.len().saturating_mul(4))?;
         let values = Arc::new(values);
         let tensor = api::copy_host_vec_to_device(&values).enqueue_on(&self.0.stream)?;
         self.0.pending_f32.borrow_mut().push(values);
@@ -302,6 +374,7 @@ impl Device {
         let values = buffer.to_host_vec().sync_on(&self.0.stream)?;
         profile("read", started);
         self.0.allocations_since_poll.set(0);
+        self.0.bytes_since_poll.set(0);
         self.0.retired.borrow_mut().clear();
         self.0.pending.borrow_mut().clear();
         self.0.pending_f32.borrow_mut().clear();
@@ -310,7 +383,7 @@ impl Device {
         Ok(values)
     }
     fn zeros(&self, len: usize) -> Result<cutile::tensor::Tensor<f32>> {
-        self.retire_completed()?;
+        self.retire_completed(len.saturating_mul(4))?;
         Ok(api::zeros(&[len]).enqueue_on(&self.0.stream)?)
     }
     pub(crate) fn zeros_buffer(&self, len: usize) -> Result<Buffer> {
@@ -3252,6 +3325,31 @@ mod retention_tests {
         assert_eq!(input.grad().unwrap().to_vec()?, [2.0, 4.0, 6.0]);
         assert_eq!(alias.to_vec()?, [1.0, 2.0, 3.0]);
         assert_eq!(temporary.to_vec()?, [3.0; 3]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn large_intermediates_poll_before_the_allocation_count_interval() -> Result<()> {
+        let device = Device::cuda(0)?;
+        let axis = Axis::new("value");
+        // 128 MiB per output: count-only polling would first retain 4 GiB.
+        const LEN: usize = 32 * 1024 * 1024;
+        let mut value = Tensor::from_slice(&vec![1.0; LEN], [axis.of(LEN)], &device)?;
+        device.synchronize()?;
+        let mut peak = 0;
+        for _ in 0..80 {
+            value = value.scale(-1.0)?;
+            peak = peak.max(retained_bytes(&device));
+        }
+        assert!(value.to_vec()?.iter().all(|&x| x == 1.0));
+        assert!(
+            peak <= 768 * 1024 * 1024,
+            "large retired batches must not accumulate for 32 allocations"
+        );
+        println!(
+            "large-intermediate retention: 80 x 128 MiB, peak_retained_bytes={peak}, exact outputs"
+        );
         Ok(())
     }
 }

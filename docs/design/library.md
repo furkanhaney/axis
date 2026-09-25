@@ -241,7 +241,8 @@ step enqueues allocations, forward arithmetic, derivatives, and optimizer
 updates without per-operation synchronization, retains every device/host buffer
 until the work completes, then synchronizes once at the Trainer step boundary.
 Explicit host reads also synchronize.
-Outside Trainer, every 32 allocations the backend records a CUDA event and
+Outside Trainer, every 32 allocations or 32 MiB of requested allocation, the
+backend records a CUDA event and
 retires buffers with no remaining tensor/plan owner after that event completes.
 If uncompleted retirement batches exceed 256 MiB, inference waits for the oldest
 event to bound the submission backlog. This is not a bound on live tensors or
@@ -1876,3 +1877,12 @@ parameters and both networks' BatchNorm running statistics change. A
 bounded end-to-end training witness (loss curves and a generated-sample
 grid, explicitly a mechanics witness rather than an image-quality claim) is
 `src/examples/training/dcgan/`.
+
+## Explicit kernel preparation
+
+`KernelSpec::Matmul` and `KernelSpec::Softmax` declare lowered contiguous
+forward-kernel shapes. `Device::prepare_kernels` validates the complete list,
+then compiles those kernels and their zero-fill specializations without tensor
+storage or execution, using the same keys as the ordinary path. It moves work
+before the first step; other operations and backward kernels stay lazy. See
+[the measured preparation boundary](../backend/execution.md#declared-forward-kernel-preparation).

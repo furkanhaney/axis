@@ -37,6 +37,13 @@ pub fn jit_cache_stats() -> JitCacheStats {
 }
 
 impl Device {
+    /// Compile declared forward kernels before the first step, without executing them.
+    pub fn prepare_kernels(&self, specs: &[crate::KernelSpec]) -> Result<()> {
+        for spec in specs {
+            spec.validate()?;
+        }
+        unavailable()
+    }
     pub fn cuda(_ordinal: usize) -> Result<Self> {
         unavailable()
     }
