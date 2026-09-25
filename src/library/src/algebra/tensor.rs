@@ -4070,7 +4070,9 @@ impl Tensor {
             }
         }
         let shape = Shape::new(dims)?;
-        if axes.len() == 1 {
+        if !axes.is_empty() {
+            // Both operands put the selected axes in the same physical order.
+            // Their product is one GEMM reduction dimension, regardless of rank.
             let batch_axes: Vec<_> = self
                 .shape()
                 .axes()

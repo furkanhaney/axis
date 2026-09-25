@@ -1,0 +1,48 @@
+RTX 5060; 2026-09-24. Baseline at 6654bef plus regression test:
+   Compiling crc32fast v1.5.2
+   Compiling serde_core v1.0.229
+   Compiling axis v0.11.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-release-fixes/src/library)
+   Compiling object v0.36.7
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling oxide-artifacts v0.2.1
+   Compiling cuda-core v0.3.1
+   Compiling cuda-async v0.3.1
+   Compiling cutile-compiler v0.3.1
+   Compiling cutile v0.3.1
+    Finished `release` profile [optimized] target(s) in 44.67s
+     Running unittests src/lib.rs (/mnt/fast980/projects/src/rasat/worktrees/axis-pr159-review/target/release/deps/axis-65034e3d45b06cb1)
+
+running 1 test
+Error: "index plan must have 1..=16777216 contributions (experimental backend limit)"
+test tests::multiple_axis_contraction_exceeds_plan_limit_with_both_gradients ... FAILED
+
+failures:
+
+failures:
+    tests::multiple_axis_contraction_exceeds_plan_limit_with_both_gradients
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 349 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `-p axis --lib`
+
+After multi-axis GEMM lowering:
+   Compiling axis v0.11.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-release-fixes/src/library)
+    Finished `release` profile [optimized] target(s) in 21.39s
+     Running unittests src/lib.rs (/mnt/fast980/projects/src/rasat/worktrees/axis-pr159-review/target/release/deps/axis-65034e3d45b06cb1)
+
+running 2 tests
+check multiple-axis contraction: PASS 4 elements max_abs_error=0.00e0
+check multiple-axis left gradient: PASS 8 elements max_abs_error=0.00e0
+check multiple-axis right gradient: PASS 8 elements max_abs_error=0.00e0
+test tests::multiple_axis_contraction_matches_dense_reference_and_gradients ... ok
+check large multi-axis contraction: PASS 66306 elements max_abs_error=0.00e0
+check large multi-axis left gradient: PASS 66048 elements max_abs_error=0.00e0
+check large multi-axis right gradient: PASS 131584 elements max_abs_error=0.00e0
+check large multi-axis contraction: PASS 66306 elements max_abs_error=0.00e0
+check large multi-axis left gradient: PASS 66048 elements max_abs_error=0.00e0
+check large multi-axis right gradient: PASS 131584 elements max_abs_error=0.00e0
+test tests::multiple_axis_contraction_exceeds_plan_limit_with_both_gradients ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 348 filtered out; finished in 3.87s
+
