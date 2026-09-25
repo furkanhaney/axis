@@ -638,6 +638,80 @@ fn shared_axes_contract_and_both_input_derivatives() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn multiple_axis_contraction_exceeds_plan_limit_with_both_gradients() -> Result<()> {
+    let device = Device::cuda(0)?;
+    let (batch, row, a, b, column) = (
+        Axis::new("batch"),
+        Axis::new("row"),
+        Axis::new("a"),
+        Axis::new("b"),
+        Axis::new("column"),
+    );
+    const B: usize = 2;
+    const M: usize = 129;
+    const A: usize = 16;
+    const K: usize = 16;
+    const N: usize = 257;
+    assert!(B * M * A * K * N > 16_777_216);
+    let lv: Vec<f32> = (0..B * M * A * K).map(|i| (i % 19) as f32 - 9.0).collect();
+    let rv: Vec<f32> = (0..B * A * K * N).map(|i| (i % 17) as f32 - 8.0).collect();
+    let weights: Vec<f32> = (0..B * M * N).map(|i| (i % 5) as f32 - 2.0).collect();
+    let mut expected = vec![0.0_f64; B * M * N];
+    let mut dl = vec![0.0_f64; lv.len()];
+    let mut dr = vec![0.0_f64; rv.len()];
+    // Independent scalar oracle, including a nonuniform upstream derivative.
+    for batch_index in 0..B {
+        for m in 0..M {
+            for n in 0..N {
+                let o = (batch_index * M + m) * N + n;
+                for aa in 0..A {
+                    for bb in 0..K {
+                        let l = ((batch_index * M + m) * A + aa) * K + bb;
+                        let r = ((batch_index * A + aa) * K + bb) * N + n;
+                        expected[o] += f64::from(lv[l]) * f64::from(rv[r]);
+                        dl[l] += f64::from(weights[o]) * f64::from(rv[r]);
+                        dr[r] += f64::from(weights[o]) * f64::from(lv[l]);
+                    }
+                }
+            }
+        }
+    }
+    for reordered in [false, true] {
+        let mut left =
+            Tensor::from_slice(&lv, [batch.of(B), row.of(M), a.of(A), b.of(K)], &device)?;
+        let mut right =
+            Tensor::from_slice(&rv, [batch.of(B), a.of(A), b.of(K), column.of(N)], &device)?;
+        if reordered {
+            left = left.with_layout([b, row, batch, a])?;
+            right = right.with_layout([column, b, a, batch])?;
+        }
+        let left = left.with_grad();
+        let right = right.with_grad();
+        let output = left.contract(&right, if reordered { [b, a] } else { [a, b] })?;
+        assert_eq!(
+            output.shape(),
+            &Shape::new([batch.of(B), row.of(M), column.of(N)])?
+        );
+        close("large multi-axis contraction", &output.to_vec()?, &expected);
+        let weight = Tensor::from_slice(&weights, output.shape().dims().iter().copied(), &device)?;
+        output.mul(&weight)?.sum([batch, row, column])?.backward()?;
+        close(
+            "large multi-axis left gradient",
+            &left.grad().unwrap().to_vec()?,
+            &dl,
+        );
+        close(
+            "large multi-axis right gradient",
+            &right.grad().unwrap().to_vec()?,
+            &dr,
+        );
+        device.synchronize()?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn multiple_axis_contraction_matches_dense_reference_and_gradients() -> Result<()> {
     let device = Device::cuda(0)?;
     let (row, inner_a, inner_b, column) = (

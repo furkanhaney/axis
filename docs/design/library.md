@@ -243,7 +243,7 @@ until the work completes, then synchronizes once at the Trainer step boundary.
 Explicit host reads also synchronize. CPU code builds index plans; these
 generic gather/reduction plans prioritize verifiable semantics. They are
 limited to 16,777,216 contributions per operation and are not a competitive
-GEMM implementation. Single-axis contractions take a batched tiled cuTile
+GEMM implementation. Contractions over one or more axes take a batched tiled cuTile
 matrix path. Axis caches host plans by named shape and layout, and retains up
 to 256 MiB of uploaded plans per device; larger and one-off plans remain
 step-local so a stable-shape speedup cannot grow device memory without bound.
@@ -261,8 +261,12 @@ mode. Softmax forward and backward use one tiled reduction per contiguous row,
 padding non-power-of-two widths inside the tile; they no longer inherit the
 generic index-plan contribution bound. Attention still composes separate
 contraction, mask, softmax, and value-contraction operations rather than using
-a fused attention kernel. Multi-axis contractions still use the generic plan
-path.
+a fused attention kernel. Multi-axis contractions arrange the selected axes in
+the same physical order in both operands and flatten their product into the
+matrix reduction dimension. Both derivatives use the matrix path too; this
+avoids the generic plan's contribution limit while preserving logical axis
+order and shared batch axes. Floating-point sums may be reassociated relative
+to the old generic reduction. Empty-axis outer products retain the generic path.
 
 Configured 2D and 3D convolution lower padding and stride through one compact,
 rank-tagged unfold specification, then lower each channel group to the batched
