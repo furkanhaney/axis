@@ -52,7 +52,7 @@ Every gap below was hit by that work or is required by the next step:
 
 ## Status legend
 
-- **fixed on main**: merged, not yet in a published release.
+- **in 0.12.0**: included in the 0.12.0 release; consumer upgrades are explicit.
 - **partial**: improved on main; needs re-measuring on the consumer's shape.
 - **missing**: not started.
 
@@ -80,11 +80,11 @@ Every gap below was hit by that work or is required by the next step:
   `with_layout` (it returns declared order), and `Tensor::stack`'s position
   sets logical order, so both the calculator and the router wrote their own
   "read in this axis order" helper.
-- **Done when.** Contiguous tensors copy straight through (done on main,
-  #153); strided tensors use an incremental offset walk (done on main); a
+- **Done when.** Contiguous tensors copy straight through (in 0.12.0,
+  #153); strided tensors use an incremental offset walk (in 0.12.0); a
   `to_vec_in(order)` (or equivalent) returns values in a requested axis order
   so consumers stop reimplementing it.
-- **Status.** fixed on main for speed (#153); order API missing.
+- **Status.** in 0.12.0 for speed (#153); order API missing.
 
 ### E3. Fast large reductions
 
@@ -109,7 +109,7 @@ Every gap below was hit by that work or is required by the next step:
   `Driver(DriverError(2, "out of memory"))`.
 - **Done when.** A long loop of steps with no explicit synchronize holds
   flat memory, measured.
-- **Status.** fixed on main for unused intermediate retention: completion
+- **Status.** in 0.12.0 for unused intermediate retention: completion
   events retire buffers and inference backpressure bounds the pending backlog.
   Trainer retains its single step boundary. An 8,192-step synthetic witness
   holds bounded memory; the consumer transformer remains to be re-measured.
@@ -122,8 +122,8 @@ Every gap below was hit by that work or is required by the next step:
   calculator's first forward. Every consumer called
   `cutile::jit_cache::enable_default()` itself, pinning `cutile` just for it.
 - **Done when.** Enabled by Axis, with stats exposed.
-- **Status.** fixed on main (#154, `jit_cache_stats`). Consumers drop their
-  own call after the next release.
+- **Status.** in 0.12.0 (#154, `jit_cache_stats`). Consumers drop their
+  own call when upgrading to 0.12.0.
 
 ### E6. The index-plan contribution limit
 
@@ -266,8 +266,8 @@ Every gap below was hit by that work or is required by the next step:
 
 ## Order
 
-1. **Release what main already fixed** (E2 speed, E5), then **E1 and E4**:
-   small, and both block the router past 100 apps. Re-measure **E3**.
+1. **E1** next: device-resident gather/dispatch still blocks the router.
+   **E2 speed, E4 and E5** are in 0.12.0. Re-measure **E3**.
 2. **X1, X2, X3**: the consumers' hand-written audits, receipts and state
    machines become Axis features.
 3. **X4, X6, X7, X8**: `axis compile`. Each depends on X1 and X2.

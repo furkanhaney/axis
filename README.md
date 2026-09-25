@@ -76,7 +76,7 @@ runs on single hosts, not framework-wide claims. Receipts:
 Add the current crates.io release to a Rust project:
 
 ```bash
-cargo add axis@0.11.0
+cargo add axis@0.12.0
 ```
 
 ## Executable research checks
