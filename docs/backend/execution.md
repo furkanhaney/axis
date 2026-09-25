@@ -297,3 +297,37 @@ microbenchmark (100 steps of `[256,16,32,32] + [16]` broadcast-add, mean,
 backward) moved from 410.2ms/step (plan caching alone) to 170.0ms/step, a
 further 58.5% reduction and 89.3% off the original 1594.7ms/step baseline
 (9.4x). Real ImageNet64 numbers on the tower are in the PR.
+
+## Declared forward-kernel preparation
+
+`Device::prepare_kernels(&[KernelSpec])` compiles a declared list of contiguous
+matrix-product and softmax shapes, including their output zero-fill kernels,
+without allocating tensor storage or executing those kernels. Metadata-only
+cuTile tensors produce the same specialization keys as the actual execution
+path. Matrix preparation follows the device's FP32/BF16 mode. Every declaration
+is validated before any compilation; zero or overflowing dimensions are errors.
+
+Use this synchronous API during startup, before the latency-sensitive first
+step. It front-loads compilation and warm-cache module loading; it does not
+reduce total startup time or compile in parallel. Layout copies, other operators
+and backward kernels remain lazy. Consumers must declare their actual lowered
+shapes; this is not graph capture or automatic whole-model discovery.
+
+The RTX 5060 synthetic witness evaluates 30 matrix-product/softmax pairs (47
+unique kernel specializations, including zero-fill). Independent scalar outputs
+pass, and exact output fingerprints agree across all four fresh-process runs:
+
+| Process cache state | Preparation | First step | Cache hits / misses |
+| --- | ---: | ---: | ---: |
+| Cold, lazy | 0 ms | 17,712.551 ms | 0 / 47 |
+| Cold, prepared | 17,632.633 ms | 10.917 ms | 0 / 47 |
+| Warm, lazy | 0 ms | 3,637.746 ms | 47 / 0 |
+| Warm, prepared | 3,485.925 ms | 10.299 ms | 47 / 0 |
+
+Prepared first steps invoke no further cache lookup or compilation; warm
+processes still use the same disk cache and compile nothing. The witness ran
+on a shared workstation while another CUDA suite was running, so timings are
+observations, not an isolated throughput comparison. BF16 and all-declarations-
+validated-before-compilation tests pass separately. These numbers do not claim
+a complete beat_this preparation recipe or its two-second song target. Raw
+receipt: [kernel preparation](../../data/evidence/kernel-preparation.log).

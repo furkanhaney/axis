@@ -145,6 +145,67 @@ trait Enqueue: DeviceOp + Sized {
 impl<T: DeviceOp> Enqueue for T {}
 
 impl Device {
+    /// Compile declared forward kernels before the first step, without allocating
+    /// tensor storage or executing those kernels. Uses this device's FP32/BF16
+    /// matrix mode and the same specialization keys as ordinary execution.
+    ///
+    /// Call during startup: preparation is synchronous and front-loads compilation;
+    /// it does not promise lower total startup time. Only the listed matrix and
+    /// softmax kernels are covered; layout copies, other operators and backward
+    /// remain lazy. Every declaration is validated before any is compiled.
+    pub fn prepare_kernels(&self, specs: &[crate::KernelSpec]) -> Result<()> {
+        use crate::KernelSpec;
+        for spec in specs {
+            spec.validate()?;
+        }
+        for &spec in specs {
+            // Ordinary execution zero-fills each flat output before reshaping.
+            // Prepare that upstream kernel too, using its real launch geometry.
+            let output_len = match spec {
+                KernelSpec::Matmul {
+                    batch,
+                    rows,
+                    columns,
+                    ..
+                } => batch * rows * columns,
+                KernelSpec::Softmax { rows, width } => rows * width,
+            };
+            let mut flat = api::meta::<f32>(&[output_len]).sync_on(&self.0.stream)?;
+            cutile::kernels::creation::full(0.0_f32, (&mut flat).partition([128]))
+                .compile_on(&self.0.stream)?;
+            match spec {
+                KernelSpec::Matmul {
+                    batch,
+                    rows: m,
+                    inner: k,
+                    columns: n,
+                } => {
+                    let left = api::meta::<f32>(&[batch, m, k]).sync_on(&self.0.stream)?;
+                    let right = api::meta::<f32>(&[batch, k, n]).sync_on(&self.0.stream)?;
+                    let mut out = api::meta::<f32>(&[batch, m, n]).sync_on(&self.0.stream)?;
+                    let generics = vec![contraction_tile(k).to_string(), k.to_string()];
+                    if self.0.bf16_matmul {
+                        kernels::matmul_bf16((&mut out).partition([1, 64, 64]), &left, &right)
+                            .generics(generics)
+                            .compile_on(&self.0.stream)?;
+                    } else {
+                        kernels::matmul((&mut out).partition([1, 64, 64]), &left, &right)
+                            .generics(generics)
+                            .compile_on(&self.0.stream)?;
+                    }
+                }
+                KernelSpec::Softmax { rows, width } => {
+                    let input = api::meta::<f32>(&[rows, width]).sync_on(&self.0.stream)?;
+                    let mut out = api::meta::<f32>(&[rows, width]).sync_on(&self.0.stream)?;
+                    let tile = width.next_power_of_two();
+                    kernels::softmax((&mut out).partition([1, tile]), &input, width as i32)
+                        .generics(vec![tile.to_string()])
+                        .compile_on(&self.0.stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
     /// The first CUDA `Device` created in a process also enables cuTile's
     /// persistent on-disk kernel cache; `AXIS_JIT_CACHE=off` opts out and
     /// `AXIS_JIT_CACHE_DIR` redirects it. See `jit_cache_stats`.

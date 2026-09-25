@@ -1868,3 +1868,12 @@ parameters and both networks' BatchNorm running statistics change. A
 bounded end-to-end training witness (loss curves and a generated-sample
 grid, explicitly a mechanics witness rather than an image-quality claim) is
 `src/examples/training/dcgan/`.
+
+## Explicit kernel preparation
+
+`KernelSpec::Matmul` and `KernelSpec::Softmax` declare lowered contiguous
+forward-kernel shapes. `Device::prepare_kernels` validates the complete list,
+then compiles those kernels and their zero-fill specializations without tensor
+storage or execution, using the same keys as the ordinary path. It moves work
+before the first step; other operations and backward kernels stay lazy. See
+[the measured preparation boundary](../backend/execution.md#declared-forward-kernel-preparation).

@@ -33,6 +33,8 @@ mod nn;
 mod normalization;
 #[path = "model/optim.rs"]
 mod optim;
+#[path = "runtime/preparation.rs"]
+mod preparation;
 #[path = "model/preprocess.rs"]
 mod preprocess;
 #[path = "model/recurrent.rs"]
@@ -94,6 +96,7 @@ pub use optim::{
     Adam, AdamW, Muon, MuonMatrix, MuonMatrixOrientation, MuonWithAuxAdamW, SGD, clip_grad_norm,
     cosine_annealing_lr, one_cycle_lr,
 };
+pub use preparation::KernelSpec;
 pub use preprocess::Standardizer;
 pub use recurrent::{
     Gru, GruCell, GruRun, Lstm, LstmCell, LstmRun, LstmState, RecurrentConfig, Rnn, RnnCell,
@@ -160,8 +163,8 @@ pub mod prelude {
         EmpiricalResidualReceipt, ExactGELU, FeatureAlphaDropout, FinitePasses, FinitePassesLoader,
         FinitePassesReceipt, Flatten, Fold, GELU, GLU, GroupNorm, Gru, GruCell, GruRun, Hardshrink,
         Hardsigmoid, Hardswish, Hardtanh, Identity, IdentityScheme, Idr, IdrLimits, IdrReceipt,
-        InMemoryDataset, InstanceNorm, JitCacheStats, LPPool1d, LPPool2d, LPPool3d, LawIdentity,
-        LayerNorm, LeakyReLU, LearningDirection, LearningEvidence, LearningLimits,
+        InMemoryDataset, InstanceNorm, JitCacheStats, KernelSpec, LPPool1d, LPPool2d, LPPool3d,
+        LawIdentity, LayerNorm, LeakyReLU, LearningDirection, LearningEvidence, LearningLimits,
         LearningObservation, LearningProgress, LearningProgressReceipt, Linear,
         LinearCrossEntropyOptions, LocalResponseNorm, LogSigmoid, LogSoftmax, Lstm, LstmCell,
         LstmRun, LstmState, MaxPool1d, MaxPool2d, MaxPool3d, MaxUnpool1d, MaxUnpool2d, MaxUnpool3d,

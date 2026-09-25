@@ -1,0 +1,14 @@
+   Compiling axis v0.11.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-kernel-preparation/src/library)
+    Finished `release` profile [optimized] target(s) in 21.41s
+     Running unittests src/lib.rs (/mnt/fast980/projects/src/rasat/worktrees/axis-pr159-review/target/release/deps/axis-65034e3d45b06cb1)
+
+running 2 tests
+test preparation::cuda_tests::preparation_validates_all_shapes_and_covers_bf16 ... ok
+test preparation::cuda_tests::prepared_kernels_match_lazy_cold_and_warm_execution ... PREPARATION mode=lazy-cold prepare_ms=0.000 first_step_ms=17712.551 hits=0 misses=47 fingerprint=5642898900330465153
+PREPARATION mode=prepared-cold prepare_ms=17632.633 first_step_ms=10.917 hits=0 misses=47 fingerprint=5642898900330465153
+PREPARATION mode=lazy-warm prepare_ms=0.000 first_step_ms=3637.746 hits=47 misses=0 fingerprint=5642898900330465153
+PREPARATION mode=prepared-warm prepare_ms=3485.925 first_step_ms=10.299 hits=47 misses=0 fingerprint=5642898900330465153
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 351 filtered out; finished in 43.79s
+
