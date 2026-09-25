@@ -1,0 +1,12 @@
+   Compiling axis v0.11.0 (/mnt/fast980/projects/src/rasat/worktrees/axis-buffer-retirement/src/library)
+    Finished `release` profile [optimized] target(s) in 20.82s
+     Running unittests src/lib.rs (/mnt/fast980/projects/src/rasat/worktrees/axis-pr159-review/target/release/deps/axis-65034e3d45b06cb1)
+
+running 2 tests
+test backend::retention_tests::long_inference_retires_intermediates_without_a_caller_synchronize ... retention=true steps=512 peak_retained_bytes=536870912 device_memory_delta=503316480 elapsed_ms=6.489
+retention=false steps=8192 peak_retained_bytes=101711872 device_memory_delta=1769472 elapsed_ms=76.492
+ok
+test backend::retention_tests::retirement_preserves_live_aliases_and_gradient_inputs ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 349 filtered out; finished in 2.37s
+

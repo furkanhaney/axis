@@ -136,10 +136,10 @@ land an Axis abstraction.
 Atlas's `rbc-point` runtime (Studio `codex/axis-endtoend`) left two framework
 items after PR #59, recorded here so the issue tracker can stay empty:
 
-- Bound pending-buffer retention automatically for long inference forwards
-  (issue #54). The consumer's explicit stream synchronizations at encoder and
-  member boundaries are verified and remain; the framework still retires
-  pending buffers only at the Trainer boundary.
+- Pending-buffer retention (issues #54 and #157) now uses completion events
+  outside Trainer, with bounded inference backpressure. The synthetic long-loop
+  witness is in [the execution profile](../backend/execution.md); consumer
+  synchronizations can be removed only after their own output checks.
 - The cached click is kernel-bound at 39.6 ms of a 55 ms click against a 50 ms
   p95 contract: FP32 matmul 22.7, layout copies 7.3, plan-based means 4.8,
   zero-fills 2.9 (issue #58, closed). Candidates: FP16/BF16 matmul for

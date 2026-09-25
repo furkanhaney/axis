@@ -98,18 +98,21 @@ Every gap below was hit by that work or is required by the next step:
 - **Status.** partial: `da74ad4` parallelized the grouped reduction across
   chunks; re-measure on this shape.
 
-### E4. Buffer lifetime without a synchronize
+### E4. Buffer lifetime without caller-inserted synchronization
 
 - **Need.** Intermediate buffers freed when their last use completes, not
   only at `Device::synchronize`.
-- **Evidence.** `Device::track` pushes every buffer to a pending list that
+- **Evidence.** In 0.11.0, `Device::track` pushes every buffer to a pending list that
   only `synchronize` clears. The calculator grew about 30 MB per step until
   `forward` synchronized every step. The router's window held 3.4 GB after
   its startup audit, and the next process on the same 8 GB card failed with
   `Driver(DriverError(2, "out of memory"))`.
 - **Done when.** A long loop of steps with no explicit synchronize holds
   flat memory, measured.
-- **Status.** missing.
+- **Status.** fixed on main for unused intermediate retention: completion
+  events retire buffers and inference backpressure bounds the pending backlog.
+  Trainer retains its single step boundary. An 8,192-step synthetic witness
+  holds bounded memory; the consumer transformer remains to be re-measured.
 
 ### E5. Persistent kernel cache by default
 

@@ -240,7 +240,15 @@ The first backend is stream-ordered CUDA using cuTile kernels. An eager training
 step enqueues allocations, forward arithmetic, derivatives, and optimizer
 updates without per-operation synchronization, retains every device/host buffer
 until the work completes, then synchronizes once at the Trainer step boundary.
-Explicit host reads also synchronize. CPU code builds index plans; these
+Explicit host reads also synchronize.
+Outside Trainer, every 32 allocations the backend records a CUDA event and
+retires buffers with no remaining tensor/plan owner after that event completes.
+If uncompleted retirement batches exceed 256 MiB, inference waits for the oldest
+event to bound the submission backlog. This is not a bound on live tensors or
+autograd graphs. Trainer disables this maintenance for its entire step, including
+error paths, preserving its existing single synchronization boundary.
+
+CPU code builds index plans; these
 generic gather/reduction plans prioritize verifiable semantics. They are
 limited to 16,777,216 contributions per operation and are not a competitive
 GEMM implementation. Contractions over one or more axes take a batched tiled cuTile
